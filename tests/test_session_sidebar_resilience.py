@@ -83,6 +83,13 @@ def test_sessions_sidebar_response_item_drops_bulky_detail_fields(monkeypatch):
         "has_pending_user_message": True,
         "worktree_path": "/tmp/worktree",
         "worktree_branch": "feature/sidebar",
+        "catalog_projection_version": 1,
+        "workspace": "/tmp/worktree",
+        "cwd": "/tmp/worktree",
+        "workspace_kind": "worktree",
+        "workspace_parent_id": "/tmp/repo",
+        "workspace_group_id": "/tmp/worktree",
+        "workspace_group_label": "feature-sidebar",
         "compression_anchor_summary": "X" * 50000,
         "compression_anchor_details": {"huge": True},
         "context_engine_state": {"expensive": True},
@@ -103,6 +110,13 @@ def test_sessions_sidebar_response_item_drops_bulky_detail_fields(monkeypatch):
     assert item["has_pending_user_message"] is True
     assert item["worktree_path"] == "/tmp/worktree"
     assert item["worktree_branch"] == "feature/sidebar"
+    assert item["catalog_projection_version"] == 1
+    assert item["workspace"] == "/tmp/worktree"
+    assert item["cwd"] == "/tmp/worktree"
+    assert item["workspace_kind"] == "worktree"
+    assert item["workspace_parent_id"] == "/tmp/repo"
+    assert item["workspace_group_id"] == "/tmp/worktree"
+    assert item["workspace_group_label"] == "feature-sidebar"
     assert item["attention"] == {"kind": "none"}
     for key in (
         "compression_anchor_summary",
@@ -125,6 +139,13 @@ def test_sidebar_allowlist_preserves_fields_consumed_by_frontend():
         "_state_db_title",
         "has_pending_user_message",
         "worktree_branch",
+        "catalog_projection_version",
+        "workspace",
+        "cwd",
+        "workspace_kind",
+        "workspace_parent_id",
+        "workspace_group_id",
+        "workspace_group_label",
     }
 
     assert required <= routes._SIDEBAR_SESSION_RESPONSE_FIELDS

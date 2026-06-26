@@ -8579,6 +8579,7 @@ def _run_agent_streaming(
                             # write to the wrong DB (TLS profile is set on the
                             # HTTP thread but not propagated to this worker).
                             profile=getattr(s, 'profile', None),
+                            workspace=getattr(s, 'workspace', None),
                         )
                 except Exception:
                     logger.debug("Failed to sync session to insights")

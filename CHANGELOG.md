@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **CLI, cron, and Desktop session rows now expose the same source and workspace catalog metadata in the WebUI session API.** Projected compression chains keep the visible root title while grouping under the active tip workspace, WebUI state sync writes the session workspace into `state.db`, and sidebar responses preserve the shared `raw_source` / `session_source` / `workspace_*` fields clients need for consistent cross-surface grouping.
+
 ## [v0.51.683] — 2026-06-26 — Release YM (WebUI finds the agent for pip-style installs — no more cron.jobs import error)
 
 ### Fixed

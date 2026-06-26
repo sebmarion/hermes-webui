@@ -251,6 +251,45 @@ def test_cheap_fingerprint_detects_source_change(tmp_path):
     assert fp2 != fp1, "a source change alters projected metadata and must be detected"
 
 
+def test_cheap_fingerprint_detects_cwd_change_when_column_exists(tmp_path):
+    """Workspace changes alter the shared catalog projection and must republish."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    conn.execute("ALTER TABLE sessions ADD COLUMN cwd TEXT")
+    _add_session(conn, "s1", "telegram", mc=2)
+    conn.execute("UPDATE sessions SET cwd = '/work/old' WHERE id = 's1'")
+    conn.commit()
+    fp1 = gw._cheap_change_fingerprint(db)
+
+    conn.execute("UPDATE sessions SET cwd = '/work/new' WHERE id = 's1'")
+    conn.commit()
+    fp2 = gw._cheap_change_fingerprint(db)
+
+    assert fp2 != fp1, "cwd changes alter projected workspace metadata and must be detected"
+
+
+def test_cheap_fingerprint_detects_agent_git_workspace_change(tmp_path):
+    """Agent git aliases feed workspace grouping, so field-only changes republish."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    conn.execute("ALTER TABLE sessions ADD COLUMN cwd TEXT")
+    conn.execute("ALTER TABLE sessions ADD COLUMN git_branch TEXT")
+    conn.execute("ALTER TABLE sessions ADD COLUMN git_repo_root TEXT")
+    _add_session(conn, "s1", "telegram", mc=2)
+    conn.execute(
+        "UPDATE sessions SET cwd = '/work/hermes-agent-wt-api', git_branch = 'api', "
+        "git_repo_root = '/work/hermes-agent' WHERE id = 's1'"
+    )
+    conn.commit()
+    fp1 = gw._cheap_change_fingerprint(db)
+
+    conn.execute("UPDATE sessions SET git_branch = 'review' WHERE id = 's1'")
+    conn.commit()
+    fp2 = gw._cheap_change_fingerprint(db)
+
+    assert fp2 != fp1, "git_branch changes alter projected workspace metadata and must be detected"
+
+
 def test_cheap_fingerprint_detects_same_count_message_rewrite(tmp_path):
     """Regression (#3536 review): SessionDB.replace_messages (/retry, /undo,
     /compress) deletes + reinserts a transcript with NEW timestamps but can leave

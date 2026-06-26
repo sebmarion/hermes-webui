@@ -4797,10 +4797,12 @@ def _load_cli_sessions_uncached(
             _title = _sidecar_meta['title']
         _archived = bool(_sidecar_meta.get('archived'))
         _display_title = _title or f'{_source.title()} Session'
+        _workspace = row.get('workspace_path') or row.get('cwd') or _cli_workspace()
         cli_sessions.append({
             'session_id': sid,
             'title': _display_title,
-            'workspace': _cli_workspace(),
+            'workspace': _workspace,
+            'cwd': row.get('cwd') or _workspace,
             'model': row['model'] or None,
             'message_count': row['message_count'] or row['actual_message_count'] or 0,
             'created_at': row['started_at'],
@@ -4819,6 +4821,17 @@ def _load_cli_sessions_uncached(
             'platform': row.get('platform'),
             'session_source': row.get('session_source'),
             'source_label': row.get('source_label'),
+            'catalog_projection_version': row.get('catalog_projection_version'),
+            'workspace_type': row.get('workspace_type'),
+            'workspace_kind': row.get('workspace_kind'),
+            'workspace_id': row.get('workspace_id'),
+            'workspace_label': row.get('workspace_label'),
+            'workspace_path': row.get('workspace_path'),
+            'workspace_group_id': row.get('workspace_group_id'),
+            'workspace_group_label': row.get('workspace_group_label'),
+            'workspace_parent_id': row.get('workspace_parent_id'),
+            'workspace_parent_label': row.get('workspace_parent_label'),
+            'workspace_parent_path': row.get('workspace_parent_path'),
             'parent_session_id': row.get('parent_session_id'),
             'parent_title': row.get('parent_title'),
             'parent_source': row.get('parent_source'),
@@ -4869,10 +4882,12 @@ def _load_cli_sessions_uncached(
                     _title = _sidecar_meta['title']
                 _archived = bool(_sidecar_meta.get('archived'))
                 _display_title = _title or 'Cron Session'
+                _workspace = row.get('workspace_path') or row.get('cwd') or _cli_workspace()
                 cli_sessions.append({
                     'session_id': sid,
                     'title': _display_title,
-                    'workspace': _cli_workspace(),
+                    'workspace': _workspace,
+                    'cwd': row.get('cwd') or _workspace,
                     'model': row['model'] or None,
                     'message_count': row['message_count'] or row['actual_message_count'] or 0,
                     'created_at': row['started_at'],
@@ -4891,6 +4906,17 @@ def _load_cli_sessions_uncached(
                     'platform': row.get('platform'),
                     'session_source': row.get('session_source'),
                     'source_label': row.get('source_label'),
+                    'catalog_projection_version': row.get('catalog_projection_version'),
+                    'workspace_type': row.get('workspace_type'),
+                    'workspace_kind': row.get('workspace_kind'),
+                    'workspace_id': row.get('workspace_id'),
+                    'workspace_label': row.get('workspace_label'),
+                    'workspace_path': row.get('workspace_path'),
+                    'workspace_group_id': row.get('workspace_group_id'),
+                    'workspace_group_label': row.get('workspace_group_label'),
+                    'workspace_parent_id': row.get('workspace_parent_id'),
+                    'workspace_parent_label': row.get('workspace_parent_label'),
+                    'workspace_parent_path': row.get('workspace_parent_path'),
                     'parent_session_id': row.get('parent_session_id'),
                     'parent_title': row.get('parent_title'),
                     'parent_source': row.get('parent_source'),

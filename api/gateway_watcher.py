@@ -83,8 +83,8 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
     _PROJECTION_SESSION_COLS = (
         'id', 'source', 'session_source', 'title', 'model', 'message_count',
         'started_at', 'ended_at', 'end_reason', 'parent_session_id', 'archived',
-        'user_id', 'chat_id', 'chat_type', 'thread_id', 'session_key',
-        'origin_chat_id', 'origin_user_id', 'platform',
+        'cwd', 'git_branch', 'git_repo_root', 'user_id', 'chat_id', 'chat_type',
+        'thread_id', 'session_key', 'origin_chat_id', 'origin_user_id', 'platform',
     )
     try:
         with closing(sqlite3.connect(str(db_path))) as conn:

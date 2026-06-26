@@ -34,6 +34,7 @@ from api.agent_sessions import (
     _looks_like_default_cli_title,
     is_cli_session_row,
     is_cli_session_row_visible,
+    normalize_session_catalog_row,
     read_session_lineage_report,
 )
 from api.compression_anchor import visible_messages_for_anchor
@@ -89,6 +90,7 @@ def _sync_session_title_to_insights(session) -> None:
             title=session.title,
             message_count=len(messages),
             profile=getattr(session, "profile", None),
+            workspace=getattr(session, "workspace", None),
         )
     except Exception:
         logger.debug("Failed to update session title in state.db", exc_info=True)
@@ -6445,6 +6447,7 @@ def _normalize_sidebar_source_flags(session: dict) -> dict:
         return session
     normalized = dict(session)
     normalized["is_cli_session"] = is_cli_session_row(normalized)
+    normalized = normalize_session_catalog_row(normalized)
     return normalized
 
 
@@ -6605,6 +6608,19 @@ def _merge_cli_sidebar_metadata(ui_session: dict, cli_meta: dict) -> dict:
         "raw_source",
         "session_source",
         "source_label",
+        "catalog_projection_version",
+        "workspace",
+        "cwd",
+        "workspace_type",
+        "workspace_kind",
+        "workspace_id",
+        "workspace_label",
+        "workspace_path",
+        "workspace_group_id",
+        "workspace_group_label",
+        "workspace_parent_id",
+        "workspace_parent_label",
+        "workspace_parent_path",
         "user_id",
         "chat_id",
         "chat_type",
@@ -7057,6 +7073,18 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "display_title",
     "_state_db_title",
     "workspace",
+    "cwd",
+    "catalog_projection_version",
+    "workspace_type",
+    "workspace_kind",
+    "workspace_id",
+    "workspace_label",
+    "workspace_path",
+    "workspace_group_id",
+    "workspace_group_label",
+    "workspace_parent_id",
+    "workspace_parent_label",
+    "workspace_parent_path",
     "model",
     "model_provider",
     "message_count",
@@ -17577,6 +17605,7 @@ def _handle_chat_sync(handler, body):
                 # the wrong profile's state.db. HTTP thread today, but
                 # defense-in-depth. Opus pre-release advisor MUST-FIX.
                 profile=getattr(s, 'profile', None),
+                workspace=getattr(s, 'workspace', None),
             )
     except Exception:
         logger.debug("Failed to update session cost tracking")

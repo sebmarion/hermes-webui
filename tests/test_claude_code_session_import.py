@@ -22,6 +22,144 @@ def _claude_fixture_rows() -> list[dict]:
     ]
 
 
+def test_session_catalog_normalizes_webui_and_desktop_workspace_contracts():
+    import api.agent_sessions as agent_sessions
+
+    webui_row = agent_sessions.normalize_session_catalog_row({
+        "id": "webui-cwd",
+        "source": "cli",
+        "cwd": "/work/hermes-agent-wt-api",
+    })
+
+    assert webui_row["raw_source"] == "cli"
+    assert webui_row["session_source"] == "cli"
+    assert webui_row["source_label"] == "CLI"
+    assert webui_row["catalog_projection_version"] == 1
+    assert webui_row["workspace"] == "/work/hermes-agent-wt-api"
+    assert webui_row["cwd"] == "/work/hermes-agent-wt-api"
+    assert webui_row["workspace_kind"] == "worktree"
+    assert webui_row["workspace_parent_id"] == "/work/hermes-agent"
+    assert webui_row["workspace_parent_label"] == "hermes-agent"
+    assert webui_row["workspace_group_id"] == "/work/hermes-agent-wt-api"
+    assert webui_row["workspace_group_label"] == "api"
+
+    desktop_row = agent_sessions.normalize_session_catalog_row({
+        "id": "desktop-worktree",
+        "source": "tui",
+        "worktree_path": "/repos/hermes-agent-wt-mobile",
+        "worktree_branch": "mobile",
+        "worktree_repo_root": "/repos/hermes-agent",
+    })
+
+    assert desktop_row["session_source"] == "cli"
+    assert desktop_row["source_label"] == "TUI"
+    assert desktop_row["workspace"] == "/repos/hermes-agent-wt-mobile"
+    assert desktop_row["cwd"] == "/repos/hermes-agent-wt-mobile"
+    assert desktop_row["workspace_kind"] == "worktree"
+    assert desktop_row["workspace_label"] == "mobile"
+    assert desktop_row["workspace_parent_id"] == "/repos/hermes-agent"
+    assert desktop_row["workspace_parent_label"] == "hermes-agent"
+
+    agent_git_row = agent_sessions.normalize_session_catalog_row({
+        "id": "agent-git-worktree",
+        "source": "tui",
+        "cwd": "/repos/hermes-agent-wt-review",
+        "git_branch": "review",
+        "git_repo_root": "/repos/hermes-agent",
+    })
+
+    assert agent_git_row["workspace_kind"] == "worktree"
+    assert agent_git_row["workspace_label"] == "review"
+    assert agent_git_row["workspace_parent_id"] == "/repos/hermes-agent"
+    assert agent_git_row["workspace_parent_label"] == "hermes-agent"
+
+    no_workspace = agent_sessions.normalize_session_catalog_row({
+        "id": "no-workspace",
+        "source": "cron",
+    })
+
+    assert no_workspace["workspace_kind"] == "none"
+    assert no_workspace["workspace_id"] == agent_sessions.NO_WORKSPACE_ID
+    assert no_workspace["workspace_group_label"] == "No workspace"
+
+
+def test_session_catalog_projection_preserves_tip_workspace_for_compressed_chain():
+    import api.agent_sessions as agent_sessions
+
+    projected = agent_sessions._project_agent_session_rows([
+        {
+            "id": "root",
+            "title": "Root title",
+            "source": "cli",
+            "model": "gpt-root",
+            "message_count": 2,
+            "actual_message_count": 2,
+            "actual_user_message_count": 1,
+            "started_at": 1.0,
+            "last_activity": 2.0,
+            "ended_at": 2.5,
+            "end_reason": "compression",
+            "cwd": "/work/hermes-agent",
+        },
+        {
+            "id": "tip",
+            "title": "Tip title",
+            "source": "cli",
+            "model": "gpt-tip",
+            "message_count": 4,
+            "actual_message_count": 4,
+            "actual_user_message_count": 2,
+            "started_at": 3.0,
+            "last_activity": 4.0,
+            "ended_at": None,
+            "end_reason": None,
+            "parent_session_id": "root",
+            "cwd": "/work/hermes-agent-wt-api",
+        },
+    ])
+
+    assert len(projected) == 1
+    row = projected[0]
+    assert row["id"] == "tip"
+    assert row["title"] == "Root title"
+    assert row["_lineage_root_id"] == "root"
+    assert row["_lineage_tip_id"] == "tip"
+    assert row["workspace"] == "/work/hermes-agent-wt-api"
+    assert row["cwd"] == "/work/hermes-agent-wt-api"
+    assert row["workspace_kind"] == "worktree"
+    assert row["workspace_parent_id"] == "/work/hermes-agent"
+    assert row["workspace_group_label"] == "api"
+
+
+def test_session_catalog_projection_keeps_rows_sorted_after_shared_import():
+    import api.agent_sessions as agent_sessions
+
+    projected = agent_sessions._project_agent_session_rows([
+        {
+            "id": "old",
+            "title": "Old",
+            "source": "cli",
+            "message_count": 1,
+            "actual_message_count": 1,
+            "actual_user_message_count": 1,
+            "started_at": 1.0,
+            "last_activity": 2.0,
+        },
+        {
+            "id": "new",
+            "title": "New",
+            "source": "cli",
+            "message_count": 1,
+            "actual_message_count": 1,
+            "actual_user_message_count": 1,
+            "started_at": 3.0,
+            "last_activity": 4.0,
+        },
+    ])
+
+    assert [row["id"] for row in projected] == ["new", "old"]
+
+
 def test_default_claude_code_scan_is_disabled_inside_test_state(monkeypatch, tmp_path):
     """Test runs must not accidentally scan Michael's real ~/.claude/projects."""
     import api.models as models
@@ -153,6 +291,13 @@ def test_get_cli_sessions_cache_invalidates_when_sqlite_wal_changes(monkeypatch,
                 "message_count": calls,
                 "actual_message_count": calls,
                 "actual_user_message_count": 1,
+                "cwd": "/work/hermes-agent-wt-api",
+                "workspace_kind": "worktree",
+                "workspace_parent_id": "/work/hermes-agent",
+                "workspace_parent_label": "hermes-agent",
+                "workspace_group_id": "/work/hermes-agent-wt-api",
+                "workspace_group_label": "api",
+                "workspace_path": "/work/hermes-agent-wt-api",
                 "last_activity": float(calls),
                 "started_at": 1.0,
             }
@@ -173,6 +318,11 @@ def test_get_cli_sessions_cache_invalidates_when_sqlite_wal_changes(monkeypatch,
     # the second pass incremented calls to 2 and 4 but cron-only filter
     # excluded the cli-source session from both second passes).
     assert second[0]["message_count"] == 3
+    assert second[0]["workspace"] == "/work/hermes-agent-wt-api"
+    assert second[0]["cwd"] == "/work/hermes-agent-wt-api"
+    assert second[0]["workspace_kind"] == "worktree"
+    assert second[0]["workspace_parent_id"] == "/work/hermes-agent"
+    assert second[0]["workspace_group_label"] == "api"
 
 
 def test_session_import_cli_returns_read_only_claude_code_payload(monkeypatch, tmp_path):

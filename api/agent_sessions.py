@@ -77,6 +77,157 @@ def _with_normalized_source(row: dict) -> dict:
     return {**row, **normalized}
 
 
+NO_WORKSPACE_ID = "__no_workspace__"
+
+
+def _segments(path: str) -> list[str]:
+    return str(path or "").rstrip("/\\").replace("\\", "/").split("/") if str(path or "").strip() else []
+
+
+def _base_name(path: str) -> str | None:
+    parts = [p for p in _segments(path) if p]
+    return parts[-1] if parts else None
+
+
+def _with_base_name(path: str, name: str) -> str:
+    raw = str(path or "").rstrip("/\\")
+    if not raw:
+        return name
+    sep = "\\" if "\\" in raw and "/" not in raw else "/"
+    parts = raw.replace("\\", "/").split("/")
+    parts[-1] = name
+    joined = "/".join(parts)
+    return joined.replace("/", sep) if sep == "\\" else joined
+
+
+def _clean_path(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).expanduser())
+    except Exception:
+        return text
+
+
+def classify_session_workspace(
+    workspace=None,
+    *,
+    cwd=None,
+    worktree_path=None,
+    worktree_branch=None,
+    worktree_repo_root=None,
+    git_branch=None,
+    git_repo_root=None,
+    no_workspace_label: str = "No workspace",
+) -> dict:
+    """Return stable workspace grouping metadata for a session row.
+
+    This fallback mirrors Hermes Agent's shared ``session_catalog`` contract for
+    deployments/tests where the shared module is not importable yet.
+    """
+    path = _clean_path(cwd) or _clean_path(workspace) or _clean_path(worktree_path)
+    wt_path = _clean_path(worktree_path) or path
+    repo_root = _clean_path(worktree_repo_root) or _clean_path(git_repo_root)
+    branch = str(worktree_branch or git_branch or "").strip()
+
+    if repo_root and wt_path:
+        worktree_key = wt_path
+        parent_key = repo_root
+        parent_label = _base_name(repo_root) or repo_root
+        worktree_label = branch or _base_name(wt_path) or wt_path
+        kind = "worktree" if wt_path != repo_root else "directory"
+    elif path:
+        base = _base_name(path) or path
+        match = None
+        try:
+            import re
+
+            match = re.match(r"^(.+)-wt-(.+)$", base)
+        except Exception:
+            match = None
+        if match:
+            parent_label = match.group(1)
+            parent_key = _with_base_name(path, parent_label)
+            worktree_key = path
+            worktree_label = match.group(2)
+            kind = "worktree"
+        else:
+            parent_key = path
+            parent_label = base
+            worktree_key = path
+            worktree_label = base
+            kind = "directory"
+        wt_path = worktree_key
+        repo_root = parent_key
+    else:
+        return {
+            "workspace_type": "none",
+            "workspace_kind": "none",
+            "workspace_id": NO_WORKSPACE_ID,
+            "workspace_label": no_workspace_label,
+            "workspace_path": None,
+            "workspace_group_id": NO_WORKSPACE_ID,
+            "workspace_group_label": no_workspace_label,
+            "workspace_parent_id": NO_WORKSPACE_ID,
+            "workspace_parent_label": no_workspace_label,
+            "workspace_parent_path": None,
+        }
+
+    return {
+        "workspace_type": kind,
+        "workspace_kind": kind,
+        "workspace_id": worktree_key,
+        "workspace_label": worktree_label,
+        "workspace_path": wt_path,
+        "workspace_group_id": worktree_key,
+        "workspace_group_label": worktree_label,
+        "workspace_parent_id": parent_key,
+        "workspace_parent_label": parent_label,
+        "workspace_parent_path": repo_root,
+    }
+
+
+def normalize_session_catalog_row(row: dict, *, no_workspace_label: str = "No workspace") -> dict:
+    """Attach shared source + workspace catalog fields to one session row."""
+    if not isinstance(row, dict):
+        return row
+    out = dict(row)
+
+    source_seed = out.get("source") or out.get("raw_source") or out.get("source_tag")
+    source_meta = normalize_agent_session_source(source_seed)
+    for key, value in source_meta.items():
+        if out.get(key) in (None, ""):
+            out[key] = value
+    if out.get("source_tag") in (None, "") and source_meta.get("raw_source"):
+        out["source_tag"] = source_meta["raw_source"]
+
+    workspace_path = out.get("cwd") or out.get("workspace") or out.get("worktree_path")
+    workspace_meta = classify_session_workspace(
+        workspace_path,
+        cwd=out.get("cwd"),
+        worktree_path=out.get("worktree_path"),
+        worktree_branch=out.get("worktree_branch"),
+        worktree_repo_root=out.get("worktree_repo_root"),
+        git_branch=out.get("git_branch"),
+        git_repo_root=out.get("git_repo_root"),
+        no_workspace_label=no_workspace_label,
+    )
+    for key, value in workspace_meta.items():
+        if out.get(key) in (None, ""):
+            out[key] = value
+
+    resolved_path = workspace_meta.get("workspace_path") or workspace_path
+    if resolved_path:
+        if out.get("workspace") in (None, ""):
+            out["workspace"] = resolved_path
+        if out.get("cwd") in (None, ""):
+            out["cwd"] = resolved_path
+
+    out["catalog_projection_version"] = 1
+    return out
+
+
 def _optional_col(name: str, columns: set[str], fallback: str = "NULL") -> str:
     return f"s.{name}" if name in columns else f"{fallback} AS {name}"
 
@@ -374,21 +525,19 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
             continue
 
         if tip is row:
-            projected.append(dict(row))
+            projected.append(normalize_session_catalog_row(_with_normalized_source(dict(row))))
             continue
 
         merged = dict(row)
         # Keep the chain head's visible identity (title, started_at), but
         # point the row at the latest importable segment for navigation AND
-        # surface the tip's recency so an actively-used chain bubbles to the
-        # top of the sidebar by its true last activity. Without overriding
-        # last_activity, a long-lived chain whose tip is being edited NOW
-        # would sort by the root's old timestamp and fall below recently
-        # touched standalone sessions — exactly the inverse of what a user
-        # expects from "Show agent sessions" sorted by activity.
+        # surface the tip's recency/cwd so an actively-used chain bubbles to the
+        # top of the sidebar by its true last activity and groups under the
+        # workspace that owns the importable tip.
         for key in (
             'id', 'model', 'message_count', 'actual_message_count', 'actual_user_message_count',
-            'ended_at', 'end_reason', 'last_activity',
+            'ended_at', 'end_reason', 'last_activity', 'last_active',
+            'cwd', 'worktree_path', 'worktree_branch', 'worktree_repo_root',
         ):
             if key in tip:
                 merged[key] = tip[key]
@@ -409,7 +558,7 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
         merged['_lineage_root_id'] = row['id']
         merged['_lineage_tip_id'] = tip['id']
         merged['_compression_segment_count'] = segment_count
-        projected.append(merged)
+        projected.append(normalize_session_catalog_row(_with_normalized_source(merged)))
 
     projected.sort(
         key=lambda row: _as_score(row.get('last_activity'), row.get('started_at')),
@@ -466,6 +615,9 @@ def read_importable_agent_session_rows(
             return []
 
         parent_expr = _optional_col('parent_session_id', session_cols)
+        cwd_expr = _optional_col('cwd', session_cols)
+        git_branch_expr = _optional_col('git_branch', session_cols)
+        git_repo_root_expr = _optional_col('git_repo_root', session_cols)
         session_source_expr = _optional_col('session_source', session_cols)
         ended_expr = _optional_col('ended_at', session_cols)
         end_reason_expr = _optional_col('end_reason', session_cols)
@@ -582,6 +734,9 @@ def read_importable_agent_session_rows(
         select_sql = f"""
             SELECT s.id, s.title, s.model, s.message_count,
                    s.started_at, s.source,
+                   {cwd_expr},
+                   {git_branch_expr},
+                   {git_repo_root_expr},
                    {session_source_expr},
                    {user_id_expr},
                    {chat_id_expr},
@@ -1097,3 +1252,28 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
             entry['_compression_segment_count'] = max(segment_count, tip_depth)
 
     return metadata
+
+
+# Prefer Hermes Agent's shared catalog projection when the source tree/package is
+# importable (normal WebUI runtime via api.config/bootstrap). Keep the local
+# definitions above as a compatibility fallback for standalone WebUI tests or
+# older deployments where hermes-agent is not on sys.path yet.
+try:  # pragma: no cover - fallback path is exercised by legacy deployments
+    from session_catalog import (
+        CLI_MIN_UNTITLED_MESSAGE_COUNT as CLI_MIN_UNTITLED_MESSAGE_COUNT,
+        CLI_MIN_UNTITLED_USER_MESSAGE_COUNT as CLI_MIN_UNTITLED_USER_MESSAGE_COUNT,
+        MESSAGING_SOURCES as MESSAGING_SOURCES,
+        SOURCE_LABELS as SOURCE_LABELS,
+        classify_session_workspace as classify_session_workspace,
+        is_cli_session_row as is_cli_session_row,
+        is_cli_session_row_visible as is_cli_session_row_visible,
+        normalize_agent_session_source as normalize_agent_session_source,
+        normalize_session_catalog_row as normalize_session_catalog_row,
+        project_agent_session_rows as _project_agent_session_rows,
+        _continuation_root_id as _continuation_root_id,
+        _is_continuation_session as _is_continuation_session,
+        _looks_like_default_cli_title as _looks_like_default_cli_title,
+        _with_normalized_source as _with_normalized_source,
+    )
+except Exception:  # pragma: no cover
+    pass

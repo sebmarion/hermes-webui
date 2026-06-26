@@ -105,7 +105,7 @@ def _get_state_db(profile: Optional[str] = None):
         return None
 
 
-def sync_session_start(session_id: str, model=None, profile: Optional[str] = None) -> None:
+def sync_session_start(session_id: str, model=None, profile: Optional[str] = None, workspace: Optional[str] = None) -> None:
     """Register a WebUI session in state.db (idempotent).
     Called when a session's first message is sent.
 
@@ -122,7 +122,10 @@ def sync_session_start(session_id: str, model=None, profile: Optional[str] = Non
             session_id=session_id,
             source='webui',
             model=model,
+            cwd=workspace,
         )
+        if workspace:
+            db.update_session_cwd(session_id, workspace)
     except Exception:
         logger.debug("Failed to sync session start to state.db")
     finally:
@@ -134,7 +137,8 @@ def sync_session_start(session_id: str, model=None, profile: Optional[str] = Non
 
 def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=0,
                        estimated_cost=None, model=None, title: Optional[str] = None,
-                       message_count: Optional[int] = None, profile: Optional[str] = None) -> None:
+                       message_count: Optional[int] = None, profile: Optional[str] = None,
+                       workspace: Optional[str] = None) -> None:
     """Update token usage and title for a WebUI session in state.db.
     Called after each turn completes. Uses absolute=True to set totals
     (the WebUI Session already accumulates across turns).
@@ -152,7 +156,12 @@ def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=
         return
     try:
         # Ensure session exists first (idempotent)
-        db.ensure_session(session_id=session_id, source='webui', model=model)
+        db.ensure_session(session_id=session_id, source='webui', model=model, cwd=workspace)
+        if workspace:
+            try:
+                db.update_session_cwd(session_id, workspace)
+            except Exception:
+                logger.debug("Failed to sync session workspace to state.db")
         # Set absolute token counts
         db.update_token_counts(
             session_id=session_id,
