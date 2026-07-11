@@ -632,14 +632,12 @@ def read_importable_agent_session_rows(
                 where_clauses.append(f"s.source NOT IN ({placeholders})")
                 params.extend(excluded)
 
-        use_preaggregated_candidate_order = (
-            use_messages_join
-            and messages_has_timestamp
-            and included == ("cron",)
-            and not messages_index_present
-        )
-        if use_preaggregated_candidate_order:
-            order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
+        if use_messages_join and messages_has_timestamp:
+            # Build the recent-activity candidate window from one indexed
+            # aggregate instead of a correlated MAX() subquery per session.
+            # The correlated form re-opened the messages index for every one of
+            # the 1,000+ sessions in a large state.db and made a cold sidebar
+            # request spend seconds before it could even apply LIMIT.
             latest_messages_cte = (
                 "latest_messages AS (\n"
                 "                    SELECT mx.session_id AS session_id, MAX(mx.timestamp) AS last_message_at\n"
@@ -647,14 +645,9 @@ def read_importable_agent_session_rows(
                 "                    GROUP BY mx.session_id\n"
                 "                )"
             )
-            candidate_order_clause = "ORDER BY COALESCE(lm.last_message_at, s.started_at) DESC, s.started_at DESC"
-        elif use_messages_join and messages_has_timestamp:
             order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
             candidate_order_clause = (
-                "ORDER BY COALESCE(\n"
-                "                        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),\n"
-                "                        s.started_at\n"
-                "                    ) DESC,\n"
+                "ORDER BY COALESCE(lm.last_message_at, s.started_at) DESC,\n"
                 "                    s.started_at DESC"
             )
 
