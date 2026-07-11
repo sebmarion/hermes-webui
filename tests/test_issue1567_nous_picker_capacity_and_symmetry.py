@@ -301,7 +301,7 @@ class TestApiModelsLargeCatalog:
         _install_fake_hermes_cli(monkeypatch, nous_ids=catalog)
         monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
 
-        restore = _swap_in_test_config({"model": {"provider": "nous"}})
+        restore = _swap_in_test_config({"model": {"provider": "nous", "default": catalog[0]}})
         try:
             data = config.get_available_models()
             nous_groups = [g for g in data["groups"] if g["provider_id"] == "nous"]
@@ -333,7 +333,7 @@ class TestApiModelsLargeCatalog:
         _install_fake_hermes_cli(monkeypatch, nous_ids=small_catalog)
         monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
 
-        restore = _swap_in_test_config({"model": {"provider": "nous"}})
+        restore = _swap_in_test_config({"model": {"provider": "nous", "default": small_catalog[0]}})
         try:
             data = config.get_available_models()
             grp = next(g for g in data["groups"] if g["provider_id"] == "nous")

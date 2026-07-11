@@ -4344,12 +4344,13 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
 def _hide_from_default_sidebar(session: dict, *, show_cron: bool = False, show_webhook: bool = False) -> bool:
     """Return True for internal/background sessions hidden from the default list."""
     sid = str(session.get('session_id') or '')
-    source = (
-        session.get('source_tag')
-        or session.get('source')
-        or session.get('raw_source')
-        or session.get('session_source')
-    )
+    source_values = [
+        str(session.get(key) or '').strip().lower()
+        for key in ('source_tag', 'source', 'raw_source', 'session_source')
+    ]
+    source = next((value for value in source_values if value), '')
+    if 'subagent' in source_values or session.get('delegate_from') or session.get('_delegate_from'):
+        return True
     if not show_cron and (source == 'cron' or sid.startswith('cron_')):
         return True
     if not show_webhook and source == 'webhook':

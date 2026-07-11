@@ -69,6 +69,11 @@ def test_sessions_list_reconciles_stale_stream_state_before_serializing(monkeypa
     monkeypatch.setattr(routes, "all_sessions", fake_all_sessions)
     monkeypatch.setattr(routes, "get_session", fake_get_session)
     monkeypatch.setattr(routes, "_clear_stale_stream_state", fake_clear_stale_stream_state)
+    monkeypatch.setattr(
+        routes,
+        "_schedule_stale_stream_state_reconciliation",
+        lambda rows: routes._reconcile_stale_stream_state_for_session_rows(rows) or True,
+    )
     monkeypatch.setattr(routes, "load_settings", lambda: {"show_cli_sessions": False})
     monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
 
@@ -79,10 +84,19 @@ def test_sessions_list_reconciles_stale_stream_state_before_serializing(monkeypa
     assert handler.status == 200
     payload = handler.json_body()
     sessions = payload["sessions"]
-    assert all_sessions_calls["count"] == 2
+    assert all_sessions_calls["count"] == 1
     assert repaired["value"] is True
-    assert sessions[0]["active_stream_id"] is None
+    # The request serves its already-built projection; repair is visible after
+    # the normal cache refresh rather than blocking this response.
+    assert sessions[0]["active_stream_id"] == "stale-stream"
     assert sessions[0]["is_streaming"] is False
+
+    routes._session_list_cache_clear()
+    second = _FakeHandler()
+    routes.handle_get(second, parsed)
+    second_sessions = second.json_body()["sessions"]
+    assert all_sessions_calls["count"] == 2
+    assert second_sessions[0]["active_stream_id"] is None
     routes._session_list_cache_clear()
 
 

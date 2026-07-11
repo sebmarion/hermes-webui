@@ -121,7 +121,8 @@ def test_skills_content_has_linked_files_key():
         d, status = get("/api/skills")
         if not d.get("skills"):
             return  # no skills in test env, skip
-        name = d["skills"][0]["name"]
+        from urllib.parse import quote as _quote
+        name = _quote(d["skills"][0]["name"], safe="")
         d2, status2 = get(f"/api/skills/content?name={name}")
         assert status2 == 200
         assert "linked_files" in d2, "linked_files key missing from skills/content response"
@@ -138,7 +139,7 @@ def test_skills_content_file_path_traversal_rejected():
         d, status = get("/api/skills")
         if not d.get("skills"):
             return  # no skills in test env, skip
-        name = d["skills"][0]["name"]
+        name = _quote(d["skills"][0]["name"], safe="")
         traversal = _quote("../../etc/passwd", safe="")
         try:
             d2, status2 = get(f"/api/skills/content?name={name}&file={traversal}")

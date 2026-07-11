@@ -483,6 +483,7 @@ def read_importable_agent_session_rows(
     log=None,
     exclude_sources: tuple[str, ...] | None = ("cron", "webui"),
     include_sources: tuple[str, ...] | None = None,
+    include_children: bool = False,
 ) -> list[dict]:
     """Return agent sessions projected as importable conversations.
 
@@ -496,8 +497,10 @@ def read_importable_agent_session_rows(
     sidebar. This mirrors Hermes Agent CLI's session-list behaviour: interactive
     views should stay focused on user-facing conversations, while callers that
     need a source-specific diagnostic view can opt out by passing
-    ``exclude_sources=None``. ``include_sources`` is an additional narrowing
-    filter; callers that want an include-only query should explicitly pass
+    ``exclude_sources=None``. Delegated child sessions are also omitted unless
+    ``include_children=True``; they remain directly addressable by session id but
+    must not consume ordinary sidebar slots. ``include_sources`` is an additional
+    narrowing filter; callers that want an include-only query should explicitly pass
     ``exclude_sources=None`` so the default exclusions do not also apply.
     """
     db_path = Path(db_path)
@@ -551,6 +554,12 @@ def read_importable_agent_session_rows(
         origin_chat_id_expr = _optional_col('origin_chat_id', session_cols)
         origin_user_id_expr = _optional_col('origin_user_id', session_cols)
         platform_expr = _optional_col('platform', session_cols)
+        delegate_from_expr = (
+            "CASE WHEN json_valid(s.model_config) "
+            "THEN json_extract(s.model_config, '$._delegate_from') ELSE NULL END AS delegate_from"
+            if 'model_config' in session_cols
+            else "NULL AS delegate_from"
+        )
         # Older/minimal state.db schemas can have NO ``messages`` table at all,
         # or a ``messages`` table without a ``session_id`` / ``timestamp`` column.
         # The projection SQL below joins ``messages`` and aggregates
@@ -631,13 +640,25 @@ def read_importable_agent_session_rows(
                 placeholders = ", ".join("?" for _ in excluded)
                 where_clauses.append(f"s.source NOT IN ({placeholders})")
                 params.extend(excluded)
+        if not include_children:
+            # Delegate-task children are transcript/debug artifacts, not top-level
+            # conversations. Push this into the candidate query so fan-out cannot
+            # crowd real sessions out of the SQL LIMIT.
+            where_clauses.append("LOWER(TRIM(COALESCE(s.source, ''))) != 'subagent'")
+            if 'model_config' in session_cols:
+                where_clauses.append(
+                    "(s.model_config IS NULL OR NOT json_valid(s.model_config) OR "
+                    "COALESCE(json_extract(s.model_config, '$._delegate_from'), '') = '')"
+                )
 
-        if use_messages_join and messages_has_timestamp:
-            # Build the recent-activity candidate window from one indexed
-            # aggregate instead of a correlated MAX() subquery per session.
-            # The correlated form re-opened the messages index for every one of
-            # the 1,000+ sessions in a large state.db and made a cold sidebar
-            # request spend seconds before it could even apply LIMIT.
+        use_preaggregated_candidate_order = (
+            use_messages_join
+            and messages_has_timestamp
+            and included == ("cron",)
+            and not messages_index_present
+        )
+        if use_preaggregated_candidate_order:
+            order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
             latest_messages_cte = (
                 "latest_messages AS (\n"
                 "                    SELECT mx.session_id AS session_id, MAX(mx.timestamp) AS last_message_at\n"
@@ -645,9 +666,14 @@ def read_importable_agent_session_rows(
                 "                    GROUP BY mx.session_id\n"
                 "                )"
             )
+            candidate_order_clause = "ORDER BY COALESCE(lm.last_message_at, s.started_at) DESC, s.started_at DESC"
+        elif use_messages_join and messages_has_timestamp:
             order_by_clause = "ORDER BY COALESCE(MAX(m.timestamp), s.started_at) DESC"
             candidate_order_clause = (
-                "ORDER BY COALESCE(lm.last_message_at, s.started_at) DESC,\n"
+                "ORDER BY COALESCE(\n"
+                "                        (SELECT MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id),\n"
+                "                        s.started_at\n"
+                "                    ) DESC,\n"
                 "                    s.started_at DESC"
             )
 
@@ -664,6 +690,7 @@ def read_importable_agent_session_rows(
                    {origin_user_id_expr},
                    {platform_expr},
                    {parent_expr},
+                   {delegate_from_expr},
                    {ended_expr},
                    {end_reason_expr},
                    {actual_count_expr} AS actual_message_count,

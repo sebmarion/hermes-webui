@@ -2256,6 +2256,13 @@ function _isReadOnlySession(session) {
   return !!(session && (session.read_only || session.is_read_only));
 }
 
+function _isSubagentSession(session) {
+  if(!session) return false;
+  const sources=[session.source_tag,session.raw_source,session.session_source,session.source]
+    .map(v=>String(v||'').trim().toLowerCase());
+  return sources.includes('subagent') || !!session.delegate_from || !!session._delegate_from;
+}
+
 function _isBranchableReadOnlySession(session) {
   if (!_isReadOnlySession(session)) return false;
   const sources = [
@@ -4417,6 +4424,7 @@ async function _archiveSession(session, archived=true, beforeListRender=null){
 
 function _openSessionActionMenu(session, anchorEl){
   const isReadOnly = _isReadOnlySession(session);
+  const isSubagentSession = _isSubagentSession(session);
   if(_sessionActionMenu && _sessionActionSessionId===session.session_id && _sessionActionAnchor===anchorEl){
     closeSessionActionMenu();
     return;
@@ -4430,15 +4438,17 @@ function _openSessionActionMenu(session, anchorEl){
   _appendSessionCopyLinkAction(menu, session);
   if(isReadOnly){
     _appendSessionExportHtmlAction(menu, session);
-    menu.appendChild(_buildSessionAction(
-      session.archived?t('session_restore'):t('session_hide_external'),
-      session.archived?t('session_restore_desc'):t('session_hide_external_desc'),
-      session.archived?ICONS.unarchive:ICONS.archive,
-      async()=>{
-        closeSessionActionMenu();
-        await _archiveSession(session,!session.archived);
-      }
-    ));
+    if(!isSubagentSession){
+      menu.appendChild(_buildSessionAction(
+        session.archived?t('session_restore'):t('session_hide_external'),
+        session.archived?t('session_restore_desc'):t('session_hide_external_desc'),
+        session.archived?ICONS.unarchive:ICONS.archive,
+        async()=>{
+          closeSessionActionMenu();
+          await _archiveSession(session,!session.archived);
+        }
+      ));
+    }
     _mountSessionActionMenu(menu, session, anchorEl);
     return;
   }

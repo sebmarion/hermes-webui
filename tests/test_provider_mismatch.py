@@ -1708,6 +1708,7 @@ def test_stale_openai_model_cleared_for_custom_only_provider(monkeypatch):
     """A stale openai/... session model must be cleared when active provider is
     'custom' and no catalog group can route the openai prefix (#829)."""
     import api.routes as routes
+    monkeypatch.setattr(routes, "DEFAULT_MODEL", "")
 
     monkeypatch.setattr(
         routes,
