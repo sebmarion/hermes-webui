@@ -4341,6 +4341,19 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         s.save()
     return s
 
+def _is_delegate_child_sidebar_session(session: dict) -> bool:
+    """Return True only for rows carrying an authoritative delegate-child signal."""
+    source_values = [
+        str(session.get(key) or '').strip().lower()
+        for key in ('source_tag', 'source', 'raw_source', 'session_source')
+    ]
+    return bool(
+        'subagent' in source_values
+        or session.get('delegate_from')
+        or session.get('_delegate_from')
+    )
+
+
 def _hide_from_default_sidebar(session: dict, *, show_cron: bool = False, show_webhook: bool = False) -> bool:
     """Return True for internal/background sessions hidden from the default list."""
     sid = str(session.get('session_id') or '')
@@ -4349,7 +4362,7 @@ def _hide_from_default_sidebar(session: dict, *, show_cron: bool = False, show_w
         for key in ('source_tag', 'source', 'raw_source', 'session_source')
     ]
     source = next((value for value in source_values if value), '')
-    if 'subagent' in source_values or session.get('delegate_from') or session.get('_delegate_from'):
+    if _is_delegate_child_sidebar_session(session):
         return True
     if not show_cron and (source == 'cron' or sid.startswith('cron_')):
         return True
@@ -4476,6 +4489,11 @@ def _preserve_messageful_sidebar_discoverability(
         if not sid or sid in visible_ids:
             continue
         if _sidebar_message_count(session) <= 0:
+            continue
+        # Delegate children are intentionally absent from the ordinary sidebar,
+        # even when they are messageful and have no visible parent/lineage row.
+        # Direct transcript lookup remains the supported diagnostic path.
+        if _is_delegate_child_sidebar_session(session):
             continue
         if _is_intentionally_background_sidebar_session(session):
             continue

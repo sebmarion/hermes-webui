@@ -100,7 +100,7 @@ def test_read_only_sessions_can_still_open_actions_for_copy_link():
     assert "const isReadOnly = _isReadOnlySession(session);" in open_menu_block
     # Read-only sessions still get Copy link + Export. Ordinary external rows
     # may be hidden/restored, but delegate children must never get that action.
-    assert "if(isReadOnly){\n    _appendSessionExportHtmlAction(menu, session);" in open_menu_block
+    assert "if(isReadOnly||isSubagentSession){\n    _appendSessionExportHtmlAction(menu, session);" in open_menu_block
     assert "if(!isSubagentSession){" in open_menu_block
     assert "await _archiveSession(session,!session.archived);" in open_menu_block
     assert "_mountSessionActionMenu(menu, session, anchorEl);\n    return;" in open_menu_block

@@ -4440,7 +4440,7 @@ function _openSessionActionMenu(session, anchorEl){
   const menu=document.createElement('div');
   menu.className='session-action-menu';
   _appendSessionCopyLinkAction(menu, session);
-  if(isReadOnly){
+  if(isReadOnly||isSubagentSession){
     _appendSessionExportHtmlAction(menu, session);
     if(!isSubagentSession){
       menu.appendChild(_buildSessionAction(

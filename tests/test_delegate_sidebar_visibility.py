@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 from api.agent_sessions import read_importable_agent_session_rows
-from api.models import _hide_from_default_sidebar
+from api.models import _hide_from_default_sidebar, _preserve_messageful_sidebar_discoverability
 
 ROOT = Path(__file__).resolve().parents[1]
 SESSIONS_JS = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
@@ -74,10 +74,32 @@ def test_model_layer_defensively_hides_materialized_delegate_rows():
     assert _hide_from_default_sidebar({"session_id": "continuation", "source": "tui", "parent_session_id": "p"}) is False
 
 
+def test_discoverability_rescue_never_reintroduces_delegate_child():
+    child = {
+        "session_id": "orphan-child",
+        "source": "webui",
+        "delegate_from": "missing-parent",
+        "message_count": 4,
+    }
+    assert _preserve_messageful_sidebar_discoverability([child], []) == []
+
+
+def test_discoverability_rescue_keeps_generic_parented_lineage_eligible():
+    continuation = {
+        "session_id": "continuation",
+        "source": "webui",
+        "parent_session_id": "missing-parent",
+        "message_count": 4,
+    }
+    rescued = _preserve_messageful_sidebar_discoverability([continuation], [])
+    assert [row["session_id"] for row in rescued] == ["continuation"]
+
+
 def test_explicit_subagent_menu_has_no_archive_action():
     start = SESSIONS_JS.index("function _openSessionActionMenu(session, anchorEl){")
     end = SESSIONS_JS.index("document.addEventListener('click'", start)
     block = SESSIONS_JS[start:end]
     assert "const isSubagentSession = _isSubagentSession(session);" in block
+    assert "if(isReadOnly||isSubagentSession){" in block
     assert "if(!isSubagentSession){" in block
     assert block.index("if(!isSubagentSession){") < block.index("await _archiveSession(session,!session.archived);")
