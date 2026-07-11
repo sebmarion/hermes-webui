@@ -2204,10 +2204,15 @@ def _build_session_list_cache_payload(
 
     diag_stage("all_sessions")
     webui_sessions = _all_sessions_for_sidebar()
+    # Stale stream cleanup can require a full session reload and an atomic
+    # sidecar write. Never put that repair on the sidebar request thread: a
+    # crashed/restarted worker may leave many stale rows, turning a cheap list
+    # read into seconds of serialized file I/O. The request serves the indexed
+    # projection immediately; one background repair owner converges persisted
+    # state and the next cache invalidation picks it up.
     diag_stage("reconcile_stale_stream_state")
-    if _reconcile_stale_stream_state_for_session_rows(webui_sessions):
-        diag_stage("all_sessions_after_stale_stream_reconcile")
-        webui_sessions = _all_sessions_for_sidebar()
+    if _schedule_stale_stream_state_reconciliation(webui_sessions):
+        diag_stage("reconcile_stale_stream_state_deferred")
     diag_stage("normalize_cli_rows")
     show_cli_sessions = bool(show_cli_sessions)
     show_previous_messaging_sessions = bool(show_previous_messaging_sessions)
@@ -5130,6 +5135,34 @@ def _resolve_share_session_pair(sid: str, handler):
         if reason == "was_webui" or synth is None:
             raise KeyError(sid) from None
         return synth, None, cli_meta
+_STALE_STREAM_RECONCILIATION_LOCK = threading.Lock()
+
+
+def _schedule_stale_stream_state_reconciliation(session_rows) -> bool:
+    """Schedule at most one stale-stream repair pass outside the request thread."""
+    if not session_rows:
+        return False
+    if not _STALE_STREAM_RECONCILIATION_LOCK.acquire(blocking=False):
+        return False
+
+    def _run_reconciliation():
+        try:
+            _reconcile_stale_stream_state_for_session_rows(session_rows)
+        except Exception:
+            logger.debug("Background stale stream reconciliation failed", exc_info=True)
+        finally:
+            _STALE_STREAM_RECONCILIATION_LOCK.release()
+
+    try:
+        threading.Thread(
+            target=_run_reconciliation,
+            name="stale-stream-reconciliation",
+            daemon=True,
+        ).start()
+    except Exception:
+        _STALE_STREAM_RECONCILIATION_LOCK.release()
+        return False
+    return True
 
 
 def _reconcile_stale_stream_state_for_session_rows(session_rows) -> bool:
@@ -15550,8 +15583,10 @@ def handle_post(handler, parsed) -> bool:
             cli_meta = _lookup_cli_session_metadata(sid)
             if not cli_meta:
                 return bad(handler, "Session not found", 404)
-            if cli_meta.get("read_only"):
-                return bad(handler, "Read-only imported sessions cannot be archived from WebUI", 400)
+            # Archiving changes only the WebUI projection sidecar. It is valid
+            # for read-only external transcripts; the source transcript remains
+            # immutable. Subagent projections are the exception because they are
+            # owned by the delegate runner rather than by this WebUI.
             # Delegated subagent children (#5307) are view-only and owned by the
             # delegate runner — never materialize one into a writable WebUI
             # sidecar via the archive fallback (the 3rd of the shared
@@ -15580,6 +15615,7 @@ def handle_post(handler, parsed) -> bool:
                 s.thread_id = cli_meta.get("thread_id")
                 s.session_key = cli_meta.get("session_key")
                 s.platform = cli_meta.get("platform")
+                s.read_only = bool(cli_meta.get("read_only"))
                 s.save(touch_updated_at=False)
             else:
                 msgs = get_cli_session_messages(sid)
@@ -15605,6 +15641,7 @@ def handle_post(handler, parsed) -> bool:
                 s.thread_id = cli_meta.get("thread_id")
                 s.session_key = cli_meta.get("session_key")
                 s.platform = cli_meta.get("platform")
+                s.read_only = bool(cli_meta.get("read_only"))
         with _get_session_agent_lock(sid):
             s.archived = bool(body.get("archived", True))
             s.save(touch_updated_at=False)

@@ -292,6 +292,69 @@ def test_session_import_cli_queues_generated_title_for_writable_default_cli_titl
     })]
 
 
+def test_archive_read_only_external_materializes_webui_projection(monkeypatch, tmp_path):
+    """Archiving an external read-only transcript hides only its WebUI projection."""
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    import api.models as models
+    import api.routes as routes
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    sid = "claude_code_external_archive"
+    messages = [
+        {"role": "user", "content": "external prompt", "timestamp": 1.0},
+        {"role": "assistant", "content": "external answer", "timestamp": 2.0},
+    ]
+    source_before = list(messages)
+
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setattr(routes, "SESSIONS", models.SESSIONS)
+    monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
+    monkeypatch.setattr(routes, "read_body", lambda _handler: {"session_id": sid, "archived": True})
+    monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda _sid: False)
+    monkeypatch.setattr(
+        routes,
+        "_lookup_cli_session_metadata",
+        lambda _sid: {
+            "session_id": sid,
+            "title": "External transcript",
+            "model": "claude-code",
+            "source_tag": "claude_code",
+            "raw_source": "claude_code",
+            "session_source": "external_agent",
+            "source_label": "Claude Code",
+            "read_only": True,
+            "created_at": 1.0,
+            "updated_at": 2.0,
+        },
+    )
+    monkeypatch.setattr(routes, "get_cli_session_messages", lambda _sid, profile=None: list(messages))
+    monkeypatch.setattr(routes, "publish_session_list_changed", lambda *args, **kwargs: None)
+    captured = {}
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda _handler, payload, status=200, extra_headers=None: captured.update(
+            payload=payload, status=status
+        ) or True,
+    )
+
+    assert routes.handle_post(object(), SimpleNamespace(path="/api/session/archive")) is True
+    assert captured["status"] == 200
+    assert captured["payload"]["session"]["archived"] is True
+    assert captured["payload"]["session"]["read_only"] is True
+
+    sidecar = models.Session.load(sid)
+    assert sidecar is not None
+    assert sidecar.archived is True
+    assert sidecar.read_only is True
+    assert messages == source_before
+
+
 def test_read_only_source_badge_ui_guards_are_present():
     sessions_js = (REPO_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
     messages_js = (REPO_ROOT / "static" / "messages.js").read_text(encoding="utf-8")
@@ -304,7 +367,8 @@ def test_read_only_source_badge_ui_guards_are_present():
     assert "read-only-session" in sessions_js
     assert "if(!readOnly)" in sessions_js
     assert "Read-only imported sessions cannot be renamed" in sessions_js
-    assert "Read-only imported sessions cannot be modified" in sessions_js
+    assert "session_hide_external" in sessions_js
+    assert "_archiveSession(session,!session.archived)" in sessions_js
     assert "S.session.read_only||S.session.is_read_only" in messages_js
     assert "topbar-source-badge" in ui_js
     assert " · read-only" in ui_js
@@ -313,7 +377,7 @@ def test_read_only_source_badge_ui_guards_are_present():
     assert 'data-source-key="claude_code"' in style_css
     assert ".session-item.read-only-session:hover .session-source-chip" in style_css
     assert "Read-only imported sessions cannot be deleted" in routes_py
-    assert "Read-only imported sessions cannot be archived" in routes_py
+    assert "Archiving changes only the WebUI projection sidecar" in routes_py
 
 
 def test_messaging_source_badge_not_gated_on_is_cli_session():
