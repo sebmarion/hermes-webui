@@ -290,6 +290,12 @@ def test_free_tier_cap_prevents_picker_drowning(monkeypatch):
     try:
         from hermes_cli import models as _hm
         monkeypatch.setattr(_hm, "_openrouter_catalog_cache", None, raising=False)
+        # Keep the test hermetic and reserve the provider-catalog time budget
+        # for the direct free-tier augmentation under test.  Otherwise the
+        # installed agent package may perform a real curated-catalog fetch
+        # first and exhaust the shared rebuild budget before urlopen() runs.
+        monkeypatch.setattr(_hm, "fetch_openrouter_models", lambda *a, **k: [])
+        monkeypatch.setattr(_hm, "provider_model_ids", lambda *a, **k: [])
     except Exception:
         pass
 
