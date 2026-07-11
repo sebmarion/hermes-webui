@@ -15,6 +15,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -1837,13 +1838,105 @@ def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
 _LIST_PROFILES_CACHE: tuple[list, float] | None = None
 _LIST_PROFILES_CACHE_TTL = 4.0  # seconds. The perf(session-load-latency) pass bumped this to 60s, but that was reverted: profile-row mutations (defaults / providers / skills / gateway config) do NOT invalidate this cache, so a 60s TTL served stale profile rows for too long after such a change. 4s keeps the os.walk frequent enough that mutation→poll staleness is negligible while still making rapid dropdown re-opens free. The create/delete invalidation hooks below clear the cache immediately on those specific mutations.
 _LIST_PROFILES_CACHE_LOCK = threading.Lock()
+_LIST_PROFILES_REBUILDING = False
+_LIST_PROFILES_CACHE_GENERATION = 0
 
 
 def _invalidate_list_profiles_cache() -> None:
     """Drop the cached profile list (call after create/delete/switch)."""
-    global _LIST_PROFILES_CACHE
+    global _LIST_PROFILES_CACHE, _LIST_PROFILES_CACHE_GENERATION
     with _LIST_PROFILES_CACHE_LOCK:
         _LIST_PROFILES_CACHE = None
+        _LIST_PROFILES_CACHE_GENERATION += 1
+
+
+def _build_profile_rows_minimal() -> list:
+    """Build a cheap profile projection while the detailed rows refresh.
+
+    The detailed builder walks every profile's skills tree and probes gateway
+    state. On this install that is tens of seconds for 35 profiles. Names and
+    paths are enough for the first profile-picker paint; detailed fields are
+    filled by the background rebuild and served on the next request.
+    """
+    try:
+        from hermes_cli.profiles import (
+            _get_default_hermes_home,
+            _get_profiles_root,
+            _PROFILE_ID_RE as _UPSTREAM_PROFILE_ID_RE,
+        )
+    except Exception:
+        home = Path(_INITIAL_HERMES_HOME or os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+        return [{
+            "name": "default",
+            "path": str(home),
+            "is_default": True,
+            "is_active": False,
+            "gateway_running": False,
+            "model": None,
+            "provider": None,
+            "has_env": (home / ".env").exists(),
+            "visible": True,
+            "skill_count": 0,
+            "enabled_skills": 0,
+            "total_skills": 0,
+        }]
+
+    rows = []
+
+    def add(home: Path, name: str, is_default: bool) -> None:
+        rows.append({
+            "name": name,
+            "path": str(home),
+            "is_default": is_default,
+            "is_active": False,
+            "gateway_running": False,
+            "model": None,
+            "provider": None,
+            "has_env": (home / ".env").exists(),
+            "visible": _profile_visible_from_meta(home),
+            "skill_count": 0,
+            "enabled_skills": 0,
+            "total_skills": 0,
+        })
+
+    default_home = _get_default_hermes_home()
+    if default_home.is_dir():
+        add(default_home, "default", True)
+    profiles_root = _get_profiles_root()
+    if profiles_root.is_dir():
+        for entry in sorted(profiles_root.iterdir()):
+            if entry.is_dir() and _UPSTREAM_PROFILE_ID_RE.match(entry.name):
+                add(entry, entry.name, False)
+    return rows
+
+
+def _start_profile_rows_rebuild() -> None:
+    """Refresh detailed profile rows once, outside the HTTP request thread."""
+    global _LIST_PROFILES_REBUILDING
+    with _LIST_PROFILES_CACHE_LOCK:
+        if _LIST_PROFILES_REBUILDING:
+            return
+        _LIST_PROFILES_REBUILDING = True
+        generation = _LIST_PROFILES_CACHE_GENERATION
+
+    def rebuild() -> None:
+        global _LIST_PROFILES_CACHE, _LIST_PROFILES_REBUILDING
+        try:
+            rows = _build_profile_rows_fast()
+            with _LIST_PROFILES_CACHE_LOCK:
+                if rows is not None and generation == _LIST_PROFILES_CACHE_GENERATION:
+                    _LIST_PROFILES_CACHE = (rows, time.time())
+        except Exception:
+            logger.debug("Background profile-row rebuild failed", exc_info=True)
+        finally:
+            with _LIST_PROFILES_CACHE_LOCK:
+                _LIST_PROFILES_REBUILDING = False
+
+    threading.Thread(
+        target=rebuild,
+        name="profile-rows-rebuild",
+        daemon=True,
+    ).start()
 
 
 def _build_profile_rows_fast() -> list | None:
@@ -1988,53 +2081,38 @@ def list_profiles_api() -> list:
             'total_skills': total_count,
         }]
 
-    # Single-flight the build (#5364): hold the cache lock across the row build
-    # so a cold-startup burst of concurrent requests collapses to ONE build while
-    # the others wait and then serve the freshly-cached rows — instead of every
-    # thread rebuilding (each walking all profiles' skill trees) at once. The
-    # per-profile skills locks taken inside _build_profile_rows_fast are always
-    # acquired AFTER this lock (never the reverse), so there is no deadlock.
+    # Single-flight the build (#5364): return stale/minimal rows immediately
+    # while one background worker performs the expensive skills-tree and gateway
+    # probes. A cold profile request must never block the HTTP worker for tens of
+    # seconds merely to paint the picker.
     with _LIST_PROFILES_CACHE_LOCK:
         cached = _LIST_PROFILES_CACHE
         if cached is not None and now - cached[1] < _LIST_PROFILES_CACHE_TTL:
             rows = cached[0]
         else:
-            rows = _build_profile_rows_fast()
-            if rows is not None:
-                _LIST_PROFILES_CACHE = (rows, now)
+            rows = cached[0] if cached is not None else None
+
+    _start_profile_rows_rebuild()
+    if rows is None:
+        rows = _build_profile_rows_minimal()
 
     if rows is None:
-        # Fallback: cheap helpers unavailable — use the original (slow) path,
-        # or the default-only dict if hermes_cli isn't importable at all.
-        logger.debug(
-            "list_profiles_api: fast path unavailable, falling back to "
-            "upstream list_profiles() (slower)"
-        )
-        try:
-            from hermes_cli.profiles import list_profiles
-            infos = list_profiles()
-        except ImportError:
-            return [_default_profile_dict()]
-
-        active = get_active_profile_name()
-        result = []
-        for p in infos:
-            enabled_count, total_count = _get_profile_skills_stats(p.path)
-            result.append({
-                'name': p.name,
-                'path': str(p.path),
-                'is_default': p.is_default,
-                'is_active': p.name == active,
-                'gateway_running': p.gateway_running,
-                'model': p.model,
-                'provider': p.provider,
-                'has_env': p.has_env,
-                'visible': _profile_visible_from_meta(p.path),
-                'skill_count': enabled_count,
-                'enabled_skills': enabled_count,
-                'total_skills': total_count,
-            })
-        return result
+        # Safety fallback: callers still receive a valid profile shape while a
+        # future rebuild retries.
+        rows = [{
+            "name": "default",
+            "path": str(_DEFAULT_HERMES_HOME),
+            "is_default": True,
+            "is_active": False,
+            "gateway_running": False,
+            "model": None,
+            "provider": None,
+            "has_env": (_DEFAULT_HERMES_HOME / ".env").exists(),
+            "visible": True,
+            "skill_count": 0,
+            "enabled_skills": 0,
+            "total_skills": 0,
+        }]
 
     active = get_active_profile_name()
     return [{**p, 'is_active': p['name'] == active} for p in rows]
