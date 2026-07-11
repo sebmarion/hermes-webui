@@ -67,6 +67,24 @@ def _sessions_payload_rows():
     ]
 
 
+def test_sessions_api_defers_stale_stream_repair(monkeypatch):
+    scheduled = []
+    synchronous = []
+
+    monkeypatch.setattr(routes, "all_sessions", lambda **_kwargs: _sessions_payload_rows())
+    monkeypatch.setattr(routes, "_schedule_stale_stream_state_reconciliation", lambda rows: scheduled.append(rows) or True)
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda rows: synchronous.append(rows) or True)
+    monkeypatch.setattr(routes, "load_settings", lambda: {"show_cli_sessions": False})
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+
+    handler = _FakeHandler()
+    routes.handle_get(handler, urlparse("http://example.com/api/sessions"))
+
+    assert handler.status == 200
+    assert len(scheduled) == 1
+    assert synchronous == []
+
+
 def test_sessions_api_enriches_only_returned_rows_by_default(monkeypatch):
     all_sessions_kwargs = []
     enriched_batches = []
