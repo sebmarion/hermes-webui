@@ -15550,8 +15550,9 @@ def handle_post(handler, parsed) -> bool:
             cli_meta = _lookup_cli_session_metadata(sid)
             if not cli_meta:
                 return bad(handler, "Session not found", 404)
-            if cli_meta.get("read_only"):
-                return bad(handler, "Read-only imported sessions cannot be archived from WebUI", 400)
+            # Archive/restore mutates only the WebUI projection sidecar. It is
+            # valid for read-only external transcripts because their source
+            # remains immutable. Delegate-runner-owned subagents stay excluded.
             # Delegated subagent children (#5307) are view-only and owned by the
             # delegate runner — never materialize one into a writable WebUI
             # sidecar via the archive fallback (the 3rd of the shared
@@ -15580,6 +15581,7 @@ def handle_post(handler, parsed) -> bool:
                 s.thread_id = cli_meta.get("thread_id")
                 s.session_key = cli_meta.get("session_key")
                 s.platform = cli_meta.get("platform")
+                s.read_only = bool(cli_meta.get("read_only"))
                 s.save(touch_updated_at=False)
             else:
                 msgs = get_cli_session_messages(sid)
@@ -15605,6 +15607,7 @@ def handle_post(handler, parsed) -> bool:
                 s.thread_id = cli_meta.get("thread_id")
                 s.session_key = cli_meta.get("session_key")
                 s.platform = cli_meta.get("platform")
+                s.read_only = bool(cli_meta.get("read_only"))
         with _get_session_agent_lock(sid):
             s.archived = bool(body.get("archived", True))
             s.save(touch_updated_at=False)

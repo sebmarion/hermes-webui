@@ -4396,7 +4396,6 @@ function _playSessionActionMenuEntrance(menu){
 }
 
 async function _archiveSession(session, archived=true, beforeListRender=null){
-  if(_isReadOnlySession(session)){ if(typeof showToast==='function') showToast('Read-only imported sessions cannot be modified.',3000); return false; }
   const reflowPositions=_captureSessionReflowPositions();
   const renderHold=beforeListRender?Promise.resolve().then(beforeListRender):null;
   try{
@@ -4418,6 +4417,8 @@ async function _archiveSession(session, archived=true, beforeListRender=null){
 
 function _openSessionActionMenu(session, anchorEl){
   const isReadOnly = _isReadOnlySession(session);
+  const isSubagentViewOnly = [session&&session.source_tag, session&&session.raw_source, session&&session.source]
+    .some(value=>String(value||'').trim().toLowerCase()==='subagent');
   if(_sessionActionMenu && _sessionActionSessionId===session.session_id && _sessionActionAnchor===anchorEl){
     closeSessionActionMenu();
     return;
@@ -4431,6 +4432,17 @@ function _openSessionActionMenu(session, anchorEl){
   _appendSessionCopyLinkAction(menu, session);
   if(isReadOnly){
     _appendSessionExportHtmlAction(menu, session);
+    if(!isSubagentViewOnly){
+      menu.appendChild(_buildSessionAction(
+        session.archived?t('session_restore'):t('session_hide_external'),
+        session.archived?t('session_restore_desc'):t('session_hide_external_desc'),
+        session.archived?ICONS.unarchive:ICONS.archive,
+        async()=>{
+          closeSessionActionMenu();
+          await _archiveSession(session,!session.archived);
+        }
+      ));
+    }
     _mountSessionActionMenu(menu, session, anchorEl);
     return;
   }
