@@ -1865,6 +1865,34 @@ def _build_profile_rows_minimal() -> list:
             _PROFILE_ID_RE as _UPSTREAM_PROFILE_ID_RE,
         )
     except Exception:
+        # Compatibility fallback for older/minimal hermes_cli installations and
+        # tests that provide only list_profiles(). Preserve the old profile
+        # metadata contract rather than collapsing named profiles to default.
+        try:
+            from hermes_cli.profiles import list_profiles
+            infos = list_profiles()
+        except Exception:
+            infos = []
+        if infos:
+            rows = []
+            for profile in infos:
+                home = Path(profile.path).expanduser()
+                enabled_count, total_count = _get_profile_skills_stats(home)
+                rows.append({
+                    "name": profile.name,
+                    "path": str(home),
+                    "is_default": bool(getattr(profile, "is_default", False)),
+                    "is_active": False,
+                    "gateway_running": bool(getattr(profile, "gateway_running", False)),
+                    "model": getattr(profile, "model", None),
+                    "provider": getattr(profile, "provider", None),
+                    "has_env": bool(getattr(profile, "has_env", (home / ".env").exists())),
+                    "visible": _profile_visible_from_meta(home),
+                    "skill_count": enabled_count,
+                    "enabled_skills": enabled_count,
+                    "total_skills": total_count,
+                })
+            return rows
         home = Path(_INITIAL_HERMES_HOME or os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
         return [{
             "name": "default",
