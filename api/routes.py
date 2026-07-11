@@ -15583,10 +15583,9 @@ def handle_post(handler, parsed) -> bool:
             cli_meta = _lookup_cli_session_metadata(sid)
             if not cli_meta:
                 return bad(handler, "Session not found", 404)
-            # Archiving changes only the WebUI projection sidecar. It is valid
-            # for read-only external transcripts; the source transcript remains
-            # immutable. Subagent projections are the exception because they are
-            # owned by the delegate runner rather than by this WebUI.
+            # Archive/restore mutates only the WebUI projection sidecar. It is
+            # valid for read-only external transcripts because their source
+            # remains immutable. Delegate-runner-owned subagents stay excluded.
             # Delegated subagent children (#5307) are view-only and owned by the
             # delegate runner — never materialize one into a writable WebUI
             # sidecar via the archive fallback (the 3rd of the shared
