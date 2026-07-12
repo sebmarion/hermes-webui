@@ -135,6 +135,7 @@ def test_get_cli_sessions_cache_invalidates_when_sqlite_wal_changes(monkeypatch,
     monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: str(hermes_home))
     monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
     monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0, raising=False)
+    monkeypatch.setattr(models, "_active_stream_ids", lambda: set())
     monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
     models.clear_cli_sessions_cache()
 
