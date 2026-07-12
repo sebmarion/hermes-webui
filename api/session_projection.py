@@ -20,7 +20,7 @@ def _path_stamp(path: Path) -> tuple[int, int]:
 
 
 def _read_projection_token(db_path: Path):
-    """Read the Agent-owned generation, falling back to legacy file stamps."""
+    """Read generation; use legacy stamps only when the table is absent."""
     db_path = Path(db_path)
     if not db_path.exists():
         return ("missing", 0)
@@ -32,20 +32,25 @@ def _read_projection_token(db_path: Path):
         )
         try:
             conn.execute("PRAGMA busy_timeout=50")
-            row = conn.execute(
-                "SELECT generation FROM session_projection_meta WHERE id = 1"
-            ).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT generation FROM session_projection_meta WHERE id = 1"
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                if "no such table" in str(exc).lower():
+                    return (
+                        "legacy",
+                        _path_stamp(db_path),
+                        _path_stamp(Path(f"{db_path}-wal")),
+                    )
+                raise
             if row is not None:
                 return ("projection", int(row[0] or 0))
+            raise RuntimeError("session_projection_meta row is missing")
         finally:
             conn.close()
     except Exception:
-        pass
-    return (
-        "legacy",
-        _path_stamp(db_path),
-        _path_stamp(Path(f"{db_path}-wal")),
-    )
+        raise
 
 
 def projection_token(db_path: Path | None):

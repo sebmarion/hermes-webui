@@ -31,6 +31,12 @@ def test_cli_cache_key_stays_frozen_during_streaming(monkeypatch, tmp_path):
         "_sqlite_file_stat_cache_key",
         lambda _p: ("fp", fp["value"]),
     )
+    generation = {"value": 3}
+    monkeypatch.setattr(
+        models,
+        "_agent_session_projection_token",
+        lambda _p: ("projection", generation["value"]),
+    )
 
     _set_active_streams(monkeypatch, {"live-1"})
     _, _, _, key_streaming_a = models._resolve_cli_sessions_context(None)
@@ -47,7 +53,10 @@ def test_cli_cache_key_stays_frozen_during_streaming(monkeypatch, tmp_path):
     fp["value"] = 11
     _, _, _, key_idle_b = models._resolve_cli_sessions_context(None)
 
-    assert key_idle_a != key_idle_b
+    assert key_idle_a == key_idle_b
+    generation["value"] = 4
+    _, _, _, key_visible_change = models._resolve_cli_sessions_context(None)
+    assert key_visible_change != key_idle_b
 
 
 def test_get_cli_sessions_follower_reuses_stale_rows_during_slow_rebuild(monkeypatch, tmp_path):
@@ -245,11 +254,12 @@ def test_get_cli_sessions_clear_during_rebuild_does_not_restore_stale_rows(monke
     monkeypatch.setattr(models, "_load_cli_sessions_uncached", lambda *_args, **_kwargs: [{"session_id": "recovered", "title": "recovered-row"}])
     recovered = models.get_cli_sessions()
     assert recovered == [{"session_id": "recovered", "title": "recovered-row"}]
+    _, _, _, recovered_cache_key = models._resolve_cli_sessions_context(None)
     with models._CLI_SESSIONS_CACHE_LOCK:
-        assert cache_key in models._CLI_SESSIONS_CACHE
+        assert recovered_cache_key in models._CLI_SESSIONS_CACHE
 
 
-def test_get_cli_sessions_clear_during_rebuild_preserves_joiners(monkeypatch, tmp_path):
+def test_get_cli_sessions_clear_during_rebuild_does_not_promote_joiners(monkeypatch, tmp_path):
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
     monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: str(hermes_home))
@@ -264,8 +274,6 @@ def test_get_cli_sessions_clear_during_rebuild_preserves_joiners(monkeypatch, tm
 
     owner_started = threading.Event()
     owner_block = threading.Event()
-    second_started = threading.Event()
-    second_block = threading.Event()
     load_count = {"value": 0}
     load_count_lock = threading.Lock()
     results = {}
@@ -278,8 +286,6 @@ def test_get_cli_sessions_clear_during_rebuild_preserves_joiners(monkeypatch, tm
             owner_started.set()
             owner_block.wait()
             return [{"session_id": "owner", "title": "owner-row"}]
-        second_started.set()
-        second_block.wait()
         return [{"session_id": "fresh", "title": "fresh-row"}]
 
     monkeypatch.setattr(models, "_load_cli_sessions_uncached", _blocking_loader)
@@ -306,11 +312,6 @@ def test_get_cli_sessions_clear_during_rebuild_preserves_joiners(monkeypatch, tm
     assert follower_b.is_alive()
 
     owner_block.set()
-    assert second_started.wait(1.0), "second rebuild did not start"
-    time.sleep(0.2)
-
-    assert load_count["value"] == 2
-    second_block.set()
 
     owner.join(2.0)
     follower_a.join(2.0)
@@ -319,13 +320,16 @@ def test_get_cli_sessions_clear_during_rebuild_preserves_joiners(monkeypatch, tm
     assert not owner.is_alive()
     assert not follower_a.is_alive()
     assert not follower_b.is_alive()
-    assert load_count["value"] == 2
+    assert load_count["value"] == 1
     assert results.get("owner") == [{"session_id": "owner", "title": "owner-row"}]
-    assert results.get("follower_a") == [{"session_id": "fresh", "title": "fresh-row"}]
-    assert results.get("follower_b") == [{"session_id": "fresh", "title": "fresh-row"}]
+    assert results.get("follower_a") == []
+    assert results.get("follower_b") == []
+
+    assert models.get_cli_sessions() == [{"session_id": "fresh", "title": "fresh-row"}]
+    assert load_count["value"] == 2
 
 
-def test_get_cli_sessions_clear_during_rebuild_reclaims_after_invalidated_wait(monkeypatch, tmp_path):
+def test_get_cli_sessions_clear_during_rebuild_never_makes_follower_scan(monkeypatch, tmp_path):
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir()
     monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: str(hermes_home))
@@ -345,7 +349,6 @@ def test_get_cli_sessions_clear_during_rebuild_reclaims_after_invalidated_wait(m
 
     owner_started = threading.Event()
     owner_block = threading.Event()
-    second_started = threading.Event()
     load_count = {"value": 0}
     load_count_lock = threading.Lock()
     results = {}
@@ -358,7 +361,6 @@ def test_get_cli_sessions_clear_during_rebuild_reclaims_after_invalidated_wait(m
             owner_started.set()
             owner_block.wait()
             return [{"session_id": "owner", "title": "owner-row"}]
-        second_started.set()
         return [{"session_id": "fresh", "title": "fresh-row"}]
 
     monkeypatch.setattr(models, "_load_cli_sessions_uncached", _blocking_loader)
@@ -379,15 +381,17 @@ def test_get_cli_sessions_clear_during_rebuild_reclaims_after_invalidated_wait(m
     models.clear_cli_sessions_cache()
     owner_block.set()
 
-    assert second_started.wait(1.0), "follower did not reclaim the rebuild"
     owner.join(2.0)
     follower.join(2.0)
 
     assert not owner.is_alive()
     assert not follower.is_alive()
-    assert load_count["value"] == 2
+    assert load_count["value"] == 1
     assert results.get("owner") == [{"session_id": "owner", "title": "owner-row"}]
-    assert results.get("follower") == [{"session_id": "fresh", "title": "fresh-row"}]
+    assert results.get("follower") == []
+
+    assert models.get_cli_sessions() == [{"session_id": "fresh", "title": "fresh-row"}]
+    assert load_count["value"] == 2
 
 
 def test_cache_cli_sessions_if_current_skips_stale_store(monkeypatch, tmp_path):

@@ -30,6 +30,7 @@ _SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
 _SESSIONS_CACHE: OrderedDict[tuple, tuple[float, tuple, dict]] = OrderedDict()
 _SESSIONS_CACHE_LOCK = threading.RLock()
 _SESSIONS_CACHE_INFLIGHT: dict[tuple, threading.Event] = {}
+_SESSIONS_CACHE_REFRESH_OWNER = ("__global_session_projection_refresh__",)
 _SESSIONS_CACHE_GLOBAL_INVALIDATION_VERSION = 0
 _SESSIONS_CACHE_ALL_PROFILES_INVALIDATION_VERSION = 0
 _SESSIONS_CACHE_PROFILE_INVALIDATION_VERSION: dict[str, int] = {}
@@ -494,12 +495,13 @@ def _session_list_runtime_sort_key(row: dict) -> tuple[int, float]:
 
 
 def _session_list_cache_claim_rebuild(key: tuple) -> tuple[threading.Event, bool]:
+    """Claim the sole reconciliation worker across every response variant."""
     with _SESSIONS_CACHE_LOCK:
-        current = _SESSIONS_CACHE_INFLIGHT.get(key)
+        current = _SESSIONS_CACHE_INFLIGHT.get(_SESSIONS_CACHE_REFRESH_OWNER)
         if current is not None:
             return current, False
         event = threading.Event()
-        _SESSIONS_CACHE_INFLIGHT[key] = event
+        _SESSIONS_CACHE_INFLIGHT[_SESSIONS_CACHE_REFRESH_OWNER] = event
         return event, True
 
 
@@ -507,7 +509,7 @@ def _session_list_cache_done(key: tuple, event: threading.Event | None) -> None:
     with _SESSIONS_CACHE_LOCK:
         if event is None:
             return
-        if _SESSIONS_CACHE_INFLIGHT.get(key) is event:
-            _SESSIONS_CACHE_INFLIGHT.pop(key, None)
+        if _SESSIONS_CACHE_INFLIGHT.get(_SESSIONS_CACHE_REFRESH_OWNER) is event:
+            _SESSIONS_CACHE_INFLIGHT.pop(_SESSIONS_CACHE_REFRESH_OWNER, None)
     if event is not None:
         event.set()

@@ -23,6 +23,7 @@ from api.config import (
 )
 from api.workspace import get_last_workspace
 from api.usage import prompt_cache_hit_percent
+from api.session_projection import projection_token as _agent_session_projection_token
 from api.agent_sessions import (
     _is_continuation_session,
     is_cli_session_row,
@@ -49,6 +50,7 @@ _CLI_SESSIONS_CACHE_TTL_SECONDS = 5.0
 _CLI_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 30.0
 _CLI_SESSIONS_CACHE_LOCK = threading.Lock()
 _CLI_SESSIONS_CACHE_INFLIGHT: "dict[tuple, threading.Event]" = {}
+_CLI_SESSIONS_REFRESH_OWNER = ("__global_agent_session_projection_refresh__",)
 _CLI_SESSIONS_CACHE_INVALIDATION_VERSION = 0
 _CLI_SESSIONS_CACHE = {}
 _CLI_SESSIONS_CACHE_WAIT_SECONDS = 0.25
@@ -6242,11 +6244,11 @@ def _cli_sessions_cache_invalidation_stamp() -> int:
 
 def _cli_sessions_cache_claim_rebuild(cache_key: tuple) -> tuple[threading.Event, bool]:
     with _CLI_SESSIONS_CACHE_LOCK:
-        current = _CLI_SESSIONS_CACHE_INFLIGHT.get(cache_key)
+        current = _CLI_SESSIONS_CACHE_INFLIGHT.get(_CLI_SESSIONS_REFRESH_OWNER)
         if current is not None:
             return current, False
         event = threading.Event()
-        _CLI_SESSIONS_CACHE_INFLIGHT[cache_key] = event
+        _CLI_SESSIONS_CACHE_INFLIGHT[_CLI_SESSIONS_REFRESH_OWNER] = event
         return event, True
 
 
@@ -6254,8 +6256,8 @@ def _cli_sessions_cache_done(cache_key: tuple, event: threading.Event | None) ->
     with _CLI_SESSIONS_CACHE_LOCK:
         if event is None:
             return
-        if _CLI_SESSIONS_CACHE_INFLIGHT.get(cache_key) is event:
-            _CLI_SESSIONS_CACHE_INFLIGHT.pop(cache_key, None)
+        if _CLI_SESSIONS_CACHE_INFLIGHT.get(_CLI_SESSIONS_REFRESH_OWNER) is event:
+            _CLI_SESSIONS_CACHE_INFLIGHT.pop(_CLI_SESSIONS_REFRESH_OWNER, None)
     if event is not None:
         event.set()
 
@@ -6293,6 +6295,34 @@ def _copy_fresh_cli_sessions_cache_entry(cache_key: tuple):
         if cached_expires_at <= time.monotonic():
             return None
         return _copy_cli_sessions(cached_sessions)
+
+
+def _cli_sessions_cache_scope(cache_key: tuple) -> tuple:
+    """Drop the volatile projection token while retaining response semantics."""
+    if cache_key and cache_key[0] == 'all_profiles':
+        return tuple(cache_key[:3]) + tuple(cache_key[4:])
+    if len(cache_key) >= 5:
+        return tuple(cache_key[:4]) + tuple(cache_key[5:])
+    return tuple(cache_key)
+
+
+def _copy_last_known_cli_sessions(cache_key: tuple):
+    scope = _cli_sessions_cache_scope(cache_key)
+    with _CLI_SESSIONS_CACHE_LOCK:
+        candidates = []
+        for candidate_key, entry in _CLI_SESSIONS_CACHE.items():
+            if _cli_sessions_cache_scope(candidate_key) != scope:
+                continue
+            if len(entry) == 3:
+                expires_at, stamp, sessions = entry
+            else:
+                expires_at, sessions = entry
+                stamp = _CLI_SESSIONS_CACHE_INVALIDATION_VERSION
+            if stamp == _CLI_SESSIONS_CACHE_INVALIDATION_VERSION:
+                candidates.append((expires_at, sessions))
+        if not candidates:
+            return None
+        return _copy_cli_sessions(max(candidates, key=lambda item: item[0])[1])
 
 
 def _load_and_cache_cli_sessions(
@@ -6338,7 +6368,14 @@ def _reload_cli_sessions_after_inflight(
     while True:
         event, is_owner = _cli_sessions_cache_claim_rebuild(cache_key)
         if is_owner:
-            break
+            # The original owner may have completed between the caller's
+            # first claim and this helper. Release the accidental claim; this
+            # request is still a follower and must never start another scan.
+            _cli_sessions_cache_done(cache_key, event)
+            last_known = _copy_last_known_cli_sessions(cache_key)
+            if last_known is not None:
+                return last_known
+            return stale_sessions if stale_sessions is not None else []
         wait_finished = False
         try:
             wait_finished = bool(
@@ -6353,27 +6390,15 @@ def _reload_cli_sessions_after_inflight(
         cached_sessions = _copy_fresh_cli_sessions_cache_entry(cache_key)
         if cached_sessions is not None:
             return cached_sessions
+        last_known = _copy_last_known_cli_sessions(cache_key)
+        if last_known is not None:
+            return last_known
         if stale_sessions is not None and stale_stamp == _cli_sessions_cache_invalidation_stamp():
             return stale_sessions
-        if not wait_finished:
-            # A timed-out follower is never allowed to become another SQLite
-            # scanner. Return the last-known-good rows, or an empty cold
-            # projection while the single owner continues in the background.
-            return stale_sessions if stale_sessions is not None else []
-    try:
-        invalidation_stamp = _cli_sessions_cache_invalidation_stamp()
-        return _load_and_cache_cli_sessions(
-            cache_key=cache_key,
-            ttl=ttl,
-            invalidation_stamp=invalidation_stamp,
-            load_sessions=load_sessions,
-            stale_sessions=stale_sessions,
-            stale_stamp=stale_stamp,
-            all_profiles=all_profiles,
-            db_path=db_path,
-        )
-    finally:
-        _cli_sessions_cache_done(cache_key, event)
+        # Followers never become scanners. After one wait they receive the
+        # last-known-good projection (or an empty cold projection) and a later
+        # request may claim the next debounced refresh.
+        return stale_sessions if stale_sessions is not None else []
 
 
 def _cli_sessions_cache_ttl_seconds() -> float:
@@ -6574,14 +6599,15 @@ def _resolve_cli_sessions_context(source_filter=None, include_claude_code: bool 
 
     db_path = hermes_home / 'state.db'
     projects_dir = _default_claude_code_projects_dir()
-    # #4842: while a turn streams, freeze the volatile state.db component of the
-    # key so per-message writes don't bust the CLI cache and re-run the heavy
-    # CLI/cron projection on every poll (mirrors the route-level #4808 freeze).
-    # The wider streaming TTL in get_cli_sessions() still forces a periodic
-    # rebuild so a streaming session's own count stays fresh within that window,
-    # and structural mutations invalidate via clear_cli_sessions_cache().
+    # The Agent-owned generation advances only for sidebar-visible changes.
+    # Reading it is scheduled by projection_token() off the caller thread, so
+    # this request-time key never opens SQLite or follows message/WAL churn.
     _streaming_marker = _cli_sessions_streaming_freeze_marker()
-    db_state_key = _streaming_marker if _streaming_marker is not None else _sqlite_file_stat_cache_key(db_path)
+    db_state_key = (
+        _streaming_marker
+        if _streaming_marker is not None
+        else _agent_session_projection_token(db_path)
+    )
     cache_key = (
         str(hermes_home),
         str(cli_profile or ''),
@@ -6624,7 +6650,9 @@ def _all_profiles_cli_contexts() -> tuple[list[tuple[Path, Path, str | None]], t
         db_path = hermes_home / 'state.db'
         profile_value = str(profile_name or 'default').strip() or 'default'
         contexts.append((hermes_home, db_path, profile_value))
-        cache_entries.append((home_key, profile_value, _sqlite_file_stat_cache_key(db_path)))
+        cache_entries.append(
+            (home_key, profile_value, _agent_session_projection_token(db_path))
+        )
 
     try:
         _add_context(get_active_profile_name())

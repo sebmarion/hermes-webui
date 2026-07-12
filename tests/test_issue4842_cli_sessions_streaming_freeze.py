@@ -52,7 +52,7 @@ def test_freeze_marker_changes_when_stream_set_changes(monkeypatch):
     assert M._cli_sessions_streaming_freeze_marker() is None
 
 
-def test_cache_key_stable_across_message_writes_while_streaming(monkeypatch, tmp_path):
+def test_cache_key_uses_visible_generation_and_ignores_message_writes(monkeypatch, tmp_path):
     """THE core guarantee: with a stream active, the CLI cache key must NOT change
     when the state.db content fingerprint advances (a new streamed message row).
     Before the fix the key folded in the live fingerprint and changed every write."""
@@ -60,9 +60,15 @@ def test_cache_key_stable_across_message_writes_while_streaming(monkeypatch, tmp
     db.write_bytes(b"")  # exists; fingerprint reader degrades gracefully
 
     monkeypatch.setattr(M, "_default_claude_code_projects_dir", lambda: tmp_path / "projects")
-    # Simulate the volatile fingerprint advancing on each streamed message.
+    # Message/WAL churn is no longer consulted. Only the Agent projection
+    # generation may invalidate the inner cache while idle.
     fp = {"v": 0}
     monkeypatch.setattr(M, "_sqlite_file_stat_cache_key", lambda p: ("fp", fp["v"]))
+    generation = {"v": 5}
+    monkeypatch.setattr(
+        M, "_agent_session_projection_token",
+        lambda _p: ("projection", generation["v"]),
+    )
 
     # Active stream -> key should be frozen (independent of fp).
     _set_active_streams(monkeypatch, ["live-stream-1"])
@@ -76,16 +82,17 @@ def test_cache_key_stable_across_message_writes_while_streaming(monkeypatch, tmp
         "projection would re-run on every poll (#4842 regression)"
     )
 
-    # Idle -> key tracks the fingerprint again (so genuine new rows show up).
+    # Idle message writes remain invisible to the key.
     _set_active_streams(monkeypatch, [])
     fp["v"] = 10
     _, _, _, key_idle1 = M._resolve_cli_sessions_context(None)
     fp["v"] = 11
     _, _, _, key_idle2 = M._resolve_cli_sessions_context(None)
-    assert key_idle1 != key_idle2, (
-        "When idle the CLI cache key must still advance with the content "
-        "fingerprint so newly-committed sessions are not served stale"
-    )
+    assert key_idle1 == key_idle2
+
+    generation["v"] = 6
+    _, _, _, key_visible_change = M._resolve_cli_sessions_context(None)
+    assert key_visible_change != key_idle2
 
 
 def test_streaming_ttl_wider_than_idle(monkeypatch):
@@ -117,4 +124,3 @@ def test_structural_change_listener_clears_cli_cache(monkeypatch):
         "_on_session_list_changed must clear the CLI/cron projection cache so a "
         "structural mutation isn't masked by the streaming freeze (#4842)"
     )
-

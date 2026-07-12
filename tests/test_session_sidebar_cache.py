@@ -148,6 +148,59 @@ def test_session_list_cache_singleflight_rebuild_once(monkeypatch):
     assert calls == 1
 
 
+def test_session_list_cache_has_one_refresh_owner_across_variant_keys(monkeypatch):
+    routes._session_list_cache_clear()
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    key_a = routes._session_list_cache_key(
+        active_profile="default", all_profiles=False,
+        show_cli_sessions=False, show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+    key_b = routes._session_list_cache_key(
+        active_profile="default", all_profiles=False,
+        show_cli_sessions=True, show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+
+    def owner_builder():
+        calls.append("owner")
+        started.set()
+        release.wait(1.0)
+        return _session_cache_payload("owner")
+
+    def follower_builder():
+        calls.append("follower")
+        return _session_cache_payload("follower")
+
+    owner = threading.Thread(
+        target=lambda: routes._get_cached_session_list_payload(
+            key=key_a,
+            builder=owner_builder,
+            seed_builder=lambda: _session_cache_payload("seed-a"),
+        )
+    )
+    follower_result = []
+    owner.start()
+    assert started.wait(1.0)
+    follower_result.append(
+        routes._get_cached_session_list_payload(
+            key=key_b,
+            builder=follower_builder,
+            seed_builder=lambda: _session_cache_payload("seed-b"),
+        )
+    )
+    release.set()
+    owner.join(2.0)
+    _wait_for_background_refreshes()
+
+    assert calls == ["owner"]
+    assert follower_result == [_session_cache_payload("seed-b")]
+
+
 def test_session_list_cache_follower_wait_stage_when_rebuild_inflight(monkeypatch):
     routes._session_list_cache_clear()
     monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
