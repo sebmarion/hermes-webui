@@ -1,6 +1,7 @@
 import io
 import json
 import pathlib
+import time
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
@@ -9,10 +10,24 @@ import api.routes as routes
 import pytest
 
 
+def _wait_for_background_refreshes() -> None:
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        with routes._SESSIONS_CACHE_LOCK:
+            events = list(routes._SESSIONS_CACHE_INFLIGHT.values())
+        if not events:
+            return
+        for event in events:
+            event.wait(0.05)
+    raise AssertionError("session-list background refresh did not settle")
+
+
 @pytest.fixture(autouse=True)
 def _clear_session_list_cache_between_tests():
+    _wait_for_background_refreshes()
     routes._session_list_cache_clear()
     yield
+    _wait_for_background_refreshes()
     routes._session_list_cache_clear()
 
 

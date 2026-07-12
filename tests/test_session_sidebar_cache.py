@@ -1,4 +1,5 @@
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -8,15 +9,25 @@ import api.routes as routes
 from api import route_session_list_cache, session_events
 
 
+def _wait_for_background_refreshes() -> None:
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        with routes._SESSIONS_CACHE_LOCK:
+            events = list(routes._SESSIONS_CACHE_INFLIGHT.values())
+        if not events:
+            return
+        for event in events:
+            event.wait(0.05)
+    raise AssertionError("session-list background refresh did not settle")
+
+
 @pytest.fixture(autouse=True)
 def _isolated_session_list_cache_state():
+    _wait_for_background_refreshes()
     routes._session_list_cache_clear()
-    with routes._SESSIONS_CACHE_LOCK:
-        routes._SESSIONS_CACHE_INFLIGHT.clear()
     yield
+    _wait_for_background_refreshes()
     routes._session_list_cache_clear()
-    with routes._SESSIONS_CACHE_LOCK:
-        routes._SESSIONS_CACHE_INFLIGHT.clear()
 
 
 class _StageRecorder:
