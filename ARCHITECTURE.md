@@ -539,7 +539,24 @@ on_tool callback:
 The approval surface-on-tool logic means approvals appear immediately after the tool
 fires (within the same SSE stream), without waiting for the next poll cycle.
 
-### 4.5 Approval System Integration
+### 4.5 Durable async-delegation wakeups
+
+Async delegation completions do not rely on the SSE connection or the
+process-local deferred-wakeup dictionary. `api/background_process.py` first
+validates the owning WebUI session and inserts the formatted wakeup into the
+SQLite store in `api/delegation_wakeup_store.py`. Only after that commit does
+it acknowledge the Hermes delegation tracker. The stored row moves atomically
+from `pending` to `claimed` to `delivered`; a failed idle turn start releases
+the claim, and startup recovery requeues interrupted claims. Delivered rows
+remain as durable deduplication records, so duplicate queue events and browser
+disconnects cannot create a second wakeup turn.
+
+Generic terminal process completions retain their existing process-registry
+and in-memory deferred-wakeup behavior. The durable store is deliberately
+limited to canonical `async_delegation` events, which have stable delegation
+and owning-session identities.
+
+### 4.6 Approval System Integration
 
 The approval system uses the existing Hermes gateway module at tools/approval.py.
 All state lives in module-level variables in that file:

@@ -76,6 +76,23 @@ _LAST_EMIT_TS: dict[str, float] = {}
 _PENDING_EMIT_PAYLOADS: dict[str, dict] = {}
 _PENDING_EMIT_TIMERS: dict[str, threading.Timer] = {}
 
+# Durable async-delegation ownership store.  Kept lazy so importing this module
+# does not create state directories during static tooling/tests.
+_WAKEUP_STORE = None
+_WAKEUP_STORE_LOCK = threading.Lock()
+_WAKEUP_THREAD_FACTORY = threading.Thread
+_TRACKER_ACK_LOCK = threading.Lock()
+
+
+def _delegation_wakeup_store():
+    global _WAKEUP_STORE
+    with _WAKEUP_STORE_LOCK:
+        if _WAKEUP_STORE is None:
+            from api.delegation_wakeup_store import DelegationWakeupStore
+
+            _WAKEUP_STORE = DelegationWakeupStore()
+        return _WAKEUP_STORE
+
 
 # ── Persistent per-session SSE channel (Option X) ──────────────────────────
 # SESSION_CHANNELS maps WebUI session_id -> SessionChannel. Each channel owns
@@ -565,9 +582,11 @@ def _build_payload(evt: dict, session_id: str) -> dict:
     # the process id. Alias it locally before exposing it as payload ``task_id``
     # to avoid confusing that wire-format name with the WebUI session id.
     process_id = _event_process_id(evt)
+    delegation_id = _async_delegation_id(evt)
+    task_id = delegation_id or process_id
     payload: dict[str, Any] = {
         "session_id": str(session_id),
-        "task_id": process_id,
+        "task_id": task_id,
         "completed_at": time.time(),
         "event_id": uuid.uuid4().hex,
     }
@@ -925,6 +944,13 @@ def _process_one(evt: dict) -> None:
     """Route a single completion_queue event to the matching WebUI session."""
     from api import config as _cfg
 
+    # Async delegation has a separate durable ownership/claim state machine.
+    # Return after it runs so none of the generic process-registry in-memory
+    # dedupe paths can ACK or discard this event first.
+    if evt.get("type") == "async_delegation":
+        _process_async_delegation_event(evt)
+        return
+
     # Hoist the process-registry import once per event: it was imported in
     # three separate blocks below (session_key recovery, env-immune owner
     # cross-check, upstream is_completion_consumed dedupe) on every completion
@@ -996,16 +1022,9 @@ def _process_one(evt: dict) -> None:
         proc_session=_ps_xs,
     )
     # ── Idempotency vs the REAL merged upstream #2279 (shared dedupe key) ──
-    # The real merged #2279 next-turn drain
-    # (api/streaming._drain_webui_process_notifications) dedupes ONLY via
-    # process_registry.is_completion_consumed() / _completion_consumed — it
-    # does NOT populate BG_TASK_COMPLETE_EVENTS_SEEN (that set is ours-original
-    # and private to this module). So the cross-A/B shared dedupe contract is
-    # process_registry._completion_consumed, NOT BG_TASK_COMPLETE_EVENTS_SEEN.
     # If the upstream A-drain already delivered this process_id (A-first
     # order), it marked _completion_consumed; B must early-return here or it
-    # would double-fire a wakeup. This guard aligns our B-drain to the real
-    # upstream key (verified against origin/master streaming.py).
+    # would double-fire a wakeup.
     if process_id:
         try:
             if _process_registry is not None and _process_registry.is_completion_consumed(process_id):
@@ -1029,43 +1048,11 @@ def _process_one(evt: dict) -> None:
     payload = _build_payload(evt, session_id)
     _emit_bg_task_complete_events_coalesced(session_id, payload)
     _cfg.PENDING_BG_TASK_COMPLETIONS.add(session_id)
-    # Mark the event consumed in the agent's process registry so the REAL
-    # merged PR #2279's next-turn drain
-    # (api/streaming._drain_webui_process_notifications) treats this process_id
-    # as already-delivered and does not re-fire a wakeup (B-first order).
-    # This is the SHARED upstream dedupe key (see _mark_registry_completion_
-    # consumed for the coupling contract + why a future rename now fails loud).
     if process_id:
         _mark_registry_completion_consumed(process_id)
 
     # ── Option Z (PRIMARY): server-side wakeup, NO browser round-trip ──────
-    # The SSE emit above is now demoted to a pure live-view layer (an open tab
-    # streams the turn live via the per-session SSE channel). The ACTUAL agent
-    # wakeup is started HERE, server-side, so a CLOSED tab still gets the turn
-    # — parity with how CLI / Telegram / gateway self-wake from a
-    # notify_on_complete completion. This is the fix for the structural flaw:
-    # "fire a long background task, close the tab, come back later" is THE
-    # primary background-task use case and browser-mediated wakeup could never
-    # serve it.
-    #
-    #   - turn ACTIVE → do NOT start a turn. Leave the PENDING_PROCESS_
-    #     COMPLETIONS marker so PR #2279's next-turn drain
-    #     (api/streaming._drain_webui_process_notifications) injects the wakeup
-    #     when the active turn ends. (That path already works when a turn is
-    #     active — it was never the gap.)
-    #   - turn IDLE → start a new server-side turn directly with wakeup_prompt
-    #     as the user message (the real gap Option Z closes).
-    #
-    # Idempotency is already guaranteed above: BG_TASK_COMPLETE_EVENTS_SEEN +
-    # the registry _completion_consumed marker mean this process_id reached
-    # here at most once, so the wakeup turn starts at most once.
     try:
-        # ``wakeup_prompt`` is server-internal state used only by the
-        # Option Z server-side wakeup; it was previously surfaced on the
-        # SSE payload but T1 trimmed the payload to the minimal shape
-        # `{session_id, task_id, completed_at, summary?, event_id}`, so
-        # we derive the prompt directly from the evt here (same source the
-        # prior _build_payload used).
         wakeup_prompt_raw = format_wakeup_prompt(evt)
         wakeup_prompt = wakeup_prompt_raw.strip() if wakeup_prompt_raw else ""
         if wakeup_prompt:
@@ -1094,14 +1081,6 @@ def _process_one(evt: dict) -> None:
                     session_id,
                 )
             else:
-                # Idle-path sibling of the F1 (409/teardown) fix: pass
-                # ``process_id`` so that if this idle wakeup's daemon thread
-                # loses the per-session lock race and 409s, the re-defer in
-                # ``_start_server_side_wakeup_turn`` records the entry WITH its
-                # process_id — keeping the ``record_deferred_wakeup`` dedup
-                # guard (``if process_id and any(...)``) live on that re-defer
-                # path so a second 409 race cannot accumulate a duplicate
-                # deferred entry (which would deliver the same wakeup twice).
                 _start_server_side_wakeup_turn(
                     session_id,
                     wakeup_prompt,
@@ -1112,6 +1091,74 @@ def _process_one(evt: dict) -> None:
         logger.warning(
             "server-side wakeup dispatch failed for session %s", session_id, exc_info=True
         )
+
+
+def _process_async_delegation_event(evt: dict) -> None:
+    """Durably accept one async completion before ACK or dispatch."""
+    from api import config as cfg
+
+    delegation_id = str(evt.get("delegation_id") or "").strip()
+    session_key = str(evt.get("session_key") or "").strip()
+    if not delegation_id or not session_key:
+        logger.debug("async_delegation drop: missing delegation_id/session_key")
+        return
+    with cfg.PROCESS_SESSION_INDEX_LOCK:
+        session_id = str(cfg.PROCESS_SESSION_INDEX.get(session_key) or "")
+    if not session_id:
+        logger.debug(
+            "async_delegation drop: no session mapping for key=%r delegation_id=%r",
+            session_key,
+            delegation_id,
+        )
+        return
+    wakeup_prompt = str(format_wakeup_prompt(evt) or "").strip()
+    if not wakeup_prompt:
+        logger.debug("async_delegation drop: formatter returned no prompt for %s", delegation_id)
+        return
+
+    try:
+        store = _delegation_wakeup_store()
+        outcome = store.record_pending(
+            delegation_id=delegation_id,
+            session_id=session_id,
+            session_key=session_key,
+            wakeup_prompt=wakeup_prompt,
+            event=evt,
+        )
+    except Exception:
+        logger.warning(
+            "async_delegation durable insert failed for %s; leaving unacked",
+            delegation_id,
+            exc_info=True,
+        )
+        return
+    if outcome.status in {"collision", "conflict"}:
+        logger.error(
+            "async_delegation ownership collision blocked: delegation_id=%s session=%s",
+            delegation_id,
+            session_id,
+        )
+        return
+    row = outcome.row or store.get(delegation_id) or {}
+    if row.get("state") == "delivered":
+        return
+
+    # Hermes may stop replaying only after WebUI owns the wakeup durably.
+    # Serialize the external tracker call with the durable marker update so
+    # concurrent duplicate queue events in this host cannot both ACK it.
+    with _TRACKER_ACK_LOCK:
+        row = store.get(delegation_id) or {}
+        if row.get("tracker_acked_at") is None:
+            if _try_mark_async_delegation_tracker(evt=evt):
+                store.mark_tracker_acked(delegation_id)
+
+    # Live-view is observational only and happens after durable acceptance.
+    if outcome.status == "inserted":
+        _emit_bg_task_complete_events_coalesced(session_id, _build_payload(evt, session_id))
+        cfg.PENDING_BG_TASK_COMPLETIONS.add(session_id)
+
+    if not _session_has_active_turn(session_id):
+        dispatch_pending_delegation_wakeups_for_session(session_id)
 
 
 def record_deferred_wakeup(
@@ -1210,6 +1257,12 @@ def drain_deferred_wakeups_for_session(session_id: str) -> int:
     from api import config as _cfg
 
     try:
+        # Async-delegation wakeups use the durable SQLite state machine. Only
+        # one prompt starts per turn boundary; generic process wakeups below
+        # retain their established in-memory behavior.
+        durable_started = dispatch_pending_delegation_wakeups_for_session(session_id)
+        if durable_started:
+            return durable_started
         # Multi-stream guard: only fire when the session is TRULY idle.
         if _session_has_active_turn(session_id):
             return 0
@@ -1281,6 +1334,70 @@ def drain_deferred_wakeups_for_session(session_id: str) -> int:
             exc_info=True,
         )
         return 0
+
+
+def _run_claimed_delegation_wakeup(row: dict) -> None:
+    store = _delegation_wakeup_store()
+    delegation_id = str(row.get("delegation_id") or "")
+    claim_token = str(row.get("claim_token") or "")
+    try:
+        from api.routes import start_session_turn
+
+        response = start_session_turn(
+            str(row.get("session_id") or ""),
+            str(row.get("wakeup_prompt") or ""),
+            source="process_wakeup",
+        )
+        status = int((response or {}).get("_status", 200) or 200)
+        if status >= 400:
+            store.release_claim(
+                delegation_id,
+                claim_token,
+                str((response or {}).get("error") or f"status={status}"),
+            )
+            return
+        if not store.mark_delivered(delegation_id, claim_token):
+            logger.error("async_delegation delivered transition lost for %s", delegation_id)
+    except Exception as exc:
+        store.release_claim(delegation_id, claim_token, str(exc))
+        logger.warning("async_delegation wakeup start failed for %s", delegation_id, exc_info=True)
+
+
+def dispatch_pending_delegation_wakeups_for_session(session_id: str) -> int:
+    """Atomically claim and launch at most one durable wakeup for a session."""
+    if not session_id or _session_has_active_turn(session_id):
+        return 0
+    store = _delegation_wakeup_store()
+    claimed = store.claim_next(session_id)
+    if claimed is None:
+        return 0
+    try:
+        thread = _WAKEUP_THREAD_FACTORY(
+            target=_run_claimed_delegation_wakeup,
+            args=(claimed,),
+            name=f"hermes-webui-delegation-wakeup-{str(session_id)[:8]}",
+            daemon=True,
+        )
+        thread.start()
+        return 1
+    except Exception as exc:
+        store.release_claim(
+            str(claimed.get("delegation_id") or ""),
+            str(claimed.get("claim_token") or ""),
+            str(exc),
+        )
+        logger.warning("async_delegation wakeup thread failed to start", exc_info=True)
+        return 0
+
+
+def replay_pending_delegation_wakeups() -> int:
+    """Startup recovery: requeue interrupted claims and launch each idle owner once."""
+    store = _delegation_wakeup_store()
+    store.recover_claims()
+    started = 0
+    for session_id in store.pending_session_ids():
+        started += dispatch_pending_delegation_wakeups_for_session(session_id)
+    return started
 
 
 def _session_has_active_turn(session_id: str) -> bool:
@@ -1411,6 +1528,23 @@ def _start_server_side_wakeup_turn(
     ).start()
 
 
+# Shared helper to notify the agent async-delegation tracker when available.
+# The canonical Hermes compat surface is ``tools.async_delegation``; if that
+# module exists and exposes ``mark_async_delegation_delivered``, call it after
+# the event is durably enqueued/claimed for the correct session. Failures here
+# are logged but never crash the WebUI drain.
+def _try_mark_async_delegation_tracker(*, evt: dict) -> bool:
+    try:
+        import tools.async_delegation as _ad
+        marker = getattr(_ad, "mark_async_delegation_delivered", None)
+        if callable(marker):
+            marker(evt)
+            return True
+    except Exception:
+        logger.debug("async_delegation tracker notification failed", exc_info=True)
+    return False
+
+
 def _drain_loop() -> None:
     try:
         from tools import process_registry as _pr_mod  # noqa: F401
@@ -1497,6 +1631,10 @@ def start_drain_thread() -> bool:
     with _THREAD_LIFECYCLE_LOCK:
         if _DRAIN_THREAD is not None and _DRAIN_THREAD.is_alive():
             return False
+        try:
+            replay_pending_delegation_wakeups()
+        except Exception:
+            logger.warning("async_delegation startup replay failed", exc_info=True)
         _DRAIN_STOP.clear()
         _DRAIN_THREAD = threading.Thread(
             target=_drain_loop,
