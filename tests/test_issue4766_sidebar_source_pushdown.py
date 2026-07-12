@@ -117,7 +117,10 @@ def _run_node(script):
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache(monkeypatch):
+    # This module exercises the reconciled payload filters directly; the v2
+    # cold-seed path has separate contract coverage.
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
     routes._session_list_cache_clear()
     yield
     routes._session_list_cache_clear()

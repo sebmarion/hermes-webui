@@ -17,18 +17,30 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent.resolve()
 from tests._pytest_port import BASE
 
 
 def get(path, *, profile=None):
-    headers = {}
-    if profile:
-        headers["Cookie"] = f"hermes_profile={profile}"
-    req = urllib.request.Request(BASE + path, headers=headers)
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read()), r.status
+    def _read_once():
+        headers = {}
+        if profile:
+            headers["Cookie"] = f"hermes_profile={profile}"
+        req = urllib.request.Request(BASE + path, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read()), r.status
+
+    result = _read_once()
+    if urlsplit(path).path == "/api/sessions":
+        # The v2 contract serves the last-known-good snapshot immediately and
+        # reconciles state.db on one background owner. These integration tests
+        # insert Agent rows directly, so allow the projection to converge.
+        for _ in range(6):
+            time.sleep(0.05)
+            result = _read_once()
+    return result
 
 
 def post(path, body=None, *, profile=None):

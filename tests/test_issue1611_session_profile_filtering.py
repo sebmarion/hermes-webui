@@ -764,9 +764,17 @@ def _delete_agent_session(conn: sqlite3.Connection, session_id: str) -> None:
 
 
 def _get_json(path: str) -> tuple[dict, int]:
-    req = urllib.request.Request(BASE + path)
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read()), resp.status
+    def _read_once():
+        req = urllib.request.Request(BASE + path)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read()), resp.status
+
+    result = _read_once()
+    if urlparse(path).path == "/api/sessions":
+        for _ in range(6):
+            time.sleep(0.05)
+            result = _read_once()
+    return result
 
 
 def _post_json(path: str, body: dict) -> tuple[dict, int]:

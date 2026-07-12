@@ -46,7 +46,10 @@ def _handle_sessions(url):
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache(monkeypatch):
+    # These unit tests pin the full reconciliation builder. The v2 bounded
+    # seed/background contract is covered in test_session_projection_hot_path.
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
     routes._session_list_cache_clear()
     models.clear_cli_sessions_cache()
     yield
