@@ -107,6 +107,7 @@ def test_get_cli_sessions_cold_followers_join_single_rebuild(monkeypatch, tmp_pa
     monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
     models.clear_cli_sessions_cache()
     monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0, raising=False)
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_WAIT_SECONDS", 2.0, raising=False)
 
     owner_started = threading.Event()
     owner_block = threading.Event()
@@ -259,6 +260,11 @@ def test_get_cli_sessions_clear_during_rebuild_preserves_joiners(monkeypatch, tm
     monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
     models.clear_cli_sessions_cache()
     monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0, raising=False)
+    # This case exercises invalidation preserving existing joiners, not the
+    # independent-rebuild timeout path covered above. Keep the join budget well
+    # above a loaded full-suite scheduler quantum so timing noise cannot turn it
+    # into that different behavior.
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_WAIT_SECONDS", 2.0, raising=False)
 
     owner_started = threading.Event()
     owner_block = threading.Event()

@@ -7737,6 +7737,37 @@ def _state_db_session_source(sid: str) -> str:
     return str(row[0] or "").strip().lower()
 
 
+def _state_db_session_delegate_from(sid: str) -> str:
+    """Return the authoritative delegate parent from ``model_config``.
+
+    Some delegate rows predate or bypass ``source='subagent'`` normalization.
+    Mutation guards must still recognize those rows as delegate-runner-owned.
+    """
+    if not sid or not is_safe_session_id(sid):
+        return ""
+    try:
+        from api.models import _active_state_db_path
+        db_path = _active_state_db_path()
+        if not db_path or not Path(db_path).exists():
+            return ""
+        import sqlite3 as _sqlite
+        with closing(_sqlite.connect(str(db_path))) as _conn:
+            row = _conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?", (sid,)
+            ).fetchone()
+    except Exception:
+        return ""
+    if not row or not row[0]:
+        return ""
+    try:
+        config = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(config, dict):
+        return ""
+    return str(config.get("_delegate_from") or "").strip()
+
+
 def _is_subagent_child_session_id(sid: str) -> bool:
     """Return True when ``sid`` is a delegated subagent child in state.db.
 
@@ -7746,7 +7777,10 @@ def _is_subagent_child_session_id(sid: str) -> bool:
     recover the transcript from state.db rather than 404 as a deleted WebUI
     session (#5307).
     """
-    return _state_db_session_source(sid) == "subagent"
+    return bool(
+        _state_db_session_source(sid) == "subagent"
+        or _state_db_session_delegate_from(sid)
+    )
 
 
 def _session_is_subagent_view_only(sid: str) -> bool:

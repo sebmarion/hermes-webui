@@ -6826,6 +6826,7 @@ def _load_cli_sessions_uncached(
             'platform': row.get('platform'),
             'session_source': row.get('session_source') or _source_meta.get('session_source'),
             'source_label': row.get('source_label') or _source_meta.get('source_label'),
+            'delegate_from': row.get('delegate_from'),
             'parent_session_id': row.get('parent_session_id'),
             'parent_title': row.get('parent_title'),
             'parent_source': row.get('parent_source'),

@@ -37,7 +37,8 @@ SESSIONS_JS = ROOT / "static" / "sessions.js"
 
 def _make_state_db(path: Path, sid: str, *, message_count: int = 2,
                    title: str = "tui session", model: str = "MiniMax-M3",
-                   source: str = "tui", cwd: str = "/root") -> None:
+                   source: str = "tui", cwd: str = "/root",
+                   model_config: dict | None = None) -> None:
     """Create a minimal state.db with one session and a few messages.
 
     Schema mirrors hermes_state.SessionDB closely enough for
@@ -95,9 +96,10 @@ def _make_state_db(path: Path, sid: str, *, message_count: int = 2,
         """
     )
     conn.execute(
-        "INSERT OR REPLACE INTO sessions (id, source, model, message_count, started_at, title, cwd) "
-        "VALUES (?, ?, ?, ?, 1781024055.0, ?, ?)",
-        (sid, source, model, message_count, title, cwd),
+        "INSERT OR REPLACE INTO sessions (id, source, model, model_config, message_count, started_at, title, cwd) "
+        "VALUES (?, ?, ?, ?, ?, 1781024055.0, ?, ?)",
+        (sid, source, model, json.dumps(model_config) if model_config else None,
+         message_count, title, cwd),
     )
     for i in range(message_count):
         conn.execute(
@@ -259,6 +261,19 @@ def test_state_db_source_helper_reads_subagent(routes_module, isolated_state_db)
     assert routes_module._state_db_session_source("sa-1") == "subagent"
     assert routes_module._is_subagent_child_session_id("sa-1") is True
     assert routes_module._is_subagent_child_session_id("does-not-exist") is False
+
+
+def test_delegate_model_config_is_view_only_without_subagent_source(
+    routes_module, isolated_state_db
+):
+    _make_state_db(
+        isolated_state_db["db"], "delegate-by-config", source="tui",
+        model_config={"_delegate_from": "parent-session"},
+    )
+    assert routes_module._state_db_session_source("delegate-by-config") == "tui"
+    assert routes_module._state_db_session_delegate_from("delegate-by-config") == "parent-session"
+    assert routes_module._is_subagent_child_session_id("delegate-by-config") is True
+    assert routes_module._session_is_subagent_view_only("delegate-by-config") is True
 
 
 def test_import_cli_endpoint_does_not_materialize_subagent_child():
