@@ -262,6 +262,23 @@ This is the most architecturally interesting part. Two endpoints cooperate:
     GET  /api/chat/stream    Long-lived SSE connection. Reads from STREAMS[stream_id]
                              and forwards events to the browser until 'done' or 'error'.
 
+    POST /api/internal/recovery/start
+                             Loopback-only watchdog handoff authenticated with a
+                             timestamped HMAC from the durable WebUI signing key.
+                             This endpoint is not a browser/API chat-start alias.
+
+For a WebUI-owned watchdog recovery, the internal endpoint acquires the existing
+per-session agent lock before re-reading state.db, the WebUI sidecar, and the turn
+journal. It retains that lock through `_start_run()` and stream reservation, so a
+concurrent human `/api/chat/start` and recovery start have exactly one winner.
+Malformed, stale, active, pending, terminal, duplicate, source-mismatched, or
+workspace-mismatched recovery candidates fail closed. `runner-local` is also
+rejected here because its reservation owner is outside the WebUI process. A
+journal `completed` event is necessary but not sufficient for watchdog success:
+the exact assistant message recorded by that terminal event must end with a
+strict `RECOVERED: <summary>` marker; `RECOVERY_BLOCKED: <reason>` remains
+blocked and a missing/ambiguous marker retains the watchdog's durable slot.
+
 Queue registry:
 
     STREAMS = {}               dict: stream_id -> queue.Queue

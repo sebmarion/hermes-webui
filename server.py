@@ -567,6 +567,8 @@ def main() -> None:
         print(f"[!!] WARNING: Could not raise file descriptor limit: {fd_limit.get('error')}", flush=True)
 
     fix_credential_permissions()
+    from api.atomic_recovery import ensure_internal_recovery_key
+    ensure_internal_recovery_key()
 
     try:
         from api.models import _active_state_db_path

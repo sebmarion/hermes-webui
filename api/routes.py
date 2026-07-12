@@ -5458,6 +5458,7 @@ def _csrf_exempt_path(path: str) -> bool:
         "/api/auth/passkey/options",
         "/api/auth/passkey/login",
         "/api/csp-report",
+        "/api/internal/recovery/start",
     }
 
 
@@ -13853,6 +13854,18 @@ def handle_post(handler, parsed) -> bool:
         if diag:
             diag.finish()
         raise
+    if parsed.path == "/api/internal/recovery/start":
+        from api.atomic_recovery import (
+            start_atomic_webui_recovery,
+            verify_internal_recovery_request,
+        )
+
+        allowed, auth_error = verify_internal_recovery_request(handler, body)
+        if not allowed:
+            return bad(handler, auth_error or "Internal recovery authentication failed", status=403)
+        result = start_atomic_webui_recovery(body)
+        status = int(result.pop("_status", 200) or 200)
+        return j(handler, result, status=status)
     if not _guard_request_session_visibility(handler, parsed, body=body, method="POST"):
         if diag:
             diag.finish()
@@ -20853,9 +20866,22 @@ def _start_chat_stream_for_session(
     goal_related: bool = False,
     source: str = "webui",
     moa_config=None,
+    session_lock_held: bool = False,
+    recovery_claim_token: str | None = None,
+    recovery_fingerprint: str | None = None,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     attachments = attachments or []
+    recovery_assistant_index_before: int | None = None
+    if recovery_claim_token or recovery_fingerprint:
+        recovery_assistant_index_before = next(
+            (
+                idx
+                for idx in range(len(getattr(s, "messages", None) or []) - 1, -1, -1)
+                if isinstance(s.messages[idx], dict) and s.messages[idx].get("role") == "assistant"
+            ),
+            -1,
+        )
     # Prevent duplicate runs in the same session while a stream is still active.
     # This commonly happens after page refresh/reconnect races and can produce
     # duplicated clarify cards for what appears to be a single user request.
@@ -20891,6 +20917,34 @@ def _start_chat_stream_for_session(
     session_lock = _get_session_agent_lock(s.session_id)
     diag.stage("session_lock_wait") if diag else None
     while True:
+        if session_lock_held:
+            locked_stream_id = getattr(s, "active_stream_id", None)
+            if locked_stream_id:
+                return {
+                    "error": "session already has an active stream",
+                    "active_stream_id": locked_stream_id,
+                    "_status": 409,
+                }
+            blocking_run_stream_id = _active_run_stream_for_session(s.session_id)
+            if blocking_run_stream_id:
+                return {
+                    "error": "session already has an active stream",
+                    "active_stream_id": blocking_run_stream_id,
+                    "_status": 409,
+                }
+            stream_id = uuid.uuid4().hex
+            was_hidden_empty_session = _is_hidden_empty_session(s)
+            _prepare_chat_start_session_for_stream(
+                s,
+                msg=msg,
+                attachments=attachments,
+                workspace=workspace,
+                model=model,
+                model_provider=model_provider,
+                stream_id=stream_id,
+                source=source,
+            )
+            break
         with session_lock:
             locked_stream_id = getattr(s, "active_stream_id", None)
             if locked_stream_id:
@@ -20957,11 +21011,33 @@ def _start_chat_stream_for_session(
                 "workspace": workspace,
                 "model": model,
                 "model_provider": model_provider,
+                "source": source,
+                **({"recovery_claim_token": recovery_claim_token} if recovery_claim_token else {}),
+                **({"recovery_fingerprint": recovery_fingerprint} if recovery_fingerprint else {}),
+                **(
+                    {"profile": str(getattr(s, "profile", None) or "default")}
+                    if recovery_claim_token or recovery_fingerprint
+                    else {}
+                ),
+                **(
+                    {"recovery_assistant_index_before": recovery_assistant_index_before}
+                    if recovery_assistant_index_before is not None
+                    else {}
+                ),
                 "created_at": s.pending_started_at,
             },
         )
     except Exception:
         logger.warning("Failed to append submitted turn journal event", exc_info=True)
+        if recovery_claim_token or recovery_fingerprint:
+            # Recovery requires a durable reservation before any worker starts.
+            # Keep the persisted active/pending owner fail-closed and return an
+            # uncertain server error; the watchdog retains its global slot.
+            return {
+                "error": "Atomic recovery reservation could not be journaled",
+                "active_stream_id": stream_id,
+                "_status": 500,
+            }
     diag.stage("set_last_workspace") if diag else None
     set_last_workspace(workspace)
     diag.stage("stream_registration") if diag else None
@@ -21064,6 +21140,9 @@ def _start_run(
     route: str,
     diag=None,
     moa_config=None,
+    session_lock_held: bool = False,
+    recovery_claim_token: str | None = None,
+    recovery_fingerprint: str | None = None,
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -21091,6 +21170,12 @@ def _start_run(
         runtime_adapter_runner_enabled,
     )
 
+    if session_lock_held and runtime_adapter_runner_enabled():
+        return {
+            "error": "Atomic recovery is unavailable when an external runner owns reservation",
+            "_status": 501,
+        }
+
     if runtime_adapter_enabled() or runtime_adapter_runner_enabled():
         def _legacy_start_run(request: StartRunRequest) -> dict:
             return _start_chat_stream_for_session(
@@ -21104,6 +21189,9 @@ def _start_run(
                 diag=diag,
                 source=request.source or source,
                 moa_config=moa_config,
+                session_lock_held=session_lock_held,
+                recovery_claim_token=recovery_claim_token,
+                recovery_fingerprint=recovery_fingerprint,
             )
 
         def _legacy_adapter_factory():
@@ -21144,6 +21232,9 @@ def _start_run(
         diag=diag,
         source=source,
         moa_config=moa_config,
+        session_lock_held=session_lock_held,
+        recovery_claim_token=recovery_claim_token,
+        recovery_fingerprint=recovery_fingerprint,
     )
 
 
