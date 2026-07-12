@@ -338,7 +338,7 @@ def test_real_generic_target_turn_once_across_duplicate_restart_two_profiles_and
         assert row["state"] == "delivered"
         journal = turn_journal.read_turn_journal(f"target-{profile}")["events"]
         assert sum(
-            item.get("event") == "submitted"
+            item.get("event") == "worker_started"
             and item.get("delegation_id") == event["delegation_id"]
             for item in journal
         ) == 1

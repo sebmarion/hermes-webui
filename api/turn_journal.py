@@ -155,12 +155,12 @@ def reserve_delegation_turn(
                     event for event in journal.get("events") or []
                     if str((event or {}).get("delegation_id") or "") == key
                 ]
-                submitted = [
+                started = [
                     event for event in matches
-                    if str((event or {}).get("event") or "") == "submitted"
+                    if str((event or {}).get("event") or "") == "worker_started"
                 ]
-                if submitted:
-                    return submitted[-1], False
+                if started:
+                    return started[-1], False
                 latest = matches[-1] if matches else None
                 if (
                     latest is not None
@@ -215,9 +215,31 @@ def find_delegation_turn(
     matches = [
         event for event in journal.get("events") or []
         if str((event or {}).get("delegation_id") or "") == key
-        and str((event or {}).get("event") or "") == "submitted"
+        and str((event or {}).get("event") or "") == "worker_started"
     ]
     return matches[-1] if matches else None
+
+
+def mark_delegation_turn_started(
+    session_id: str,
+    delegation_id: str,
+    *,
+    turn_id: str,
+    stream_id: str,
+    session_dir: Path | None = None,
+) -> dict:
+    """Persist the replay boundary only after the provider worker starts."""
+    return append_turn_journal_event(
+        session_id,
+        {
+            "event": "worker_started",
+            "delegation_id": str(delegation_id),
+            "turn_id": str(turn_id),
+            "stream_id": str(stream_id),
+            "owner_pid": os.getpid(),
+        },
+        session_dir=session_dir,
+    )
 
 
 def read_turn_journal(session_id: str, *, session_dir: Path | None = None) -> dict:

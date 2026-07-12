@@ -22931,13 +22931,71 @@ def _start_chat_stream_for_session(
             worker_kwargs["moa_config"] = moa_config
         if bestplan_config and not backend_is_gateway:
             worker_kwargs["bestplan_config"] = bestplan_config
+
+        worker_ready = threading.Event()
+        worker_cancel = threading.Event()
+        worker_start = {
+            "ok": not bool(delegation_id),
+            "event": journal_event,
+            "error": None,
+        }
+
+        def _durable_worker_target():
+            if delegation_id:
+                try:
+                    from api.turn_journal import mark_delegation_turn_started
+
+                    worker_start["event"] = mark_delegation_turn_started(
+                        s.session_id,
+                        delegation_id,
+                        turn_id=str(
+                            delegation_turn_id
+                            or journal_event.get("turn_id")
+                            or ""
+                        ),
+                        stream_id=stream_id,
+                    )
+                    worker_start["ok"] = True
+                except Exception as exc:
+                    worker_start["error"] = exc
+                    logger.exception(
+                        "Failed to persist delegation worker-start boundary"
+                    )
+                finally:
+                    worker_ready.set()
+                if not worker_start["ok"] or worker_cancel.is_set():
+                    return
+            worker_target(
+                s.session_id,
+                msg,
+                model,
+                workspace,
+                stream_id,
+                attachments,
+                **worker_kwargs,
+            )
+
         thr = threading.Thread(
-            target=worker_target,
-            args=(s.session_id, msg, model, workspace, stream_id, attachments),
-            kwargs=worker_kwargs,
+            target=_durable_worker_target if delegation_id else worker_target,
+            args=(
+                ()
+                if delegation_id
+                else (s.session_id, msg, model, workspace, stream_id, attachments)
+            ),
+            kwargs={} if delegation_id else worker_kwargs,
             daemon=True,
         )
         thr.start()
+        if delegation_id:
+            if not worker_ready.wait(timeout=10):
+                worker_cancel.set()
+            if not worker_start["ok"]:
+                _clear_stale_stream_state(s)
+                return {
+                    "error": "delegation worker-start boundary could not be persisted",
+                    "_status": 503,
+                }
+            journal_event = worker_start["event"]
     except Exception:
         if not (recovery_claim_token or recovery_fingerprint):
             raise

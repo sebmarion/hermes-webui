@@ -112,7 +112,7 @@ def test_target_turn_delegation_id_is_durable_and_duplicate_returns_same_turn(tm
     assert len(calls) == 1
     events = turn_journal.read_turn_journal(session.session_id)["events"]
     assert sum(
-        e.get("delegation_id") == "deleg-1" and e.get("event") == "submitted"
+        e.get("delegation_id") == "deleg-1" and e.get("event") == "worker_started"
         for e in events
     ) == 1
 
