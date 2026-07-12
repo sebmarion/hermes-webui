@@ -155,6 +155,7 @@ def test_generated_title_persist_reloads_latest_session_before_saving(tmp_path, 
     cache = OrderedDict()
 
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
     monkeypatch.setattr(models, "SESSIONS", cache, raising=False)
     monkeypatch.setattr(routes, "SESSIONS", cache, raising=False)
     monkeypatch.setattr(routes, "_sync_session_title_to_insights", lambda session: None)
