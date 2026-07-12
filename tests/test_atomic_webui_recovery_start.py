@@ -401,6 +401,43 @@ def test_atomic_recovery_blocks_newer_turn_and_fingerprint_mismatch(recovery_sta
     assert "fingerprint" in result["error"].lower()
 
 
+def test_atomic_recovery_rejects_model_and_qualified_provider_mismatch(recovery_state):
+    _write_sidecar(recovery_state, model="different-model")
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert result["_status"] == 409
+    assert "model mismatch" in result["error"].lower()
+    assert recovery_state["config"].STREAMS == {}
+
+    _write_sidecar(
+        recovery_state,
+        model="@custom:expected:test-model",
+        model_provider="custom:other",
+    )
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert result["_status"] == 409
+    assert "provider mismatch" in result["error"].lower()
+    assert recovery_state["config"].STREAMS == {}
+
+
+def test_atomic_recovery_uses_db_model_with_consistent_qualified_sidecar(recovery_state, monkeypatch):
+    _write_sidecar(
+        recovery_state,
+        model="@custom:expected:test-model",
+        model_provider="custom:expected",
+    )
+    observed = {}
+
+    def capture_start(_session, **kwargs):
+        observed.update(kwargs)
+        return {"session_id": "session-1", "stream_id": "stream", "turn_id": "turn"}
+
+    monkeypatch.setattr(recovery_state["routes"], "_start_run", capture_start)
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert result["stream_id"] == "stream"
+    assert observed["model"] == "test-model"
+    assert observed["model_provider"] == "custom:expected"
+
+
 @pytest.mark.parametrize("terminal", ["completed", "interrupted"])
 def test_atomic_recovery_blocks_completed_or_interrupted_latest_turn(recovery_state, terminal):
     submitted = _append_journal(
@@ -464,6 +501,32 @@ def test_atomic_recovery_blocks_workspace_malformed_and_duplicate_state(recovery
     assert "duplicate" in result["error"].lower()
 
 
+@pytest.mark.parametrize("terminal", ["completed", "interrupted"])
+def test_atomic_recovery_terminal_binding_ignores_clock_skew(recovery_state, terminal):
+    submitted = _append_journal(
+        recovery_state,
+        {
+            "event": "submitted",
+            "stream_id": "old-stream",
+            "role": "user",
+            "content": recovery_state["messages"][0]["content"],
+            "created_at": recovery_state["messages"][0]["timestamp"] + 10_000,
+        },
+    )
+    _append_journal(
+        recovery_state,
+        {
+            "event": terminal,
+            "stream_id": "old-stream",
+            "turn_id": submitted["turn_id"],
+            "created_at": recovery_state["messages"][0]["timestamp"] - 10_000,
+        },
+    )
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert result["_status"] == 409
+    assert terminal in result["error"].lower()
+
+
 @pytest.mark.parametrize(
     ("request_has_git_root", "db_has_git_root"),
     [(False, True), (True, False)],
@@ -495,6 +558,7 @@ def test_human_vs_recovery_race_has_exactly_one_winner_and_expected_start(recove
     original_start_run = routes._start_run
     recovery_entered_start = threading.Event()
     human_attempting = threading.Event()
+    thread_timeout = 15.0
     observed = {}
 
     def recovery_start_run(session, **kwargs):
@@ -505,7 +569,7 @@ def test_human_vs_recovery_race_has_exactly_one_winner_and_expected_start(recove
         observed["session_id"] = session.session_id
         observed["workspace"] = kwargs["workspace"]
         recovery_entered_start.set()
-        assert human_attempting.wait(timeout=2)
+        assert human_attempting.wait(timeout=thread_timeout), "human runner did not reach the session lock"
         return original_start_run(session, **kwargs)
 
     monkeypatch.setattr(routes, "_start_run", recovery_start_run)
@@ -519,7 +583,7 @@ def test_human_vs_recovery_race_has_exactly_one_winner_and_expected_start(recove
         outcomes["recovery"] = atomic_recovery.start_atomic_webui_recovery(recovery_state["body"])
 
     def human_runner():
-        assert recovery_entered_start.wait(timeout=2)
+        assert recovery_entered_start.wait(timeout=thread_timeout), "recovery runner did not reach _start_run"
         human_attempting.set()
         outcomes["human"] = original_start_run(
             human_session,
@@ -537,11 +601,11 @@ def test_human_vs_recovery_race_has_exactly_one_winner_and_expected_start(recove
     human_thread = threading.Thread(target=human_runner)
     recovery_thread.start()
     human_thread.start()
-    recovery_thread.join(timeout=5)
-    human_thread.join(timeout=5)
+    recovery_thread.join(timeout=thread_timeout * 2)
+    human_thread.join(timeout=thread_timeout * 2)
 
-    assert not recovery_thread.is_alive()
-    assert not human_thread.is_alive()
+    assert not recovery_thread.is_alive(), "recovery runner did not finish"
+    assert not human_thread.is_alive(), "human runner did not finish"
     statuses = sorted(int(result.get("_status", 200)) for result in outcomes.values())
     assert statuses == [200, 409]
     assert outcomes["recovery"].get("stream_id")

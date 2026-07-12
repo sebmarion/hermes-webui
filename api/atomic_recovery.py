@@ -187,7 +187,17 @@ def _read_sidecar(session_id: str) -> dict:
     return payload
 
 
-def _read_journal_state(session_id: str) -> dict:
+def _normalized_turn_text(value) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _read_journal_state(session_id: str, last_user_text: str) -> dict:
+    """Bind journal terminal state structurally to the authoritative DB user turn.
+
+    Wall-clock timestamps are freshness evidence only. They are not logical turn
+    identity: imported events and clock skew can move them backwards or forwards.
+    A duplicate matching submitted turn is ambiguous and therefore fails closed.
+    """
     from api.turn_journal import read_turn_journal
 
     journal = read_turn_journal(session_id)
@@ -205,22 +215,40 @@ def _read_journal_state(session_id: str) -> dict:
         normalized = dict(event)
         normalized["_created_at"] = created_at
         checked.append(normalized)
-    checked.sort(key=lambda event: event["_created_at"])
     if not checked:
         return {"events": []}
-    latest_turn_id = str(checked[-1].get("turn_id") or "")
-    if not latest_turn_id:
-        raise ValueError("authoritative WebUI turn journal is malformed")
-    latest = [event for event in checked if str(event.get("turn_id") or "") == latest_turn_id]
-    terminals = [event for event in latest if str(event.get("event") or "") in {"completed", "interrupted"}]
+    matching_turn_ids = {
+        str(event.get("turn_id") or "")
+        for event in checked
+        if str(event.get("event") or "") == "submitted"
+        and str(event.get("role") or "") == "user"
+        and str(event.get("source") or "") != "cron-recovery"
+        and _normalized_turn_text(event.get("content")) == _normalized_turn_text(last_user_text)
+    }
+    matching_turn_ids.discard("")
+    if len(matching_turn_ids) > 1:
+        raise ValueError("authoritative WebUI turn journal is ambiguous for the database user turn")
+    if not matching_turn_ids:
+        return {"events": checked}
+    matched_turn_id = next(iter(matching_turn_ids))
+    matched = [event for event in checked if str(event.get("turn_id") or "") == matched_turn_id]
+    terminals = [event for event in matched if str(event.get("event") or "") in {"completed", "interrupted"}]
     if len(terminals) > 1:
         raise ValueError("authoritative WebUI turn journal has conflicting terminal state")
     return {
         "events": checked,
-        "latest_at": latest[-1]["_created_at"],
+        "matched_turn_id": matched_turn_id,
         "terminal_event": str(terminals[-1].get("event") or "") if terminals else None,
-        "terminal_at": terminals[-1]["_created_at"] if terminals else 0,
     }
+
+
+def _split_qualified_model(raw) -> tuple[str, str | None]:
+    value = str(raw or "").strip()
+    if value.startswith("@") and ":" in value:
+        provider, bare = value[1:].rsplit(":", 1)
+        if provider.strip() and bare.strip():
+            return bare.strip(), provider.strip()
+    return value, None
 
 
 def _resolved_existing_directory(raw, label: str) -> Path:
@@ -309,7 +337,7 @@ def start_atomic_webui_recovery(body: dict) -> dict:
         try:
             db_state = _read_db_turn(session_id, profile)
             sidecar = _read_sidecar(session_id)
-            journal = _read_journal_state(session_id)
+            journal = _read_journal_state(session_id, db_state["last_user_text"])
             requested_workspace = _resolved_existing_directory(body.get("workspace"), "requested")
             sidecar_workspace = _resolved_existing_directory(
                 sidecar.get("workspace") or sidecar.get("workspace_path"), "WebUI"
@@ -342,7 +370,7 @@ def start_atomic_webui_recovery(body: dict) -> dict:
         if str(sidecar.get("profile") or "default") != profile:
             return _blocked("Recovery profile does not own the WebUI sidecar")
         terminal = journal.get("terminal_event")
-        if terminal and float(journal.get("terminal_at") or 0) >= db_state["last_user_at"]:
+        if terminal:
             return _blocked(f"Recovery blocked because the latest turn is {terminal}")
         for event in journal.get("events") or []:
             if str(event.get("source") or "") != "cron-recovery":
@@ -377,8 +405,15 @@ def start_atomic_webui_recovery(body: dict) -> dict:
             return _blocked(stale_owner_error)
         if _resolved_existing_directory(getattr(session, "workspace", None), "session") != requested_workspace:
             return _blocked("Recovery workspace mismatch after session reload")
-        if not (getattr(session, "model", None) or db_state.get("model")):
+        db_model = str(db_state.get("model") or "").strip()
+        session_model, qualified_provider = _split_qualified_model(getattr(session, "model", None))
+        session_provider = str(getattr(session, "model_provider", None) or "").strip()
+        if not db_model or not session_model:
             return _blocked("Authoritative WebUI session model is missing")
+        if session_model != db_model:
+            return _blocked("Recovery model mismatch after session reload")
+        if qualified_provider and session_provider and qualified_provider != session_provider:
+            return _blocked("Recovery model provider mismatch after session reload")
         with LOCK:
             cached_session = SESSIONS.get(session_id)
             if cached_session is not None and cached_session is not session:
@@ -400,8 +435,8 @@ def start_atomic_webui_recovery(body: dict) -> dict:
             msg=RECOVERY_PROMPT,
             attachments=[],
             workspace=str(requested_workspace),
-            model=getattr(session, "model", None) or db_state.get("model"),
-            model_provider=getattr(session, "model_provider", None),
+            model=db_model,
+            model_provider=qualified_provider or session_provider or None,
             normalized_model=False,
             source="cron-recovery",
             route="internal_atomic_recovery",
