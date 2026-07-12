@@ -84,6 +84,10 @@ def test_shutdown_waits_for_blocking_wakeup_worker_before_returning(monkeypatch)
 def test_target_turn_delegation_id_is_durable_and_duplicate_returns_same_turn(tmp_path, monkeypatch):
     from api import models, routes, turn_journal
 
+    # Exercise the production legacy-direct turn boundary deterministically.
+    # The developer shell may opt into runner-local globally, but this test
+    # intentionally stubs the legacy provider worker below.
+    monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "legacy-direct")
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(turn_journal, "_default_session_dir", lambda: tmp_path / "sessions")
     session = models.Session(
@@ -116,6 +120,7 @@ def test_target_turn_delegation_id_is_durable_and_duplicate_returns_same_turn(tm
 def test_target_turn_fails_closed_when_submitted_journal_cannot_persist(tmp_path, monkeypatch):
     from api import models, routes, turn_journal
 
+    monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "legacy-direct")
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(turn_journal, "_default_session_dir", lambda: tmp_path / "sessions")
     session = models.Session(
@@ -172,6 +177,7 @@ def test_fresh_process_crash_after_start_before_wakeup_mark_never_starts_second_
         "HERMES_WEBUI_STATE_DIR": str(state),
         "HERMES_HOME": str(state),
         "HERMES_WEBUI_DEFAULT_WORKSPACE": str(tmp_path),
+        "HERMES_WEBUI_RUNTIME_ADAPTER": "legacy-direct",
         "PYTHONPATH": os.pathsep.join(filter(None, (os.getcwd(), env.get("PYTHONPATH", "")))),
     })
     first_code = r'''

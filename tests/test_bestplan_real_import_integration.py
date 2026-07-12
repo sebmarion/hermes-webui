@@ -277,6 +277,10 @@ def test_real_two_profile_trackers_never_cross_ack(tmp_path, monkeypatch):
 def test_real_generic_target_turn_once_across_duplicate_restart_two_profiles_and_closed_tab(
     tmp_path, monkeypatch,
 ):
+    # Pin the production legacy-direct adapter because provider execution is
+    # the sole stub in this integration. A developer's runner-local shell
+    # setting must not redirect the turn into an unconfigured external runner.
+    monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "legacy-direct")
     _bestplan, async_delegation = _agent_modules(monkeypatch)
     from api import background_process as bp
     from api import models, routes, turn_journal
