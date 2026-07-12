@@ -10,6 +10,7 @@ from pathlib import Path
 from api.config import LOCK, SESSION_DIR, SESSIONS, SETTINGS_FILE
 from api.models import _active_state_db_path, _active_stream_ids
 from api.profiles import _profiles_match
+from api.session_projection import projection_token as _session_list_projection_token
 
 
 _SESSIONS_CACHE_TTL_SECONDS = 2.5
@@ -372,10 +373,7 @@ def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple
         state_db_path = Path(_session_list_cache_state_db_path())
     except Exception:
         state_db_path = None
-    try:
-        state_db_wal_path = state_db_path.with_name(f"{state_db_path.name}-wal") if state_db_path is not None else None
-    except Exception:
-        state_db_wal_path = None
+    projection_token = _session_list_projection_token(state_db_path)
     try:
         gateway_metadata_path = _session_list_cache_gateway_session_metadata_path()
     except Exception:
@@ -385,16 +383,12 @@ def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple
     except Exception:
         session_index_path = None
     return (
-        _session_list_cache_path_stamp(state_db_path),
-        _session_list_cache_path_stamp(state_db_wal_path),
+        projection_token,
+        projection_token,
         _session_list_cache_path_stamp(gateway_metadata_path),
         _session_list_cache_path_stamp(session_index_path),
         _session_list_cache_path_stamp(_session_list_cache_settings_file()),
-        # Commit-reliable content fingerprint of state.db — the file-stat stamps
-        # above can collide under WAL-mode writes (same mtime_ns bucket + WAL
-        # frame size), so without this a freshly-committed CLI/gateway session
-        # could be served stale for the cache TTL. Mirrors the models-layer fix.
-        _session_list_cache_state_db_fingerprint(state_db_path),
+        projection_token,
         swv,
     )
 

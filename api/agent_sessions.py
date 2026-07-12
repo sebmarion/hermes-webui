@@ -1,5 +1,6 @@
 """Shared helpers for reading Hermes Agent sessions from state.db."""
 import logging
+import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -555,6 +556,20 @@ def read_importable_agent_session_rows(
             )
             return []
 
+        projection_enabled = os.getenv(
+            "HERMES_WEBUI_SESSION_PROJECTION_V2", "true"
+        ).strip().lower() not in {"0", "false", "no", "off"}
+        projection_meta_present = False
+        if projection_enabled and "last_activity_at" in session_cols:
+            try:
+                projection_meta_present = cur.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'session_projection_meta'"
+                ).fetchone() is not None
+            except sqlite3.Error:
+                projection_meta_present = False
+        use_session_projection = projection_meta_present
+
         parent_expr = _optional_col('parent_session_id', session_cols)
         session_source_expr = _optional_col('session_source', session_cols)
         ended_expr = _optional_col('ended_at', session_cols)
@@ -585,7 +600,7 @@ def read_importable_agent_session_rows(
         # fall back to the per-session ``s.message_count`` / ``s.started_at``. (#3762)
         messages_has_session_id = 'session_id' in message_cols
         messages_has_timestamp = 'timestamp' in message_cols
-        use_messages_join = messages_has_session_id
+        use_messages_join = messages_has_session_id and not use_session_projection
         count_col = 'id' if 'id' in message_cols else 'session_id'
 
         # Defensive index prime (#3887). The normal candidate-ordering shape uses
@@ -594,7 +609,7 @@ def read_importable_agent_session_rows(
         # Writable dbs self-heal by recreating the index. Read-only or locked dbs
         # fall back to the pre-aggregated cron-only path below instead of failing.
         messages_index_present = False
-        if messages_has_session_id and messages_has_timestamp:
+        if use_messages_join and messages_has_timestamp:
             try:
                 cur.execute("PRAGMA index_list(messages)")
                 messages_index_present = any(str(row[1]) == "idx_messages_session" for row in cur.fetchall())
@@ -616,7 +631,17 @@ def read_importable_agent_session_rows(
                 except sqlite3.Error:
                     pass  # read-only db / locked / older schema — degrade gracefully
 
-        if use_messages_join:
+        if use_session_projection:
+            # Agent schema v20 owns the sidebar projection.  It maintains
+            # message_count and last_activity_at transactionally and publishes
+            # a generation only for visible-session changes, so WebUI must not
+            # rediscover this state by scanning or repairing messages here.
+            actual_count_expr = "s.message_count"
+            user_message_count_expr = "s.message_count"
+            last_activity_expr = "s.last_activity_at"
+            join_clause = ""
+            group_by_clause = ""
+        elif use_messages_join:
             actual_count_expr = f"COUNT(m.{count_col})"
             if 'role' in message_cols:
                 user_message_count_expr = "COUNT(CASE WHEN LOWER(m.role) = 'user' THEN 1 END)"
@@ -634,9 +659,17 @@ def read_importable_agent_session_rows(
             join_clause = ""
             group_by_clause = ""
 
-        order_by_clause = "ORDER BY s.started_at DESC"
+        order_by_clause = (
+            "ORDER BY s.last_activity_at DESC, s.started_at DESC"
+            if use_session_projection
+            else "ORDER BY s.started_at DESC"
+        )
         latest_messages_cte = None
-        candidate_order_clause = "ORDER BY s.started_at DESC"
+        candidate_order_clause = (
+            "ORDER BY s.last_activity_at DESC, s.started_at DESC"
+            if use_session_projection
+            else "ORDER BY s.started_at DESC"
+        )
 
         where_clauses = ["s.source IS NOT NULL"]
         params: list[object] = []

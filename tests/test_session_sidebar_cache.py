@@ -5,7 +5,7 @@ import pytest
 
 import api.config as config
 import api.routes as routes
-from api import session_events
+from api import route_session_list_cache, session_events
 
 
 @pytest.fixture(autouse=True)
@@ -198,7 +198,7 @@ def test_session_list_cache_follower_wait_stage_when_rebuild_inflight(monkeypatc
     assert "session_list_cache_hit" in owner_diag.stages or "session_list_cache_stored" in owner_diag.stages
 
 
-def test_session_list_cache_source_changed_owner_rebuilds_while_follower_reuses_stale(monkeypatch):
+def test_session_list_cache_source_change_returns_stale_and_rebuilds_off_request(monkeypatch):
     routes._session_list_cache_clear()
 
     key = routes._session_list_cache_key(
@@ -216,10 +216,7 @@ def test_session_list_cache_source_changed_owner_rebuilds_while_follower_reuses_
             stamp,
             payload,
         )
-    # Simulate state.db/WAL/fingerprint changing after the stale payload was
-    # cached. The owner must rebuild synchronously so committed external state is
-    # visible immediately, but followers can still use stale while that rebuild
-    # is blocked; otherwise sidebar polling can pile up behind a slow rebuild.
+    # Source changes must never turn the caller into a rebuild worker.
     monkeypatch.setattr(
         routes,
         "_session_list_cache_source_stamp",
@@ -228,47 +225,109 @@ def test_session_list_cache_source_changed_owner_rebuilds_while_follower_reuses_
 
     started = threading.Event()
     release = threading.Event()
-    owner_result = {}
-    follower_result = {}
-    owner_diag = _StageRecorder()
-    follower_diag = _StageRecorder()
+    diag = _StageRecorder()
 
     def builder():
         started.set()
-        release.wait()
+        release.wait(1.0)
         return _session_cache_payload("fresh")
 
-    def owner():
-        owner_result["payload"] = routes._get_cached_session_list_payload(
-            key=key,
-            builder=builder,
-            diag=owner_diag,
-        )
-
-    def follower():
-        follower_result["payload"] = routes._get_cached_session_list_payload(
-            key=key,
-            builder=builder,
-            diag=follower_diag,
-        )
-
-    owner_thread = threading.Thread(target=owner)
-    follower_thread = threading.Thread(target=follower)
     try:
-        owner_thread.start()
+        result = routes._get_cached_session_list_payload(
+            key=key, builder=builder, diag=diag
+        )
+        assert result == _session_cache_payload("stale")
         assert started.wait(1.0)
-        follower_thread.start()
-        follower_thread.join(1.0)
-        assert not follower_thread.is_alive()
     finally:
         release.set()
-        owner_thread.join(2.0)
-        follower_thread.join(2.0)
 
-    assert owner_result["payload"] == _session_cache_payload("fresh")
-    assert follower_result["payload"] == _session_cache_payload("stale")
-    assert "session_list_cache_rebuild_owner" in owner_diag.stages
-    assert "session_list_cache_wait_stale_fallback" in follower_diag.stages
+    assert "session_list_cache_stale_background_rebuild" in diag.stages
+
+
+def test_session_list_cache_cold_seed_returns_before_background_builder(monkeypatch):
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+    key = routes._session_list_cache_key(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def builder():
+        started.set()
+        release.wait(1.0)
+        return _session_cache_payload("fresh")
+
+    try:
+        result = routes._get_cached_session_list_payload(
+            key=key,
+            builder=builder,
+            seed_builder=lambda: _session_cache_payload("index-seed"),
+        )
+        assert result == _session_cache_payload("index-seed")
+        assert started.wait(1.0)
+    finally:
+        release.set()
+
+
+def test_ten_cold_callers_share_one_background_refresh(monkeypatch):
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+    key = routes._session_list_cache_key(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    calls = 0
+    seed_calls = 0
+    calls_lock = threading.Lock()
+
+    def builder():
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        started.set()
+        release.wait(1.0)
+        return _session_cache_payload("fresh")
+
+    def seed_builder():
+        nonlocal seed_calls
+        with calls_lock:
+            seed_calls += 1
+        return _session_cache_payload("index-seed")
+
+    results = []
+    threads = [
+        threading.Thread(
+            target=lambda: results.append(
+                routes._get_cached_session_list_payload(
+                    key=key,
+                    builder=builder,
+                    seed_builder=seed_builder,
+                )
+            )
+        )
+        for _ in range(10)
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        assert started.wait(1.0)
+        for thread in threads:
+            thread.join(1.0)
+        assert all(not thread.is_alive() for thread in threads)
+    finally:
+        release.set()
+
+    assert calls == 1
+    assert seed_calls == 1
+    assert results == [_session_cache_payload("index-seed")] * 10
 
 
 def test_session_list_cache_owner_returns_stale_and_rebuilds_in_background(monkeypatch):
@@ -443,7 +502,7 @@ def test_session_list_cache_rebuild_retries_after_invalidation():
     assert calls == ["build", "build"]
 
 
-def test_session_list_cache_source_stamp_tracks_state_db_wal(tmp_path, monkeypatch):
+def test_session_list_cache_source_stamp_tracks_projection_generation(tmp_path, monkeypatch):
     state_db = tmp_path / "state.db"
     state_db.write_text("db", encoding="utf-8")
     state_db_wal = tmp_path / "state.db-wal"
@@ -460,6 +519,12 @@ def test_session_list_cache_source_stamp_tracks_state_db_wal(tmp_path, monkeypat
     monkeypatch.setattr(routes, "_gateway_session_metadata_path", lambda: gateway)
     monkeypatch.setattr(routes, "SESSION_DIR", session_dir)
     monkeypatch.setattr(routes, "SETTINGS_FILE", settings_file)
+    generation = {"value": 1}
+    monkeypatch.setattr(
+        route_session_list_cache,
+        "_session_list_projection_token",
+        lambda _path: ("projection", generation["value"]),
+    )
 
     key = routes._session_list_cache_key(
         active_profile="default",
@@ -470,7 +535,7 @@ def test_session_list_cache_source_stamp_tracks_state_db_wal(tmp_path, monkeypat
     )
 
     before = routes._session_list_cache_source_stamp(key)
-    state_db_wal.write_text("wal-2-more", encoding="utf-8")
+    generation["value"] = 2
     after = routes._session_list_cache_source_stamp(key)
 
     assert after != before
@@ -689,17 +754,25 @@ def test_source_stamp_tracks_settings_even_while_streaming(tmp_path, monkeypatch
     assert after != before
 
 
-def test_source_stamp_still_tracks_wal_when_idle(tmp_path, monkeypatch):
-    """Regression guard: with NO active stream the stamp must still advance on a
-    state.db/WAL write (the original commit-reliable behavior is preserved)."""
+def test_source_stamp_ignores_wal_churn_when_idle(tmp_path, monkeypatch):
+    """Agent message WAL writes do not invalidate the sidebar request cache.
+
+    The background projection monitor publishes only the Agent-owned generation,
+    so subagent and other non-sidebar writes cannot force request-time work.
+    """
     key, state_db_wal, _settings, _fp = _build_stamp_env(tmp_path, monkeypatch)
     monkeypatch.setattr(routes, "_active_stream_ids", lambda: set())
+    monkeypatch.setattr(
+        route_session_list_cache,
+        "_session_list_projection_token",
+        lambda _path: ("projection", 9),
+    )
 
     before = routes._session_list_cache_source_stamp(key)
     state_db_wal.write_text("wal-2-more", encoding="utf-8")
     after = routes._session_list_cache_source_stamp(key)
 
-    assert after != before
+    assert after == before
 
 
 def _streaming_ttl_key():

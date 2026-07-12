@@ -129,6 +129,79 @@ def _make_state_db(path: Path) -> None:
     conn.close()
 
 
+def _make_projection_state_db(path: Path) -> None:
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            title TEXT,
+            model TEXT,
+            model_config TEXT,
+            started_at REAL NOT NULL,
+            last_activity_at REAL,
+            message_count INTEGER DEFAULT 0,
+            parent_session_id TEXT,
+            ended_at REAL,
+            end_reason TEXT
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp REAL
+        );
+        CREATE TABLE session_projection_meta (
+            id INTEGER PRIMARY KEY,
+            generation INTEGER NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE INDEX idx_sessions_projection_activity
+            ON sessions(last_activity_at DESC, source, id);
+        """
+    )
+    conn.execute(
+        "INSERT INTO session_projection_meta VALUES (1, 4, 40.0)"
+    )
+    conn.execute(
+        "INSERT INTO sessions VALUES "
+        "('visible', 'tui', 'Visible', 'm', NULL, 1.0, 40.0, 2, NULL, NULL, NULL)"
+    )
+    conn.execute(
+        "INSERT INTO sessions VALUES "
+        "('child', 'subagent', 'Child', 'm', NULL, 2.0, 50.0, 2, 'visible', NULL, NULL)"
+    )
+    for index in range(100):
+        conn.execute(
+            "INSERT INTO messages VALUES (?, 'visible', 'user', 'payload', ?)",
+            (index + 1, float(index)),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_projection_schema_skips_messages_join_and_subagent_rows(monkeypatch, tmp_path):
+    db = tmp_path / "state.db"
+    _make_projection_state_db(db)
+    executed = []
+    real_connect = agent_sessions.sqlite3.connect
+
+    def recording_connect(*args, **kwargs):
+        return _RecordingConnection(real_connect(*args, **kwargs), executed)
+
+    monkeypatch.setattr(agent_sessions.sqlite3, "connect", recording_connect)
+
+    rows = agent_sessions.read_importable_agent_session_rows(db, limit=20)
+
+    assert [row["id"] for row in rows] == ["visible"]
+    projection_selects = [sql for sql, _params in executed if "FROM sessions s" in sql]
+    assert projection_selects
+    assert all("JOIN messages" not in sql for sql in projection_selects)
+    assert any("s.last_activity_at" in sql for sql in projection_selects)
+
+
 def test_read_importable_agent_session_rows_uses_parameterized_include_filter(monkeypatch, tmp_path):
     db = tmp_path / "state.db"
     _make_state_db(db)

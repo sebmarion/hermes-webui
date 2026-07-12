@@ -2151,6 +2151,78 @@ def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
     ]
 
 
+def _build_session_list_seed_payload(
+    *,
+    active_profile: str | None,
+    all_profiles: bool,
+    include_archived: bool,
+    exclude_hidden: bool,
+    sidebar_source: str | None,
+    archived_limit: int | None,
+    archived_offset: int,
+) -> dict:
+    """Build a bounded cold response from the immutable WebUI index only."""
+    from api import models as _models
+
+    rows = [
+        _normalize_sidebar_source_flags(row)
+        for row in _models.read_session_index_projection()
+        if isinstance(row, dict)
+    ]
+    if all_profiles:
+        scoped = rows
+        other_profile_count = 0
+    else:
+        scoped = [
+            row
+            for row in rows
+            if _profiles_match(row.get("profile"), active_profile)
+        ]
+        other_profile_count = 0 if _is_isolated_profile_mode() else len(rows) - len(scoped)
+
+    if exclude_hidden:
+        scoped = [row for row in scoped if not row.get("default_hidden")]
+    archived_count = sum(1 for row in scoped if row.get("archived"))
+    visible = [row for row in scoped if not row.get("archived")]
+    selected = list(scoped if include_archived else visible)
+    if sidebar_source == "webui":
+        selected = [row for row in selected if not _is_cli_session_for_settings(row)]
+    elif sidebar_source == "cli":
+        selected = [row for row in selected if _is_cli_session_for_settings(row)]
+
+    if include_archived and archived_limit is not None:
+        limit = max(0, int(archived_limit))
+        offset = max(0, int(archived_offset or 0))
+        visible_rows = [row for row in selected if not row.get("archived")]
+        archived_rows = [row for row in selected if row.get("archived")]
+        selected = visible_rows + archived_rows[offset: offset + limit]
+
+    return {
+        "sessions": [dict(row) for row in selected],
+        "sidebar_reference_sessions": [],
+        "cli_count": sum(1 for row in scoped if _is_cli_session_for_settings(row)),
+        "archived_count": archived_count,
+        "archived_webui_count": sum(
+            1 for row in scoped if row.get("archived") and not _is_cli_session_for_settings(row)
+        ),
+        "archived_cli_count": sum(
+            1 for row in scoped if row.get("archived") and _is_cli_session_for_settings(row)
+        ),
+        "webui_session_count": sum(
+            1 for row in selected if not _is_cli_session_for_settings(row)
+        ),
+        "cli_session_count": sum(
+            1 for row in selected if _is_cli_session_for_settings(row)
+        ),
+        "include_archived": include_archived,
+        "archived_limit": archived_limit,
+        "archived_offset": archived_offset,
+        "all_profiles": all_profiles,
+        "active_profile": active_profile,
+        "other_profile_count": other_profile_count,
+    }
+
+
 def _build_session_list_cache_payload(
     active_profile: str | None,
     all_profiles: bool,
@@ -2640,6 +2712,7 @@ def _get_cached_session_list_payload(
     *,
     key: tuple,
     builder,
+    seed_builder=None,
     diag=None,
 ) -> dict:
     if diag is not None:
@@ -2658,8 +2731,49 @@ def _get_cached_session_list_payload(
         return cached
 
     stale = cached  # now actually a stale payload when one exists, else None
-    stale_reason = _session_list_cache_stale_reason(key) if stale is not None else None
-    if stale is not None and stale_reason != "source":
+
+    def _start_background_rebuild(event: threading.Event) -> None:
+        def _rebuild_session_list_cache():
+            refresh_started = time.monotonic()
+            try:
+                rebuild_attempts = 0
+                while True:
+                    invalidation_stamp = _session_list_cache_invalidation_stamp(key)
+                    try:
+                        payload = builder()
+                    except Exception:
+                        logger.exception(
+                            "session list stale-cache background rebuild failed"
+                        )
+                        return
+                    if _session_list_cache_invalidation_stamp(key) == invalidation_stamp:
+                        _session_list_cache_set(key, payload)
+                        logger.info(
+                            "session list background refresh complete "
+                            "duration_seconds=%.3f rows=%d archived_rows=%d attempts=%d",
+                            time.monotonic() - refresh_started,
+                            len(payload.get("sessions") or []),
+                            int(payload.get("archived_count") or 0),
+                            rebuild_attempts + 1,
+                        )
+                        return
+                    rebuild_attempts += 1
+                    if rebuild_attempts >= 3:
+                        return
+            finally:
+                _session_list_cache_done(key, event)
+
+        try:
+            thread = threading.Thread(
+                target=_rebuild_session_list_cache,
+                name="session-list-cache-rebuild",
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            _session_list_cache_done(key, event)
+
+    if stale is not None:
         event, is_owner = _session_list_cache_claim_rebuild(key)
         if is_owner:
             if diag is not None:
@@ -2668,42 +2782,39 @@ def _get_cached_session_list_payload(
                 except Exception:
                     pass
 
-            def _rebuild_stale_session_list_cache():
-                try:
-                    rebuild_attempts = 0
-                    while True:
-                        invalidation_stamp = _session_list_cache_invalidation_stamp(key)
-                        try:
-                            payload = builder()
-                        except Exception:
-                            logger.exception(
-                                "session list stale-cache background rebuild failed"
-                            )
-                            return
-                        if _session_list_cache_invalidation_stamp(key) == invalidation_stamp:
-                            _session_list_cache_set(key, payload)
-                            return
-                        rebuild_attempts += 1
-                        if rebuild_attempts >= 3:
-                            return
-                finally:
-                    _session_list_cache_done(key, event)
-
-            try:
-                thread = threading.Thread(
-                    target=_rebuild_stale_session_list_cache,
-                    name="session-list-cache-rebuild",
-                    daemon=True,
-                )
-                thread.start()
-            except Exception:
-                _session_list_cache_done(key, event)
+            _start_background_rebuild(event)
         elif diag is not None:
             try:
                 diag.stage("session_list_cache_stale_return")
             except Exception:
                 pass
         return stale
+
+    if seed_builder is not None:
+        event, is_owner = _session_list_cache_claim_rebuild(key)
+        if is_owner:
+            try:
+                seed = seed_builder()
+            except Exception:
+                logger.exception("session list cold index seed failed")
+                seed = {"sessions": []}
+            _session_list_cache_set(key, seed)
+            _start_background_rebuild(event)
+            if diag is not None:
+                try:
+                    diag.stage("session_list_cache_cold_seed")
+                except Exception:
+                    pass
+            return seed
+
+        latest, _is_fresh = _session_list_cache_get(key, allow_stale=True)
+        if latest is not None:
+            return latest
+        try:
+            return seed_builder()
+        except Exception:
+            logger.exception("session list cold follower seed failed")
+            return {"sessions": []}
 
     event, is_owner = _session_list_cache_claim_rebuild(key)
     if is_owner:
@@ -12914,6 +13025,22 @@ def handle_get(handler, parsed) -> bool:
                     archived_limit=archived_limit,
                     archived_offset=archived_offset,
                     diag=diag,
+                ),
+                seed_builder=(
+                    (lambda: _build_session_list_seed_payload(
+                        active_profile=active_profile,
+                        all_profiles=all_profiles,
+                        include_archived=include_archived,
+                        exclude_hidden=exclude_hidden,
+                        sidebar_source=sidebar_source,
+                        archived_limit=archived_limit,
+                        archived_offset=archived_offset,
+                    ))
+                    if str(
+                        os.getenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "1")
+                    ).strip().lower()
+                    not in {"0", "false", "no", "off"}
+                    else None
                 ),
                 diag=diag,
             )

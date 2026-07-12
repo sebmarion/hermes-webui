@@ -62,6 +62,8 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       models.py            Session model + CRUD, per-session profile tracking, CLI/state.db bridge
       profiles.py          Profile state management, hermes_cli wrapper
       onboarding.py        First-run onboarding status, real provider config writes, OAuth linking, readiness detection
+      route_session_list_cache.py Last-known-good sidebar snapshots + single-flight background refresh
+      session_projection.py Non-blocking Agent projection generation monitor
       routes.py            All GET + POST route handlers (if/elif dispatch, no decorators)
       startup.py           Startup helpers: auto_install_agent_deps()
       state_sync.py        /insights sync — message_count to the agent's state.db
@@ -136,6 +138,7 @@ Environment variables controlling behavior:
     HERMES_WEBUI_DEFAULT_MODEL     Optional model override; unset means provider default
     HERMES_WEBUI_PASSWORD          Optional: enable password auth (off by default)
     HERMES_WEBUI_SKIP_ONBOARDING   Optional: bypass the first-run onboarding wizard
+    HERMES_WEBUI_SESSION_PROJECTION_V2 Temporary rollback flag; set to 0 for the legacy synchronous session-list path
     HERMES_PREFILL_MESSAGES_FILE   Optional JSON message list for browser-turn prefill context
     HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT Optional command that prints JSON messages or plain-text user prefill context
     HERMES_WEBUI_PREFILL_MESSAGES_SCRIPT_TIMEOUT Optional script timeout in seconds (default 5, max 30)
@@ -225,12 +228,25 @@ Session is a plain Python class (not a dataclass, not SQLAlchemy):
 
     get_session(sid): checks SESSIONS cache, loads from disk on miss, raises KeyError
     new_session(workspace, model): creates Session, caches in SESSIONS, saves, returns
-    all_sessions(): scans SESSION_DIR/*.json + SESSIONS, deduplicates, sorts by updated_at,
-                    returns list of compact() dicts
+    all_sessions(): full reconciliation path used by the background session-list
+                    refresh owner; may scan sidecars and enrich imported rows
 
-    all_sessions() does a full directory scan on every call.
-    With 10 sessions: negligible. With 1000+: will be slow.
-    See Architecture Phase C for the index file fix.
+`GET /api/sessions` is a bounded last-known-good read. A cold request reads only
+`sessions/_index.json`, overlays in-memory runtime state, stores that seed in the
+session-list cache, and starts one daemon refresh owner. Warm or invalidated
+requests return the cached snapshot immediately while that owner performs
+discovery, stale-stream reconciliation, orphan pruning, sidecar repair, Agent
+session import, and lineage enrichment. Followers never start their own repair
+or SQLite scan.
+
+Agent-backed invalidation uses the Agent-owned `session_projection_meta`
+generation. `api/session_projection.py` polls that one-row value off the request
+thread and exposes only an in-memory token to cache stamps. When Agent schema
+support is present, `api/agent_sessions.py` reads `sessions.last_activity_at`
+and `message_count` directly, filters `source='subagent'` before the SQL limit,
+and never joins or repairs the `messages` table. Older Agent schemas retain the
+legacy aggregation query as a background-only compatibility fallback. WebUI
+never migrates Agent state.
 
 title_from(): takes messages list, finds first user message, returns first 64 chars.
 Called after run_conversation() completes to set the session title retroactively.

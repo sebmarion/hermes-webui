@@ -1,7 +1,9 @@
 import io
 import json
+import threading
 from urllib.parse import urlparse
 
+import api.models as models
 import api.profiles as profiles
 import api.routes as routes
 
@@ -29,21 +31,22 @@ def test_sessions_list_reconciles_stale_stream_state_before_serializing(monkeypa
     routes._session_list_cache_clear()
     repaired = {"value": False}
     all_sessions_calls = {"count": 0}
+    refresh_finished = threading.Event()
+    repair_finished = threading.Event()
 
     class _Session:
         def __init__(self):
             self.session_id = "stale-session"
             self.active_stream_id = "stale-stream"
 
-    def fake_all_sessions(diag=None, **_kwargs):
-        all_sessions_calls["count"] += 1
+    def projected_rows():
         if repaired["value"]:
             active_stream_id = None
             is_streaming = False
         else:
             active_stream_id = "stale-stream"
             is_streaming = False
-        return [
+        rows = [
             {
                 "session_id": "stale-session",
                 "title": "Stale Session",
@@ -55,6 +58,13 @@ def test_sessions_list_reconciles_stale_stream_state_before_serializing(monkeypa
                 "last_message_at": 1,
             }
         ]
+        return rows
+
+    def fake_all_sessions(diag=None, **_kwargs):
+        all_sessions_calls["count"] += 1
+        rows = projected_rows()
+        refresh_finished.set()
+        return rows
 
     def fake_get_session(session_id, metadata_only=False):
         assert session_id == "stale-session"
@@ -64,9 +74,11 @@ def test_sessions_list_reconciles_stale_stream_state_before_serializing(monkeypa
     def fake_clear_stale_stream_state(session):
         repaired["value"] = True
         session.active_stream_id = None
+        repair_finished.set()
         return True
 
     monkeypatch.setattr(routes, "all_sessions", fake_all_sessions)
+    monkeypatch.setattr(models, "read_session_index_projection", projected_rows)
     monkeypatch.setattr(routes, "get_session", fake_get_session)
     monkeypatch.setattr(routes, "_clear_stale_stream_state", fake_clear_stale_stream_state)
     monkeypatch.setattr(
@@ -84,6 +96,8 @@ def test_sessions_list_reconciles_stale_stream_state_before_serializing(monkeypa
     assert handler.status == 200
     payload = handler.json_body()
     sessions = payload["sessions"]
+    assert refresh_finished.wait(1.0)
+    assert repair_finished.wait(1.0)
     assert all_sessions_calls["count"] == 1
     assert repaired["value"] is True
     # The request serves its already-built projection; repair is visible after
@@ -92,9 +106,11 @@ def test_sessions_list_reconciles_stale_stream_state_before_serializing(monkeypa
     assert sessions[0]["is_streaming"] is False
 
     routes._session_list_cache_clear()
+    refresh_finished.clear()
     second = _FakeHandler()
     routes.handle_get(second, parsed)
     second_sessions = second.json_body()["sessions"]
+    assert refresh_finished.wait(1.0)
     assert all_sessions_calls["count"] == 2
     assert second_sessions[0]["active_stream_id"] is None
     routes._session_list_cache_clear()

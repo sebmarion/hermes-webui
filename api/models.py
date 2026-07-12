@@ -5346,6 +5346,60 @@ def _diag_stage(diag, name: str) -> None:
             pass
 
 
+def read_session_index_projection() -> list[dict]:
+    """Read the last-known-good WebUI sidebar index without repair work.
+
+    This deliberately does not scan the session directory, load sidecars,
+    query state.db, prune rows, or rewrite the index. It is the bounded cold
+    response while the full reconciler runs under a background cache owner.
+    """
+    try:
+        raw = json.loads(SESSION_INDEX_FILE.read_bytes())
+    except Exception:
+        raw = []
+    rows = [dict(item) for item in raw if isinstance(item, dict)]
+    try:
+        active_stream_ids = _active_stream_ids()
+    except Exception:
+        active_stream_ids = set()
+    index_map = {
+        str(row.get("session_id")): row
+        for row in rows
+        if str(row.get("session_id") or "").strip()
+    }
+    with LOCK:
+        for session in SESSIONS.values():
+            index_map[session.session_id] = session.compact(
+                include_runtime=True,
+                active_stream_ids=active_stream_ids,
+            )
+    projected = []
+    for row in index_map.values():
+        item = dict(row)
+        item["is_streaming"] = _is_streaming_session(
+            item.get("active_stream_id"), active_stream_ids
+        )
+        if not item.get("profile"):
+            item["profile"] = "default"
+        if (
+            item.get("title", "Untitled") == "Untitled"
+            and int(item.get("message_count") or 0) == 0
+            and not item.get("active_stream_id")
+            and not item.get("has_pending_user_message")
+            and not item.get("worktree_path")
+        ):
+            continue
+        projected.append(item)
+    projected.sort(
+        key=lambda item: (
+            bool(item.get("pinned")),
+            _session_sort_timestamp(item),
+        ),
+        reverse=True,
+    )
+    return projected
+
+
 def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
     _diag_stage(diag, "all_sessions.active_streams")
     active_stream_ids = _active_stream_ids()
@@ -6295,17 +6349,10 @@ def _reload_cli_sessions_after_inflight(
         if stale_sessions is not None and stale_stamp == _cli_sessions_cache_invalidation_stamp():
             return stale_sessions
         if not wait_finished:
-            fallback_invalidation_stamp = _cli_sessions_cache_invalidation_stamp()
-            return _load_and_cache_cli_sessions(
-                cache_key=cache_key,
-                ttl=ttl,
-                invalidation_stamp=fallback_invalidation_stamp,
-                load_sessions=load_sessions,
-                stale_sessions=stale_sessions,
-                stale_stamp=stale_stamp,
-                all_profiles=all_profiles,
-                db_path=db_path,
-            )
+            # A timed-out follower is never allowed to become another SQLite
+            # scanner. Return the last-known-good rows, or an empty cold
+            # projection while the single owner continues in the background.
+            return stale_sessions if stale_sessions is not None else []
     try:
         invalidation_stamp = _cli_sessions_cache_invalidation_stamp()
         return _load_and_cache_cli_sessions(

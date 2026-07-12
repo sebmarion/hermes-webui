@@ -86,6 +86,7 @@ def test_sessions_api_defers_stale_stream_repair(monkeypatch):
 
 
 def test_sessions_api_enriches_only_returned_rows_by_default(monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
     all_sessions_kwargs = []
     enriched_batches = []
 
@@ -119,6 +120,7 @@ def test_sessions_api_enriches_only_returned_rows_by_default(monkeypatch):
 
 
 def test_sessions_api_fetches_archived_rows_only_when_requested(monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
     enriched_batches = []
 
     monkeypatch.setattr(routes, "all_sessions", lambda **_kwargs: _sessions_payload_rows())
@@ -147,6 +149,7 @@ def test_sessions_api_fetches_archived_rows_only_when_requested(monkeypatch):
 
 
 def test_sessions_api_can_limit_archived_rows_without_hiding_visible_rows(monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
     rows = [
         {"session_id": "visible-a", "title": "Visible A", "profile": "default", "archived": False, "message_count": 1, "updated_at": 50, "last_message_at": 50},
         {"session_id": "visible-b", "title": "Visible B", "profile": "default", "archived": False, "message_count": 1, "updated_at": 40, "last_message_at": 40},
