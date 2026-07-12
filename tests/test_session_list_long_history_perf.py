@@ -136,6 +136,7 @@ def test_sessions_api_enriches_only_returned_rows_by_default(monkeypatch):
 
 def test_sessions_api_fetches_archived_rows_only_when_requested(monkeypatch):
     monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
     enriched_batches = []
 
     monkeypatch.setattr(routes, "all_sessions", lambda **_kwargs: _sessions_payload_rows())

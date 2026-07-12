@@ -48,7 +48,8 @@ def _session_cache_payload(marker: str, *, all_profiles: bool = False) -> dict:
     }
 
 
-def test_session_list_cache_key_separates_profile_and_all_profiles():
+def test_session_list_cache_key_separates_profile_and_all_profiles(monkeypatch):
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
     routes._session_list_cache_clear()
 
     calls = []
@@ -452,7 +453,8 @@ def test_session_list_cache_stale_background_rebuild_failure_releases_owner(monk
     assert cached == _session_cache_payload("fresh")
 
 
-def test_session_list_cache_invalidated_on_session_list_publish():
+def test_session_list_cache_invalidated_on_session_list_publish(monkeypatch):
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
     routes._session_list_cache_clear()
 
     key_a = routes._session_list_cache_key(
