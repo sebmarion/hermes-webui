@@ -9,7 +9,7 @@ class _Resolved:
         self.resolved = resolved
         self.status = status
 
-    def to_agent_result(self, *, conversation_history, user_message):
+    def to_agent_result(self, *, conversation_history, user_message, host_agent=None):
         response = "waiting" if self.status == "waiting" else self.status
         return {
             "final_response": response,
@@ -42,6 +42,7 @@ def _install_bestplan_module(monkeypatch, *, resolved):
     module.BestplanStore = BestplanStore
     module.try_resolve_go = try_resolve_go
     module.capture_bestplan_agent_result = capture_bestplan_agent_result
+    module.is_bestplan_invocation = lambda message: "bestplan" in str(message).lower()
     module.is_go_enabled = lambda config=None: True
     monkeypatch.setitem(sys.modules, "agent.bestplan_state", module)
     return calls
@@ -151,3 +152,52 @@ def test_missing_core_is_transparent_disabled_but_go_fails_closed_enabled(tmp_pa
     )
     assert result["host_ingress"]["status"] == "resolver_unavailable"
     assert agent.calls == 1
+
+
+def test_ordinary_turn_never_instantiates_bestplan_store(tmp_path, monkeypatch):
+    import api.streaming as streaming
+
+    module = types.ModuleType("agent.bestplan_state")
+
+    class BestplanStore:
+        def __init__(self, **_kwargs):
+            raise AssertionError("ordinary turns must not open/DDL bestplan state")
+
+    module.BestplanStore = BestplanStore
+    module.is_bestplan_invocation = lambda message: str(message).startswith("/bestplan")
+    module.capture_bestplan_agent_result = lambda result, **_kwargs: result
+    module.try_resolve_go = lambda *_args, **_kwargs: _Resolved(False)
+    module.is_go_enabled = lambda _config=None: True
+    monkeypatch.setitem(sys.modules, "agent.bestplan_state", module)
+
+    class Agent:
+        def run_conversation(self, **_kwargs):
+            return {"final_response": "ordinary", "messages": []}
+
+    result = streaming._run_agent_with_bestplan_ingress(
+        Agent(),
+        original_message="hello",
+        invocation_message="hello",
+        conversation_history=[],
+        run_conversation_kwargs={"user_message": "hello"},
+        session_id="session-a",
+        profile="coder",
+        workspace="/tmp/work",
+        profile_home=str(tmp_path),
+        config={"autonomy": {"go_enabled": True}},
+    )
+    assert result["final_response"] == "ordinary"
+
+
+def test_legacy_session_key_binding_survives_old_hermes_helper(monkeypatch):
+    import contextvars
+    import api.streaming as streaming
+
+    module = types.ModuleType("gateway.session_context")
+    module._SESSION_KEY = contextvars.ContextVar("legacy_session_key", default="")
+    monkeypatch.setitem(sys.modules, "gateway.session_context", module)
+
+    tokens = streaming._set_turn_session_identity("session-a")
+    assert module._SESSION_KEY.get() == "session-a"
+    streaming._reset_turn_session_identity(tokens)
+    assert module._SESSION_KEY.get() == ""

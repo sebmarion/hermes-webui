@@ -1819,7 +1819,9 @@ def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, se
 # the _run_agent_streaming thread (concurrent tool batches use
 # contextvars.copy_context() so children inherit this binding); binding the
 # context-local here makes the capture task/thread-local and race-immune.
-def _set_turn_session_identity(session_id: str):
+def _set_turn_session_identity(
+    session_id: str, *, profile: str = "", hermes_home: str = "",
+):
     """Bind THIS turn's session identity to the current (task/thread-local)
     context and return an opaque token for _reset_turn_session_identity.
 
@@ -1851,14 +1853,26 @@ def _set_turn_session_identity(session_id: str):
     except Exception:
         logger.debug("per-turn approval session-key bind failed", exc_info=True)
     try:
-        from gateway.session_context import bind_delivery_context
+        import gateway.session_context as _session_context
 
-        tokens["delivery_context"] = bind_delivery_context(
-            session_key=sid,
-            session_id=sid,
-            ui_session_id=sid,
-            async_delivery=True,
-        )
+        bind_delivery_context = getattr(_session_context, "bind_delivery_context", None)
+        if callable(bind_delivery_context):
+            tokens["delivery_context"] = bind_delivery_context(
+                session_key=sid,
+                session_id=sid,
+                ui_session_id=sid,
+                async_delivery=True,
+                profile=str(profile or ""),
+                hermes_home=str(hermes_home or ""),
+                capability_version=1,
+            )
+        else:
+            legacy_key = getattr(_session_context, "_SESSION_KEY", None)
+            if legacy_key is not None and callable(getattr(legacy_key, "set", None)):
+                tokens["legacy_delivery_context"] = (
+                    legacy_key,
+                    legacy_key.set(sid),
+                )
     except Exception:
         logger.debug("per-turn delivery-context bind failed", exc_info=True)
     return tokens
@@ -1883,6 +1897,12 @@ def _reset_turn_session_identity(tokens) -> None:
             reset_delivery_context(tok)
         except Exception:
             logger.debug("per-turn delivery-context reset failed", exc_info=True)
+    legacy = tokens.get("legacy_delivery_context")
+    if legacy is not None:
+        try:
+            legacy[0].reset(legacy[1])
+        except Exception:
+            logger.debug("legacy per-turn session-key reset failed", exc_info=True)
     tok = tokens.get("approval")
     if tok is not None:
         try:
@@ -1941,14 +1961,26 @@ def _bestplan_host_result(
     conversation_history: list[dict],
     status: str,
     response: str,
+    host_agent=None,
 ) -> dict:
+    messages = [
+        *conversation_history,
+        {"role": "user", "content": original_message},
+        {"role": "assistant", "content": response},
+    ]
+    if host_agent is not None:
+        try:
+            from agent.agent_runtime_helpers import repair_message_sequence
+
+            repair_message_sequence(host_agent, messages)
+        except (ImportError, AttributeError):
+            logger.debug("old-core host role repair unavailable", exc_info=True)
+        persist = getattr(host_agent, "_persist_session", None)
+        if callable(persist):
+            persist(messages, conversation_history)
     return {
         "final_response": response,
-        "messages": [
-            *conversation_history,
-            {"role": "user", "content": original_message},
-            {"role": "assistant", "content": response},
-        ],
+        "messages": messages,
         "api_calls": 0,
         "completed": True,
         "host_ingress": {"resolved": True, "status": status},
@@ -1965,6 +1997,7 @@ def _try_resolve_bestplan_go_ingress(
     workspace: str,
     profile_home: str,
     config: dict,
+    host_agent=None,
 ):
     """Resolve bare go without consuming generic process notifications."""
     if str(original_message or "").strip().casefold() != "go":
@@ -1989,6 +2022,7 @@ def _try_resolve_bestplan_go_ingress(
                 conversation_history=conversation_history,
                 status="resolver_unavailable",
                 response=response,
+                host_agent=host_agent or agent,
             )
         return None
 
@@ -2011,12 +2045,14 @@ def _try_resolve_bestplan_go_ingress(
                 conversation_history=conversation_history,
                 status="resolver_error",
                 response=response,
+                host_agent=host_agent or agent,
             )
         raise
     if resolved.resolved:
         return resolved.to_agent_result(
             conversation_history=conversation_history,
             user_message=original_message,
+            host_agent=host_agent or agent,
         )
     return None
 
@@ -2029,13 +2065,20 @@ def _capture_bestplan_result(
     profile: str,
     workspace: str,
     profile_home: str,
+    host_agent=None,
 ) -> dict:
     try:
-        from agent.bestplan_state import BestplanStore, capture_bestplan_agent_result
+        from agent.bestplan_state import (
+            BestplanStore,
+            capture_bestplan_agent_result,
+            is_bestplan_invocation,
+        )
     except ModuleNotFoundError as exc:
         if exc.name == "agent.bestplan_state":
             return result
         raise
+    if not is_bestplan_invocation(invocation_message):
+        return result
     return capture_bestplan_agent_result(
         result,
         invocation_message=invocation_message,
@@ -2043,6 +2086,7 @@ def _capture_bestplan_result(
         profile=str(profile or ""),
         workspace=workspace,
         store=BestplanStore(db_path=Path(profile_home) / "state.db"),
+        host_agent=host_agent,
     )
 
 
@@ -2068,6 +2112,7 @@ def _run_agent_with_bestplan_ingress(
         profile=profile,
         workspace=workspace,
         profile_home=profile_home,
+        host_agent=agent,
         config=config,
     )
     if resolved is not None:
@@ -2081,6 +2126,7 @@ def _run_agent_with_bestplan_ingress(
         profile=str(profile or ""),
         workspace=workspace,
         profile_home=profile_home,
+        host_agent=agent,
     )
 
 
@@ -7500,7 +7546,6 @@ def _run_agent_streaming(
         # captures THIS session, not a concurrent turn's process-global env).
         # Co-located with the existing env-restore lifecycle: set here, reset
         # in the outer finally next to _clear_thread_env().
-        _turn_session_identity_tokens = _set_turn_session_identity(session_id)
         s = get_session(session_id)
         _turn_pending_source = getattr(s, 'pending_user_source', None) or 'webui'
         update_active_run(stream_id, phase="running", session_id=session_id, profile=getattr(s, "profile", None) or profile)
@@ -7590,6 +7635,12 @@ def _run_agent_streaming(
                     getattr(s, 'profile', None),
                     exc_info=True,
                 )
+
+        _turn_session_identity_tokens = _set_turn_session_identity(
+            session_id,
+            profile=str(getattr(s, "profile", None) or ""),
+            hermes_home=_profile_home,
+        )
 
         # Profile-aware provider/model enrichment: when the session belongs
         # to a profile that specifies model.provider and model.default, use
@@ -8959,18 +9010,18 @@ def _run_agent_streaming(
             )
             if result is None:
                 _process_notifications = _drain_webui_process_notifications(session_id)
-                _agent_msg_text = msg_text
-                if _process_notifications:
-                    _agent_msg_text = "\n\n".join(
-                        [*_process_notifications, msg_text]
-                    ).strip()
                 _bestplan_invocation_message = _expand_bestplan_skill_invocation(
-                    _agent_msg_text,
+                    msg_text,
                     session_id=session_id,
                 )
+                _agent_msg_text = _bestplan_invocation_message
+                if _process_notifications:
+                    _agent_msg_text = "\n\n".join(
+                        [*_process_notifications, _bestplan_invocation_message]
+                    ).strip()
                 user_message = _build_native_multimodal_message(
                     workspace_ctx,
-                    _bestplan_invocation_message,
+                    _agent_msg_text,
                     attachments,
                     workspace,
                     cfg=_cfg,
@@ -8995,14 +9046,16 @@ def _run_agent_streaming(
                 if bestplan_config is not None:
                     _run_conversation_kwargs["bestplan_config"] = bestplan_config
                 result = agent.run_conversation(**_run_conversation_kwargs)
-                result = _capture_bestplan_result(
-                    result,
-                    invocation_message=_bestplan_invocation_message,
-                    session_id=session_id,
-                    profile=str(getattr(s, "profile", None) or ""),
-                    workspace=str(s.workspace),
-                    profile_home=_profile_home,
-                )
+                if str(result.get("final_response") or "").strip():
+                    result = _capture_bestplan_result(
+                        result,
+                        invocation_message=msg_text,
+                        session_id=session_id,
+                        profile=str(getattr(s, "profile", None) or ""),
+                        workspace=str(s.workspace),
+                        profile_home=_profile_home,
+                        host_agent=agent,
+                    )
             # #4729: the run is done — flush any reasoning tail still in the coalescing
             # buffer (the agent never calls reasoning_callback(None), and a turn can end on
             # reasoning with no trailing token/tool boundary to trigger a flush) so the last
@@ -9487,7 +9540,15 @@ def _run_agent_streaming(
                                 _heal_ok = False
                             if _heal_ok and _heal_result is not None:
                                 # Retry succeeded — replace result and skip error
-                                result = _heal_result
+                                result = _capture_bestplan_result(
+                                    _heal_result,
+                                    invocation_message=msg_text,
+                                    session_id=session_id,
+                                    profile=str(getattr(s, "profile", None) or ""),
+                                    workspace=str(s.workspace),
+                                    profile_home=_profile_home,
+                                    host_agent=agent,
+                                )
                                 # Fall through past the error-emission block;
                                 # the post-result persistence code below will
                                 # process ``result`` normally.  We jump past

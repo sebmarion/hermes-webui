@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import os
+import stat
+import time
 
 from api.delegation_wakeup_store import DelegationWakeupStore
 
@@ -74,8 +77,73 @@ def test_startup_recovery_requeues_interrupted_claim(tmp_path):
     store = DelegationWakeupStore(path)
     _record(store)
     assert store.claim_next("session-a")["state"] == "claimed"
+    store._conn.execute(
+        "UPDATE delegation_wakeups SET lease_expires_at=? WHERE delegation_id='deleg_1'",
+        (time.time() - 1,),
+    )
+    store._conn.commit()
     store.close()
 
     restarted = DelegationWakeupStore(path)
     assert restarted.recover_claims() == 1
     assert restarted.list_pending()[0]["state"] == "pending"
+
+
+def test_store_repairs_private_permissions_under_permissive_umask(tmp_path):
+    private = tmp_path / "private"
+    old_umask = os.umask(0)
+    try:
+        store = DelegationWakeupStore(private / "wakeups.sqlite3")
+    finally:
+        os.umask(old_umask)
+    assert stat.S_IMODE(private.stat().st_mode) == 0o700
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    for suffix in ("-wal", "-shm"):
+        sidecar = store.path.with_name(store.path.name + suffix)
+        if sidecar.exists():
+            assert stat.S_IMODE(sidecar.stat().st_mode) == 0o600
+
+
+def test_live_foreign_claim_is_not_recovered_but_expired_claim_is(tmp_path):
+    store = DelegationWakeupStore(tmp_path / "private" / "wakeups.sqlite3")
+    _record(store)
+    claim = store.claim_next("session-a", owner_uuid="owner-a", lease_seconds=60)
+    assert claim["claim_owner"] == "owner-a"
+    assert store.recover_claims(owner_uuid="owner-b") == 0
+    store._conn.execute(
+        "UPDATE delegation_wakeups SET lease_expires_at=? WHERE delegation_id='deleg_1'",
+        (time.time() - 1,),
+    )
+    store._conn.commit()
+    assert store.recover_claims(owner_uuid="owner-b") == 1
+
+
+def test_profile_identity_is_part_of_dedupe_and_delivered_payload_is_compacted(tmp_path):
+    store = DelegationWakeupStore(tmp_path / "private" / "wakeups.sqlite3")
+    outcome = store.record_pending(
+        delegation_id="deleg_1",
+        session_id="session-a",
+        session_key="session-a",
+        wakeup_prompt="secret completion body",
+        event={"summary": "secret result"},
+        origin_profile="coder",
+        origin_tracker_path="/profiles/coder/async_delegations.json",
+        origin_ui_session_id="session-a",
+    )
+    assert outcome.status == "inserted"
+    collision = store.record_pending(
+        delegation_id="deleg_1",
+        session_id="session-a",
+        session_key="session-a",
+        wakeup_prompt="secret completion body",
+        event={"summary": "secret result"},
+        origin_profile="other",
+        origin_tracker_path="/profiles/other/async_delegations.json",
+        origin_ui_session_id="session-a",
+    )
+    assert collision.status == "collision"
+    claim = store.claim_next("session-a", owner_uuid="owner", lease_seconds=60)
+    assert store.mark_delivered("deleg_1", claim["claim_token"])
+    row = store.get("deleg_1")
+    assert row["wakeup_prompt"] == ""
+    assert row["event_json"] == ""

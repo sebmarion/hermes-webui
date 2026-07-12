@@ -545,16 +545,22 @@ Async delegation completions do not rely on the SSE connection or the
 process-local deferred-wakeup dictionary. `api/background_process.py` first
 validates the owning WebUI session and inserts the formatted wakeup into the
 SQLite store in `api/delegation_wakeup_store.py`. Only after that commit does
-it acknowledge the Hermes delegation tracker. The stored row moves atomically
-from `pending` to `claimed` to `delivered`; a failed idle turn start releases
-the claim, and startup recovery requeues interrupted claims. Delivered rows
-remain as durable deduplication records, so duplicate queue events and browser
-disconnects cannot create a second wakeup turn.
+it acknowledge the explicit profile-bound Hermes delegation tracker, and that
+ACK must verify its durable read-back. The stored row moves atomically from
+`pending` to lease-owned `claimed` to `delivered`; a failed idle turn start
+releases the claim, and startup recovery requeues only expired claims after
+single-instance ownership is established. The store lives in a private `0700`
+directory with `0600` SQLite files. Delivered rows are compacted to dedupe
+identity and retained for 45 days (longer than Hermes replay retention), so
+duplicate queue events and browser disconnects cannot create a second wakeup
+turn or retain full completion prose indefinitely.
 
 Generic terminal process completions retain their existing process-registry
 and in-memory deferred-wakeup behavior. The durable store is deliberately
 limited to canonical `async_delegation` events, which have stable delegation
-and owning-session identities.
+and immutable origin-profile, tracker-store, and UI/session identities. Startup
+first asks every profile's Hermes tracker to replay undelivered checkpoints,
+then durably inserts/ACKs them before normal queue draining begins.
 
 ### 4.6 Approval System Integration
 

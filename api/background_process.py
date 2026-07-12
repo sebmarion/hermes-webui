@@ -46,6 +46,7 @@ import queue
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,10 @@ _WAKEUP_STORE = None
 _WAKEUP_STORE_LOCK = threading.Lock()
 _WAKEUP_THREAD_FACTORY = threading.Thread
 _TRACKER_ACK_LOCK = threading.Lock()
+_PROCESS_OWNER_UUID = uuid.uuid4().hex
+_WAKEUP_THREADS: set[threading.Thread] = set()
+_WAKEUP_THREADS_LOCK = threading.Lock()
+_WAKEUP_INTAKE_STOP = threading.Event()
 
 
 def _delegation_wakeup_store():
@@ -1093,21 +1098,93 @@ def _process_one(evt: dict) -> None:
         )
 
 
+def _load_async_event_session(session_id: str, origin_profile: str):
+    try:
+        from api.models import get_session
+        from api.profiles import _profiles_match
+
+        session = get_session(session_id)
+        if session is None:
+            return None
+        if origin_profile and not _profiles_match(
+            getattr(session, "profile", None), origin_profile,
+        ):
+            logger.error(
+                "async_delegation profile mismatch blocked: session=%s event=%r stored=%r",
+                session_id, origin_profile, getattr(session, "profile", None),
+            )
+            return None
+        return session
+    except Exception:
+        logger.debug("async event session lookup failed for %s", session_id, exc_info=True)
+        return None
+
+
+def recover_profile_async_delegations() -> int:
+    """Recover every profile's Hermes checkpoint into the shared queue."""
+    from api.profiles import list_profiles_api
+    from tools.async_delegation import recover_async_delegations
+
+    queued = 0
+    seen: set[str] = set()
+    for profile in list_profiles_api():
+        home = str((profile or {}).get("path") or "").strip()
+        if not home:
+            continue
+        tracker = str((Path(home).expanduser() / "async_delegations.json").resolve())
+        if tracker in seen:
+            continue
+        seen.add(tracker)
+        result = recover_async_delegations(tracker_path=tracker) or {}
+        queued += int(result.get("queued") or 0)
+    return queued
+
+
 def _process_async_delegation_event(evt: dict) -> None:
     """Durably accept one async completion before ACK or dispatch."""
     from api import config as cfg
 
     delegation_id = str(evt.get("delegation_id") or "").strip()
     session_key = str(evt.get("session_key") or "").strip()
-    if not delegation_id or not session_key:
-        logger.debug("async_delegation drop: missing delegation_id/session_key")
+    origin_profile = str(evt.get("origin_profile") or "").strip()
+    origin_tracker_path = str(evt.get("origin_tracker_path") or "").strip()
+    origin_ui_session_id = str(evt.get("origin_ui_session_id") or "").strip()
+    if not delegation_id:
+        logger.debug("async_delegation drop: missing delegation_id")
         return
-    with cfg.PROCESS_SESSION_INDEX_LOCK:
-        session_id = str(cfg.PROCESS_SESSION_INDEX.get(session_key) or "")
+    session_id = ""
+    for candidate in (
+        origin_ui_session_id,
+        str(evt.get("parent_session_id") or "").strip(),
+        session_key,
+    ):
+        if not candidate:
+            continue
+        session = _load_async_event_session(candidate, origin_profile)
+        if session is not None:
+            session_id = str(getattr(session, "session_id", candidate) or candidate)
+            break
+    if not session_id and session_key:
+        with cfg.PROCESS_SESSION_INDEX_LOCK:
+            mapped_session_id = str(cfg.PROCESS_SESSION_INDEX.get(session_key) or "")
+        if mapped_session_id:
+            if not origin_profile:
+                # Legacy Hermes records predate immutable origin profile/home
+                # identity. Preserve their narrow session-key binding.
+                session_id = mapped_session_id
+            else:
+                mapped_session = _load_async_event_session(
+                    mapped_session_id, origin_profile,
+                )
+                if mapped_session is not None:
+                    session_id = str(
+                        getattr(mapped_session, "session_id", mapped_session_id)
+                        or mapped_session_id
+                    )
     if not session_id:
         logger.debug(
-            "async_delegation drop: no session mapping for key=%r delegation_id=%r",
-            session_key,
+            "async_delegation drop: no canonical session for key=%r delegation_id=%r",
+            session_key or origin_ui_session_id,
             delegation_id,
         )
         return
@@ -1116,14 +1193,39 @@ def _process_async_delegation_event(evt: dict) -> None:
         logger.debug("async_delegation drop: formatter returned no prompt for %s", delegation_id)
         return
 
+    store = _delegation_wakeup_store()
+    existing = store.get(delegation_id) or {}
+    if existing.get("state") == "delivered":
+        same_owner = (
+            existing.get("session_id") == session_id
+            and existing.get("session_key") == session_key
+            and existing.get("origin_profile") == origin_profile
+            and existing.get("origin_tracker_path") == origin_tracker_path
+            and existing.get("origin_ui_session_id") == origin_ui_session_id
+        )
+        if not same_owner:
+            logger.error(
+                "async_delegation delivered-row ownership collision blocked: %s",
+                delegation_id,
+            )
+            return
+        with _TRACKER_ACK_LOCK:
+            existing = store.get(delegation_id) or {}
+            if existing.get("tracker_acked_at") is None:
+                if _try_mark_async_delegation_tracker(evt=evt):
+                    store.mark_tracker_acked(delegation_id)
+        return
+
     try:
-        store = _delegation_wakeup_store()
         outcome = store.record_pending(
             delegation_id=delegation_id,
             session_id=session_id,
             session_key=session_key,
             wakeup_prompt=wakeup_prompt,
             event=evt,
+            origin_profile=origin_profile,
+            origin_tracker_path=origin_tracker_path,
+            origin_ui_session_id=origin_ui_session_id,
         )
     except Exception:
         logger.warning(
@@ -1139,10 +1241,6 @@ def _process_async_delegation_event(evt: dict) -> None:
             session_id,
         )
         return
-    row = outcome.row or store.get(delegation_id) or {}
-    if row.get("state") == "delivered":
-        return
-
     # Hermes may stop replaying only after WebUI owns the wakeup durably.
     # Serialize the external tracker call with the durable marker update so
     # concurrent duplicate queue events in this host cannot both ACK it.
@@ -1151,6 +1249,10 @@ def _process_async_delegation_event(evt: dict) -> None:
         if row.get("tracker_acked_at") is None:
             if _try_mark_async_delegation_tracker(evt=evt):
                 store.mark_tracker_acked(delegation_id)
+
+    row = store.get(delegation_id) or {}
+    if row.get("state") == "delivered":
+        return
 
     # Live-view is observational only and happens after durable acceptance.
     if outcome.status == "inserted":
@@ -1361,14 +1463,24 @@ def _run_claimed_delegation_wakeup(row: dict) -> None:
     except Exception as exc:
         store.release_claim(delegation_id, claim_token, str(exc))
         logger.warning("async_delegation wakeup start failed for %s", delegation_id, exc_info=True)
+    finally:
+        current = threading.current_thread()
+        with _WAKEUP_THREADS_LOCK:
+            _WAKEUP_THREADS.discard(current)
 
 
 def dispatch_pending_delegation_wakeups_for_session(session_id: str) -> int:
     """Atomically claim and launch at most one durable wakeup for a session."""
-    if not session_id or _session_has_active_turn(session_id):
+    if (
+        not session_id
+        or _WAKEUP_INTAKE_STOP.is_set()
+        or _session_has_active_turn(session_id)
+    ):
         return 0
     store = _delegation_wakeup_store()
-    claimed = store.claim_next(session_id)
+    claimed = store.claim_next(
+        session_id, owner_uuid=_PROCESS_OWNER_UUID, lease_seconds=60,
+    )
     if claimed is None:
         return 0
     try:
@@ -1378,9 +1490,16 @@ def dispatch_pending_delegation_wakeups_for_session(session_id: str) -> int:
             name=f"hermes-webui-delegation-wakeup-{str(session_id)[:8]}",
             daemon=True,
         )
+        with _WAKEUP_THREADS_LOCK:
+            _WAKEUP_THREADS.add(thread)
         thread.start()
         return 1
     except Exception as exc:
+        try:
+            with _WAKEUP_THREADS_LOCK:
+                _WAKEUP_THREADS.discard(thread)
+        except Exception:
+            pass
         store.release_claim(
             str(claimed.get("delegation_id") or ""),
             str(claimed.get("claim_token") or ""),
@@ -1393,7 +1512,7 @@ def dispatch_pending_delegation_wakeups_for_session(session_id: str) -> int:
 def replay_pending_delegation_wakeups() -> int:
     """Startup recovery: requeue interrupted claims and launch each idle owner once."""
     store = _delegation_wakeup_store()
-    store.recover_claims()
+    store.recover_claims(owner_uuid=_PROCESS_OWNER_UUID)
     started = 0
     for session_id in store.pending_session_ids():
         started += dispatch_pending_delegation_wakeups_for_session(session_id)
@@ -1538,8 +1657,7 @@ def _try_mark_async_delegation_tracker(*, evt: dict) -> bool:
         import tools.async_delegation as _ad
         marker = getattr(_ad, "mark_async_delegation_delivered", None)
         if callable(marker):
-            marker(evt)
-            return True
+            return marker(evt) is True
     except Exception:
         logger.debug("async_delegation tracker notification failed", exc_info=True)
     return False
@@ -1631,6 +1749,11 @@ def start_drain_thread() -> bool:
     with _THREAD_LIFECYCLE_LOCK:
         if _DRAIN_THREAD is not None and _DRAIN_THREAD.is_alive():
             return False
+        _WAKEUP_INTAKE_STOP.clear()
+        try:
+            recover_profile_async_delegations()
+        except Exception:
+            logger.warning("Hermes async tracker startup recovery failed", exc_info=True)
         try:
             replay_pending_delegation_wakeups()
         except Exception:
@@ -1646,7 +1769,23 @@ def start_drain_thread() -> bool:
 
 
 def stop_drain_thread(timeout: float = 2.0) -> None:
+    _WAKEUP_INTAKE_STOP.set()
     _DRAIN_STOP.set()
     th = _DRAIN_THREAD
     if th is not None and th.is_alive():
         th.join(timeout=timeout)
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        with _WAKEUP_THREADS_LOCK:
+            live = [
+                worker
+                for worker in _WAKEUP_THREADS
+                if callable(getattr(worker, "is_alive", None)) and worker.is_alive()
+            ]
+            _WAKEUP_THREADS.intersection_update(live)
+        if not live or time.monotonic() >= deadline:
+            break
+        for worker in live:
+            join = getattr(worker, "join", None)
+            if callable(join):
+                join(timeout=max(0.0, deadline - time.monotonic()))

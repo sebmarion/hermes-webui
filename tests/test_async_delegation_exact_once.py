@@ -70,6 +70,7 @@ def _install_tracker(monkeypatch, calls):
 
     def mark_async_delegation_delivered(evt):
         calls.append(evt)
+        return True
 
     module.mark_async_delegation_delivered = mark_async_delegation_delivered
     monkeypatch.setitem(sys.modules, "tools.async_delegation", module)
@@ -301,7 +302,95 @@ def test_streaming_uses_canonical_delivery_context_without_made_up_env_flag(monk
                 "session_id": "session-a",
                 "ui_session_id": "session-a",
                 "async_delivery": True,
+                "profile": "",
+                "hermes_home": "",
+                "capability_version": 1,
             },
         ),
         ("reset", token),
     ]
+
+
+def test_delivered_row_repairs_missing_tracker_ack_before_early_return(delivery, monkeypatch):
+    bp, _cfg, store = delivery
+    tracker = []
+    _install_tracker(monkeypatch, tracker)
+    store.record_pending(
+        delegation_id="deleg_1",
+        session_id="session-a",
+        session_key="session-a",
+        wakeup_prompt="done",
+        event=_event(),
+    )
+    claim = store.claim_next("session-a", owner_uuid="old", lease_seconds=60)
+    assert store.mark_delivered("deleg_1", claim["claim_token"])
+    assert store.get("deleg_1")["tracker_acked_at"] is None
+
+    bp._process_one(_event())
+
+    assert len(tracker) == 1
+    assert store.get("deleg_1")["tracker_acked_at"] is not None
+
+
+def test_event_routes_from_canonical_ui_identity_without_process_index(delivery, monkeypatch):
+    bp, cfg, store = delivery
+    starts = _install_start(monkeypatch)
+    _install_tracker(monkeypatch, [])
+    with cfg.PROCESS_SESSION_INDEX_LOCK:
+        cfg.PROCESS_SESSION_INDEX.clear()
+    monkeypatch.setattr(
+        bp,
+        "_load_async_event_session",
+        lambda sid, profile: types.SimpleNamespace(session_id=sid, profile=profile),
+        raising=False,
+    )
+    evt = _event()
+    evt.update({
+        "origin_ui_session_id": "session-a",
+        "parent_session_id": "session-a",
+        "origin_profile": "coder",
+        "origin_tracker_path": "/tmp/coder/async_delegations.json",
+    })
+
+    bp._process_one(evt)
+
+    assert len(starts) == 1
+    row = store.get("deleg_1")
+    assert row["origin_profile"] == "coder"
+    assert row["origin_tracker_path"].endswith("coder/async_delegations.json")
+
+
+def test_legacy_process_index_fallback_still_enforces_origin_profile(delivery, monkeypatch):
+    bp, cfg, store = delivery
+    _install_start(monkeypatch)
+    _install_tracker(monkeypatch, [])
+    with cfg.PROCESS_SESSION_INDEX_LOCK:
+        cfg.PROCESS_SESSION_INDEX["legacy-key"] = "wrong-profile-session"
+
+    checked = []
+
+    def load_session(session_id, origin_profile):
+        checked.append((session_id, origin_profile))
+        return None
+
+    monkeypatch.setattr(bp, "_load_async_event_session", load_session)
+    evt = _event(session_key="legacy-key")
+    evt["origin_profile"] = "coder"
+
+    bp._process_one(evt)
+
+    assert ("wrong-profile-session", "coder") in checked
+    assert store.get("deleg_1") is None
+
+
+def test_tracker_ack_requires_explicit_durable_success(delivery, monkeypatch):
+    bp, _cfg, store = delivery
+    starts = _install_start(monkeypatch)
+    module = types.ModuleType("tools.async_delegation")
+    module.mark_async_delegation_delivered = lambda _evt: False
+    monkeypatch.setitem(sys.modules, "tools.async_delegation", module)
+
+    bp._process_one(_event())
+
+    assert store.get("deleg_1")["tracker_acked_at"] is None
+    assert len(starts) == 1

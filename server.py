@@ -633,6 +633,34 @@ def main() -> None:
     DEFAULT_WORKSPACE.mkdir(parents=True, exist_ok=True)
 
     try:
+        from api.gateway_watcher import start_watcher
+
+        def _start_watcher_safe():
+            try:
+                start_watcher()
+            except Exception as e:
+                print(f'[!!] WARNING: Gateway watcher failed to start: {e}', flush=True)
+
+        t = threading.Thread(target=_start_watcher_safe, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        if t.is_alive():
+            print('[tip] Gateway watcher still initializing (non-blocking)', flush=True)
+    except Exception as e:
+        print(f'[!!] WARNING: Gateway watcher failed to start: {e}', flush=True)
+
+    try:
+        from api.plugins import load_plugins
+        load_plugins()
+    except Exception as e:
+        print(f'[!!] WARNING: Plugin loading failed: {e}', flush=True)
+
+    _abort_if_already_serving(HOST, PORT)
+    httpd = QuietHTTPServer((HOST, PORT), Handler)
+
+    # Single-instance ownership and bind are proven before any durable wakeup
+    # recovery or queue intake can claim work.
+    try:
         from api.background_process import start_drain_thread
         if start_drain_thread():
             print('[ok] bg_task_complete drain thread started', flush=True)
@@ -645,15 +673,6 @@ def main() -> None:
             print('[ok] SessionChannel reaper thread started', flush=True)
     except Exception as e:
         print(f'[!!] WARNING: SessionChannel reaper failed to start: {e}', flush=True)
-
-    try:
-        from api.plugins import load_plugins
-        load_plugins()
-    except Exception as e:
-        print(f'[!!] WARNING: Plugin loading failed: {e}', flush=True)
-
-    _abort_if_already_serving(HOST, PORT)
-    httpd = QuietHTTPServer((HOST, PORT), Handler)
 
     from api.config import TLS_ENABLED, TLS_CERT, TLS_KEY
     scheme = 'https' if TLS_ENABLED else 'http'
@@ -715,11 +734,6 @@ def main() -> None:
         except Exception:
             logger.debug("Failed to stop gateway watcher during shutdown")
         try:
-            from api.session_lifecycle import drain_all_on_shutdown
-            drain_all_on_shutdown()
-        except Exception:
-            logger.debug("Failed to drain lifecycle on shutdown", exc_info=True)
-        try:
             from api.background_process import stop_drain_thread
             stop_drain_thread()
         except Exception:
@@ -729,4 +743,11 @@ def main() -> None:
             stop_session_channel_reaper()
         except Exception:
             logger.debug("Failed to stop SessionChannel reaper during shutdown", exc_info=True)
-if __name__ == '__main__': main()
+        try:
+            from api.session_lifecycle import drain_all_on_shutdown
+            drain_all_on_shutdown()
+        except Exception:
+            logger.debug("Failed to drain lifecycle on shutdown", exc_info=True)
+
+if __name__ == '__main__':
+    main()

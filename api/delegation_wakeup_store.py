@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -26,7 +27,12 @@ CREATE TABLE IF NOT EXISTS delegation_wakeups (
     claimed_at REAL,
     delivered_at REAL,
     tracker_acked_at REAL,
-    last_error TEXT
+    last_error TEXT,
+    origin_profile TEXT NOT NULL DEFAULT '',
+    origin_tracker_path TEXT NOT NULL DEFAULT '',
+    origin_ui_session_id TEXT NOT NULL DEFAULT '',
+    claim_owner TEXT,
+    lease_expires_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_delegation_wakeups_session_state
     ON delegation_wakeups(session_id, state, created_at);
@@ -46,13 +52,45 @@ class DelegationWakeupStore:
         if path is None:
             from api.config import STATE_DIR
 
-            path = Path(STATE_DIR) / "delegation_wakeups.sqlite3"
+            path = Path(STATE_DIR) / "private" / "delegation_wakeups.sqlite3"
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
         self._lock = threading.RLock()
         self._conn = self._connect()
         self._conn.executescript(_SCHEMA)
+        self._migrate_schema()
         self._conn.commit()
+        self._repair_modes()
+        self.prune_delivered()
+
+    def _migrate_schema(self) -> None:
+        existing = {
+            str(row[1]) for row in self._conn.execute(
+                "PRAGMA table_info(delegation_wakeups)"
+            )
+        }
+        for name, ddl in {
+            "origin_profile": "TEXT NOT NULL DEFAULT ''",
+            "origin_tracker_path": "TEXT NOT NULL DEFAULT ''",
+            "origin_ui_session_id": "TEXT NOT NULL DEFAULT ''",
+            "claim_owner": "TEXT",
+            "lease_expires_at": "REAL",
+        }.items():
+            if name not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE delegation_wakeups ADD COLUMN {name} {ddl}"
+                )
+
+    def _repair_modes(self) -> None:
+        os.chmod(self.path.parent, 0o700)
+        for candidate in (
+            self.path,
+            self.path.with_name(self.path.name + "-wal"),
+            self.path.with_name(self.path.name + "-shm"),
+        ):
+            if candidate.exists():
+                os.chmod(candidate, 0o600)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.path), timeout=30, check_same_thread=False)
@@ -85,6 +123,9 @@ class DelegationWakeupStore:
         session_key: str,
         wakeup_prompt: str,
         event: dict[str, Any],
+        origin_profile: str = "",
+        origin_tracker_path: str = "",
+        origin_ui_session_id: str = "",
     ) -> RecordOutcome:
         delegation_id = str(delegation_id or "").strip()
         session_id = str(session_id or "").strip()
@@ -107,6 +148,9 @@ class DelegationWakeupStore:
                     same_owner = (
                         existing["session_id"] == session_id
                         and existing["session_key"] == session_key
+                        and existing["origin_profile"] == str(origin_profile or "")
+                        and existing["origin_tracker_path"] == str(origin_tracker_path or "")
+                        and existing["origin_ui_session_id"] == str(origin_ui_session_id or "")
                     )
                     same_payload = (
                         existing["wakeup_prompt"] == wakeup_prompt
@@ -121,11 +165,14 @@ class DelegationWakeupStore:
                 conn.execute(
                     """INSERT INTO delegation_wakeups (
                         delegation_id, session_id, session_key, wakeup_prompt,
-                        event_json, state, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                        event_json, state, created_at, updated_at,
+                        origin_profile, origin_tracker_path, origin_ui_session_id
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
                     (
                         delegation_id, session_id, session_key, wakeup_prompt,
-                        event_json, now, now,
+                        event_json, now, now, str(origin_profile or ""),
+                        str(origin_tracker_path or ""),
+                        str(origin_ui_session_id or ""),
                     ),
                 )
                 conn.commit()
@@ -151,9 +198,17 @@ class DelegationWakeupStore:
                 "WHERE state='pending' ORDER BY session_id"
             ).fetchall()]
 
-    def claim_next(self, session_id: str) -> dict[str, Any] | None:
+    def claim_next(
+        self,
+        session_id: str,
+        *,
+        owner_uuid: str = "",
+        lease_seconds: float = 30.0,
+    ) -> dict[str, Any] | None:
         token = uuid.uuid4().hex
         now = time.time()
+        owner = str(owner_uuid or f"pid-{os.getpid()}")
+        lease_expires_at = now + max(1.0, float(lease_seconds))
         with self._lock:
             conn = self._conn
             try:
@@ -170,9 +225,9 @@ class DelegationWakeupStore:
                 delegation_id = str(row["delegation_id"])
                 changed = conn.execute(
                     """UPDATE delegation_wakeups SET state='claimed', claim_token=?,
-                       claimed_at=?, updated_at=?, last_error=NULL
+                       claim_owner=?, lease_expires_at=?, claimed_at=?, updated_at=?, last_error=NULL
                        WHERE delegation_id=? AND state='pending'""",
-                    (token, now, now, delegation_id),
+                    (token, owner, lease_expires_at, now, now, delegation_id),
                 ).rowcount
                 if changed != 1:
                     conn.commit()
@@ -191,7 +246,8 @@ class DelegationWakeupStore:
         with self._lock:
             changed = self._conn.execute(
                 """UPDATE delegation_wakeups SET state='pending', claim_token=NULL,
-                   claimed_at=NULL, updated_at=?, last_error=?
+                   claim_owner=NULL, lease_expires_at=NULL, claimed_at=NULL,
+                   updated_at=?, last_error=?
                    WHERE delegation_id=? AND state='claimed' AND claim_token=?""",
                 (time.time(), str(error or ""), str(delegation_id), str(claim_token)),
             ).rowcount
@@ -203,7 +259,8 @@ class DelegationWakeupStore:
         with self._lock:
             changed = self._conn.execute(
                 """UPDATE delegation_wakeups SET state='delivered', delivered_at=?,
-                   updated_at=?, last_error=NULL
+                   updated_at=?, last_error=NULL, wakeup_prompt='', event_json='',
+                   claim_owner=NULL, lease_expires_at=NULL
                    WHERE delegation_id=? AND state='claimed' AND claim_token=?""",
                 (now, now, str(delegation_id), str(claim_token)),
             ).rowcount
@@ -220,13 +277,30 @@ class DelegationWakeupStore:
             self._conn.commit()
             return changed == 1
 
-    def recover_claims(self) -> int:
+    def recover_claims(self, *, owner_uuid: str = "") -> int:
+        del owner_uuid  # recovery is lease-proven, never owner-name based
         with self._lock:
             changed = self._conn.execute(
                 """UPDATE delegation_wakeups SET state='pending', claim_token=NULL,
-                   claimed_at=NULL, updated_at=?, last_error='recovered_after_restart'
-                   WHERE state='claimed'""",
-                (time.time(),),
+                   claim_owner=NULL, lease_expires_at=NULL, claimed_at=NULL,
+                   updated_at=?, last_error='recovered_expired_claim'
+                   WHERE state='claimed' AND lease_expires_at IS NOT NULL
+                   AND lease_expires_at <= ?""",
+                (time.time(), time.time()),
             ).rowcount
             self._conn.commit()
+            return int(changed)
+
+    def prune_delivered(
+        self, *, retention_seconds: float = 45 * 24 * 60 * 60,
+    ) -> int:
+        cutoff = time.time() - max(float(retention_seconds), 31 * 24 * 60 * 60)
+        with self._lock:
+            changed = self._conn.execute(
+                "DELETE FROM delegation_wakeups WHERE state='delivered' "
+                "AND delivered_at IS NOT NULL AND delivered_at < ?",
+                (cutoff,),
+            ).rowcount
+            self._conn.commit()
+            self._repair_modes()
             return int(changed)
