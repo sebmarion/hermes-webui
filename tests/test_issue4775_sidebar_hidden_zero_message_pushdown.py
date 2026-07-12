@@ -170,7 +170,10 @@ def _run_node(script):
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache(monkeypatch):
+    # These tests monkeypatch the legacy full builder directly. Keep them on the
+    # compatibility path; projection-v2 behavior has dedicated cache coverage.
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
     routes._session_list_cache_clear()
     yield
     routes._session_list_cache_clear()

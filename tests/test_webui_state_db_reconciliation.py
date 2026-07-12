@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path
@@ -331,8 +332,8 @@ def test_api_sessions_overlays_webui_state_db_summary_after_desktop_append(monke
 
     # Simulate the official Hermes Desktop App continuing the same WebUI-origin
     # Hermes Agent session and settling its final rows into state.db. The second
-    # request happens immediately, so it only updates if the WebUI sidebar cache
-    # observes state.db changes even when the CLI/external-session tab is hidden.
+    # request happens immediately. The bounded-read endpoint may serve the
+    # last-known-good snapshot while one background refresh observes state.db.
     _append_state_db_rows(
         tmp_path / "state.db",
         sid,
@@ -342,10 +343,18 @@ def test_api_sessions_overlays_webui_state_db_summary_after_desktop_append(monke
         ],
     )
 
-    second = _GetHandler("/api/sessions?sidebar_source=webui")
-    routes.handle_get(second, urlparse(second.path))
-    assert second.status == 200
-    row = next(row for row in second.response_json["sessions"] if row["session_id"] == sid)
+    deadline = time.monotonic() + 3.0
+    row = None
+    while time.monotonic() < deadline:
+        second = _GetHandler("/api/sessions?sidebar_source=webui")
+        routes.handle_get(second, urlparse(second.path))
+        assert second.status == 200
+        row = next(row for row in second.response_json["sessions"] if row["session_id"] == sid)
+        if row["message_count"] == 4:
+            break
+        time.sleep(0.05)
+
+    assert row is not None
     assert row["message_count"] == 4
     assert row["last_message_at"] == 1003.0
     assert row["updated_at"] == 1003.0

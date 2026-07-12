@@ -330,6 +330,9 @@ def test_sessions_endpoint_suppresses_duplicate_webui_state_projection(monkeypat
     import api.profiles as profiles
     import api.routes as routes
 
+    # This test stubs legacy Agent/CLI sources directly, so exercise the
+    # compatibility builder rather than projection-v2's index-only seed.
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
     monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _sessions: False)
     monkeypatch.setattr(routes, "load_settings", lambda: {"show_cli_sessions": True})
     monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")

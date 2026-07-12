@@ -89,6 +89,8 @@ def test_attention_summary_reports_clarify_when_no_approval_is_pending():
 
 
 def test_sessions_api_includes_attention_summary_for_sidebar_rows(monkeypatch):
+    # This test stubs the legacy full builder rather than the index projection.
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
     sid = "attention-api-session"
     _clear_attention_state(sid)
     try:
