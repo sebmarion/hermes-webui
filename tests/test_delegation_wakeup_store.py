@@ -147,3 +147,28 @@ def test_profile_identity_is_part_of_dedupe_and_delivered_payload_is_compacted(t
     row = store.get("deleg_1")
     assert row["wakeup_prompt"] == ""
     assert row["event_json"] == ""
+
+
+def test_legacy_store_is_transactionally_migrated_and_claims_become_recoverable(tmp_path, monkeypatch):
+    from api import config
+
+    monkeypatch.setattr(config, "STATE_DIR", tmp_path)
+    legacy = tmp_path / "delegation_wakeups.sqlite3"
+    old = DelegationWakeupStore(legacy)
+    _record(old)
+    claim = old.claim_next("session-a", owner_uuid="old-process", lease_seconds=3600)
+    assert claim["state"] == "claimed"
+    old.close()
+    os.chmod(legacy, 0o644)
+
+    migrated = DelegationWakeupStore()
+    assert migrated.path == tmp_path / "private" / "delegation_wakeups.sqlite3"
+    row = migrated.get("deleg_1")
+    assert row["state"] == "pending"
+    assert row["claim_token"] is None
+    assert stat.S_IMODE(legacy.stat().st_mode) == 0o600
+    assert stat.S_IMODE(migrated.path.stat().st_mode) == 0o600
+    migrated.close()
+
+    restarted = DelegationWakeupStore()
+    assert restarted.get("deleg_1")["state"] == "pending"

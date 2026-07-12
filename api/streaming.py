@@ -1853,19 +1853,34 @@ def _set_turn_session_identity(
     except Exception:
         logger.debug("per-turn approval session-key bind failed", exc_info=True)
     try:
-        import gateway.session_context as _session_context
+        import importlib
+
+        _session_context = importlib.import_module("gateway.session_context")
 
         bind_delivery_context = getattr(_session_context, "bind_delivery_context", None)
         if callable(bind_delivery_context):
-            tokens["delivery_context"] = bind_delivery_context(
-                session_key=sid,
-                session_id=sid,
-                ui_session_id=sid,
-                async_delivery=True,
-                profile=str(profile or ""),
-                hermes_home=str(hermes_home or ""),
-                capability_version=1,
-            )
+            try:
+                tokens["delivery_context"] = bind_delivery_context(
+                    session_key=sid,
+                    session_id=sid,
+                    ui_session_id=sid,
+                    async_delivery=True,
+                    profile=str(profile or ""),
+                    hermes_home=str(hermes_home or ""),
+                    capability_version=1,
+                )
+                tokens["bestplan_capability_version"] = 1
+            except TypeError:
+                # Immediately preceding Hermes API: generic durable routing
+                # had only these four parameters.  Preserve it, but leave the
+                # strict BestPlan capability at version 0.
+                tokens["delivery_context"] = bind_delivery_context(
+                    session_key=sid,
+                    session_id=sid,
+                    ui_session_id=sid,
+                    async_delivery=True,
+                )
+                tokens["bestplan_capability_version"] = 0
         else:
             legacy_key = getattr(_session_context, "_SESSION_KEY", None)
             if legacy_key is not None and callable(getattr(legacy_key, "set", None)):
@@ -1875,6 +1890,12 @@ def _set_turn_session_identity(
                 )
     except Exception:
         logger.debug("per-turn delivery-context bind failed", exc_info=True)
+    try:
+        from hermes_constants import set_hermes_home_override
+
+        tokens["hermes_home_override"] = set_hermes_home_override(hermes_home or None)
+    except (ImportError, AttributeError):
+        pass
     return tokens
 
 
@@ -1889,6 +1910,14 @@ def _reset_turn_session_identity(tokens) -> None:
     """
     if not tokens:
         return
+    tok = tokens.get("hermes_home_override")
+    if tok is not None:
+        try:
+            from hermes_constants import reset_hermes_home_override
+
+            reset_hermes_home_override(tok)
+        except (ImportError, AttributeError):
+            logger.debug("per-turn Hermes-home override reset unavailable", exc_info=True)
     tok = tokens.get("delivery_context")
     if tok is not None:
         try:
@@ -2003,12 +2032,15 @@ def _try_resolve_bestplan_go_ingress(
     if str(original_message or "").strip().casefold() != "go":
         return None
     go_enabled = bool(((config or {}).get("autonomy") or {}).get("go_enabled"))
+    if not go_enabled:
+        return None
     try:
-        from agent.bestplan_state import (
-            BestplanStore,
-            is_go_enabled,
-            try_resolve_go,
-        )
+        import importlib
+
+        _bestplan_state = importlib.import_module("agent.bestplan_state")
+        BestplanStore = _bestplan_state.BestplanStore
+        is_go_enabled = _bestplan_state.is_go_enabled
+        try_resolve_go = _bestplan_state.try_resolve_go
     except ModuleNotFoundError as exc:
         # WebUI can be upgraded before its managed Hermes runtime. Preserve
         # ordinary turns while the feature is disabled, but never let an
@@ -2026,6 +2058,14 @@ def _try_resolve_bestplan_go_ingress(
             )
         return None
 
+    if int(getattr(_bestplan_state, "BESTPLAN_HOST_CAPABILITY_VERSION", 0) or 0) < 1:
+        return _bestplan_host_result(
+            original_message=original_message,
+            conversation_history=conversation_history,
+            status="capability_upgrade_required",
+            response="Plan execution was not started (capability_upgrade_required): Hermes core V1 host capability required",
+            host_agent=host_agent or agent,
+        )
     store = BestplanStore(db_path=Path(profile_home) / "state.db")
     try:
         resolved = try_resolve_go(
@@ -2049,11 +2089,17 @@ def _try_resolve_bestplan_go_ingress(
             )
         raise
     if resolved.resolved:
-        return resolved.to_agent_result(
-            conversation_history=conversation_history,
-            user_message=original_message,
-            host_agent=host_agent or agent,
-        )
+        try:
+            return resolved.to_agent_result(
+                conversation_history=conversation_history,
+                user_message=original_message,
+                host_agent=host_agent or agent,
+            )
+        except TypeError:
+            return resolved.to_agent_result(
+                conversation_history=conversation_history,
+                user_message=original_message,
+            )
     return None
 
 
@@ -2068,26 +2114,51 @@ def _capture_bestplan_result(
     host_agent=None,
 ) -> dict:
     try:
-        from agent.bestplan_state import (
-            BestplanStore,
-            capture_bestplan_agent_result,
-            is_bestplan_invocation,
-        )
+        import importlib
+
+        _bestplan_state = importlib.import_module("agent.bestplan_state")
+        BestplanStore = _bestplan_state.BestplanStore
+        capture_bestplan_agent_result = _bestplan_state.capture_bestplan_agent_result
+        is_bestplan_invocation = _bestplan_state.is_bestplan_invocation
     except ModuleNotFoundError as exc:
         if exc.name == "agent.bestplan_state":
             return result
         raise
     if not is_bestplan_invocation(invocation_message):
         return result
-    return capture_bestplan_agent_result(
-        result,
+    if int(getattr(_bestplan_state, "BESTPLAN_HOST_CAPABILITY_VERSION", 0) or 0) < 1:
+        updated = dict(result)
+        response = re.sub(
+            r"<<<HERMES_BESTPLAN_V1>>>.*?<<<END_HERMES_BESTPLAN_V1>>>",
+            "", str(result.get("final_response") or ""), flags=re.DOTALL,
+        ).strip()
+        response = "\n\n".join(filter(None, (
+            response,
+            "[BestPlan status: planning-only; Hermes core capability V1 is required before this plan can be executable.]",
+        )))
+        updated["final_response"] = response
+        messages = [dict(item) if isinstance(item, dict) else item for item in (updated.get("messages") or [])]
+        for index in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[index], dict) and messages[index].get("role") == "assistant":
+                messages[index]["content"] = response
+                break
+        updated["messages"] = messages
+        updated["bestplan_capture"] = {
+            "executable": False, "plan_id": None, "digest": None,
+            "error": "capability_upgrade_required",
+        }
+        return updated
+    kwargs = dict(
         invocation_message=invocation_message,
         session_id=session_id,
         profile=str(profile or ""),
         workspace=workspace,
         store=BestplanStore(db_path=Path(profile_home) / "state.db"),
-        host_agent=host_agent,
     )
+    try:
+        return capture_bestplan_agent_result(result, host_agent=host_agent, **kwargs)
+    except TypeError:
+        return capture_bestplan_agent_result(result, **kwargs)
 
 
 def _run_agent_with_bestplan_ingress(

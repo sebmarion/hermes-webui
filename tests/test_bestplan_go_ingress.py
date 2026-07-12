@@ -40,6 +40,7 @@ def _install_bestplan_module(monkeypatch, *, resolved):
         return {**result, "captured": True}
 
     module.BestplanStore = BestplanStore
+    module.BESTPLAN_HOST_CAPABILITY_VERSION = 1
     module.try_resolve_go = try_resolve_go
     module.capture_bestplan_agent_result = capture_bestplan_agent_result
     module.is_bestplan_invocation = lambda message: "bestplan" in str(message).lower()
@@ -189,6 +190,27 @@ def test_ordinary_turn_never_instantiates_bestplan_store(tmp_path, monkeypatch):
     assert result["final_response"] == "ordinary"
 
 
+def test_disabled_bare_go_never_instantiates_bestplan_store(tmp_path, monkeypatch):
+    import api.streaming as streaming
+
+    module = types.ModuleType("agent.bestplan_state")
+
+    class BestplanStore:
+        def __init__(self, **_kwargs):
+            raise AssertionError("disabled bare go must not open/DDL bestplan state")
+
+    module.BestplanStore = BestplanStore
+    module.is_go_enabled = lambda config=None: False
+    module.try_resolve_go = lambda *_args, **_kwargs: _Resolved(False)
+    monkeypatch.setitem(sys.modules, "agent.bestplan_state", module)
+
+    assert streaming._try_resolve_bestplan_go_ingress(
+        object(), original_message="go", conversation_history=[],
+        session_id="session-a", profile="coder", workspace="/tmp/work",
+        profile_home=str(tmp_path), config={"autonomy": {"go_enabled": False}},
+    ) is None
+
+
 def test_legacy_session_key_binding_survives_old_hermes_helper(monkeypatch):
     import contextvars
     import api.streaming as streaming
@@ -201,3 +223,71 @@ def test_legacy_session_key_binding_survives_old_hermes_helper(monkeypatch):
     assert module._SESSION_KEY.get() == "session-a"
     streaming._reset_turn_session_identity(tokens)
     assert module._SESSION_KEY.get() == ""
+
+
+def test_immediately_previous_bind_signature_negotiates_without_breaking_routing(monkeypatch):
+    import api.streaming as streaming
+
+    calls = []
+    module = types.ModuleType("gateway.session_context")
+
+    def bind_delivery_context(*, session_key, session_id, ui_session_id="", async_delivery):
+        calls.append((session_key, session_id, ui_session_id, async_delivery))
+        return "old-token"
+
+    module.bind_delivery_context = bind_delivery_context
+    module.reset_delivery_context = lambda token: calls.append(("reset", token))
+    monkeypatch.setitem(sys.modules, "gateway.session_context", module)
+
+    tokens = streaming._set_turn_session_identity(
+        "session-a", profile="coder", hermes_home="/profiles/coder"
+    )
+    assert calls == [("session-a", "session-a", "session-a", True)]
+    assert tokens["delivery_context"] == "old-token"
+    assert tokens["bestplan_capability_version"] == 0
+    streaming._reset_turn_session_identity(tokens)
+    assert calls[-1] == ("reset", "old-token")
+
+
+def test_immediately_previous_core_capture_signature_is_planning_only(monkeypatch, tmp_path):
+    import api.streaming as streaming
+
+    module = types.ModuleType("agent.bestplan_state")
+    module.is_bestplan_invocation = lambda _message: True
+    module.capture_bestplan_agent_result = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("old core capture must not persist executable authority")
+    )
+    module.BestplanStore = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("old core capture must not open state")
+    )
+    monkeypatch.setitem(sys.modules, "agent.bestplan_state", module)
+    envelope = (
+        "commentary\n<<<HERMES_BESTPLAN_V1>>>\n{}\n"
+        "<<<END_HERMES_BESTPLAN_V1>>>"
+    )
+    result = streaming._capture_bestplan_result(
+        {"final_response": envelope, "messages": [{"role": "assistant", "content": envelope}]},
+        invocation_message="/bestplan x", session_id="s", profile="coder",
+        workspace="/tmp/work", profile_home=str(tmp_path),
+    )
+    assert result["bestplan_capture"]["executable"] is False
+    assert "planning-only" in result["final_response"]
+    assert "HERMES_BESTPLAN" not in result["final_response"]
+
+
+def test_immediately_previous_recovery_signature_preserves_generic_root_replay(monkeypatch):
+    import api.background_process as bp
+    import api.profiles as profiles
+
+    calls = []
+    module = types.ModuleType("tools.async_delegation")
+
+    def recover_async_delegations():
+        calls.append("legacy")
+        return {"queued": 1}
+
+    module.recover_async_delegations = recover_async_delegations
+    monkeypatch.setitem(sys.modules, "tools.async_delegation", module)
+    monkeypatch.setattr(profiles, "list_profiles_api", lambda: [{"path": "/profiles/default"}])
+    assert bp.recover_profile_async_delegations() == 1
+    assert calls == ["legacy"]

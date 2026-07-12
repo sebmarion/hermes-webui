@@ -193,27 +193,22 @@ print("RECOVERY_JSON=" + json.dumps({"queued": queued, "event": event}))
     web_store_path = tmp_path / "webui" / "private" / "wakeups.sqlite3"
     web_store = DelegationWakeupStore(web_store_path)
     monkeypatch.setattr(bp, "_WAKEUP_STORE", web_store, raising=False)
-    monkeypatch.setattr(bp, "_WAKEUP_THREAD_FACTORY", _ImmediateThread, raising=False)
-    monkeypatch.setattr(
-        bp,
-        "_load_async_event_session",
-        lambda sid, profile: types.SimpleNamespace(session_id=sid, profile=profile),
+    from api import models
+
+    session = models.Session(
+        session_id="session-a", title="BestPlan", messages=[],
+        workspace=canonical, profile="coder",
+        model="openai/gpt-5.4-mini", model_provider="openai",
     )
-    starts = []
-    routes = types.ModuleType("api.routes")
-    routes.start_session_turn = lambda sid, prompt, *, source: (
-        starts.append((sid, prompt, source)) or {"_status": 200, "stream_id": "controlled"}
-    )
-    monkeypatch.setitem(sys.modules, "api.routes", routes)
+    monkeypatch.setitem(models.SESSIONS, session.session_id, session)
     with web_cfg.PROCESS_SESSION_INDEX_LOCK:
         web_cfg.PROCESS_SESSION_INDEX.clear()
 
     bp._process_one(replayed)
 
     delivered = web_store.get(go.delegation_id)
-    assert delivered["state"] == "delivered"
+    assert delivered["state"] == "observed"
     assert delivered["tracker_acked_at"] is not None
-    assert starts and starts[0][0] == "session-a"
     persisted = async_delegation._read_persisted_unlocked(tracker_path)
     assert persisted["records"][go.delegation_id]["delivery_status"] == "delivered"
 
@@ -231,20 +226,16 @@ def test_real_two_profile_trackers_never_cross_ack(tmp_path, monkeypatch):
 
     store = DelegationWakeupStore(tmp_path / "webui" / "private" / "wakeups.sqlite3")
     monkeypatch.setattr(bp, "_WAKEUP_STORE", store, raising=False)
-    monkeypatch.setattr(bp, "_WAKEUP_THREAD_FACTORY", _ImmediateThread, raising=False)
-    monkeypatch.setattr(
-        bp,
-        "_load_async_event_session",
-        lambda sid, profile: types.SimpleNamespace(session_id=sid, profile=profile),
-    )
-    routes = types.ModuleType("api.routes")
-    routes.start_session_turn = lambda sid, prompt, *, source: {
-        "_status": 200, "stream_id": f"stream-{sid}",
-    }
-    monkeypatch.setitem(sys.modules, "api.routes", routes)
+    from api import models
 
     trackers = {}
     for profile in ("coder", "reviewer"):
+        session = models.Session(
+            session_id=f"session-{profile}", title=profile, messages=[],
+            workspace=str(tmp_path), profile=profile,
+            model="openai/gpt-5.4-mini", model_provider="openai",
+        )
+        monkeypatch.setitem(models.SESSIONS, session.session_id, session)
         tracker = tmp_path / profile / "async_delegations.json"
         trackers[profile] = tracker
         result = async_delegation.dispatch_async_delegation_batch(
@@ -259,7 +250,7 @@ def test_real_two_profile_trackers_never_cross_ack(tmp_path, monkeypatch):
             delegation_id=f"bestplan-{profile}",
             origin_profile=profile,
             origin_tracker_path=str(tracker),
-            bestplan_plan_id="",
+            bestplan_plan_id=f"bp-{profile}",
             resolved_runtimes=[{
                 "route": "code_worker", "provider": "controlled", "model": f"{profile}-model",
             }],
@@ -281,3 +272,76 @@ def test_real_two_profile_trackers_never_cross_ack(tmp_path, monkeypatch):
         other = async_delegation._read_persisted_unlocked(trackers[other_profile])
         assert own["records"][event["delegation_id"]]["delivery_status"] == "delivered"
         assert event["delegation_id"] not in other["records"]
+
+
+def test_real_generic_target_turn_once_across_duplicate_restart_two_profiles_and_closed_tab(
+    tmp_path, monkeypatch,
+):
+    _bestplan, async_delegation = _agent_modules(monkeypatch)
+    from api import background_process as bp
+    from api import models, routes, turn_journal
+    from api.delegation_wakeup_store import DelegationWakeupStore
+    from tools.process_registry import process_registry
+
+    store_path = tmp_path / "webui" / "private" / "wakeups.sqlite3"
+    store = DelegationWakeupStore(store_path)
+    monkeypatch.setattr(bp, "_WAKEUP_STORE", store, raising=False)
+    monkeypatch.setattr(bp, "_WAKEUP_THREAD_FACTORY", _ImmediateThread, raising=False)
+    bp._WAKEUP_INTAKE_STOP.clear()
+    provider_calls = []
+    monkeypatch.setattr(
+        routes, "_run_agent_streaming",
+        lambda *args, **kwargs: provider_calls.append((args, kwargs)),
+    )
+
+    events = {}
+    trackers = {}
+    for profile in ("coder", "reviewer"):
+        sid = f"target-{profile}"
+        session = models.Session(
+            session_id=sid, title=profile, messages=[], workspace=str(tmp_path),
+            profile=profile, model="openai/gpt-5.4-mini", model_provider="openai",
+        )
+        monkeypatch.setitem(models.SESSIONS, sid, session)
+        tracker = tmp_path / profile / "async_delegations.json"
+        trackers[profile] = tracker
+        dispatched = async_delegation.dispatch_async_delegation_batch(
+            goals=[f"{profile} generic"], context=None, toolsets=None, role="leaf",
+            model="controlled", session_key=sid, origin_ui_session_id=sid,
+            parent_session_id=sid,
+            runner=lambda p=profile: {
+                "results": [{"status": "completed", "summary": f"{p} result"}]
+            },
+            max_async_children=4, delegation_id=f"generic-{profile}",
+            origin_profile=profile, origin_tracker_path=str(tracker),
+            bestplan_plan_id="", resolved_runtimes=[],
+        )
+        assert dispatched["status"] == "dispatched"
+
+    deadline = time.monotonic() + 5
+    while len(events) < 2 and time.monotonic() < deadline:
+        event = process_registry.completion_queue.get(timeout=1)
+        if str(event.get("delegation_id", "")).startswith("generic-"):
+            events[event["origin_profile"]] = event
+    assert set(events) == {"coder", "reviewer"}
+
+    for event in events.values():
+        bp._process_async_delegation_event(event)
+        bp._process_async_delegation_event(dict(event))
+    assert len(provider_calls) == 2
+    for profile, event in events.items():
+        row = store.get(event["delegation_id"])
+        assert row["state"] == "delivered"
+        journal = turn_journal.read_turn_journal(f"target-{profile}")["events"]
+        assert sum(
+            item.get("event") == "submitted"
+            and item.get("delegation_id") == event["delegation_id"]
+            for item in journal
+        ) == 1
+
+    store.close()
+    restarted = DelegationWakeupStore(store_path)
+    monkeypatch.setattr(bp, "_WAKEUP_STORE", restarted, raising=False)
+    for event in events.values():
+        bp._process_async_delegation_event(dict(event))
+    assert len(provider_calls) == 2

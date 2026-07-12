@@ -22699,6 +22699,8 @@ def _start_chat_stream_for_session(
     session_lock_held: bool = False,
     recovery_claim_token: str | None = None,
     recovery_fingerprint: str | None = None,
+    delegation_id: str = "",
+    delegation_turn_id: str = "",
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     attachments = attachments or []
@@ -22877,10 +22879,25 @@ def _start_chat_stream_for_session(
                     else {}
                 ),
                 "created_at": s.pending_started_at,
+                **(
+                    {
+                        "delegation_id": str(delegation_id),
+                        "turn_id": str(delegation_turn_id),
+                    }
+                    if delegation_id else {}
+                ),
             },
         )
     except Exception:
         logger.warning("Failed to append submitted turn journal event", exc_info=True)
+        if delegation_id:
+            # The durable delegation id is the exactly-once boundary. Never
+            # launch a provider turn that cannot be found by a fresh process.
+            _clear_stale_stream_state(s)
+            return {
+                "error": "delegation turn journal could not be persisted",
+                "_status": 503,
+            }
         if recovery_claim_token or recovery_fingerprint:
             # Recovery requires a durable reservation before any worker starts.
             # Keep the persisted active/pending owner fail-closed and return an
@@ -23071,6 +23088,8 @@ def _start_run(
     session_lock_held: bool = False,
     recovery_claim_token: str | None = None,
     recovery_fingerprint: str | None = None,
+    delegation_id: str = "",
+    delegation_turn_id: str = "",
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -23122,6 +23141,8 @@ def _start_run(
                 session_lock_held=session_lock_held,
                 recovery_claim_token=recovery_claim_token,
                 recovery_fingerprint=recovery_fingerprint,
+                delegation_id=delegation_id,
+                delegation_turn_id=delegation_turn_id,
             )
 
         def _legacy_adapter_factory():
@@ -23144,7 +23165,22 @@ def _start_run(
                     provider=model_provider,
                     model=model,
                     source=source,
-                    metadata={"route": route},
+                    metadata={
+                        "route": route,
+                        **({"delegation_id": delegation_id} if delegation_id else {}),
+                        **(
+                            {"delegation_turn_id": delegation_turn_id}
+                            if delegation_turn_id else {}
+                        ),
+                        **(
+                            {"recovery_claim_token": recovery_claim_token}
+                            if recovery_claim_token else {}
+                        ),
+                        **(
+                            {"recovery_fingerprint": recovery_fingerprint}
+                            if recovery_fingerprint else {}
+                        ),
+                    },
                 )
             )
         except NotImplementedError as exc:
@@ -23167,6 +23203,8 @@ def _start_run(
         session_lock_held=session_lock_held,
         recovery_claim_token=recovery_claim_token,
         recovery_fingerprint=recovery_fingerprint,
+        delegation_id=delegation_id,
+        delegation_turn_id=delegation_turn_id,
     )
 
 
@@ -23226,6 +23264,7 @@ def start_session_turn(
     message: str,
     *,
     source: str = "process_wakeup",
+    delegation_id: str = "",
 ):
     """Start a server-side agent turn for ``session_id`` with ``message``.
 
@@ -23401,17 +23440,58 @@ def start_session_turn(
                 }
     if _paused_wakeup_response is not None:
         return _paused_wakeup_response
-    resp = _start_run(
-        s,
-        msg=msg,
-        attachments=[],
-        workspace=workspace,
-        model=model,
-        model_provider=model_provider,
-        normalized_model=normalized_model,
-        source=turn_source,
-        route="start_session_turn",
-    )
+    delegation_turn_id = ""
+    if delegation_id:
+        from api.turn_journal import find_delegation_turn, reserve_delegation_turn
+
+        existing_turn = find_delegation_turn(session_id, delegation_id)
+        if existing_turn is not None:
+            return {
+                "_status": 200,
+                "session_id": str(session_id),
+                "stream_id": str(existing_turn.get("stream_id") or ""),
+                "turn_id": str(existing_turn.get("turn_id") or ""),
+                "idempotent_replay": True,
+            }
+        reservation, inserted = reserve_delegation_turn(session_id, delegation_id)
+        if not inserted:
+            existing_turn = find_delegation_turn(session_id, delegation_id)
+            if existing_turn is not None:
+                return {
+                    "_status": 200,
+                    "session_id": str(session_id),
+                    "stream_id": str(existing_turn.get("stream_id") or ""),
+                    "turn_id": str(existing_turn.get("turn_id") or ""),
+                    "idempotent_replay": True,
+                }
+            return {
+                "error": "delegation turn is already reserved by a live owner",
+                "_status": 409,
+                "delegation_id": str(delegation_id),
+            }
+        delegation_turn_id = str(reservation.get("turn_id") or "")
+    try:
+        resp = _start_run(
+            s,
+            msg=msg,
+            attachments=[],
+            workspace=workspace,
+            model=model,
+            model_provider=model_provider,
+            normalized_model=normalized_model,
+            source=turn_source,
+            route="start_session_turn",
+            delegation_id=str(delegation_id or ""),
+            delegation_turn_id=delegation_turn_id,
+        )
+    except Exception:
+        if delegation_id:
+            from api.turn_journal import release_delegation_turn
+            release_delegation_turn(session_id, delegation_id, reason="start_exception")
+        raise
+    if delegation_id and int((resp or {}).get("_status", 200) or 200) >= 400:
+        from api.turn_journal import release_delegation_turn
+        release_delegation_turn(session_id, delegation_id, reason="start_rejected")
 
     # A durable continuation reconciles a replayed 409 only when the exact
     # stream is registered in this process. Sidecar ownership fields can be

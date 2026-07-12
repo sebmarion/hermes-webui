@@ -1135,7 +1135,13 @@ def recover_profile_async_delegations() -> int:
         if tracker in seen:
             continue
         seen.add(tracker)
-        result = recover_async_delegations(tracker_path=tracker) or {}
+        try:
+            result = recover_async_delegations(tracker_path=tracker) or {}
+        except TypeError:
+            # Immediately preceding Hermes accepted no tracker_path.  Generic
+            # root-profile recovery remains available; strict BestPlan stays
+            # disabled because that core also lacks capability V1.
+            result = recover_async_delegations() or {}
         queued += int(result.get("queued") or 0)
     return queued
 
@@ -1188,14 +1194,19 @@ def _process_async_delegation_event(evt: dict) -> None:
             delegation_id,
         )
         return
-    wakeup_prompt = str(format_wakeup_prompt(evt) or "").strip()
+    is_bestplan = bool(str(evt.get("bestplan_plan_id") or "").strip())
+    wakeup_prompt = (
+        "BestPlan completion evidence recorded. Explicit user verification or integration is required."
+        if is_bestplan
+        else str(format_wakeup_prompt(evt) or "").strip()
+    )
     if not wakeup_prompt:
         logger.debug("async_delegation drop: formatter returned no prompt for %s", delegation_id)
         return
 
     store = _delegation_wakeup_store()
     existing = store.get(delegation_id) or {}
-    if existing.get("state") == "delivered":
+    if existing.get("state") in {"delivered", "observed"}:
         same_owner = (
             existing.get("session_id") == session_id
             and existing.get("session_key") == session_key
@@ -1241,6 +1252,37 @@ def _process_async_delegation_event(evt: dict) -> None:
             session_id,
         )
         return
+    if is_bestplan:
+        # Make the local row terminal before ACKing Hermes. A crash between an
+        # ACK and this transition must never leave a pending row that the
+        # generic wakeup drain could turn into a parent-model continuation.
+        try:
+            observed = store.mark_observed(delegation_id)
+        except Exception:
+            logger.warning(
+                "BestPlan observational transition failed for %s; leaving unacked",
+                delegation_id,
+                exc_info=True,
+            )
+            return
+        if not observed:
+            logger.error(
+                "BestPlan observational transition lost for %s; leaving unacked",
+                delegation_id,
+            )
+            return
+        with _TRACKER_ACK_LOCK:
+            row = store.get(delegation_id) or {}
+            if row.get("tracker_acked_at") is None:
+                if _try_mark_async_delegation_tracker(evt=evt):
+                    store.mark_tracker_acked(delegation_id)
+        if outcome.status == "inserted":
+            _emit_bg_task_complete_events_coalesced(
+                session_id, _build_payload(evt, session_id),
+            )
+            cfg.PENDING_BG_TASK_COMPLETIONS.add(session_id)
+        return
+
     # Hermes may stop replaying only after WebUI owns the wakeup durably.
     # Serialize the external tracker call with the durable marker update so
     # concurrent duplicate queue events in this host cannot both ACK it.
@@ -1449,6 +1491,7 @@ def _run_claimed_delegation_wakeup(row: dict) -> None:
             str(row.get("session_id") or ""),
             str(row.get("wakeup_prompt") or ""),
             source="process_wakeup",
+            delegation_id=delegation_id,
         )
         status = int((response or {}).get("_status", 200) or 200)
         if status >= 400:
@@ -1768,13 +1811,13 @@ def start_drain_thread() -> bool:
         return True
 
 
-def stop_drain_thread(timeout: float = 2.0) -> None:
+def stop_drain_thread(timeout: float | None = None) -> None:
     _WAKEUP_INTAKE_STOP.set()
     _DRAIN_STOP.set()
     th = _DRAIN_THREAD
     if th is not None and th.is_alive():
         th.join(timeout=timeout)
-    deadline = time.monotonic() + max(0.0, timeout)
+    deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
     while True:
         with _WAKEUP_THREADS_LOCK:
             live = [
@@ -1783,9 +1826,21 @@ def stop_drain_thread(timeout: float = 2.0) -> None:
                 if callable(getattr(worker, "is_alive", None)) and worker.is_alive()
             ]
             _WAKEUP_THREADS.intersection_update(live)
-        if not live or time.monotonic() >= deadline:
+        if not live or (deadline is not None and time.monotonic() >= deadline):
             break
         for worker in live:
             join = getattr(worker, "join", None)
             if callable(join):
-                join(timeout=max(0.0, deadline - time.monotonic()))
+                join(
+                    timeout=None if deadline is None
+                    else max(0.0, deadline - time.monotonic())
+                )
+    if live:
+        try:
+            _delegation_wakeup_store().release_owner_claims(
+                _PROCESS_OWNER_UUID, "shutdown_timeout_abort",
+            )
+        finally:
+            raise RuntimeError(
+                f"shutdown refused to continue with {len(live)} live wakeup worker(s)"
+            )

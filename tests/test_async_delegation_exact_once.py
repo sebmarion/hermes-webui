@@ -56,8 +56,11 @@ def _install_start(monkeypatch, responses=None):
     responses = list(responses or [{"_status": 200, "stream_id": "stream-1"}])
     fake = types.ModuleType("api.routes")
 
-    def start_session_turn(session_id, message, *, source):
-        calls.append({"session_id": session_id, "message": message, "source": source})
+    def start_session_turn(session_id, message, *, source, delegation_id):
+        calls.append({
+            "session_id": session_id, "message": message, "source": source,
+            "delegation_id": delegation_id,
+        })
         return responses.pop(0) if responses else {"_status": 200, "stream_id": "stream-more"}
 
     fake.start_session_turn = start_session_turn

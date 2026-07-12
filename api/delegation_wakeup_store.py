@@ -49,13 +49,17 @@ class DelegationWakeupStore:
     """Small SQLite state machine: pending -> claimed -> delivered."""
 
     def __init__(self, path: str | Path | None = None):
+        legacy_path = None
         if path is None:
             from api.config import STATE_DIR
 
             path = Path(STATE_DIR) / "private" / "delegation_wakeups.sqlite3"
+            legacy_path = Path(STATE_DIR) / "delegation_wakeups.sqlite3"
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(self.path.parent, 0o700)
+        if legacy_path is not None and legacy_path.exists() and legacy_path != self.path:
+            self._migrate_legacy_store(legacy_path)
         self._lock = threading.RLock()
         self._conn = self._connect()
         self._conn.executescript(_SCHEMA)
@@ -63,6 +67,99 @@ class DelegationWakeupStore:
         self._conn.commit()
         self._repair_modes()
         self.prune_delivered()
+
+    def _migrate_legacy_store(self, legacy_path: Path) -> None:
+        """Copy/merge the former public store before opening the private one."""
+        legacy_path = Path(legacy_path)
+        os.chmod(legacy_path, 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = legacy_path.with_name(legacy_path.name + suffix)
+            if sidecar.exists():
+                os.chmod(sidecar, 0o600)
+        legacy = sqlite3.connect(str(legacy_path), timeout=30)
+        legacy.row_factory = sqlite3.Row
+        target = sqlite3.connect(str(self.path), timeout=30)
+        target.row_factory = sqlite3.Row
+        try:
+            if legacy.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise sqlite3.DatabaseError("legacy delegation wakeup store failed integrity check")
+            legacy.execute("PRAGMA wal_checkpoint(FULL)")
+            target.executescript(_SCHEMA)
+            source_columns = {
+                str(row[1]) for row in legacy.execute("PRAGMA table_info(delegation_wakeups)")
+            }
+            if not source_columns:
+                raise sqlite3.DatabaseError(
+                    "legacy delegation wakeup store has no wakeup table"
+                )
+            destination_columns = [
+                str(row[1]) for row in target.execute("PRAGMA table_info(delegation_wakeups)")
+            ]
+            rows = legacy.execute("SELECT * FROM delegation_wakeups").fetchall()
+            target.execute("BEGIN IMMEDIATE")
+            for source_row in rows:
+                source = dict(source_row)
+                delegation_id = str(source.get("delegation_id") or "")
+                existing = target.execute(
+                    "SELECT * FROM delegation_wakeups WHERE delegation_id=?",
+                    (delegation_id,),
+                ).fetchone()
+                values = {}
+                for column in destination_columns:
+                    if column in source:
+                        values[column] = source[column]
+                values.setdefault("origin_profile", "")
+                values.setdefault("origin_tracker_path", "")
+                values.setdefault("origin_ui_session_id", "")
+                if str(values.get("state") or "") == "claimed":
+                    values.update({
+                        "state": "pending",
+                        "claim_token": None,
+                        "claim_owner": None,
+                        "lease_expires_at": None,
+                        "claimed_at": None,
+                        "last_error": "migrated_recoverable_claim",
+                        "updated_at": time.time(),
+                    })
+                if existing is not None:
+                    current = dict(existing)
+                    owner_fields = (
+                        "session_id", "session_key", "origin_profile",
+                        "origin_tracker_path", "origin_ui_session_id",
+                    )
+                    if any(str(current.get(key) or "") != str(values.get(key) or "") for key in owner_fields):
+                        raise sqlite3.IntegrityError(
+                            f"legacy wakeup ownership collision: {delegation_id}"
+                        )
+                    continue
+                columns = sorted(values)
+                placeholders = ",".join("?" for _ in columns)
+                target.execute(
+                    f"INSERT INTO delegation_wakeups ({','.join(columns)}) VALUES ({placeholders})",
+                    tuple(values[column] for column in columns),
+                )
+            for source_row in rows:
+                delegation_id = str(source_row["delegation_id"])
+                if target.execute(
+                    "SELECT 1 FROM delegation_wakeups WHERE delegation_id=?",
+                    (delegation_id,),
+                ).fetchone() is None:
+                    raise sqlite3.DatabaseError(
+                        f"legacy wakeup verification failed: {delegation_id}"
+                    )
+            target.commit()
+        except Exception:
+            target.rollback()
+            raise
+        finally:
+            legacy.close()
+            target.close()
+        os.chmod(self.path, 0o600)
+        for database in (legacy_path, self.path):
+            for suffix in ("-wal", "-shm"):
+                sidecar = database.with_name(database.name + suffix)
+                if sidecar.exists():
+                    os.chmod(sidecar, 0o600)
 
     def _migrate_schema(self) -> None:
         existing = {
@@ -267,6 +364,20 @@ class DelegationWakeupStore:
             self._conn.commit()
             return changed == 1
 
+    def mark_observed(self, delegation_id: str) -> bool:
+        """Terminal observational delivery with no target model turn."""
+        now = time.time()
+        with self._lock:
+            changed = self._conn.execute(
+                """UPDATE delegation_wakeups SET state='observed', delivered_at=?,
+                   updated_at=?, last_error=NULL, wakeup_prompt='', event_json='',
+                   claim_token=NULL, claim_owner=NULL, lease_expires_at=NULL
+                   WHERE delegation_id=? AND state IN ('pending', 'observed')""",
+                (now, now, str(delegation_id)),
+            ).rowcount
+            self._conn.commit()
+            return changed == 1
+
     def mark_tracker_acked(self, delegation_id: str) -> bool:
         with self._lock:
             changed = self._conn.execute(
@@ -291,13 +402,25 @@ class DelegationWakeupStore:
             self._conn.commit()
             return int(changed)
 
+    def release_owner_claims(self, owner_uuid: str, error: str = "shutdown_abort") -> int:
+        with self._lock:
+            changed = self._conn.execute(
+                """UPDATE delegation_wakeups SET state='pending', claim_token=NULL,
+                   claim_owner=NULL, lease_expires_at=NULL, claimed_at=NULL,
+                   updated_at=?, last_error=?
+                   WHERE state='claimed' AND claim_owner=?""",
+                (time.time(), str(error), str(owner_uuid)),
+            ).rowcount
+            self._conn.commit()
+            return int(changed)
+
     def prune_delivered(
         self, *, retention_seconds: float = 45 * 24 * 60 * 60,
     ) -> int:
         cutoff = time.time() - max(float(retention_seconds), 31 * 24 * 60 * 60)
         with self._lock:
             changed = self._conn.execute(
-                "DELETE FROM delegation_wakeups WHERE state='delivered' "
+                "DELETE FROM delegation_wakeups WHERE state IN ('delivered', 'observed') "
                 "AND delivered_at IS NOT NULL AND delivered_at < ?",
                 (cutoff,),
             ).rowcount
