@@ -352,6 +352,58 @@ def test_atomic_recovery_reconciles_only_matching_old_dead_sidecar_owner(recover
     assert persisted.active_stream_id == result["stream_id"]
 
 
+def test_atomic_recovery_stale_owner_save_failure_is_definitive_preflight_rejection(
+    recovery_state, monkeypatch
+):
+    old = time.time() - 4_000
+    _write_sidecar(
+        recovery_state,
+        active_stream_id="dead-stream",
+        pending_user_message=recovery_state["messages"][0]["content"],
+        pending_started_at=old,
+        pending_user_source="webui",
+    )
+    models = recovery_state["models"]
+    real_save = models.Session.save
+
+    def fail_stale_owner_cleanup(session, *args, **kwargs):
+        if session.active_stream_id is None and session.pending_user_source is None:
+            raise OSError("sidecar cleanup unavailable")
+        return real_save(session, *args, **kwargs)
+
+    monkeypatch.setattr(models.Session, "save", fail_stale_owner_cleanup)
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert result["_status"] == 409
+    assert "preflight" in result["error"].lower()
+    assert recovery_state["config"].STREAMS == {}
+
+    from api.turn_journal import read_turn_journal
+
+    assert read_turn_journal("session-1", session_dir=recovery_state["session_dir"])["events"] == []
+
+
+def test_atomic_recovery_post_reload_workspace_error_is_definitive_preflight_rejection(
+    recovery_state, monkeypatch
+):
+    atomic_recovery = recovery_state["atomic_recovery"]
+    real_resolve = atomic_recovery._resolved_existing_directory
+
+    def fail_session_workspace(raw, label):
+        if label == "session":
+            raise OSError("workspace disappeared after reload")
+        return real_resolve(raw, label)
+
+    monkeypatch.setattr(atomic_recovery, "_resolved_existing_directory", fail_session_workspace)
+    result = atomic_recovery.start_atomic_webui_recovery(recovery_state["body"])
+    assert result["_status"] == 409
+    assert "preflight" in result["error"].lower()
+    assert recovery_state["config"].STREAMS == {}
+
+    from api.turn_journal import read_turn_journal
+
+    assert read_turn_journal("session-1", session_dir=recovery_state["session_dir"])["events"] == []
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -501,6 +553,34 @@ def test_atomic_recovery_blocks_workspace_malformed_and_duplicate_state(recovery
     assert "duplicate" in result["error"].lower()
 
 
+def test_atomic_recovery_launch_failed_does_not_close_possible_worker(recovery_state):
+    reservation = _append_journal(
+        recovery_state,
+        {
+            "event": "submitted",
+            "stream_id": "old-stream",
+            "source": "cron-recovery",
+            "recovery_claim_token": "claim-1",
+            "recovery_fingerprint": recovery_state["body"]["transcript_hash"],
+        },
+    )
+    for event_name in ("launch_failed", "worker_started"):
+        _append_journal(
+            recovery_state,
+            {
+                "event": event_name,
+                "stream_id": "old-stream",
+                "turn_id": reservation["turn_id"],
+                "source": "cron-recovery",
+                "recovery_claim_token": "claim-1",
+                "recovery_fingerprint": recovery_state["body"]["transcript_hash"],
+            },
+        )
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert result["_status"] == 409
+    assert "duplicate" in result["error"].lower()
+
+
 @pytest.mark.parametrize("terminal", ["completed", "interrupted"])
 def test_atomic_recovery_terminal_binding_ignores_clock_skew(recovery_state, terminal):
     submitted = _append_journal(
@@ -641,6 +721,155 @@ def test_atomic_recovery_never_launches_without_durable_reservation(recovery_sta
     persisted = _reload_session(recovery_state)
     assert persisted.active_stream_id == result["active_stream_id"]
     assert persisted.pending_user_source == "cron-recovery"
+
+
+def test_atomic_recovery_durable_launch_failure_cleans_owner_and_allows_retry(recovery_state, monkeypatch):
+    routes = recovery_state["routes"]
+
+    class _LaunchFailureThread:
+        ident = None
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(routes.threading, "Thread", _LaunchFailureThread)
+
+    first = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert first["_status"] == 409
+    assert first["recovery_launch_failed"] is True
+    assert recovery_state["config"].STREAMS == {}
+    persisted = _reload_session(recovery_state)
+    assert persisted.active_stream_id is None
+    assert persisted.pending_user_message is None
+    assert persisted.pending_user_source is None
+
+    from api.turn_journal import read_turn_journal
+
+    events = read_turn_journal("session-1", session_dir=recovery_state["session_dir"])["events"]
+    submitted = [
+        event
+        for event in events
+        if event.get("source") == "cron-recovery" and event.get("event") == "submitted"
+    ]
+    failed = [event for event in events if event.get("event") == "launch_failed"]
+    assert len(submitted) == len(failed) == 1
+    assert failed[0]["turn_id"] == submitted[0]["turn_id"]
+    assert failed[0]["stream_id"] == submitted[0]["stream_id"]
+
+    second = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert second["_status"] == 409
+    assert second["recovery_launch_failed"] is True
+    assert "duplicate" not in second["error"].lower()
+
+
+def test_atomic_recovery_cleanup_save_failure_stays_uncertain(recovery_state, monkeypatch):
+    routes = recovery_state["routes"]
+    models = recovery_state["models"]
+    real_save = models.Session.save
+
+    class _LaunchFailureThread:
+        ident = None
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+        def is_alive(self):
+            return False
+
+    def fail_cleanup_save(session, *args, **kwargs):
+        if session.active_stream_id is None and session.pending_user_source is None:
+            raise OSError("sidecar cleanup unavailable")
+        return real_save(session, *args, **kwargs)
+
+    monkeypatch.setattr(routes.threading, "Thread", _LaunchFailureThread)
+    monkeypatch.setattr(models.Session, "save", fail_cleanup_save)
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert result["_status"] == 500
+    assert "cleanup is uncertain" in result["error"].lower()
+
+    from api.turn_journal import read_turn_journal
+
+    events = read_turn_journal("session-1", session_dir=recovery_state["session_dir"])["events"]
+    assert not any(event.get("event") == "launch_failed" for event in events)
+    persisted = _reload_session(recovery_state)
+    assert persisted.active_stream_id == result["active_stream_id"]
+    assert persisted.pending_user_source == "cron-recovery"
+
+
+def test_atomic_recovery_launch_failure_journal_error_stays_uncertain(recovery_state, monkeypatch):
+    from api import turn_journal
+
+    routes = recovery_state["routes"]
+
+    class _LaunchFailureThread:
+        ident = None
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+        def is_alive(self):
+            return False
+
+    def fail_launch_failure_append(*_args, **_kwargs):
+        raise OSError("launch failure journal unavailable")
+
+    monkeypatch.setattr(routes.threading, "Thread", _LaunchFailureThread)
+    monkeypatch.setattr(turn_journal, "append_turn_journal_event_for_stream", fail_launch_failure_append)
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert result["_status"] == 500
+    assert "could not be journaled" in result["error"].lower()
+    persisted = _reload_session(recovery_state)
+    assert persisted.active_stream_id is None
+    assert persisted.pending_user_source is None
+
+    events = turn_journal.read_turn_journal(
+        "session-1", session_dir=recovery_state["session_dir"]
+    )["events"]
+    assert not any(event.get("event") == "launch_failed" for event in events)
+    retry = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert retry["_status"] == 409
+    assert "duplicate" in retry["error"].lower()
+
+
+def test_atomic_recovery_uncertain_launch_keeps_owner_and_reservation(recovery_state, monkeypatch):
+    routes = recovery_state["routes"]
+
+    class _UncertainLaunchThread:
+        ident = 123
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("raised after possible launch")
+
+        def is_alive(self):
+            return False
+
+    monkeypatch.setattr(routes.threading, "Thread", _UncertainLaunchThread)
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(recovery_state["body"])
+    assert result["_status"] == 500
+    assert "uncertain" in result["error"].lower()
+    persisted = _reload_session(recovery_state)
+    assert persisted.active_stream_id == result["active_stream_id"]
+    assert persisted.pending_user_source == "cron-recovery"
+
+    from api.turn_journal import read_turn_journal
+
+    events = read_turn_journal("session-1", session_dir=recovery_state["session_dir"])["events"]
+    assert not any(event.get("event") == "launch_failed" for event in events)
 
 
 def test_atomic_recovery_fails_closed_for_gateway_owner_before_reservation(recovery_state, monkeypatch):

@@ -21038,29 +21038,97 @@ def _start_chat_stream_for_session(
                 "active_stream_id": stream_id,
                 "_status": 500,
             }
-    diag.stage("set_last_workspace") if diag else None
-    set_last_workspace(workspace)
-    diag.stage("stream_registration") if diag else None
-    stream = create_stream_channel()
-    register_stream_owner(stream_id, s.session_id)
-    with STREAMS_LOCK:
-        STREAMS[stream_id] = stream
-    # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
-    if goal_related:
-        STREAM_GOAL_RELATED[stream_id] = True
-    diag.stage("worker_thread_start") if diag else None
-    backend_is_gateway = webui_gateway_chat_enabled(get_config())
-    worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
-    worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
-    if moa_config and not backend_is_gateway:
-        worker_kwargs["moa_config"] = moa_config
-    thr = threading.Thread(
-        target=worker_target,
-        args=(s.session_id, msg, model, workspace, stream_id, attachments),
-        kwargs=worker_kwargs,
-        daemon=True,
-    )
-    thr.start()
+    thr = None
+    try:
+        diag.stage("set_last_workspace") if diag else None
+        set_last_workspace(workspace)
+        diag.stage("stream_registration") if diag else None
+        stream = create_stream_channel()
+        register_stream_owner(stream_id, s.session_id)
+        with STREAMS_LOCK:
+            STREAMS[stream_id] = stream
+        # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
+        if goal_related:
+            STREAM_GOAL_RELATED[stream_id] = True
+        diag.stage("worker_thread_start") if diag else None
+        backend_is_gateway = webui_gateway_chat_enabled(get_config())
+        worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
+        worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
+        if moa_config and not backend_is_gateway:
+            worker_kwargs["moa_config"] = moa_config
+        thr = threading.Thread(
+            target=worker_target,
+            args=(s.session_id, msg, model, workspace, stream_id, attachments),
+            kwargs=worker_kwargs,
+            daemon=True,
+        )
+        thr.start()
+    except Exception:
+        if not (recovery_claim_token or recovery_fingerprint):
+            raise
+        logger.exception("Atomic recovery worker launch failed for stream %s", stream_id)
+        with ACTIVE_RUNS_LOCK:
+            active_run_exists = stream_id in (ACTIVE_RUNS or {})
+        try:
+            # ``ident`` remains set after a thread exits, so this also catches
+            # the started-and-finished-before-observation case.
+            thread_started = bool(thr and (thr.is_alive() or thr.ident is not None))
+        except Exception:
+            thread_started = True
+        if active_run_exists or thread_started:
+            # A custom Thread implementation could raise after starting. Keep
+            # ownership and reservation intact because launch is uncertain.
+            return {
+                "error": "Atomic recovery worker launch outcome is uncertain",
+                "active_stream_id": stream_id,
+                "_status": 500,
+            }
+        try:
+            with STREAMS_LOCK:
+                STREAMS.pop(stream_id, None)
+                STREAM_GOAL_RELATED.pop(stream_id, None)
+                STREAM_LAST_EVENT_ID.pop(stream_id, None)
+                CANCEL_FLAGS.pop(stream_id, None)
+            unregister_stream_owner(stream_id)
+            if getattr(s, "active_stream_id", None) == stream_id:
+                s.active_stream_id = None
+                s.pending_user_message = None
+                s.pending_attachments = []
+                s.pending_started_at = None
+                s.pending_user_source = None
+                s.save(touch_updated_at=False)
+        except Exception:
+            logger.exception("Atomic recovery launch ownership cleanup failed for stream %s", stream_id)
+            return {
+                "error": "Atomic recovery worker launch cleanup is uncertain",
+                "active_stream_id": stream_id,
+                "_status": 500,
+            }
+        try:
+            from api.turn_journal import append_turn_journal_event_for_stream
+            append_turn_journal_event_for_stream(
+                s.session_id,
+                stream_id,
+                {
+                    "event": "launch_failed",
+                    "source": "cron-recovery",
+                    "recovery_claim_token": recovery_claim_token,
+                    "recovery_fingerprint": recovery_fingerprint,
+                    "created_at": time.time(),
+                },
+            )
+        except Exception:
+            logger.exception("Atomic recovery launch failure could not be journaled for stream %s", stream_id)
+            return {
+                "error": "Atomic recovery worker launch failure could not be journaled",
+                "active_stream_id": stream_id,
+                "_status": 500,
+            }
+        return {
+            "error": "Atomic recovery worker failed before launch",
+            "recovery_launch_failed": True,
+            "_status": 409,
+        }
     response = {
         "stream_id": stream_id,
         "session_id": s.session_id,

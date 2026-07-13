@@ -273,7 +273,14 @@ journal. It retains that lock through `_start_run()` and stream reservation, so 
 concurrent human `/api/chat/start` and recovery start have exactly one winner.
 Malformed, stale, active, pending, terminal, duplicate, source-mismatched, or
 workspace-mismatched recovery candidates fail closed. `runner-local` is also
-rejected here because its reservation owner is outside the WebUI process. A
+rejected here because its reservation owner is outside the WebUI process. The
+recovery `submitted` reservation is durable before stream registration or worker
+start. If launch then fails and no worker or active run can exist, stream and
+sidecar ownership are durably cleared before an exact `launch_failed` event is
+appended; only that fully completed transition releases the watchdog slot and
+permits a later retry. If launch may have occurred, cleanup is uncertain, or the
+failure event cannot be persisted, the endpoint returns an uncertain server
+error instead. A
 journal `completed` event is necessary but not sufficient for watchdog success:
 the exact assistant message recorded by that terminal event must end with a
 strict `RECOVERED: <summary>` marker; `RECOVERY_BLOCKED: <reason>` remains

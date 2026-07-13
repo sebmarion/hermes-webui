@@ -1,6 +1,8 @@
 import json
 import os
 
+import pytest
+
 import api.turn_journal as turn_journal
 from api.session_recovery import audit_session_recovery
 from api.turn_journal import (
@@ -96,6 +98,48 @@ def test_append_turn_journal_event_still_writes_when_fcntl_unavailable(tmp_path,
 
     result = read_turn_journal("sid-1", session_dir=tmp_path)
     assert result["events"][0]["turn_id"] == "turn-no-fcntl"
+
+
+def test_append_turn_journal_event_fails_closed_when_directory_fsync_fails(tmp_path, monkeypatch):
+    real_fsync = turn_journal.os.fsync
+    fsync_calls = 0
+
+    def fail_directory_fsync(fd):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 2:
+            raise OSError("directory fsync unavailable")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(turn_journal.os, "fsync", fail_directory_fsync)
+    with pytest.raises(OSError, match="directory fsync unavailable"):
+        append_turn_journal_event(
+            "sid-1",
+            {"event": "submitted", "turn_id": "turn-dir-fsync", "content": "hello"},
+            session_dir=tmp_path,
+        )
+    assert fsync_calls == 2
+
+
+def test_append_turn_journal_event_fails_closed_when_new_journal_parent_fsync_fails(tmp_path, monkeypatch):
+    real_fsync = turn_journal.os.fsync
+    fsync_calls = 0
+
+    def fail_parent_fsync(fd):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 3:
+            raise OSError("journal parent fsync unavailable")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(turn_journal.os, "fsync", fail_parent_fsync)
+    with pytest.raises(OSError, match="journal parent fsync unavailable"):
+        append_turn_journal_event(
+            "sid-1",
+            {"event": "submitted", "turn_id": "turn-parent-fsync", "content": "hello"},
+            session_dir=tmp_path,
+        )
+    assert fsync_calls == 3
 
 
 def test_derive_turn_journal_states_keeps_latest_event_per_turn():

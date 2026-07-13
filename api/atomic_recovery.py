@@ -251,6 +251,59 @@ def _split_qualified_model(raw) -> tuple[str, str | None]:
     return value, None
 
 
+def _has_unclosed_recovery_reservation(events: list[dict], claim_token: str, fingerprint: str) -> bool:
+    """Return whether a matching recovery reservation could have launched.
+
+    A durable ``launch_failed`` event closes only its exact submitted turn. It
+    is written after proving no worker became live, so a later watchdog attempt
+    may safely reuse the deterministic claim/fingerprint. Missing or conflicting
+    lifecycle evidence remains fail-closed.
+    """
+    reservations = [
+        event
+        for event in events
+        if str(event.get("event") or "") == "submitted"
+        and str(event.get("source") or "") == "cron-recovery"
+        and (
+            str(event.get("recovery_claim_token") or "") == claim_token
+            or str(event.get("recovery_fingerprint") or "") == fingerprint
+        )
+    ]
+    for reservation in reservations:
+        if (
+            str(reservation.get("recovery_claim_token") or "") != claim_token
+            or str(reservation.get("recovery_fingerprint") or "") != fingerprint
+        ):
+            return True
+        turn_id = str(reservation.get("turn_id") or "")
+        stream_id = str(reservation.get("stream_id") or "")
+        if not turn_id or not stream_id:
+            return True
+        lifecycle = [
+            event
+            for event in events
+            if str(event.get("turn_id") or "") == turn_id
+            and str(event.get("stream_id") or "") == stream_id
+        ]
+        failed = [event for event in lifecycle if str(event.get("event") or "") == "launch_failed"]
+        ambiguous_lifecycle = [
+            event
+            for event in lifecycle
+            if str(event.get("event") or "") not in {"submitted", "launch_failed"}
+        ]
+        if len(failed) != 1 or ambiguous_lifecycle:
+            return True
+        failure = failed[0]
+        if (
+            str(failure.get("recovery_claim_token") or "")
+            != str(reservation.get("recovery_claim_token") or "")
+            or str(failure.get("recovery_fingerprint") or "")
+            != str(reservation.get("recovery_fingerprint") or "")
+        ):
+            return True
+    return False
+
+
 def _resolved_existing_directory(raw, label: str) -> Path:
     try:
         path = Path(str(raw or "")).expanduser().resolve(strict=True)
@@ -372,17 +425,14 @@ def start_atomic_webui_recovery(body: dict) -> dict:
         terminal = journal.get("terminal_event")
         if terminal:
             return _blocked(f"Recovery blocked because the latest turn is {terminal}")
-        for event in journal.get("events") or []:
-            if str(event.get("source") or "") != "cron-recovery":
-                continue
-            if (
-                str(event.get("recovery_claim_token") or "") == claim_token
-                or str(event.get("recovery_fingerprint") or "") == fingerprint
-            ):
-                return _blocked("Duplicate recovery reservation already exists")
+        if _has_unclosed_recovery_reservation(journal.get("events") or [], claim_token, fingerprint):
+            return _blocked("Duplicate recovery reservation already exists")
 
-        from api import routes
-        from api.models import Session
+        try:
+            from api import routes
+            from api.models import Session
+        except Exception:
+            return _blocked("Recovery preflight dependencies are unavailable")
 
         try:
             session = Session.load(session_id)
@@ -393,42 +443,52 @@ def start_atomic_webui_recovery(body: dict) -> dict:
         session_profile = str(getattr(session, "profile", None) or "default").strip() or "default"
         if session_profile != profile:
             return _blocked("Recovery profile does not own the loaded WebUI session")
-        from api.gateway_chat import webui_gateway_chat_enabled
-        from api.runtime_adapter import runtime_adapter_runner_enabled
+        try:
+            from api.gateway_chat import webui_gateway_chat_enabled
+            from api.runtime_adapter import runtime_adapter_runner_enabled
 
-        if webui_gateway_chat_enabled():
-            return _blocked("Atomic recovery is unavailable for Gateway-owned chat execution", 501)
-        if runtime_adapter_runner_enabled():
-            return _blocked("Atomic recovery is unavailable when an external runner owns reservation", 501)
-        stale_owner_error = _reconcile_stale_sidecar_owner(session, db_state)
-        if stale_owner_error:
-            return _blocked(stale_owner_error)
-        if _resolved_existing_directory(getattr(session, "workspace", None), "session") != requested_workspace:
-            return _blocked("Recovery workspace mismatch after session reload")
-        db_model = str(db_state.get("model") or "").strip()
-        session_model, qualified_provider = _split_qualified_model(getattr(session, "model", None))
-        session_provider = str(getattr(session, "model_provider", None) or "").strip()
-        if not db_model or not session_model:
-            return _blocked("Authoritative WebUI session model is missing")
-        if session_model != db_model:
-            return _blocked("Recovery model mismatch after session reload")
-        if qualified_provider and session_provider and qualified_provider != session_provider:
-            return _blocked("Recovery model provider mismatch after session reload")
-        with LOCK:
-            cached_session = SESSIONS.get(session_id)
-            if cached_session is not None and cached_session is not session:
-                # A human request may already hold a reference returned by
-                # get_session() before recovery acquired this session lock.
-                # Preserve that object identity while replacing its persisted
-                # snapshot; otherwise the stale human object can start a second
-                # stream immediately after recovery releases the lock.
-                # Update persisted fields in place rather than swapping or
-                # clearing the object: concurrent readers may already hold this
-                # reference, and must never observe a transient empty __dict__.
-                cached_session.__dict__.update(session.__dict__)
-                session = cached_session
-            SESSIONS[session_id] = session
-            SESSIONS.move_to_end(session_id)
+            if webui_gateway_chat_enabled():
+                return _blocked("Atomic recovery is unavailable for Gateway-owned chat execution", 501)
+            if runtime_adapter_runner_enabled():
+                return _blocked("Atomic recovery is unavailable when an external runner owns reservation", 501)
+        except Exception:
+            return _blocked("Recovery execution-owner preflight failed before reservation")
+
+        try:
+            stale_owner_error = _reconcile_stale_sidecar_owner(session, db_state)
+            if stale_owner_error:
+                return _blocked(stale_owner_error)
+            if _resolved_existing_directory(getattr(session, "workspace", None), "session") != requested_workspace:
+                return _blocked("Recovery workspace mismatch after session reload")
+            db_model = str(db_state.get("model") or "").strip()
+            session_model, qualified_provider = _split_qualified_model(getattr(session, "model", None))
+            session_provider = str(getattr(session, "model_provider", None) or "").strip()
+            if not db_model or not session_model:
+                return _blocked("Authoritative WebUI session model is missing")
+            if session_model != db_model:
+                return _blocked("Recovery model mismatch after session reload")
+            if qualified_provider and session_provider and qualified_provider != session_provider:
+                return _blocked("Recovery model provider mismatch after session reload")
+            with LOCK:
+                cached_session = SESSIONS.get(session_id)
+                if cached_session is not None and cached_session is not session:
+                    # A human request may already hold a reference returned by
+                    # get_session() before recovery acquired this session lock.
+                    # Preserve that object identity while replacing its persisted
+                    # snapshot; otherwise the stale human object can start a second
+                    # stream immediately after recovery releases the lock.
+                    # Update persisted fields in place rather than swapping or
+                    # clearing the object: concurrent readers may already hold this
+                    # reference, and must never observe a transient empty __dict__.
+                    cached_session.__dict__.update(session.__dict__)
+                    session = cached_session
+                SESSIONS[session_id] = session
+                SESSIONS.move_to_end(session_id)
+        except Exception:
+            # Nothing has been journaled or launched yet. This is a definitive
+            # preflight rejection, not an uncertain start: returning 409 lets the
+            # watchdog release its machine-global dispatch slot safely.
+            return _blocked("Recovery preflight failed before reservation")
 
         return routes._start_run(
             session,

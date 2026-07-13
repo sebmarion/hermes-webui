@@ -63,6 +63,18 @@ def _journal_file_lock(file_obj):
         _fcntl.flock(file_obj.fileno(), _fcntl.LOCK_UN)
 
 
+def _fsync_directory(path: Path) -> None:
+    """Durably commit directory entries on platforms that expose O_DIRECTORY."""
+    o_directory = getattr(os, "O_DIRECTORY", None)
+    if o_directory is None:
+        return
+    dir_fd = os.open(path, os.O_RDONLY | o_directory)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def append_turn_journal_event(
     session_id: str,
     event: dict,
@@ -88,6 +100,7 @@ def append_turn_journal_event(
         payload.setdefault("terminal", True)
 
     path = _journal_path(session_id, session_dir=session_dir)
+    journal_dir_was_missing = not path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
     fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
@@ -96,16 +109,12 @@ def append_turn_journal_event(
             fh.write(line)
             fh.flush()
             os.fsync(fh.fileno())
-    o_directory = getattr(os, "O_DIRECTORY", None)
-    if o_directory is not None:
-        try:
-            dir_fd = os.open(path.parent, o_directory)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
+    # A newly-created shard is not a durable reservation until its directory
+    # entry is durable too. When the journal directory itself was created, its
+    # name must also be committed in the existing session directory.
+    _fsync_directory(path.parent)
+    if journal_dir_was_missing:
+        _fsync_directory(path.parent.parent)
     return payload
 
 
