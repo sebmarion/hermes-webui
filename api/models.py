@@ -6700,6 +6700,57 @@ def _all_profiles_cli_contexts() -> tuple[list[tuple[Path, Path, str | None]], t
     return contexts, tuple(cache_entries)
 
 
+def shared_interactive_sidebar_projection_all_profiles(
+    sidecar_rows: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Project each profile against its own canonical state database."""
+    rows = [row for row in (sidecar_rows or []) if isinstance(row, dict)]
+    contexts, _cache_key = _all_profiles_cli_contexts()
+    if not contexts:
+        return rows, []
+
+    projected: list[dict] = []
+    legacy: list[dict] = []
+    represented_profiles: set[str] = set()
+    for _hermes_home, db_path, profile in contexts:
+        profile_name = str(profile or "default").strip() or "default"
+        if profile_name in represented_profiles:
+            continue
+        represented_profiles.add(profile_name)
+        profile_sidecars = [
+            row
+            for row in rows
+            if (str(row.get("profile") or "default").strip() or "default")
+            == profile_name
+        ]
+        profile_rows, profile_legacy = shared_interactive_sidebar_projection(
+            profile_sidecars,
+            profile=profile_name,
+            db_path=db_path,
+        )
+        projected.extend(profile_rows)
+        legacy.extend(profile_legacy)
+
+    # Preserve rows from a profile that disappeared between sidecar loading and
+    # profile-context enumeration. The next cache rebuild can reconcile them;
+    # this request must not destructively drop the last-known-good row.
+    projected.extend(
+        row
+        for row in rows
+        if (str(row.get("profile") or "default").strip() or "default")
+        not in represented_profiles
+    )
+    projected.sort(
+        key=lambda row: row.get("last_message_at") or row.get("updated_at") or 0,
+        reverse=True,
+    )
+    legacy.sort(
+        key=lambda row: row.get("last_message_at") or row.get("updated_at") or 0,
+        reverse=True,
+    )
+    return projected, legacy
+
+
 def clear_sidecar_metadata_cache() -> None:
     """Drop all memoized sidebar-projection sidecar metadata (test/lifecycle hook)."""
     with _SIDECAR_METADATA_CACHE_LOCK:
@@ -6760,6 +6811,375 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
             while len(_SIDECAR_METADATA_CACHE) > _SIDECAR_METADATA_CACHE_MAX:
                 _SIDECAR_METADATA_CACHE.popitem(last=False)
     return dict(metadata)
+
+
+def shared_interactive_sidebar_projection(
+    sidecar_rows: list[dict],
+    *,
+    profile: str | None = None,
+    db_path: Path | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Return state.db-first interactive rows plus the legacy WebUI archive.
+
+    The state database owns shared conversation identity and metadata. A
+    matching sidecar contributes only runtime/UI overlays (stream recovery,
+    project presentation, and other WebUI-only fields). Sidecar-only archived
+    conversations are returned separately so callers can render them without
+    mixing them into the canonical list. Empty sidecars are intentionally
+    ignored. If state.db is unavailable the original rows are returned
+    unchanged, preserving the non-destructive degradation contract.
+    """
+    state_db_path = Path(db_path) if db_path is not None else _active_state_db_path()
+    try:
+        canonical_rows = read_shared_session_rows(
+            state_db_path,
+            sources=SHARED_INTERACTIVE_SESSION_SOURCES,
+            include_archived=True,
+        )
+    except Exception:
+        logger.debug("Shared interactive state projection unavailable", exc_info=True)
+        return list(sidecar_rows or []), []
+    if not canonical_rows:
+        # An empty projection can mean a missing/old DB, a profile with no
+        # interactive rows, or a caller whose state-db path is temporarily
+        # unavailable. Do not classify archived sidecars as legacy until there
+        # is an actual canonical WebUI projection to compare them against.
+        return list(sidecar_rows or []), []
+
+    try:
+        active_stream_ids = set(_active_stream_ids())
+    except Exception:
+        active_stream_ids = set()
+
+    def _is_webui_sidecar(row: dict) -> bool:
+        markers = {
+            str(row.get(key) or "").strip().lower()
+            for key in ("source", "source_tag", "raw_source", "session_source", "source_label")
+        }
+        markers.discard("")
+        return not markers or "webui" in markers
+
+    def _is_shared_interactive_sidecar(row: dict) -> bool:
+        if _is_webui_sidecar(row):
+            return True
+        markers = {
+            str(row.get(key) or "").strip().lower()
+            for key in ("source", "source_tag", "raw_source", "session_source", "source_label")
+        }
+        markers.discard("")
+        return bool(
+            markers & set(SHARED_INTERACTIVE_SESSION_SOURCES)
+            or "cli" in markers
+            or is_cli_session_row(row)
+        )
+
+    sidecar_rows = [row for row in (sidecar_rows or []) if isinstance(row, dict)]
+    sidecars = {
+        str(row.get("session_id")): row
+        for row in sidecar_rows
+        if row.get("session_id") and _is_shared_interactive_sidecar(row)
+    }
+    webui_sidecars = {
+        sid: row
+        for sid, row in sidecars.items()
+        if _is_webui_sidecar(row)
+    }
+
+    # Older WebUI builds kept pins only in the JSON sidecar. Import those bits
+    # once, before state.db becomes authoritative. The marker is deliberately
+    # separate from the session rows: a later explicit unpin must be able to
+    # remain false even while the legacy sidecar still contains ``pinned``.
+    pin_migration_marker = state_db_path.parent / ".webui-shared-pins-state-db-v2.migrated"
+    if not pin_migration_marker.exists():
+        try:
+            from api.state_sync import sync_session_pinned
+
+            canonical_by_alias = {}
+            for canonical in canonical_rows:
+                canonical_id = str(canonical.get("id") or "").strip()
+                if not canonical_id:
+                    continue
+                aliases = {
+                    canonical_id,
+                    str(canonical.get("_lineage_root_id") or "").strip(),
+                    str(canonical.get("_lineage_tip_id") or "").strip(),
+                    *(
+                        str(member_id).strip()
+                        for member_id in (canonical.get("_lineage_member_ids") or [])
+                        if str(member_id).strip()
+                    ),
+                }
+                for alias in aliases - {""}:
+                    canonical_by_alias[alias] = canonical
+
+            pinned_canonicals = {
+                id(canonical): canonical
+                for sidecar_id, sidecar in webui_sidecars.items()
+                if bool(sidecar.get("pinned"))
+                for canonical in [canonical_by_alias.get(sidecar_id)]
+                if canonical is not None
+                and str(canonical.get("source") or "").strip().lower() == "webui"
+            }
+            for canonical in pinned_canonicals.values():
+                canonical_id = str(canonical.get("id") or "").strip()
+                if canonical_id and not bool(canonical.get("pinned")):
+                    sync_session_pinned(canonical_id, True, profile=profile)
+                    canonical["pinned"] = True
+
+            pin_migration_marker.parent.mkdir(parents=True, exist_ok=True)
+            pin_migration_marker.touch(exist_ok=True)
+        except Exception:
+            # Leave the marker absent so a transient state.db failure retries
+            # on the next projection instead of losing legacy pins.
+            logger.debug("Failed to migrate legacy WebUI pins", exc_info=True)
+    # The shared projection owns interactive rows only. Cron, gateway,
+    # messaging, and other externally-owned sidecars still belong to the
+    # existing source-specific merge pipeline.
+    passthrough = [row for row in sidecar_rows if not _is_shared_interactive_sidecar(row)]
+    if passthrough:
+        try:
+            passthrough_ids = {
+                str(row.get("session_id"))
+                for row in passthrough
+                if row.get("session_id")
+            }
+            passthrough_metadata = _read_state_db_sidebar_overrides(
+                state_db_path,
+                passthrough_ids,
+                count_session_ids=passthrough_ids,
+            )
+            _apply_sidebar_state_db_override_metadata(passthrough, passthrough_metadata)
+        except Exception:
+            logger.debug("Failed to overlay state.db metadata on external sidecars", exc_info=True)
+    deleted_tombstones = _load_webui_deleted_session_tombstone()
+    represented_ids: set[str] = set()
+    projected: list[dict] = []
+    runtime_fields = {
+        "active_stream_id", "pending_user_message", "pending_attachments",
+        "pending_started_at", "pending_user_source", "has_pending_user_message",
+        "is_streaming", "project_id", "attention", "default_hidden",
+        "worktree_path", "worktree_branch", "worktree_repo_root", "worktree_created_at",
+        "read_only", "enabled_toolsets", "composer_draft",
+        # Usage remains WebUI-side presentation metadata until the shared
+        # agent projection exposes a stable usage schema. Preserve it from a
+        # matching sidecar so compact sidebar responses keep their historical
+        # contract while titles/archive/cwd come from state.db.
+        "input_tokens", "output_tokens", "estimated_cost",
+        "cache_read_tokens", "cache_write_tokens", "cache_hit_percent",
+        "total_tokens", "reasoning_tokens", "cost_usd",
+    }
+    for state_row in canonical_rows:
+        sid = str(state_row.get("id") or "").strip()
+        if not sid:
+            continue
+        source_meta = normalize_agent_session_source(state_row.get("source"))
+        raw_source = str(
+            source_meta.get("raw_source") or state_row.get("source") or "webui"
+        ).strip().lower()
+        aliases = {
+            sid,
+            str(state_row.get("_lineage_root_id") or "").strip(),
+            str(state_row.get("_lineage_tip_id") or "").strip(),
+        }
+        aliases.update(
+            str(member_id).strip()
+            for member_id in (state_row.get("_lineage_member_ids") or [])
+            if str(member_id).strip()
+        )
+        aliases.discard("")
+        represented_ids.update(aliases)
+        # Prefer the visible tip's sidecar. If an older lineage segment is the
+        # only sidecar available, choose the freshest overlay deterministically
+        # instead of iterating an unordered alias set and allowing an archived
+        # branch's stale title to win.
+        tip_id = str(state_row.get("_lineage_tip_id") or sid).strip()
+        overlay = sidecars.get(tip_id) or sidecars.get(sid)
+        if overlay is None:
+            candidates = [sidecars[alias] for alias in aliases if alias in sidecars]
+
+            def _overlay_activity(row: dict) -> float:
+                for key in ("last_message_at", "updated_at", "created_at"):
+                    try:
+                        value = float(row.get(key) or 0)
+                    except (TypeError, ValueError):
+                        value = 0.0
+                    if value:
+                        return value
+                return 0.0
+
+            overlay = max(candidates, key=_overlay_activity, default=None)
+        if raw_source == "webui" and sid in deleted_tombstones and overlay is None:
+            # A WebUI sidecar deletion is intentionally stronger than the
+            # append-only state.db mirror. The tombstone prevents a stale
+            # state.db row from resurfacing as an Agent/WebUI ghost until a
+            # genuinely new sidecar is written for that id.
+            represented_ids.update(aliases)
+            continue
+        state_title = str(state_row.get("title") or "").strip()
+        overlay_title = str((overlay or {}).get("title") or "").strip()
+        if not state_title and overlay_title and overlay_title.lower() != "untitled":
+            try:
+                from api.state_sync import sync_session_title
+
+                # Existing sidecars are the only durable title source for some
+                # older WebUI rows. Backfill only blank state.db titles; once a
+                # title exists there, state.db remains authoritative for both
+                # clients and a stale sidecar cannot overwrite a Hermes One
+                # rename.
+                sync_session_title(sid, overlay_title, profile=profile)
+            except Exception:
+                logger.debug("Failed to backfill WebUI title %s to state.db", sid, exc_info=True)
+        row = {
+            "id": sid,
+            "session_id": sid,
+            "canonical_session_id": sid,
+            "title": state_title or overlay_title or "Untitled",
+            "workspace": state_row.get("cwd") or (overlay or {}).get("workspace") or str(get_last_workspace()),
+            "cwd": state_row.get("cwd") or (overlay or {}).get("cwd") or (overlay or {}).get("workspace") or str(get_last_workspace()),
+            "model": state_row.get("model") or (overlay or {}).get("model"),
+            "message_count": max(
+                int(state_row.get("message_count") or 0),
+                int(state_row.get("actual_message_count") or 0),
+            ),
+            "actual_message_count": state_row.get("actual_message_count"),
+            "created_at": state_row.get("started_at") or (overlay or {}).get("created_at", 0),
+            "updated_at": state_row.get("last_activity") or state_row.get("started_at") or (overlay or {}).get("updated_at", 0),
+            "last_message_at": state_row.get("last_activity") or state_row.get("started_at") or (overlay or {}).get("last_message_at", 0),
+            "archived": bool(state_row.get("archived")),
+            "pinned": bool(state_row.get("pinned")),
+            "profile": profile or (overlay or {}).get("profile") or "default",
+            "source_tag": raw_source,
+            "raw_source": raw_source,
+            "session_source": source_meta.get("session_source") or "webui",
+            "source": raw_source,
+            "source_label": source_meta.get("source_label") or raw_source.title(),
+            "is_cli_session": is_cli_session_row({
+                **state_row,
+                **source_meta,
+                "source_tag": raw_source,
+            }),
+            "_shared_interactive": True,
+            "parent_session_id": state_row.get("parent_session_id"),
+            "end_reason": state_row.get("end_reason"),
+            "relationship_type": state_row.get("relationship_type"),
+            "_lineage_root_id": state_row.get("_lineage_root_id"),
+            "_lineage_tip_id": state_row.get("_lineage_tip_id") or sid,
+            "_compression_segment_count": state_row.get("_compression_segment_count"),
+        }
+        if overlay:
+            overlay_stream_id = str(overlay.get("active_stream_id") or "").strip()
+            overlay_runtime_is_live = bool(
+                overlay_stream_id and overlay_stream_id in active_stream_ids
+            )
+            for key in runtime_fields:
+                if key in {
+                    "active_stream_id",
+                    "pending_user_message",
+                    "pending_attachments",
+                    "pending_started_at",
+                    "pending_user_source",
+                    "has_pending_user_message",
+                    "is_streaming",
+                } and not overlay_runtime_is_live:
+                    continue
+                if key in overlay:
+                    row[key] = overlay[key]
+        projected.append(row)
+
+    # Preserve messageful interactive sidecars whose canonical row is not yet
+    # visible (for example a first-turn recovery race). They remain in the main
+    # list and carry the shared marker, but never enter the legacy WebUI archive.
+    for sid, sidecar in sidecars.items():
+        if sid in represented_ids or sid in webui_sidecars:
+            continue
+        try:
+            message_count = int(sidecar.get("message_count") or 0)
+        except (TypeError, ValueError):
+            message_count = 0
+        has_runtime_signal = bool(
+            sidecar.get("active_stream_id")
+            or sidecar.get("has_pending_user_message")
+            or sidecar.get("pending_user_message")
+            or sidecar.get("worktree_path")
+        )
+        if message_count <= 0 and not has_runtime_signal:
+            continue
+        item = dict(sidecar)
+        source_meta = normalize_agent_session_source(
+            item.get("raw_source") or item.get("source_tag") or item.get("source")
+        )
+        item.setdefault("id", sid)
+        item.setdefault("session_id", sid)
+        item.setdefault("canonical_session_id", sid)
+        item.setdefault("raw_source", source_meta.get("raw_source"))
+        item.setdefault("session_source", source_meta.get("session_source"))
+        item.setdefault("source_label", source_meta.get("source_label"))
+        item["_shared_interactive"] = True
+        projected.append(item)
+
+    legacy: list[dict] = []
+    for sid, sidecar in webui_sidecars.items():
+        if sid in represented_ids:
+            continue
+        try:
+            message_count = int(sidecar.get("message_count") or 0)
+        except (TypeError, ValueError):
+            message_count = 0
+        has_runtime_signal = bool(
+            sidecar.get("active_stream_id")
+            or sidecar.get("has_pending_user_message")
+            or sidecar.get("pending_user_message")
+            or sidecar.get("worktree_path")
+        )
+        has_sidebar_title = bool(
+            str(sidecar.get("title") or "").strip()
+            and str(sidecar.get("title") or "").strip().lower() != "untitled"
+        )
+        if message_count <= 0:
+            try:
+                message_count = len(sidecar.get("messages") or [])
+            except (TypeError, AttributeError):
+                message_count = 0
+        if not bool(sidecar.get("archived")):
+            # A current sidecar can predate its first state.db write or be in
+            # the middle of a recovery write. Preserve messageful/runtime
+            # active rows until the next state.db reconciliation; the normal
+            # orphan-prune path still removes truly empty stale rows.
+            if message_count > 0 or has_runtime_signal or has_sidebar_title:
+                projected.append(dict(sidecar))
+            continue
+        if message_count <= 0:
+            continue
+        item = dict(sidecar)
+        item.setdefault("id", sid)
+        item.setdefault("session_id", sid)
+        item.setdefault("canonical_session_id", sid)
+        item.setdefault("cwd", item.get("workspace"))
+        item.setdefault("source", "legacy_webui")
+        item["source"] = "legacy_webui"
+        item["source_tag"] = "legacy_webui"
+        item["source_label"] = "Legacy WebUI Archive"
+        item["legacy_webui_archive"] = True
+        item["canonical_id"] = sid
+        legacy.append(item)
+    projected = passthrough + projected
+    projected.sort(key=lambda row: (row.get("last_message_at") or row.get("updated_at") or 0), reverse=True)
+    legacy.sort(key=lambda row: (row.get("last_message_at") or row.get("updated_at") or 0), reverse=True)
+    return projected, legacy
+
+
+def shared_webui_sidebar_projection(
+    sidecar_rows: list[dict],
+    *,
+    profile: str | None = None,
+    db_path: Path | None = None,
+) -> tuple[list[dict], list[dict]]:
+    """Compatibility alias for the shared interactive sidebar projection."""
+    return shared_interactive_sidebar_projection(
+        sidecar_rows,
+        profile=profile,
+        db_path=db_path,
+    )
 
 
 def _load_cli_sessions_uncached(
