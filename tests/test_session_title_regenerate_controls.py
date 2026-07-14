@@ -69,14 +69,14 @@ def test_regenerate_helper_persists_generated_title_and_publishes_sidebar_refres
     assert "session_id=sid" in helper_block
 
 
-def test_regenerate_endpoint_syncs_title_to_state_db_when_enabled():
+def test_regenerate_endpoint_syncs_title_to_shared_state_db_unconditionally():
     helper_idx = ROUTES_PY.index("def _sync_session_title_to_insights")
     endpoint_idx = ROUTES_PY.index('"/api/session/title/regenerate"')
     helper_block = ROUTES_PY[helper_idx:endpoint_idx]
-    assert 'load_settings().get("sync_to_insights")' in helper_block
-    assert "sync_session_usage" in helper_block
+    assert 'load_settings().get("sync_to_insights")' not in helper_block
+    assert "sync_session_metadata" in helper_block
+    assert "sync_session_usage" not in helper_block
     assert "title=session.title" in helper_block
-    assert "message_count=len(messages)" in helper_block
     assert "profile=getattr(session, \"profile\", None)" in helper_block
 
 

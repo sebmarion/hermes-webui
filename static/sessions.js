@@ -777,16 +777,6 @@ function _purgeStaleInflightEntries() {
       if (s && s.session_id) sessionsById.set(s.session_id, s);
     }
   }
-  const sourceById = typeof _sessionListSourceById !== 'undefined'
-    && _sessionListSourceById
-    && typeof _sessionListSourceById.get === 'function'
-    ? _sessionListSourceById
-    : null;
-  const currentSidebarSource = typeof _allSessionsScope !== 'undefined'
-    && _allSessionsScope
-    && typeof _allSessionsScope.sidebarSource === 'string'
-    ? _allSessionsScope.sidebarSource
-    : null;
   for (const sid of Object.keys(INFLIGHT)) {
     // #4354: purge stale INFLIGHT even for a hung/idle session, BUT skip the one
     // session actively mid-send (#2689 start-race) — during /api/chat/start the
@@ -796,10 +786,6 @@ function _purgeStaleInflightEntries() {
       continue;
     }
     if (!sessionsById.has(sid)) {
-      const knownSource = sourceById ? sourceById.get(sid) : null;
-      if (currentSidebarSource && (!knownSource || knownSource !== currentSidebarSource)) {
-        continue;
-      }
       // Session is absent from _allSessions — it was deleted / archived /
       // filtered and can never stream again, so drop the entry.
       delete INFLIGHT[sid];
@@ -816,7 +802,7 @@ function _purgeStaleInflightEntries() {
   }
 }
 
-function _rememberSessionListSource(s, sid = null, allowScopeFallback = true) {
+function _rememberSessionListSource(s, sid = null) {
   const resolvedSid = sid || (s && s.session_id);
   if (!resolvedSid) return;
   let source = null;
@@ -828,13 +814,6 @@ function _rememberSessionListSource(s, sid = null, allowScopeFallback = true) {
     if (cached && typeof _isCliSession === 'function') {
       source = _isCliSession(cached) ? 'cli' : 'webui';
     }
-  }
-  if (!source
-    && allowScopeFallback
-    && typeof _allSessionsScope !== 'undefined'
-    && _allSessionsScope
-    && typeof _allSessionsScope.sidebarSource === 'string') {
-    source = _allSessionsScope.sidebarSource;
   }
   if (source
     && typeof _sessionListSourceById !== 'undefined'
@@ -1019,11 +998,6 @@ function _markPollingCompletionUnreadTransitions(sessions) {
     && typeof _sessionListSourceById.delete === 'function'
     ? _sessionListSourceById
     : new Map();
-  const currentSidebarSource = typeof _allSessionsScope !== 'undefined'
-    && _allSessionsScope
-    && typeof _allSessionsScope.sidebarSource === 'string'
-    ? _allSessionsScope.sidebarSource
-    : null;
   for (const s of sessions) {
     if (!s || !s.session_id) continue;
     const sid = s.session_id;
@@ -1073,8 +1047,6 @@ function _markPollingCompletionUnreadTransitions(sessions) {
   ]);
   for (const sid of staleRuntimeStateSids) {
     if (seen.has(sid)) continue;
-    const knownSource = sourceById.get(sid);
-    if (currentSidebarSource && (!knownSource || knownSource !== currentSidebarSource)) continue;
     _sessionStreamingById.delete(sid);
     _sessionListSnapshotById.delete(sid);
     sourceById.delete(sid);
@@ -1288,7 +1260,6 @@ async function newSession(flash, options={}){
     }
     S.session=data.session;S.messages=data.session.messages||[];
     S._pendingSessionToolsets=null;
-    if(_sessionSourceFilter==='cli') _sessionSourceFilter='webui';
     if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
     S.lastUsage={...(data.session.last_usage||{})};
     if(!(options&&options.worktree)) _rememberNewChatDraftSession(S.session);
@@ -2300,20 +2271,6 @@ function _isCliSession(session) {
   return session.is_cli_session === true;
 }
 
-function _sessionSourceLabel(filter, count) {
-  const n = Number(count) || 0;
-  return filter === 'cli' ? `CLI sessions (${n})` : `WebUI sessions (${n})`;
-}
-
-function _clearSessionSourceTabCounts() {
-  _serverWebuiSessionCount = null;
-  _serverCliSessionCount = null;
-}
-
-function _requestedSessionSidebarSource() {
-  return window._showCliSessions ? _sessionSourceFilter : 'webui';
-}
-
 function _sessionListExcludeHiddenEnabled() {
   return _activeProject===null || _activeProject===NO_PROJECT_FILTER;
 }
@@ -2329,7 +2286,6 @@ function _sessionArchivePagingFilterActive() {
 
 function _sessionListQueryString() {
   const qs = new URLSearchParams();
-  qs.set('sidebar_source', _requestedSessionSidebarSource());
   if(_sessionListExcludeHiddenEnabled()) qs.set('exclude_hidden','1');
   if(_showAllProfiles) qs.set('all_profiles','1');
   if(_showArchived){
@@ -2345,37 +2301,12 @@ function _sessionListQueryString() {
   return `?${qs.toString()}`;
 }
 
-function _sessionSourceTabCount(filter, renderedWebuiSessionCount, renderedCliSessionCount) {
-  const serverCount = filter === 'cli' ? _serverCliSessionCount : _serverWebuiSessionCount;
-  if (Number.isFinite(serverCount)) return serverCount;
-  return filter === 'cli' ? renderedCliSessionCount : renderedWebuiSessionCount;
-}
-
 function _setActiveProjectFilter(projectId) {
   const next = projectId === NO_PROJECT_FILTER ? NO_PROJECT_FILTER : (projectId || null);
   if (_activeProject === next) return;
   _activeProject = next;
   renderSessionListFromCache();
   void renderSessionList({deferWhileInteracting:false});
-}
-
-function _setSessionSourceFilter(filter) {
-  const next = filter === 'cli' ? 'cli' : 'webui';
-  if (_sessionSourceFilter === next) return;
-  _sessionSourceFilter = next;
-  _activeProject = null;
-  _selectedSessions.clear();
-  _sessionSelectMode = false;
-  try { localStorage.setItem('hermes-session-source-filter', next); } catch (_e) {}
-  renderSessionListFromCache();
-  void renderSessionList({deferWhileInteracting:false});
-}
-
-function _restoreSessionSourceFilter() {
-  try {
-    const raw = localStorage.getItem('hermes-session-source-filter');
-    if (raw === 'cli' || raw === 'webui') _sessionSourceFilter = raw;
-  } catch (_e) {}
 }
 
 function _normalizeMessageForCliImportComparison(message) {
@@ -3583,6 +3514,7 @@ const SESSION_ARCHIVED_PAGE_SIZE = 100;
 const SESSION_ARCHIVED_MAX_LOADED_LIMIT = 2000;
 let _allSessions = [];  // cached for search filter
 let _sidebarReferenceSessions = [];  // hidden archived ancestor rows used only for nesting/suppression
+let _legacyWebuiArchive = [];  // sidecar-only archived history, imported one session at a time
 let _allSessionsScope = null;  // {profile, allProfiles} the cache was loaded under (#4167)
 let _sessionAttentionSoundPrimed = false;
 const _sessionAttentionSoundState = new Map();
@@ -3603,12 +3535,8 @@ const SHOW_ALL_PROFILES_STORAGE_KEY = 'hermes-show-all-profiles';
 let _showAllProfiles = false;  // false = filter to active profile only
 let _profileSwitchOpeningExistingSession = false;  // true while cross-profile sidebar click switches profile before loadSession()
 let _otherProfileCount = 0;       // count of sessions from other profiles (server-reported)
-let _archivedWebuiCount = 0;      // archived WebUI sessions not fetched until requested
-let _archivedCliCount = 0;        // archived non-WebUI sessions not fetched until requested
+let _archivedCount = 0;           // combined archived conversations not fetched until requested
 let _archivedRowsLoadedLimit = SESSION_ARCHIVED_PAGE_SIZE;
-let _serverWebuiSessionCount = null;  // explicit server count for WebUI sessions
-let _serverCliSessionCount = null;    // explicit server count for CLI sessions
-let _sessionSourceFilter = 'webui';  // 'webui' keeps WebUI chats separate from read-only CLI sessions
 
 function _restoreShowAllProfiles(){
   try{
@@ -3623,7 +3551,6 @@ function _setShowAllProfiles(enabled){
 }
 
 _restoreShowAllProfiles();
-_restoreSessionSourceFilter();
 let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
@@ -4220,6 +4147,7 @@ function _buildSessionRenameStarter(session, displayEl, renderDisplay){
       const newTitle=inp.value.trim()||'Untitled';
       try{
         if(newTitle!==oldTitle){
+          await _ensureSidebarSessionProfile(session);
           await api('/api/session/rename',{method:'POST',body:JSON.stringify({session_id:session.session_id,title:newTitle})});
         }
         applyTitle(newTitle);
@@ -4443,6 +4371,7 @@ async function _archiveSession(session, archived=true, beforeListRender=null){
   const reflowPositions=_captureSessionReflowPositions();
   const renderHold=beforeListRender?Promise.resolve().then(beforeListRender):null;
   try{
+    await _ensureSidebarSessionProfile(session);
     const response=await api('/api/session/archive',{method:'POST',body:JSON.stringify({session_id:session.session_id,archived})});
     session.archived=archived;
     const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
@@ -4525,6 +4454,7 @@ function _openSessionActionMenu(session, anchorEl){
       closeSessionActionMenu();
       const newPinned=!session.pinned;
       try{
+        await _ensureSidebarSessionProfile(session);
         await api('/api/session/pin',{method:'POST',body:JSON.stringify({session_id:session.session_id,pinned:newPinned})});
         session.pinned=newPinned;
         const cached=(_allSessions||[]).find(s=>s&&s.session_id===session.session_id);
@@ -4781,8 +4711,7 @@ function showSessionListSkeleton(targetProfile){
   const knownCount = (typeof targetProfile === 'string' && targetProfile
       && typeof _knownSessionProfileCount === 'function')
     ? _knownSessionProfileCount(targetProfile) : null;
-  const filterActive = (typeof _activeProject !== 'undefined' && _activeProject)
-    || (typeof _sessionSourceFilter !== 'undefined' && _sessionSourceFilter === 'cli');
+  const filterActive = (typeof _activeProject !== 'undefined' && _activeProject);
   const wrap = document.createElement('div');
   wrap.setAttribute('aria-hidden', 'true');
   if(knownCount === 0 && !filterActive){
@@ -4989,15 +4918,14 @@ function _sessionListRenderSignature(){
     return JSON.stringify([
       _allSessions,
       _sidebarReferenceSessions,
+      _legacyWebuiArchive,
       _allProjects,
       _activeSessionIdForSidebar(),
       search,
-      _sessionSourceFilter,
       !!_sessionSelectMode,
       (window._sidebarDensity==='detailed'?'d':'c'),
       !!_showAllProfiles,
-      _otherProfileCount,_archivedWebuiCount,_archivedCliCount,
-      _serverWebuiSessionCount,_serverCliSessionCount,
+      _otherProfileCount,_archivedCount,
     ]);
   }catch(_){ return null; }
 }
@@ -5006,16 +4934,8 @@ function _applySessionListPayload(sessData, projData){
   // active profile so the "Show N from other profiles" toggle can render
   // without a second round-trip. Stashed on the module for renderSessionListFromCache.
   _otherProfileCount = sessData.other_profile_count || 0;
-  _archivedWebuiCount = Number(sessData.archived_webui_count ?? sessData.archived_count ?? 0);
-  _archivedCliCount = Number(sessData.archived_cli_count ?? 0);
-  _serverWebuiSessionCount = Object.prototype.hasOwnProperty.call(sessData, 'webui_session_count')
-    ? Number(sessData.webui_session_count)
-    : null;
-  _serverCliSessionCount = Object.prototype.hasOwnProperty.call(sessData, 'cli_session_count')
-    ? Number(sessData.cli_session_count)
-    : null;
-  if (!Number.isFinite(_serverWebuiSessionCount)) _serverWebuiSessionCount = null;
-  if (!Number.isFinite(_serverCliSessionCount)) _serverCliSessionCount = null;
+  _archivedCount = Number(sessData.archived_count ?? 0);
+  if (!Number.isFinite(_archivedCount)) _archivedCount = 0;
   // Capture server clock for clock-skew compensation (issue #1144).
   // server_time is epoch seconds from the server's time.time().
   // _serverTimeDelta = client - server, so (Date.now() - _serverTimeDelta)
@@ -5032,6 +4952,9 @@ function _applySessionListPayload(sessData, projData){
   _sidebarReferenceSessions = Array.isArray(sessData.sidebar_reference_sessions)
     ? sessData.sidebar_reference_sessions
     : [];
+  _legacyWebuiArchive = Array.isArray(sessData.legacy_webui_archive)
+    ? sessData.legacy_webui_archive
+    : [];
   _reconcileActiveSessionIdleStateFromList(serverSessions);
   _allSessions = _mergeOptimisticFirstTurnSessions(serverSessions);
   // Tag the cache with the scope it was loaded under (active profile +
@@ -5043,18 +4966,16 @@ function _applySessionListPayload(sessData, projData){
       ? sessData.active_profile
       : (S.activeProfile || 'default'),
     allProfiles: !!_showAllProfiles,
-    sidebarSource: _requestedSessionSidebarSource(),
     excludeHidden: _sessionListExcludeHiddenEnabled(),
   };
   // Record this profile's session count so the NEXT switch into it can pick an
   // honest skeleton (empty-state vs content) before its fetch resolves (#4717).
   // Only record an UNFILTERED total: skip all-profiles (conflates profiles), and
-  // skip while a project or CLI-source filter is active (those record a filtered
-  // subset that could cache a misleading 0 for a profile that has sessions under
-  // a different filter). This mirrors the read-side `filterActive` gate in
+  // skip while a project filter is active (it records a filtered subset that
+  // could cache a misleading 0 for a profile with sessions in another project).
+  // This mirrors the read-side `filterActive` gate in
   // showSessionListSkeleton so the write and read agree on what the count means.
-  const _recordFilterActive = (typeof _activeProject !== 'undefined' && _activeProject)
-    || (typeof _sessionSourceFilter !== 'undefined' && _sessionSourceFilter === 'cli');
+  const _recordFilterActive = (typeof _activeProject !== 'undefined' && _activeProject);
   if (!_showAllProfiles && !_recordFilterActive) {
     _recordSessionProfileCount(_allSessionsScope.profile, _allSessions.length);
   }
@@ -5256,13 +5177,11 @@ async function _runRenderSessionListRefresh(opts, _gen){
     const _curScope = {
       profile: S.activeProfile || 'default',
       allProfiles: !!_showAllProfiles,
-      sidebarSource: _requestedSessionSidebarSource(),
       excludeHidden: _sessionListExcludeHiddenEnabled(),
     };
     const _scopeMatches = _allSessionsScope
       && _allSessionsScope.profile === _curScope.profile
       && _allSessionsScope.allProfiles === _curScope.allProfiles
-      && _allSessionsScope.sidebarSource === _curScope.sidebarSource
       && _allSessionsScope.excludeHidden === _curScope.excludeHidden;
     // #4671: the /api/sessions fetch failed — clear the skeleton flag so this error
     // render (matched cache, or empty rows for a mismatched scope) replaces the
@@ -5274,7 +5193,6 @@ async function _runRenderSessionListRefresh(opts, _gen){
       _allSessions = [];
       _sidebarReferenceSessions = [];
       _allSessionsScope = _curScope;
-      _clearSessionSourceTabCounts();
       renderSessionListFromCache();
     }
   }
@@ -5312,6 +5230,23 @@ async function _drainRenderSessionListQueue(initialRequest){
       _renderSessionListQueuedRequest=null;
       _renderSessionListInFlight=_drainRenderSessionListQueue(next);
     }
+  }
+}
+
+async function _resumeLegacyWebuiArchiveSession(session){
+  const sid=String(session&&(
+    session.canonical_id||session.session_id
+  )||'').trim();
+  if(!sid) return;
+  try{
+    // This explicit history request is the lazy-import boundary. The server
+    // imports only this archived sidecar into state.db, then the normal loader
+    // resumes from the canonical shared projection.
+    await api(`/api/sessions/${encodeURIComponent(sid)}/messages`, {timeoutMs:120000});
+    await loadSession(sid, {force:true, skipLineageResolve:true});
+  }catch(err){
+    const message='Could not resume legacy WebUI session: '+(err&&err.message||err);
+    if(typeof showToast==='function') showToast(message,4000,'error');
   }
 }
 
@@ -7053,23 +6988,13 @@ function _sidebarRowHasVisibleMessages(s, activeSidForSidebar){
 }
 
 function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
-  let cliSessionCount=0;
-  const webuiProfileFiltered=[];
-  const cliProfileFiltered=[];
-  const webuiReferenceRaw=[];
-  const cliReferenceRaw=[];
-  const webuiSessionsRaw=[];
-  const cliSessionsRaw=[];
-  let webuiArchivedCount=0;
-  let cliArchivedCount=0;
+  const profileFiltered=[];
+  const referenceRaw=[];
+  const sessionsRaw=[];
+  let localArchivedCount=0;
   for(const s of allMatched){
     if(!_sidebarRowHasVisibleMessages(s, activeSidForSidebar)) continue;
-    const isCli=_isCliSession(s);
-    if(isCli) cliSessionCount++;
     if(s.default_hidden&&!(_activeProject&&_activeProject!==NO_PROJECT_FILTER&&s.project_id===_activeProject)) continue;
-    const profileFiltered=isCli ? cliProfileFiltered : webuiProfileFiltered;
-    const referenceRaw=isCli ? cliReferenceRaw : webuiReferenceRaw;
-    const sessionsRaw=isCli ? cliSessionsRaw : webuiSessionsRaw;
     profileFiltered.push(s);
     if(_activeProject===NO_PROJECT_FILTER){
       if(s.project_id) continue;
@@ -7077,44 +7002,29 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
       if(s.project_id!==_activeProject) continue;
     }
     referenceRaw.push(s);
-    if(s.archived){
-      if(isCli) cliArchivedCount++;
-      else webuiArchivedCount++;
-    }
+    if(s.archived) localArchivedCount++;
     if(!_showArchived&&s.archived) continue;
     sessionsRaw.push(s);
   }
-  if(_sessionSourceFilter==='cli' && !window._showCliSessions && cliSessionCount===0){
-    _sessionSourceFilter='webui';
-  }
-  const showCliOnly=_sessionSourceFilter==='cli';
-  const serverArchivedCount=showCliOnly?_archivedCliCount:_archivedWebuiCount;
   return {
-    cliSessionCount,
-    profileFiltered: showCliOnly ? cliProfileFiltered : webuiProfileFiltered,
-    sessionsRaw: showCliOnly ? cliSessionsRaw : webuiSessionsRaw,
-    archivedCount: Math.max(showCliOnly ? cliArchivedCount : webuiArchivedCount, Number(serverArchivedCount||0)),
-    webuiReferenceRaw,
-    cliReferenceRaw,
-    webuiSessionsRaw,
-    cliSessionsRaw,
+    profileFiltered,
+    referenceRaw,
+    sessionsRaw,
+    archivedCount: Math.max(localArchivedCount, Number(_archivedCount||0)),
   };
 }
 
 // Hidden archived-ancestor reference rows (sidebar_reference_sessions) arrive
-// from /api/sessions WITHOUT the client-side project/source scoping that
+// from /api/sessions WITHOUT the client-side project scoping that
 // _partitionSidebarSessionRows applies to the visible rows. Appending them to
 // EVERY render unconditionally let an archived parent from a DIFFERENT project
-// (or the other source bucket) enter a project/source-filtered render's
-// suppression context — silently hiding a visible child/fork whose archived
+// enter a project-filtered render's suppression context — silently hiding a visible child/fork whose archived
 // ancestor lives outside the current view. Scope the references to the same
-// project + source bucket as the render they feed before using them.
-function _scopedSidebarReferenceRows(isCli){
+// project as the render they feed before using them.
+function _scopedSidebarReferenceRows(){
   if(typeof _sidebarReferenceSessions==='undefined'||!Array.isArray(_sidebarReferenceSessions)||!_sidebarReferenceSessions.length) return [];
   return _sidebarReferenceSessions.filter(s=>{
     if(!s) return false;
-    // Source scope: only references in the same webui/cli bucket as this render.
-    if(_isCliSession(s)!==!!isCli) return false;
     // Project scope: mirror _partitionSidebarSessionRows exactly.
     if(_activeProject===NO_PROJECT_FILTER){ if(s.project_id) return false; }
     else if(_activeProject){ if(s.project_id!==_activeProject) return false; }
@@ -7209,30 +7119,12 @@ function renderSessionListFromCache(){
   const searchMatches=_sessionSearchMergeMatches(sidebarRows,searchQueryRaw,_contentSearchResults);
   const allMatched=_ensureActiveSessionRowPresent(searchMatches,sidebarRows);
   const {
-    cliSessionCount,
     profileFiltered,
     sessionsRaw,
     archivedCount,
-    webuiReferenceRaw,
-    cliReferenceRaw,
-    webuiSessionsRaw,
-    cliSessionsRaw,
+    referenceRaw,
   }=_partitionSidebarSessionRows(allMatched, activeSidForSidebar);
-  const referenceRaw=_sessionSourceFilter==='cli'?cliReferenceRaw:webuiReferenceRaw;
-  const isCliView=_sessionSourceFilter==='cli';
-  const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw, [...referenceRaw, ..._scopedSidebarReferenceRows(isCliView)]);
-  // Server-provided source bucket counts are authoritative for the current
-  // payload. When present, skip the expensive cross-bucket render/count pass;
-  // null is a deliberate "not computed" sentinel consumed only by
-  // _sessionSourceTabCount's fallback path below.
-  const renderedWebuiSessionCount=_serverWebuiSessionCount===null
-    ? _renderSidebarRowsFromRawSessions(webuiSessionsRaw, [...webuiReferenceRaw, ..._scopedSidebarReferenceRows(false)]).length
-    : null;
-  const renderedCliSessionCount=_serverCliSessionCount===null
-    ? _renderSidebarRowsFromRawSessions(cliSessionsRaw, [...cliReferenceRaw, ..._scopedSidebarReferenceRows(true)]).length
-    : null;
-  const webuiSessionTabCount=_sessionSourceTabCount('webui', renderedWebuiSessionCount, renderedCliSessionCount);
-  const cliSessionTabCount=_sessionSourceTabCount('cli', renderedWebuiSessionCount, renderedCliSessionCount);
+  const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw, [...referenceRaw, ..._scopedSidebarReferenceRows()]);
   _syncSidebarExpansionForActiveSession(sessions, activeSidForSidebar);
   const list=$('sessionList');
   const animateRefresh=_sessionListRefreshAnimationPending;
@@ -7273,21 +7165,6 @@ function renderSessionListFromCache(){
   if(_sessionListLoadError){
     const note=_renderSessionListLoadErrorNote();
     if(note) list.appendChild(note);
-  }
-  if(window._showCliSessions || cliSessionCount>0){
-    const sourceTabs=document.createElement('div');
-    sourceTabs.className='session-source-tabs';
-    for(const filter of ['webui','cli']){
-      const count=filter==='cli'?cliSessionTabCount:webuiSessionTabCount;
-      const btn=document.createElement('button');
-      btn.type='button';
-      btn.className='session-source-tab'+(_sessionSourceFilter===filter?' active':'');
-      btn.textContent=_sessionSourceLabel(filter,count);
-      btn.setAttribute('aria-pressed', _sessionSourceFilter===filter?'true':'false');
-      btn.onclick=()=>_setSessionSourceFilter(filter);
-      sourceTabs.appendChild(btn);
-    }
-    list.appendChild(sourceTabs);
   }
   // Project filter bar — show when there are real projects OR there are
   // unassigned sessions (so the Unassigned chip has something to filter to).
@@ -7421,12 +7298,7 @@ function renderSessionListFromCache(){
     list.appendChild(toggle);
   }
   // Empty state for active project filter
-  if(_sessionSourceFilter==='cli'&&sessions.length===0){
-    const empty=document.createElement('div');
-    empty.className='session-empty-note';
-    empty.textContent=window._showCliSessions?'No CLI sessions found.':'Enable Show agent sessions in Settings to list CLI sessions here.';
-    list.appendChild(empty);
-  } else if(_activeProject&&sessions.length===0){
+  if(_activeProject&&sessions.length===0){
     const empty=document.createElement('div');
     empty.className='session-empty-note';
     empty.textContent=_activeProject===NO_PROJECT_FILTER?'No unassigned sessions.':'No sessions in this project yet.';
@@ -7568,8 +7440,8 @@ function renderSessionListFromCache(){
   }
   const archivePagingFilterActive=_sessionArchivePagingFilterActive();
   if(_showArchived&&!archivePagingFilterActive){
-    const activeArchivedTotal=_sessionSourceFilter==='cli'?_archivedCliCount:_archivedWebuiCount;
-    const loadedArchivedCount=sidebarRows.filter(s=>s&&s.archived&&(_sessionSourceFilter==='cli'?_isCliSession(s):!_isCliSession(s))).length;
+    const activeArchivedTotal=_archivedCount;
+    const loadedArchivedCount=sidebarRows.filter(s=>s&&s.archived).length;
     const archiveLoadCapReached=Number(_archivedRowsLoadedLimit||0)>=SESSION_ARCHIVED_MAX_LOADED_LIMIT;
     const remainingArchived=archiveLoadCapReached?0:Math.max(0, Number(activeArchivedTotal||0)-loadedArchivedCount);
     if(remainingArchived>0){
@@ -7586,6 +7458,30 @@ function renderSessionListFromCache(){
       };
       list.appendChild(more);
     }
+  }
+  if(_legacyWebuiArchive.length>0){
+    const legacySection=document.createElement('div');
+    legacySection.className='session-date-group legacy-webui-archive';
+    const legacyHeader=document.createElement('div');
+    legacyHeader.className='session-date-header';
+    legacyHeader.textContent='Legacy WebUI Archive';
+    legacySection.appendChild(legacyHeader);
+    const legacyBody=document.createElement('div');
+    legacyBody.className='session-date-body';
+    for(const legacy of _legacyWebuiArchive){
+      const row=document.createElement('button');
+      row.type='button';
+      row.className='session-item archived legacy-webui-archive-item';
+      row.dataset.sid=String(legacy.session_id||legacy.canonical_id||'');
+      const title=document.createElement('span');
+      title.className='session-title';
+      title.textContent=String(legacy.title||'Untitled');
+      row.appendChild(title);
+      row.onclick=()=>_resumeLegacyWebuiArchiveSession(legacy);
+      legacyBody.appendChild(row);
+    }
+    legacySection.appendChild(legacyBody);
+    list.appendChild(legacySection);
   }
   // Select mode toggle button (only when NOT in select mode)
   if(!_sessionSelectMode){

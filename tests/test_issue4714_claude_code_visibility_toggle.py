@@ -50,6 +50,11 @@ def _clear_cache(monkeypatch):
     # These unit tests pin the full reconciliation builder. The v2 bounded
     # seed/background contract is covered in test_session_projection_hot_path.
     monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
+    monkeypatch.setattr(
+        routes,
+        "_get_cached_session_list_payload",
+        lambda *, builder, **_kwargs: builder(),
+    )
     routes._session_list_cache_clear()
     models.clear_cli_sessions_cache()
     yield

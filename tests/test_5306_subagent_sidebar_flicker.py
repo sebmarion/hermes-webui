@@ -113,7 +113,7 @@ def test_5306_active_parent_delegate_child_survives_zero_message_partition():
 global.S = { session: { session_id: 'active_parent', message_count: 5 }, busy: true, activeStreamId: 's1' };
 global._activeProject = null;
 global._showArchived = false;
-global._sessionSourceFilter = 'webui';
+global._archivedCount = 0;
 const allMatched = [
   { session_id:'active_parent', title:'Parent WebUI', session_source:'webui', raw_source:'webui', source_tag:'webui', message_count:5, is_streaming:true, active_stream_id:'s1', updated_at:100, last_message_at:100 },
   { session_id:'subagent_child', title:'Subagent Session', parent_session_id:'active_parent', relationship_type:'child_session', raw_source:'subagent', source_tag:'subagent', session_source:'other', _parent_lineage_root_id:'active_parent', _cross_surface_child_session:true, message_count:0, updated_at:101, last_message_at:101 },
@@ -121,7 +121,7 @@ const allMatched = [
 ];
 const activeSid = 'active_parent';
 const part = _partitionSidebarSessionRows(allMatched, activeSid);
-const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw);
+const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.referenceRaw);
 const parent = rows.find(r=>r.session_id==='active_parent') || {};
 console.log(JSON.stringify({
   sessionsRaw: part.sessionsRaw.map(s=>s.session_id),
@@ -154,14 +154,14 @@ def test_5306_child_across_two_renders_stays_present():
 global.S = { session: { session_id: 'active_parent', message_count: 5 }, busy: true, activeStreamId: 's1' };
 global._activeProject = null;
 global._showArchived = false;
-global._sessionSourceFilter = 'webui';
+global._archivedCount = 0;
 function renderOnce(childMsgCount){
   const allMatched = [
     { session_id:'active_parent', title:'Parent WebUI', session_source:'webui', raw_source:'webui', source_tag:'webui', message_count:5, is_streaming:true, active_stream_id:'s1', updated_at:100, last_message_at:100 },
     { session_id:'subagent_child', title:'Subagent Session', parent_session_id:'active_parent', relationship_type:'child_session', raw_source:'subagent', source_tag:'subagent', session_source:'other', _parent_lineage_root_id:'active_parent', _cross_surface_child_session:true, message_count:childMsgCount, updated_at:101, last_message_at:101 },
   ];
   const part = _partitionSidebarSessionRows(allMatched, 'active_parent');
-  const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw);
+  const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.referenceRaw);
   const parent = rows.find(r=>r.session_id==='active_parent') || {};
   return (parent._child_sessions||[]).map(c=>c.session_id);
 }
@@ -200,7 +200,7 @@ def test_5305_delegate_child_with_filtered_out_parent_is_not_orphaned():
 global.S = { session: null, busy: false, activeStreamId: null };
 global._activeProject = global.NO_PROJECT_FILTER;
 global._showArchived = false;
-global._sessionSourceFilter = 'webui';
+global._archivedCount = 0;
 // Parent carries project_id (dropped by the "no project" filter); the delegate
 // child has no project_id and survives the same filter.
 const allMatched = [
@@ -208,7 +208,7 @@ const allMatched = [
   { session_id:'subagent_child', title:'Subagent Session', parent_session_id:'proj_parent', relationship_type:'child_session', raw_source:'subagent', source_tag:'subagent', session_source:'other', _parent_lineage_root_id:'proj_parent', _cross_surface_child_session:true, message_count:3, updated_at:101, last_message_at:101 },
 ];
 const part = _partitionSidebarSessionRows(allMatched, null);
-const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.webuiReferenceRaw);
+const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.referenceRaw);
 console.log(JSON.stringify({
   sessionsRaw: part.sessionsRaw.map(s=>s.session_id),
   topLevel: rows.map(r=>r.session_id),

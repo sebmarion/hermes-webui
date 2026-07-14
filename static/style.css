@@ -5642,10 +5642,6 @@ main.main > #mainPlugin{display:none;}
 .mermaid-rendered svg{max-width:100%;height:auto;cursor:default;}
 
 /* ── Session projects ── */
-.session-source-tabs{display:flex;gap:4px;padding:4px 10px 8px;flex-shrink:0;}
-.session-source-tab{flex:1;min-width:0;border:1px solid var(--border2);border-radius:10px;background:var(--input-bg);color:var(--muted);font-size:10px;font-weight:700;line-height:1.2;padding:5px 6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background .15s,color .15s,border-color .15s;}
-.session-source-tab:hover{background:rgba(255,255,255,.08);color:var(--text);}
-.session-source-tab.active{background:var(--accent-bg);color:var(--accent-text);border-color:var(--accent-bg);}
 .session-empty-note{padding:20px 14px;color:var(--muted);font-size:12px;text-align:center;opacity:.7;}
 .session-list-error{margin:4px 10px 8px;padding:10px 12px;border:1px solid var(--border2);border-radius:8px;background:var(--surface);color:var(--text);display:flex;flex-direction:column;align-items:flex-start;gap:4px;text-align:left;opacity:1;}
 .session-list-error>div:first-child{font-size:12px;font-weight:600;line-height:1.35;word-break:break-word;}
