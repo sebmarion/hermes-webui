@@ -27,7 +27,7 @@ name: Docker smoke
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
     paths:
       - 'Dockerfile'
       - 'docker_init.bash'
@@ -36,7 +36,7 @@ on:
       - '.env.docker.example'
       - '.github/workflows/docker-smoke.yml'
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - 'Dockerfile'
       - 'docker_init.bash'
