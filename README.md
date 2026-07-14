@@ -225,8 +225,9 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Download as Markdown transcript, full JSON export, or import from JSON
 - Create a public read-only share link for the active conversation from the Control Center; shared pages show a sanitized transcript snapshot without workspace, profile, or live controls
 - Sessions persist across page reloads and SSH tunnel reconnects
+- Hermes One, WebUI, CLI, TUI, and ACP interactive conversations share one sidebar list through `~/.hermes/state.db`; source badges show where a conversation originated without splitting it into a separate tab. WebUI sidecars remain the streaming/recovery and legacy-archive layer, with archived sidecar-only history imported one conversation at a time when resumed
 - Browser tab title reflects the active session name
-- CLI session bridge -- CLI sessions from hermes-agent's SQLite store appear in the sidebar with a gold "cli" badge; click to import with full history and reply normally
+- Optional external-session bridge -- channel, cron, webhook, Claude Code, and other imported sessions can be enabled separately; shared interactive Hermes conversations are always visible
 - Token/cost display -- input tokens, output tokens, estimated cost shown per conversation (toggle in Settings or `/usage` command)
 
 ### Workspace file browser
@@ -284,7 +285,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 ### Settings and configuration
 - **Hermes Control Center** (sidebar launcher button) -- Conversation tab (export/import/clear), Preferences tab (model, send key, theme, language, all toggles), System tab (version, password)
 - Send key: Enter (default) or Ctrl/Cmd+Enter
-- Show/hide CLI sessions toggle (enabled by default)
+- Show/hide optional external sessions toggle; Hermes One, CLI, TUI, and ACP conversations remain in the shared list regardless
 - Token usage display toggle (off by default, also via `/usage` command)
 - Control Center always opens on the Conversation tab; resets on close
 - Unsaved changes guard -- discard/save prompt when closing with unpersisted changes
@@ -548,7 +549,7 @@ api/
   onboarding.py   First-run onboarding wizard, OAuth provider support
   profiles.py     Profile state management, hermes_cli wrapper
   routes.py       All GET + POST route handlers (if/elif dispatch, no decorators)
-  state_sync.py   /insights sync — message_count to state.db
+  state_sync.py   Shared state.db bridge — metadata, counts, and lineage
   streaming.py    SSE engine, run_agent, cancellation, compression
   updates.py      Self-update check and release notes
   upload.py       Multipart parser, file upload handler

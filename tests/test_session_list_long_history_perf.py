@@ -82,9 +82,18 @@ def _sessions_payload_rows():
     ]
 
 
+def _force_full_route_builder(monkeypatch):
+    monkeypatch.setattr(
+        routes,
+        "_get_cached_session_list_payload",
+        lambda *, builder, **_kwargs: builder(),
+    )
+
+
 def test_sessions_api_defers_stale_stream_repair(monkeypatch):
     scheduled = []
     synchronous = []
+    _force_full_route_builder(monkeypatch)
 
     monkeypatch.setattr(routes, "all_sessions", lambda **_kwargs: _sessions_payload_rows())
     monkeypatch.setattr(routes, "_schedule_stale_stream_state_reconciliation", lambda rows: scheduled.append(rows) or True)
@@ -104,6 +113,7 @@ def test_sessions_api_enriches_only_returned_rows_by_default(monkeypatch):
     monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
     all_sessions_kwargs = []
     enriched_batches = []
+    _force_full_route_builder(monkeypatch)
 
     def fake_all_sessions(**kwargs):
         all_sessions_kwargs.append(kwargs)
@@ -138,6 +148,7 @@ def test_sessions_api_fetches_archived_rows_only_when_requested(monkeypatch):
     monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
     monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
     enriched_batches = []
+    _force_full_route_builder(monkeypatch)
 
     monkeypatch.setattr(routes, "all_sessions", lambda **_kwargs: _sessions_payload_rows())
     monkeypatch.setattr(
@@ -174,6 +185,7 @@ def test_sessions_api_can_limit_archived_rows_without_hiding_visible_rows(monkey
         {"session_id": "archived-old", "title": "Archived Old", "profile": "default", "archived": True, "message_count": 1, "updated_at": 10, "last_message_at": 10},
     ]
     enriched_batches = []
+    _force_full_route_builder(monkeypatch)
 
     monkeypatch.setattr(routes, "all_sessions", lambda **_kwargs: rows)
     monkeypatch.setattr(
@@ -226,8 +238,49 @@ def test_archived_limit_varies_session_list_cache_key():
     assert base != larger
 
 
+def test_sessions_api_cold_request_uses_index_seed_and_background_builder(monkeypatch):
+    monkeypatch.setattr(routes, "load_settings", lambda: {"show_cli_sessions": False})
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    captured = {}
+
+    def fake_cached_payload(*, key, builder, seed_builder, diag=None):
+        captured["key"] = key
+        captured["builder"] = builder
+        captured["seed_builder"] = seed_builder
+        assert seed_builder is not None
+        return seed_builder()
+
+    monkeypatch.setattr(routes, "_get_cached_session_list_payload", fake_cached_payload)
+    monkeypatch.setattr(
+        routes,
+        "_build_session_list_seed_payload",
+        lambda **_kwargs: {
+            "sessions": [],
+            "sidebar_reference_sessions": [],
+            "legacy_webui_archive": [],
+            "cli_count": 0,
+            "archived_count": 0,
+            "archived_webui_count": 0,
+            "archived_cli_count": 0,
+            "webui_session_count": 0,
+            "include_archived": False,
+            "all_profiles": False,
+            "active_profile": "default",
+            "other_profile_count": 0,
+        },
+    )
+
+    handler = _FakeHandler()
+    routes.handle_get(handler, urlparse("http://example.com/api/sessions"))
+
+    assert handler.status == 200
+    assert callable(captured["builder"])
+    assert callable(captured["seed_builder"])
+
+
 def test_sessions_api_legacy_all_sessions_monkeypatch_fallback_is_narrow(monkeypatch):
     calls = []
+    _force_full_route_builder(monkeypatch)
 
     def legacy_all_sessions(*, diag=None):
         calls.append(diag)
@@ -277,9 +330,9 @@ def test_session_list_fetch_adds_include_archived_only_when_toggle_is_on():
     assert "className='session-archive-more'" in src
     assert "_archivedRowsLoadedLimit=Math.min(" in src
     assert "Math.max(SESSION_ARCHIVED_PAGE_SIZE, Number(_archivedRowsLoadedLimit)||SESSION_ARCHIVED_PAGE_SIZE)+SESSION_ARCHIVED_PAGE_SIZE" in src
-    assert "_archivedWebuiCount" in src
-    assert "sessData.archived_webui_count ?? sessData.archived_count ?? 0" in src
-    assert "archived_webui_count" in src
+    assert "_archivedCount" in src
+    assert "sessData.archived_count ?? 0" in src
+    assert "_archivedWebuiCount" not in src
 
 
 def test_sessions_api_runtime_overlay_sorts_active_rows_first(monkeypatch):

@@ -174,6 +174,11 @@ def _clear_cache(monkeypatch):
     # These tests monkeypatch the legacy full builder directly. Keep them on the
     # compatibility path; projection-v2 behavior has dedicated cache coverage.
     monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
+    monkeypatch.setattr(
+        routes,
+        "_get_cached_session_list_payload",
+        lambda *, builder, **_kwargs: builder(),
+    )
     routes._session_list_cache_clear()
     yield
     routes._session_list_cache_clear()
@@ -251,20 +256,16 @@ def test_omit_exclude_hidden_still_returns_default_hidden_rows(monkeypatch):
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_default_and_unassigned_queries_send_exclude_hidden(monkeypatch):
     src = SESSIONS_JS.read_text(encoding="utf-8")
-    requested_source_fn = _extract_function(src, "_requestedSessionSidebarSource")
     exclude_hidden_fn = _extract_function(src, "_sessionListExcludeHiddenEnabled")
     project_filter_fn = _extract_function(src, "_setActiveProjectFilter")
     query_fn = _extract_function(src, "_sessionListQueryString")
     script = f"""
-global.window = {{ _showCliSessions: false }};
-global._showCliSessions = false;
 global._showAllProfiles = false;
 global._showArchived = false;
 global._activeProject = null;
 global.NO_PROJECT_FILTER = '__none__';
 global.renderSessionListFromCache = () => {{}};
 global.renderSessionList = () => Promise.resolve();
-{requested_source_fn}
 {exclude_hidden_fn}
 {project_filter_fn}
 {query_fn}
@@ -277,9 +278,9 @@ console.log(JSON.stringify({{ default_query, unassigned_query, named_project_que
 """
     body = _run_node(script)
 
-    assert body["default_query"] == "?sidebar_source=webui&exclude_hidden=1"
-    assert body["unassigned_query"] == "?sidebar_source=webui&exclude_hidden=1"
-    assert body["named_project_query"] == "?sidebar_source=webui"
+    assert body["default_query"] == "?exclude_hidden=1"
+    assert body["unassigned_query"] == "?exclude_hidden=1"
+    assert body["named_project_query"] == "?"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")

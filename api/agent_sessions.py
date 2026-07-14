@@ -1,7 +1,9 @@
 """Shared helpers for reading Hermes Agent sessions from state.db."""
 import logging
 import os
+import json
 import sqlite3
+from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
 
@@ -70,6 +72,8 @@ SOURCE_LABELS = {
     'webui': 'WebUI',
     'weixin': 'Weixin',
 }
+
+SHARED_INTERACTIVE_SESSION_SOURCES = ("webui", "cli", "tui", "acp")
 
 
 def normalize_agent_session_source(raw_source: str | None) -> dict:
@@ -301,7 +305,12 @@ def is_cli_session_row_visible(row: dict) -> bool:
     return _count_user_turns(row) >= CLI_MIN_UNTITLED_USER_MESSAGE_COUNT
 
 
-def _is_continuation_session(parent: dict | None, child: dict | None) -> bool:
+def _is_continuation_session(
+    parent: dict | None,
+    child: dict | None,
+    *,
+    compression_only: bool = False,
+) -> bool:
     """Return True when ``child`` is the next segment of the same conversation.
 
     Compression rotates session ids automatically. A manual CLI close followed
@@ -319,11 +328,27 @@ def _is_continuation_session(parent: dict | None, child: dict | None) -> bool:
         return False
     if str(child.get('session_source') or '').strip().lower() == 'fork':
         return False
+    if str(child.get('source') or '').strip().lower() == 'tool':
+        return False
+    raw_model_config = child.get('model_config')
+    if isinstance(raw_model_config, str):
+        try:
+            raw_model_config = json.loads(raw_model_config)
+        except Exception:
+            raw_model_config = None
+    if isinstance(raw_model_config, dict) and (
+        raw_model_config.get('_branched_from')
+        or raw_model_config.get('_delegate_from')
+    ):
+        return False
     parent_source = str(parent.get('source') or '').strip().lower()
     child_source = str(child.get('source') or '').strip().lower()
+    if compression_only and (not parent_source or not child_source):
+        return False
     if parent_source and child_source and parent_source != child_source:
         return False
-    if parent.get('end_reason') not in {'compression', 'cli_close'}:
+    allowed_end_reasons = {'compression'} if compression_only else {'compression', 'cli_close'}
+    if parent.get('end_reason') not in allowed_end_reasons:
         return False
     ended_at = parent.get('ended_at')
     if ended_at is None:
@@ -337,7 +362,12 @@ def _is_continuation_session(parent: dict | None, child: dict | None) -> bool:
         return False
 
 
-def _continuation_root_id(rows_by_id: dict[str, dict], session_id: str | None) -> str | None:
+def _continuation_root_id(
+    rows_by_id: dict[str, dict],
+    session_id: str | None,
+    *,
+    compression_only: bool = False,
+) -> str | None:
     """Return the visible lineage root for ``session_id`` by walking continuations."""
     if not session_id:
         return None
@@ -348,7 +378,9 @@ def _continuation_root_id(rows_by_id: dict[str, dict], session_id: str | None) -
         current = rows_by_id.get(current_id)
         parent_id = current.get('parent_session_id') if current else None
         parent = rows_by_id.get(parent_id) if parent_id else None
-        if not parent or not _is_continuation_session(parent, current):
+        if not parent or not _is_continuation_session(
+            parent, current, compression_only=compression_only
+        ):
             return root_id
         if parent_id in seen:
             return root_id
@@ -358,7 +390,11 @@ def _continuation_root_id(rows_by_id: dict[str, dict], session_id: str | None) -
     return root_id
 
 
-def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
+def _project_agent_session_rows(
+    rows: list[dict],
+    *,
+    compression_only: bool = False,
+) -> list[dict]:
     """Collapse compression chains into one logical sidebar row.
 
     The visible conversation should still look like the original chain head
@@ -375,20 +411,22 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
             continue
         children_by_parent.setdefault(parent_id, []).append(row)
         parent = rows_by_id.get(parent_id)
-        if _is_continuation_session(parent, row):
+        if _is_continuation_session(parent, row, compression_only=compression_only):
             continuation_child_ids.add(row['id'])
         else:
             row['relationship_type'] = 'child_session'
             row['parent_title'] = parent.get('title') if parent else None
             row['parent_source'] = parent.get('source') if parent else None
-            parent_root = _continuation_root_id(rows_by_id, parent_id)
+            parent_root = _continuation_root_id(
+                rows_by_id, parent_id, compression_only=compression_only
+            )
             if parent_root:
                 row['_parent_lineage_root_id'] = parent_root
 
     for children in children_by_parent.values():
         children.sort(key=lambda row: row.get('started_at') or 0, reverse=True)
 
-    def compression_tip(row: dict) -> tuple[dict | None, int]:
+    def compression_tip(row: dict) -> tuple[dict | None, int, set[str]]:
         """Return the freshest importable continuation descendant for ``row``.
 
         Compression parents can have multiple continuation-looking children when
@@ -397,14 +435,19 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
         deeper descendant has the actual latest activity. Walk all reachable
         continuation descendants and select by real message activity instead.
         """
-        latest_importable = row if (row.get('actual_message_count') or 0) > 0 else None
-        segment_count = 0
-        best_depth = 1
-        best_score = (
-            _as_score(latest_importable.get('last_activity'), latest_importable.get('started_at'))
-            if latest_importable
-            else 0
+        allowed_end_reasons = (
+            {'compression'} if compression_only else {'compression', 'cli_close'}
         )
+        # A segment that ended by compression is not itself the visible tip
+        # when a valid continuation exists. Do not let a late message timestamp
+        # on the old row (for example a delayed tool write) make the physical
+        # root outrank its continuation.
+        latest_importable = (
+            None
+            if row.get('end_reason') in allowed_end_reasons
+            else row if (row.get('actual_message_count') or 0) > 0 else None
+        )
+        segment_count = 0
         stack: list[tuple[dict, int]] = [(row, 1)]
         seen: set[str] = set()
 
@@ -416,23 +459,57 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
             seen.add(current_id)
             segment_count += 1
 
-            current_score = _as_score(current.get('last_activity'), current.get('started_at'))
-            if (
-                (current.get('actual_message_count') or 0) > 0
-                and (current_score > best_score or (current_score == best_score and depth >= best_depth))
-            ):
-                latest_importable = current
-                best_depth = depth
-                best_score = current_score
             for child in children_by_parent.get(current_id, []):
                 child_id = child.get('id')
                 if not child_id or child_id in seen:
                     continue
-                if not _is_continuation_session(current, child):
+                if not _is_continuation_session(
+                    current, child, compression_only=compression_only
+                ):
                     continue
                 stack.append((child, depth + 1))
 
-        return latest_importable, max(segment_count, 1)
+        def continuation_key(child: dict) -> tuple:
+            if child.get('end_reason') == 'compression':
+                priority = 0
+            elif child.get('ended_at') is None:
+                priority = 1
+            else:
+                priority = 2
+            return (
+                priority,
+                0 if (child.get('actual_message_count') or 0) > 0 else 1,
+                -_as_score(child.get('last_activity'), child.get('started_at')),
+                -(child.get('started_at') or 0),
+                str(child.get('id') or ''),
+            )
+
+        # Follow the same deterministic branch preference as Hermes One:
+        # continue through a compression child before a newer direct live
+        # sibling, then use activity/messagefulness to choose among equivalent
+        # candidates. The full walk above still counts every valid member.
+        selected = row
+        path_seen = {str(row.get('id'))}
+        while selected:
+            candidates = [
+                child
+                for child in children_by_parent.get(selected.get('id'), [])
+                if child.get('id') not in path_seen
+                and _is_continuation_session(
+                    selected, child, compression_only=compression_only
+                )
+            ]
+            if not candidates:
+                break
+            next_child = sorted(candidates, key=continuation_key)[0]
+            path_seen.add(str(next_child.get('id')))
+            selected = next_child
+        if selected is not row and (selected.get('actual_message_count') or 0) > 0:
+            latest_importable = selected
+
+        if latest_importable is None and (row.get('actual_message_count') or 0) > 0:
+            latest_importable = row
+        return latest_importable, max(segment_count, 1), seen
 
     projected = []
     for row in rows:
@@ -441,8 +518,14 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
 
         segment_count = 1
         tip = row
-        if row.get('end_reason') in {'compression', 'cli_close'}:
-            tip, segment_count = compression_tip(row)
+        allowed_end_reasons = (
+            {'compression'}
+            if compression_only
+            else {'compression', 'cli_close'}
+        )
+        lineage_member_ids = {str(row.get('id'))}
+        if row.get('end_reason') in allowed_end_reasons:
+            tip, segment_count, lineage_member_ids = compression_tip(row)
         if not tip or (tip.get('actual_message_count') or 0) <= 0:
             continue
 
@@ -461,10 +544,22 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
         # expects from "Show agent sessions" sorted by activity.
         for key in (
             'id', 'model', 'message_count', 'actual_message_count', 'actual_user_message_count',
-            'ended_at', 'end_reason', 'last_activity',
+            'ended_at', 'end_reason', 'last_activity', 'cwd', 'archived',
+            'pinned',
         ):
             if key in tip:
                 merged[key] = tip[key]
+        # Titles follow the visible continuation tip just like message count
+        # and activity. Keeping the compressed root title here makes WebUI
+        # disagree with Hermes One whenever a continuation generated a new
+        # title for the same logical conversation.
+        if compression_only and tip.get('title'):
+            merged['title'] = tip['title']
+        if any(
+            bool(rows_by_id.get(member_id, {}).get('pinned'))
+            for member_id in lineage_member_ids
+        ):
+            merged['pinned'] = True
         if str(tip.get('source') or '').strip().lower() == 'tui':
             # TUI continuation rows are user-visible session segments (#6, #17,
             # ...), not opaque compression snapshots. Keep navigation pointed at
@@ -482,6 +577,7 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
         merged['_lineage_root_id'] = row['id']
         merged['_lineage_tip_id'] = tip['id']
         merged['_compression_segment_count'] = segment_count
+        merged['_lineage_member_ids'] = sorted(lineage_member_ids)
         projected.append(merged)
 
     projected.sort(
@@ -491,6 +587,101 @@ def _project_agent_session_rows(rows: list[dict]) -> list[dict]:
     return projected
 
 
+def read_shared_session_rows(
+    db_path: Path,
+    *,
+    source: str | None = None,
+    sources: Iterable[str] | None = None,
+    include_archived: bool = True,
+) -> list[dict]:
+    """Return the canonical logical session projection for shared clients.
+
+    This is the state.db-facing contract used by WebUI compatibility routes and
+    desktop clients. It deliberately reuses the same continuation guards as the
+    agent-session bridge, but includes children so branches, delegates, tool
+    sessions, and cross-source children remain addressable rows. Only valid
+    compression continuations are collapsed. Empty rows are not conversations
+    and are omitted from this shared projection.
+    """
+    if source is not None and sources is not None:
+        raise ValueError("source and sources are mutually exclusive")
+    if sources is not None:
+        include_sources = tuple(
+            dict.fromkeys(
+                normalized
+                for value in sources
+                if (normalized := str(value or "").strip().lower())
+            )
+        )
+        if not include_sources:
+            return []
+    else:
+        include_sources = (str(source).strip().lower(),) if source else None
+    rows = read_importable_agent_session_rows(
+        db_path,
+        limit=None,
+        exclude_sources=None,
+        include_sources=include_sources,
+        include_children=True,
+        compression_only=True,
+    )
+    projected: list[dict] = []
+    for row in rows:
+        try:
+            count = max(
+                int(row.get("actual_message_count") or 0),
+                int(row.get("message_count") or 0),
+            )
+        except (TypeError, ValueError):
+            count = 0
+        if count <= 0:
+            continue
+        if not include_archived and bool(row.get("archived")):
+            continue
+        normalized = dict(row)
+        normalized["archived"] = bool(row.get("archived"))
+        normalized["pinned"] = bool(row.get("pinned"))
+        normalized.setdefault("cwd", None)
+        projected.append(normalized)
+    return projected
+
+
+def resolve_shared_session_id(
+    db_path: Path,
+    session_id: str,
+) -> str:
+    """Resolve a physical state.db id to its visible canonical tip.
+
+    Unknown ids are returned unchanged so callers can preserve their existing
+    404 behavior. The lineage metadata lookup is intentionally bounded and uses
+    the same source/branch guards as the list projection.
+    """
+    sid = str(session_id or "").strip()
+    if not sid or not Path(db_path).exists():
+        return sid
+    # Resolve through the exact shared projection rather than the older
+    # general-purpose lineage metadata helper. That helper also understands
+    # ``cli_close`` continuations for legacy WebUI import behavior; the shared
+    # contract must canonicalize compression segments only.
+    try:
+        for row in read_shared_session_rows(Path(db_path), include_archived=True):
+            aliases = {
+                str(row.get("id") or ""),
+                str(row.get("_lineage_root_id") or ""),
+                str(row.get("_lineage_tip_id") or ""),
+            }
+            aliases.update(
+                str(member_id)
+                for member_id in (row.get("_lineage_member_ids") or [])
+                if member_id
+            )
+            if sid in aliases:
+                return str(row.get("id") or sid)
+    except Exception:
+        logger.debug("shared session projection fallback failed for %s", sid, exc_info=True)
+    return sid
+
+
 def read_importable_agent_session_rows(
     db_path: Path,
     limit: int | None = 200,
@@ -498,6 +689,8 @@ def read_importable_agent_session_rows(
     exclude_sources: tuple[str, ...] | None = ("cron", "webui"),
     include_sources: tuple[str, ...] | None = None,
     include_children: bool = False,
+    session_ids: tuple[str, ...] | list[str] | set[str] | None = None,
+    compression_only: bool = False,
 ) -> list[dict]:
     """Return agent sessions projected as importable conversations.
 
@@ -571,6 +764,10 @@ def read_importable_agent_session_rows(
         use_session_projection = projection_meta_present
 
         parent_expr = _optional_col('parent_session_id', session_cols)
+        model_config_expr = _optional_col('model_config', session_cols)
+        cwd_expr = _optional_col('cwd', session_cols)
+        archived_expr = _optional_col('archived', session_cols, '0')
+        pinned_expr = _optional_col('pinned', session_cols, '0')
         session_source_expr = _optional_col('session_source', session_cols)
         ended_expr = _optional_col('ended_at', session_cols)
         end_reason_expr = _optional_col('end_reason', session_cols)
@@ -673,6 +870,13 @@ def read_importable_agent_session_rows(
 
         where_clauses = ["s.source IS NOT NULL"]
         params: list[object] = []
+        wanted_ids = tuple(str(sid) for sid in (session_ids or ()) if sid)
+        if session_ids is not None:
+            if not wanted_ids:
+                return []
+            placeholders = ", ".join("?" for _ in wanted_ids)
+            where_clauses.append(f"s.id IN ({placeholders})")
+            params.extend(wanted_ids)
         included = ()
         if include_sources:
             included = tuple(str(source) for source in include_sources if source)
@@ -736,9 +940,13 @@ def read_importable_agent_session_rows(
                    {origin_user_id_expr},
                    {platform_expr},
                    {parent_expr},
+                   {model_config_expr},
                    {delegate_from_expr},
                    {ended_expr},
                    {end_reason_expr},
+                   {cwd_expr},
+                   {archived_expr},
+                   {pinned_expr},
                    {actual_count_expr} AS actual_message_count,
                    {user_message_count_expr} AS actual_user_message_count,
                    {last_activity_expr} AS last_activity
@@ -809,7 +1017,10 @@ def read_importable_agent_session_rows(
                 """,
                 params,
             )
-        projected = _project_agent_session_rows([dict(row) for row in cur.fetchall()])
+        projected = _project_agent_session_rows(
+            [dict(row) for row in cur.fetchall()],
+            compression_only=compression_only,
+        )
         projected = [_with_normalized_source(row) for row in projected]
         projected = [row for row in projected if is_cli_session_row_visible(row)]
         if limit is None:
@@ -1013,7 +1224,11 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
                 return {}
             session_source_expr = _optional_col('session_source', session_cols)
             source_expr = _optional_col('source', session_cols)
+            model_config_expr = _optional_col('model_config', session_cols)
             message_count_expr = _optional_col('message_count', session_cols, '0')
+            cwd_expr = _optional_col('cwd', session_cols)
+            archived_expr = _optional_col('archived', session_cols, '0')
+            pinned_expr = _optional_col('pinned', session_cols, '0')
             # Scoped fetch via PRIMARY KEY + idx_sessions_parent rather than a
             # full table scan. The sessions table grows unbounded over time
             # (1000+ rows is normal, 10000+ for power users), and this function
@@ -1049,7 +1264,7 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
                     placeholders = ','.join('?' * len(chunk))
                     cur.execute(
                         f"""
-                        SELECT s.id, {source_expr}, {session_source_expr}, s.title, s.started_at, s.parent_session_id, s.ended_at, s.end_reason, {message_count_expr}
+                        SELECT s.id, {source_expr}, {session_source_expr}, s.title, s.started_at, s.parent_session_id, s.ended_at, s.end_reason, {model_config_expr}, {message_count_expr}, {cwd_expr}, {archived_expr}, {pinned_expr}
                         FROM sessions s
                         WHERE s.id IN ({placeholders})
                         """,
@@ -1078,7 +1293,7 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
                     placeholders = ','.join('?' * len(chunk))
                     cur.execute(
                         f"""
-                        SELECT s.id, {source_expr}, {session_source_expr}, s.title, s.started_at, s.parent_session_id, s.ended_at, s.end_reason, {message_count_expr}
+                        SELECT s.id, {source_expr}, {session_source_expr}, s.title, s.started_at, s.parent_session_id, s.ended_at, s.end_reason, {model_config_expr}, {message_count_expr}, {cwd_expr}, {archived_expr}, {pinned_expr}
                         FROM sessions s
                         WHERE s.parent_session_id IN ({placeholders})
                         """,

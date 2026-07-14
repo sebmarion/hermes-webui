@@ -93,6 +93,27 @@ that breaks the page for everyone). A full chat golden-path E2E (send → stream
 render → switch → reload) lives in the maintainer's private QA harness, which has
 the agent + a mock LLM provider available.
 
+### Unified Hermes conversation-list gate
+
+Run the focused contract with:
+
+```bash
+./scripts/test.sh \
+  tests/test_shared_state_db_session_projection.py \
+  tests/test_shared_session_metadata_routes.py \
+  tests/test_issue4766_sidebar_source_pushdown.py \
+  tests/test_session_list_long_history_perf.py
+```
+
+Use isolated `HERMES_HOME` and `HERMES_WEBUI_STATE_DIR` for manual checks. Add
+messageful `webui`, `cli`, `tui`, and `acp` rows to the profile `state.db`, with
+at least one archived non-WebUI row. Verify they render in one sidebar list with
+source badges and no WebUI/CLI tabs; disabling “Show optional external sessions”
+must not remove them. “Show archived” must reveal the archived row and combined
+pagination must load further archived rows without source switching. Rename,
+workspace, archive, and pin edits must read back from `state.db` and must not
+change token usage counters.
+
 
 `tests/test_static_js_runtime_lint.py` runs this automatically when eslint is present
 and **skips gracefully** (clear message) when it isn't — so environments without the
@@ -1939,9 +1960,10 @@ Unknown / deferred:
 - [ ] `/compact` — toast "/compress is not available in the web UI yet — use the CLI for now." (was sending free text to LLM before this batch.)
 - [ ] Made-up command (e.g. `/fhfajl`) — fall through to send as text (existing behavior preserved for typos vs. real commands).
 
-Bridged CLI sessions:
+Shared Hermes conversations:
 
-- [ ] Open a CLI-bridged session in webui sidebar (if `show_cli_sessions` setting enabled).
+- [ ] Open CLI/TUI/ACP conversations from the same WebUI sidebar list; source badges render, but there are no source tabs.
+- [ ] Disable “Show optional external sessions”; shared CLI/TUI/ACP conversations remain visible while optional channel/imported rows hide.
 - [ ] `/retry`, `/undo` toast "该命令仅支持 Web UI 原生会话…" and do nothing.
 
 ---

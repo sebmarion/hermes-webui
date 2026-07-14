@@ -25,11 +25,13 @@ from api.workspace import get_last_workspace
 from api.usage import prompt_cache_hit_percent
 from api.session_projection import projection_token as _agent_session_projection_token
 from api.agent_sessions import (
+    SHARED_INTERACTIVE_SESSION_SOURCES,
     _is_continuation_session,
     is_cli_session_row,
     normalize_agent_session_source,
     open_state_db_readonly,
     read_importable_agent_session_rows,
+    read_shared_session_rows,
     read_session_lineage_metadata,
 )
 
@@ -6393,8 +6395,14 @@ def _reload_cli_sessions_after_inflight(
         last_known = _copy_last_known_cli_sessions(cache_key)
         if last_known is not None:
             return last_known
-        if stale_sessions is not None and stale_stamp == _cli_sessions_cache_invalidation_stamp():
-            return stale_sessions
+        if stale_sessions is not None:
+            if stale_stamp == _cli_sessions_cache_invalidation_stamp():
+                return stale_sessions
+            # The caller explicitly invalidated the stale projection while
+            # the owner was rebuilding. Do not resurrect those rows after the
+            # in-flight event completes; the next request will perform the
+            # fresh scan.
+            return []
         # Followers never become scanners. After one wait they receive the
         # last-known-good projection (or an empty cold projection) and a later
         # request may claim the next debounced refresh.
@@ -6603,17 +6611,33 @@ def _resolve_cli_sessions_context(source_filter=None, include_claude_code: bool 
     # Reading it is scheduled by projection_token() off the caller thread, so
     # this request-time key never opens SQLite or follows message/WAL churn.
     _streaming_marker = _cli_sessions_streaming_freeze_marker()
-    db_state_key = (
-        _streaming_marker
-        if _streaming_marker is not None
-        else _agent_session_projection_token(db_path)
-    )
+    projection_token = _agent_session_projection_token(db_path)
+    if _streaming_marker is not None:
+        db_state_key = _streaming_marker
+        db_file_stamps = ()
+    else:
+        # Keep the projection generation as a top-level cache-key component;
+        # several hot-path callers and tests rely on that stable shape. The
+        # file stamps are additional cheap invalidation signals for a newly
+        # created WAL and legacy schemas without session_projection_meta.
+        if (
+            projection_token in {("cold", 0), ("missing", 0)}
+            and not Path(db_path).exists()
+        ):
+            projection_token = ("missing", 0)
+        db_state_key = projection_token
+        db_file_stamps = (
+            _path_stat_cache_key(db_path),
+            _path_stat_cache_key(Path(f"{db_path}-wal")),
+            _path_stat_cache_key(Path(f"{db_path}-shm")),
+        )
     cache_key = (
         str(hermes_home),
         str(cli_profile or ''),
         str(db_path),
         str(source_filter or ''),
         db_state_key,
+        *db_file_stamps,
         bool(include_claude_code),
         _path_cache_key(projects_dir),
         _path_stat_cache_key(projects_dir),
@@ -6882,19 +6906,19 @@ def _load_cli_sessions_uncached(
         # even when all_sessions() omits the hidden sidecar and the state row is
         # re-injected from Hermes state.db (#4397).
         _sidecar_meta = _state_projection_sidecar_metadata(sid)
-        if _sidecar_meta.get('title'):
+        if not _title and _sidecar_meta.get('title'):
             _title = _sidecar_meta['title']
-        _archived = bool(_sidecar_meta.get('archived'))
+        _archived = bool(row.get('archived'))
         _display_title = _title or f'{_source.title()} Session'
         cli_sessions.append({
             'session_id': sid,
             'title': _display_title,
-            'workspace': _cli_workspace(),
+            'workspace': row.get('cwd') or _cli_workspace(),
             'model': row['model'] or None,
             'message_count': row['message_count'] or row['actual_message_count'] or 0,
             'created_at': row['started_at'],
             'updated_at': raw_ts,
-            'pinned': False,
+            'pinned': bool(row.get('pinned')),
             'archived': _archived,
             'project_id': _state_row_project_id(sid, _source),
             'profile': profile,
@@ -6955,19 +6979,19 @@ def _load_cli_sessions_uncached(
                     # Friendly cron job name from the once-parsed jobs.json map.
                     _title = _cron_title_from_jobs(sid) or _title
                 _sidecar_meta = _state_projection_sidecar_metadata(sid)
-                if _sidecar_meta.get('title'):
+                if not _title and _sidecar_meta.get('title'):
                     _title = _sidecar_meta['title']
-                _archived = bool(_sidecar_meta.get('archived'))
+                _archived = bool(row.get('archived'))
                 _display_title = _title or 'Cron Session'
                 cli_sessions.append({
                     'session_id': sid,
                     'title': _display_title,
-                    'workspace': _cli_workspace(),
+                    'workspace': row.get('cwd') or _cli_workspace(),
                     'model': row['model'] or None,
                     'message_count': row['message_count'] or row['actual_message_count'] or 0,
                     'created_at': row['started_at'],
                     'updated_at': raw_ts,
-                    'pinned': False,
+                    'pinned': bool(row.get('pinned')),
                     'archived': _archived,
                     'project_id': _cron_pid(),
                     'profile': profile_value,
@@ -7021,19 +7045,19 @@ def _load_cli_sessions_uncached(
                 raw_ts = row['last_activity'] or row['started_at']
                 _title = row['title']
                 _sidecar_meta = _state_projection_sidecar_metadata(sid)
-                if _sidecar_meta.get('title'):
+                if not _title and _sidecar_meta.get('title'):
                     _title = _sidecar_meta['title']
-                _archived = bool(_sidecar_meta.get('archived'))
+                _archived = bool(row.get('archived'))
                 _display_title = _title or 'Webhook Session'
                 cli_sessions.append({
                     'session_id': sid,
                     'title': _display_title,
-                    'workspace': str(get_last_workspace()),
+                    'workspace': row.get('cwd') or _cli_workspace(),
                     'model': row['model'] or None,
                     'message_count': row['message_count'] or row['actual_message_count'] or 0,
                     'created_at': row['started_at'],
                     'updated_at': raw_ts,
-                    'pinned': False,
+                    'pinned': bool(row.get('pinned')),
                     'archived': _archived,
                     'project_id': _webhook_pid(),
                     'profile': profile_value,
@@ -7217,6 +7241,7 @@ def get_state_db_session_messages(
     sid,
     *,
     stitch_continuations: bool = False,
+    compression_only: bool = False,
     profile=None,
     since_timestamp=None,
     include_inactive: bool = False,
@@ -7284,9 +7309,10 @@ def get_state_db_session_messages(
                 cur.execute("PRAGMA table_info(sessions)")
                 session_cols = {str(row['name']) for row in cur.fetchall()}
                 if {'parent_session_id', 'end_reason', 'started_at', 'source'}.issubset(session_cols):
+                    model_config_expr = 'model_config' if 'model_config' in session_cols else 'NULL AS model_config'
                     cur.execute(
-                        """
-                        SELECT id, source, started_at, parent_session_id, ended_at, end_reason
+                        f"""
+                        SELECT id, source, started_at, parent_session_id, ended_at, end_reason, {model_config_expr}
                         FROM sessions
                         WHERE id = ?
                         """,
@@ -7304,8 +7330,8 @@ def get_state_db_session_messages(
                             if not parent_id or parent_id in seen:
                                 break
                             cur.execute(
-                                """
-                                SELECT id, source, started_at, parent_session_id, ended_at, end_reason
+                                f"""
+                                SELECT id, source, started_at, parent_session_id, ended_at, end_reason, {model_config_expr}
                                 FROM sessions
                                 WHERE id = ?
                                 """,
@@ -7316,7 +7342,11 @@ def get_state_db_session_messages(
                                 break
                             parent_dict = dict(parent_row)
                             rows_by_id[str(parent_row['id'])] = parent_dict
-                            if not _is_continuation_session(parent_dict, current):
+                            if not _is_continuation_session(
+                                parent_dict,
+                                current,
+                                compression_only=compression_only,
+                            ):
                                 break
                             session_chain.insert(0, str(parent_row['id']))
                             current_id = str(parent_row['id'])

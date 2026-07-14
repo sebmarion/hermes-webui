@@ -1,4 +1,4 @@
-"""Regression coverage for issue #2351 CLI session list separation."""
+"""Regression coverage for source badges in the unified conversation list."""
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -6,33 +6,28 @@ SESSIONS_JS = ROOT / "static" / "sessions.js"
 STYLE_CSS = ROOT / "static" / "style.css"
 
 
-def test_sidebar_has_separate_webui_and_cli_session_source_tabs():
+def test_sidebar_uses_one_list_with_source_badges_instead_of_tabs():
     src = SESSIONS_JS.read_text(encoding="utf-8")
-    assert "let _sessionSourceFilter = 'webui'" in src
-    assert "hermes-session-source-filter" in src
-    assert "session-source-tabs" in src
-    assert "WebUI sessions" in src
-    assert "CLI sessions" in src
-    assert "_sessionSourceFilter==='cli'" in src
+    assert "_sessionSourceFilter" not in src
+    assert "hermes-session-source-filter" not in src
+    assert "session-source-tabs" not in src
+    assert "chip.className='session-source-chip';" in src
 
 
-def test_cli_filter_keeps_cli_rows_out_of_default_webui_list():
+def test_partition_keeps_all_sources_in_the_same_rows():
     src = SESSIONS_JS.read_text(encoding="utf-8")
     assert "function _partitionSidebarSessionRows(allMatched, activeSidForSidebar)" in src
-    assert "cliSessionCount" in src
-    assert "const showCliOnly=_sessionSourceFilter==='cli';" in src
-    assert "const webuiProfileFiltered=[];" in src
-    assert "const cliProfileFiltered=[];" in src
-    assert "const webuiSessionsRaw=[];" in src
-    assert "const cliSessionsRaw=[];" in src
-    assert "profileFiltered: showCliOnly ? cliProfileFiltered : webuiProfileFiltered," in src
-    assert "sessionsRaw: showCliOnly ? cliSessionsRaw : webuiSessionsRaw," in src
+    assert "const profileFiltered=[];" in src
+    assert "const referenceRaw=[];" in src
+    assert "const sessionsRaw=[];" in src
+    assert "showCliOnly" not in src
 
 
-def test_session_source_tabs_have_dedicated_sidebar_styles():
+def test_source_tab_styles_are_removed_but_badge_styles_remain():
     css = STYLE_CSS.read_text(encoding="utf-8")
-    assert ".session-source-tabs" in css
-    assert ".session-source-tab.active" in css
+    assert ".session-source-tabs" not in css
+    assert ".session-source-tab.active" not in css
+    assert ".session-source-chip" in css
     assert ".session-empty-note" in css
 
 

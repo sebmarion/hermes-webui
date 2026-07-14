@@ -66,7 +66,7 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       session_projection.py Non-blocking Agent projection generation monitor
       routes.py            All GET + POST route handlers (if/elif dispatch, no decorators)
       startup.py           Startup helpers: auto_install_agent_deps()
-      state_sync.py        /insights sync — message_count to the agent's state.db
+      state_sync.py        Shared state.db bridge — metadata, counts, and lineage
       streaming.py         SSE engine, run_agent, cancel, compression, HERMES_HOME save/restore
       updates.py           Self-update check and release notes
       upload.py            Multipart parser, file upload handler
@@ -112,6 +112,31 @@ State directory (runtime data, separate from source):
     last_workspace.txt Last-used workspace path
     settings.json      User settings (default model, workspace, send key, password hash)
     projects.json      Session project groups (name, color, id)
+
+Shared conversation authority:
+
+    ~/.hermes/state.db
+
+Hermes Agent's SQLite database is the canonical conversation projection shared
+by Hermes One and WebUI. WebUI JSON sidecars remain the runtime/recovery layer:
+they carry streaming state, drafts, WebUI-only presentation metadata, and the
+preserved legacy archive. Matching sidecars overlay state.db rows only with
+runtime/WebUI presentation state; shared title, workspace, archive, and pin
+bits remain authoritative in state.db. A one-time marker migrates legacy
+sidecar pins, after which a stale sidecar can never re-pin an explicit state.db
+unpin. Sidecar-only archived conversations are shown in a separate Legacy
+WebUI Archive and imported into state.db only when that individual conversation
+is resumed. WebUI never bulk-migrates or deletes those sidecars, and Hermes One
+remote mode talks to the Mac WebUI API rather than transferring SQLite files.
+
+The browser projects messageful `webui`, `cli`, `tui`, and `acp` rows from that
+database into one interactive conversation list. Source metadata is a row badge,
+not a list partition. The legacy `sidebar_source` query parameter remains an API
+compatibility filter for older clients, but the browser does not send it. The
+`show_cli_sessions` setting name is also retained for compatibility; it now gates
+only optional channel/imported rows, never these shared interactive sources.
+Archived paging and the sidebar cap operate on the combined canonical list, so
+an archived Hermes One row cannot disappear behind a WebUI-only page or CLI cap.
 
 Log file:
 
@@ -247,6 +272,16 @@ and `message_count` directly, filters `source='subagent'` before the SQL limit,
 and never joins or repairs the `messages` table. Older Agent schemas retain the
 legacy aggregation query as a background-only compatibility fallback. WebUI
 never migrates Agent state.
+
+The compatibility session API is state.db-first. `GET /api/sessions/{id}` and
+`GET /api/sessions/{id}/messages` resolve old compression IDs to the visible
+tip, return stable shared metadata (`title`, `cwd`/`workspace`, `archived`,
+counts, timestamps, and lineage), and merge state.db messages with sidecar
+messages append-only. `PATCH /api/sessions/{id}` updates title, shared agent
+workspace, archive state, or pin state without touching usage counters; archive,
+title, and pin mutations follow valid compression lineage. `sync_to_insights`
+remains a compatibility setting name but no longer controls persistence of the
+shared conversation projection.
 
 title_from(): takes messages list, finds first user message, returns first 64 chars.
 Called after run_conversation() completes to set the session title retroactively.

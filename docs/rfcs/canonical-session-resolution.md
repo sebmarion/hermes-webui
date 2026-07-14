@@ -1,6 +1,6 @@
 # Canonical Session Resolution Contract
 
-- **Status:** Proposed
+- **Status:** Implemented (projection bridge)
 - **Author:** @ai-ag2026
 - **Created:** 2026-05-25
 - **Tracking issue:** [#2361](https://github.com/nesquena/hermes-webui/issues/2361)
@@ -43,7 +43,9 @@ correct visible session target, not moving execution ownership.
 
 - Do not delete archived `pre_compression_snapshot` rows.
 - Do not merge or rewrite session files as part of this contract.
-- Do not replace state.db/session sidecar reconciliation.
+- Use `~/.hermes/state.db` as the shared conversation source of truth while
+  retaining sidecars for streaming/recovery, WebUI-only state, and legacy
+  archive preservation.
 - Do not require a new backend endpoint before narrow frontend guards can land.
 - Do not change explicit history browsing when the user deliberately opens an
   archived snapshot as a record.
@@ -54,7 +56,7 @@ correct visible session target, not moving execution ownership.
 |---|---|
 | Requested session ID | The ID supplied by route, query parameter, localStorage, sidebar click, or direct session open. |
 | Canonical visible session | The session row WebUI should display by default for normal chat navigation. |
-| `canonical_visible_session_id` | Proposed field/name for an API or helper output that identifies the canonical visible session. |
+| `canonical_visible_session_id` | The canonical visible session ID returned as `canonical_session_id` by the compatibility detail/message endpoints. |
 | Compression snapshot | A preserved archived parent row with `pre_compression_snapshot` set. |
 | Continuation session | The active child/tip created after compression, usually represented by `continuation_session_id`, `_lineage_tip_id`, or newer lineage metadata. |
 | Lineage relation | Links such as `parent_session_id`, `_lineage_root_id`, `_lineage_tip_id`, and `_compression_segment_count` that connect rows belonging to one logical conversation. |
@@ -84,6 +86,30 @@ correct visible session target, not moving execution ownership.
    should still use the stale-route recovery path. A present archived parent with
    a live continuation is not a 404; it is a canonicalization problem.
 
+8. **Only valid compression continuations collapse.** Parent/child links are
+   not sufficient: source must match and branch, delegate, tool, and
+   cross-source children remain distinct conversations. The visible row uses
+   the tip's message count and activity timestamp; segment counts are never
+   summed.
+
+9. **Legacy sidecars are lazy.** A sidecar-only archived, messageful session is
+   browseable under Legacy WebUI Archive and imported into state.db only when
+   explicitly resumed. Empty sidecars are ignored and historical sidecars are
+   never bulk-reconciled as a cutover prerequisite.
+
+10. **Shared organization metadata is state.db-owned.** Titles, agent workspace,
+    archive state, and pins are read from the canonical projection. Legacy
+    sidecar pins are migrated once; they are not re-applied after an explicit
+    state.db unpin.
+
+11. **Interactive sources share one list.** Messageful `webui`, `cli`, `tui`,
+    and `acp` rows are projected from each profile's `state.db` together. Source
+    is presentation metadata, not a browser list partition. The browser does
+    not send `sidebar_source`; the parameter remains available only for older
+    API clients. `show_cli_sessions` gates optional external/channel/imported
+    rows and cannot hide shared interactive conversations. Archive counts,
+    pagination, profile projection, and list caps apply to the combined list.
+
 ## Entry Point Matrix
 
 | Entry point | Input | Expected resolution |
@@ -106,6 +132,8 @@ restore, direct session open, or URL parsing, answer:
 - Can a `pre_compression_snapshot` become the default active chat when a
   non-snapshot `continuation_session_id` / `_lineage_tip_id` exists?
 - Do sidebar collapse and `loadSession()` pick the same visible representative?
+- Can any browser setting, source badge, archive page, or list cap hide a
+  messageful shared interactive row from the combined list?
 - Is missing-session 404 recovery kept distinct from present-but-archived lineage
   canonicalization?
 - What regression proves route, query parameter, localStorage, and sidebar paths
@@ -113,12 +141,8 @@ restore, direct session open, or URL parsing, answer:
 
 ## Rollout Plan
 
-1. Document this proposed contract and link it from the public contract index.
-2. Keep narrow bugfixes small while referencing the relevant rule they preserve.
-3. Add shared frontend helper coverage for URL/query/localStorage/sidebar
-   requested-ID inputs.
-4. If backend session APIs later expose `canonical_visible_session_id`, make the
-   frontend resolver prefer the backend value while preserving client fallback for
-   older WebUI servers.
-5. If #1925 moves execution/session ownership behind an adapter, carry this
+1. Keep narrow bugfixes small while referencing the relevant rule they preserve.
+2. Keep the compatibility endpoints and Hermes One remote client aligned on
+   stable response fields and requested-ID resolution.
+3. If #1925 moves execution/session ownership behind an adapter, carry this
    contract forward as an adapter-facing session-navigation invariant.

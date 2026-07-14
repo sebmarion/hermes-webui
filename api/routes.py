@@ -36,9 +36,11 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
 from api.agent_sessions import (
     MESSAGING_SOURCES,
+    SHARED_INTERACTIVE_SESSION_SOURCES,
     _looks_like_default_cli_title,
     is_cli_session_row,
     is_cli_session_row_visible,
+    resolve_shared_session_id,
     read_session_lineage_report,
 )
 from api.compression_anchor import visible_messages_for_anchor
@@ -86,24 +88,16 @@ def _publish_session_list_changed(
 
 
 def _sync_session_title_to_insights(session) -> None:
-    """Write title-only session metadata updates through to state.db when enabled."""
+    """Write shared session metadata without touching canonical usage totals."""
     try:
-        if not load_settings().get("sync_to_insights"):
-            return
-        from api.state_sync import sync_session_usage
+        from api.state_sync import sync_session_metadata
 
-        messages = getattr(session, "messages", None) or []
-        sync_session_usage(
+        sync_session_metadata(
             session_id=session.session_id,
-            input_tokens=getattr(session, "input_tokens", None) or 0,
-            output_tokens=getattr(session, "output_tokens", None) or 0,
-            estimated_cost=getattr(session, "estimated_cost", 0.0),
-            model=getattr(session, "model", ""),
             title=session.title,
-            message_count=len(messages),
             profile=getattr(session, "profile", None),
-            cache_read_tokens=getattr(session, "cache_read_tokens", None) or 0,
-            cache_write_tokens=getattr(session, "cache_write_tokens", None) or 0,
+            cwd=getattr(session, "workspace", None),
+            archived=getattr(session, "archived", None),
         )
     except Exception:
         logger.debug("Failed to update session title in state.db", exc_info=True)
@@ -2200,6 +2194,7 @@ def _build_session_list_seed_payload(
     return {
         "sessions": [dict(row) for row in selected],
         "sidebar_reference_sessions": [],
+        "legacy_webui_archive": [],
         "cli_count": sum(1 for row in scoped if _is_cli_session_for_settings(row)),
         "archived_count": archived_count,
         "archived_webui_count": sum(
@@ -2276,6 +2271,25 @@ def _build_session_list_cache_payload(
 
     diag_stage("all_sessions")
     webui_sessions = _all_sessions_for_sidebar()
+    # Canonical shared projection: state.db owns conversation identity and
+    # shared metadata, while matching sidecars remain runtime/UI overlays.
+    # Sidecar-only archived history is kept out of the canonical list and
+    # returned in a dedicated legacy bucket for lazy resume/import.
+    shared_projection_enabled = str(
+        os.getenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "1")
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    if not shared_projection_enabled:
+        legacy_webui_archive = []
+    elif all_profiles:
+        webui_sessions, legacy_webui_archive = (
+            shared_interactive_sidebar_projection_all_profiles(webui_sessions)
+        )
+    else:
+        webui_sessions, legacy_webui_archive = shared_interactive_sidebar_projection(
+            webui_sessions,
+            profile=active_profile,
+            db_path=_active_state_db_path(),
+        )
     # Stale stream cleanup can require a full session reload and an atomic
     # sidecar write. Never put that repair on the sidebar request thread: a
     # crashed/restarted worker may leave many stale rows, turning a cheap list
@@ -2439,7 +2453,10 @@ def _build_session_list_cache_payload(
         )
     else:
         diag_stage("filter_webui_sessions")
-        webui_sessions = [s for s in webui_sessions if not _is_cli_session_for_settings(s)]
+        webui_sessions = [
+            s for s in webui_sessions
+            if s.get("_shared_interactive") or not _is_cli_session_for_settings(s)
+        ]
         # #4985 second pass — see _prune_orphaned_webui_zero_message_sessions
         # for the gate predicate and the post-#1171-survivor rationale. The
         # prune MUST run here too: established installs have
@@ -2591,6 +2608,10 @@ def _build_session_list_cache_payload(
             dict(s) if isinstance(s, dict) else {}
             for s in sidebar_reference_sessions
         ],
+        "legacy_webui_archive": [
+            dict(s) if isinstance(s, dict) else {}
+            for s in legacy_webui_archive
+        ],
         "cli_count": len(deduped_cli),
         "archived_count": archived_count,
         "archived_webui_count": archived_webui_count,
@@ -2637,9 +2658,16 @@ def _session_list_payload_to_response(payload: dict) -> dict:
         if item:
             item["_sidebar_reference_only"] = True
         safe_reference.append(item)
+    safe_legacy = []
+    for s in payload.get("legacy_webui_archive", []) or []:
+        item = _sidebar_session_response_item(s, redact_enabled=_redact_enabled) if isinstance(s, dict) else {}
+        if item:
+            item["legacy_webui_archive"] = True
+        safe_legacy.append(item)
     response = {
         "sessions": safe_merged,
         "sidebar_reference_sessions": safe_reference,
+        "legacy_webui_archive": safe_legacy,
         "cli_count": int(payload.get("cli_count", 0)),
         "archived_count": int(payload.get("archived_count", 0)),
         "archived_webui_count": int(payload.get("archived_webui_count", 0)),
@@ -9164,13 +9192,13 @@ CLI_VISIBLE_SESSION_CAP = 20
 
 
 def _cap_recent_cli_sessions(sessions: list[dict], cli_cap: int = CLI_VISIBLE_SESSION_CAP) -> list[dict]:
-    """Keep only the most recent CLI-visible sessions after filtering."""
+    """Cap legacy CLI rows without truncating canonical shared conversations."""
     if cli_cap <= 0:
         return sessions
     kept = []
     cli_seen = 0
     for session in sessions:
-        if _is_cli_session_for_settings(session):
+        if _is_cli_session_for_settings(session) and not session.get("_shared_interactive"):
             cli_seen += 1
             if cli_seen > cli_cap:
                 continue
@@ -9219,9 +9247,20 @@ def _merge_cli_sidebar_metadata(ui_session: dict, cli_meta: dict) -> dict:
     if cli_meta.get("created_at") is not None:
         merged["created_at"] = cli_meta["created_at"]
     if cli_meta.get("updated_at") is not None:
-        merged["updated_at"] = cli_meta["updated_at"]
+        if _is_messaging_session_record(cli_meta):
+            # ``ui_session`` has already passed through the state.db-first
+            # projection. Keep that canonical timestamp instead of allowing a
+            # runtime sidecar overlay to move the row forward/backward.
+            if merged.get("updated_at") is None:
+                merged["updated_at"] = cli_meta["updated_at"]
+        else:
+            merged["updated_at"] = cli_meta["updated_at"]
     if cli_meta.get("last_message_at") is not None:
-        merged["last_message_at"] = cli_meta["last_message_at"]
+        if _is_messaging_session_record(cli_meta):
+            if merged.get("last_message_at") is None:
+                merged["last_message_at"] = cli_meta["last_message_at"]
+        else:
+            merged["last_message_at"] = cli_meta["last_message_at"]
     if cli_meta.get("message_count") is not None:
         merged["message_count"] = max(
             _numeric_count(merged.get("message_count")),
@@ -9318,6 +9357,9 @@ from api.models import (
     get_state_db_session_messages,
     get_state_db_session_message_keys_before_timestamp,
     get_state_db_session_summary,
+    read_shared_session_rows,
+    shared_interactive_sidebar_projection,
+    shared_interactive_sidebar_projection_all_profiles,
     merge_session_messages_append_only,
     _enrich_sidebar_lineage_metadata,
     _active_stream_ids,
@@ -9678,11 +9720,14 @@ def _session_attention_summary(session_id: str) -> dict | None:
 
 
 _SIDEBAR_SESSION_RESPONSE_FIELDS = {
+    "id",
     "session_id",
+    "canonical_session_id",
     "title",
     "display_title",
     "_state_db_title",
     "workspace",
+    "cwd",
     "model",
     "model_provider",
     "message_count",
@@ -9700,6 +9745,13 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "cache_read_tokens",
     "cache_write_tokens",
     "cache_hit_percent",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "total_tokens",
+    "reasoning_tokens",
+    "cost_usd",
     "personality",
     "context_length",
     "config_context_length",
@@ -9708,6 +9760,7 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "raw_source",
     "session_source",
     "source_label",
+    "source",
     "is_cli_session",
     "is_messaging_session",
     "is_streaming",
@@ -9757,6 +9810,20 @@ def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None
         for key, value in dict(session).items()
         if key in _SIDEBAR_SESSION_RESPONSE_FIELDS
     }
+    sid = str(item.get("session_id") or item.get("id") or "").strip()
+    if sid:
+        item.setdefault("id", sid)
+        item.setdefault("session_id", sid)
+        item.setdefault("canonical_session_id", sid)
+    if "source" not in item:
+        item["source"] = (
+            item.get("raw_source")
+            or item.get("source_tag")
+            or item.get("session_source")
+            or "webui"
+        )
+    if "cwd" not in item and "workspace" in item:
+        item["cwd"] = item.get("workspace")
     if isinstance(item.get("title"), str):
         item["title"] = _redact_text(item["title"], _enabled=redact_enabled)
     item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
@@ -12454,6 +12521,8 @@ def handle_get(handler, parsed) -> bool:
         if not sid:
             if _diag: _diag.finish()
             return j(handler, {"error": "session_id is required"}, status=400)
+        requested_sid = sid
+        sid = resolve_shared_session_id(_active_state_db_path(), sid)
         # ?messages=0 skips the message payload for fast session switching.
         # The frontend uses this when switching conversations in the sidebar
         # (only needs metadata). The full message array is loaded lazily
@@ -12733,6 +12802,9 @@ def handle_get(handler, parsed) -> bool:
                 "threshold_tokens": _threshold_tokens,
                 "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
             }
+            raw["canonical_session_id"] = sid
+            if requested_sid != sid:
+                raw["requested_session_id"] = requested_sid
             if original_stream_id:
                 try:
                     journal = find_run_summary(original_stream_id)
@@ -12979,6 +13051,31 @@ def handle_get(handler, parsed) -> bool:
         from api.background import get_results
         return j(handler, {"results": get_results(sid)})
 
+    shared_path = _shared_session_path(parsed.path)
+    if shared_path is not None:
+        requested_sid, resource = shared_path
+        if not is_safe_session_id(requested_sid):
+            return bad(handler, "Invalid session_id", 400)
+        detail = _shared_session_detail_payload(
+            requested_sid,
+            include_messages=(resource == "messages"),
+        )
+        if detail is None:
+            return bad(handler, "Session not found", 404)
+        if resource == "messages":
+            return j(
+                handler,
+                {
+                    "id": detail["id"],
+                    "session_id": detail["session_id"],
+                    "canonical_session_id": detail["canonical_session_id"],
+                    "messages": detail.get("messages", []),
+                    "message_count": detail["message_count"],
+                    "lineage": detail["lineage"],
+                },
+            )
+        return j(handler, detail)
+
     if parsed.path == "/api/sessions":
         diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
         try:
@@ -13044,21 +13141,14 @@ def handle_get(handler, parsed) -> bool:
                     archived_offset=archived_offset,
                     diag=diag,
                 ),
-                seed_builder=(
-                    (lambda: _build_session_list_seed_payload(
-                        active_profile=active_profile,
-                        all_profiles=all_profiles,
-                        include_archived=include_archived,
-                        exclude_hidden=exclude_hidden,
-                        sidebar_source=sidebar_source,
-                        archived_limit=archived_limit,
-                        archived_offset=archived_offset,
-                    ))
-                    if str(
-                        os.getenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "1")
-                    ).strip().lower()
-                    not in {"0", "false", "no", "off"}
-                    else None
+                seed_builder=lambda: _build_session_list_seed_payload(
+                    active_profile=active_profile,
+                    all_profiles=all_profiles,
+                    include_archived=include_archived,
+                    exclude_hidden=exclude_hidden,
+                    sidebar_source=sidebar_source,
+                    archived_limit=archived_limit,
+                    archived_offset=archived_offset,
                 ),
                 diag=diag,
             )
@@ -14665,6 +14755,7 @@ def handle_post(handler, parsed) -> bool:
 
                     _evict_session_agent(body["session_id"])
             s.save()
+        _sync_session_title_to_insights(s)
         if str(old_ws or "") != str(new_ws or ""):
             try:
                 from api.terminal import close_terminal
@@ -15703,7 +15794,17 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(body["session_id"])
             s = _ensure_full_session_before_mutation(body["session_id"], s)
         except KeyError:
-            return bad(handler, "Session not found", 404)
+            s, claim_reason = _claim_or_synthesize_cli_session(body["session_id"])
+            if claim_reason == "not_claimable":
+                return bad(handler, "Read-only imported sessions cannot be pinned from WebUI", 403)
+            if s is None or claim_reason != "materialized":
+                return bad(handler, "Session not found", 404)
+            with _get_session_agent_lock(body["session_id"]):
+                s.save(touch_updated_at=False)
+            with LOCK:
+                SESSIONS[body["session_id"]] = s
+                SESSIONS.move_to_end(body["session_id"])
+                _evict_sessions_over_cap()
         pin_requested = bool(body.get("pinned", True))
         # TOCTOU guard (Opus stage-389): the count check and the pin write
         # must happen under the same lock, otherwise two parallel pin
@@ -15761,6 +15862,16 @@ def handle_post(handler, parsed) -> bool:
             profile=getattr(s, "profile", None),
             session_id=getattr(s, "session_id", body["session_id"]),
         )
+        try:
+            from api.state_sync import sync_session_pinned
+
+            sync_session_pinned(
+                getattr(s, "session_id", body["session_id"]),
+                bool(getattr(s, "pinned", False)),
+                profile=getattr(s, "profile", None),
+            )
+        except Exception:
+            logger.debug("Failed to mirror pin %s to state.db", body["session_id"], exc_info=True)
         return j(handler, {"ok": True, "session": s.compact()})
 
     # ── Session archive (POST) ──
@@ -15849,6 +15960,7 @@ def handle_post(handler, parsed) -> bool:
         with _get_session_agent_lock(sid):
             s.archived = bool(body.get("archived", True))
             s.save(touch_updated_at=False)
+        _sync_session_title_to_insights(s)
         publish_session_list_changed(
             "session_archive",
             profile=getattr(s, "profile", None),
@@ -16387,6 +16499,82 @@ def handle_patch(handler, parsed) -> bool:
     body = read_body(handler)
     if not _guard_request_session_visibility(handler, parsed, body=body, method="PATCH"):
         return True
+    shared_path = _shared_session_path(parsed.path)
+    if shared_path is not None and shared_path[1] == "detail":
+        requested_sid = shared_path[0]
+        if not is_safe_session_id(requested_sid):
+            return bad(handler, "Invalid session_id", 400)
+        allowed = {"title", "cwd", "workspace", "archived", "pinned"}
+        if not any(key in body for key in allowed):
+            return bad(handler, "one of title, cwd, workspace, archived, or pinned is required", 400)
+        if any(key not in allowed for key in body):
+            return bad(handler, "unsupported session field", 400)
+        before = _shared_session_detail_payload(requested_sid)
+        if before is None:
+            return bad(handler, "Session not found", 404)
+        canonical_sid = before["canonical_session_id"]
+        source = str(before.get("source") or "").strip().lower()
+        if source not in SHARED_INTERACTIVE_SESSION_SOURCES:
+            return bad(
+                handler,
+                "Only shared interactive sessions can be modified here",
+                403,
+            )
+        sidecar = _shared_session_sidecar(canonical_sid)
+        claim_meta = {
+            "read_only": bool(getattr(sidecar, "read_only", False)),
+            "source_tag": getattr(sidecar, "source_tag", None) or source,
+            "raw_source": getattr(sidecar, "raw_source", None) or source,
+            "session_source": getattr(sidecar, "session_source", None) or source,
+        }
+        claimable, _claim_reason = _is_claimable_cli_source(claim_meta, source)
+        if not claimable:
+            return bad(handler, "Read-only sessions cannot be modified", 403)
+        title = body.get("title", before.get("title"))
+        cwd = body.get("cwd", body.get("workspace", before.get("cwd")))
+        if cwd is not None:
+            try:
+                cwd = str(resolve_trusted_workspace(cwd))
+            except ValueError as exc:
+                return bad(handler, str(exc), 400)
+        archived = body.get("archived", before.get("archived"))
+        pinned = body.get("pinned", before.get("pinned"))
+        try:
+            from api.state_sync import sync_session_metadata
+
+            write_succeeded = sync_session_metadata(
+                session_id=canonical_sid,
+                title=title,
+                cwd=cwd,
+                archived=bool(archived),
+                pinned=bool(pinned),
+                profile=_get_active_profile_name(),
+            )
+        except Exception:
+            logger.exception("Failed to patch shared session %s", canonical_sid)
+            return bad(handler, "Shared session state is unavailable", 503)
+        if write_succeeded is not True:
+            return bad(handler, "Shared session state is unavailable", 503)
+        profile = _get_active_profile_name()
+        _clear_session_list_cache(profile)
+        detail = _shared_session_detail_payload(canonical_sid)
+        if detail is None or any(
+            (
+                str(detail.get("title") or "").strip()
+                != str(title or "").strip(),
+                str(detail.get("cwd") or "") != str(cwd or ""),
+                bool(detail.get("archived")) != bool(archived),
+                bool(detail.get("pinned")) != bool(pinned),
+            )
+        ):
+            return bad(handler, "Shared session metadata did not persist", 503)
+        publish_session_list_changed(
+            "session_shared_metadata",
+            profile=profile,
+            session_id=canonical_sid,
+        )
+        detail["ok"] = True
+        return j(handler, detail)
     if parsed.path.startswith("/api/mcp/servers/"):
         name = parsed.path[len("/api/mcp/servers/"):]
         return _handle_mcp_server_toggle(handler, name, body)
@@ -16564,6 +16752,160 @@ def _serve_static(handler, parsed):
     handler.end_headers()
     handler.wfile.write(body)
     return True
+
+
+def _shared_session_path(path: str | None) -> tuple[str, str] | None:
+    """Parse the compatibility session REST paths without matching siblings."""
+    value = str(path or "")
+    prefix = "/api/sessions/"
+    if not value.startswith(prefix):
+        return None
+    tail = value[len(prefix):]
+    if not tail or "/" not in tail:
+        if tail in {"search", "events", "cleanup", "cleanup_zero_message", "gateway"}:
+            return None
+        return (unquote(tail), "detail") if tail else None
+    sid, suffix = tail.split("/", 1)
+    if suffix != "messages" or not sid:
+        return None
+    return unquote(sid), "messages"
+
+
+def _shared_session_sidecar(sid: str):
+    try:
+        return Session.load(sid)
+    except Exception:
+        logger.debug("Failed to load shared-session sidecar %s", sid, exc_info=True)
+        return None
+
+
+def _lazy_import_legacy_webui_session(sid: str) -> bool:
+    """Import one archived sidecar on explicit detail/message access.
+
+    This is intentionally per-session and only runs when the requested id has
+    no state.db row. It preserves legacy history without a bulk migration.
+    """
+    session = _shared_session_sidecar(sid)
+    if not session or not getattr(session, "archived", False) or not session.messages:
+        return False
+    try:
+        from api.state_sync import _get_state_db, sync_session_usage
+
+        db = _get_state_db(profile=getattr(session, "profile", None))
+        if not db:
+            return False
+        try:
+            db.ensure_session(
+                session_id=session.session_id,
+                source="webui",
+                model=getattr(session, "model", None),
+                parent_session_id=getattr(session, "parent_session_id", None),
+            )
+            for message in session.messages:
+                if not isinstance(message, dict):
+                    continue
+                kwargs = {
+                    key: message[key]
+                    for key in (
+                        "tool_name", "tool_calls", "tool_call_id", "reasoning",
+                        "reasoning_content", "reasoning_details",
+                    )
+                    if message.get(key) is not None
+                }
+                db.append_message(
+                    session.session_id,
+                    str(message.get("role") or "assistant"),
+                    message.get("content"),
+                    timestamp=message.get("timestamp"),
+                    **kwargs,
+                )
+        finally:
+            try:
+                db.close()
+            except Exception:
+                pass
+        sync_session_usage(
+            session_id=session.session_id,
+            model=getattr(session, "model", None),
+            title=getattr(session, "title", None),
+            message_count=len(session.messages),
+            cwd=getattr(session, "workspace", None),
+            archived=True,
+            profile=getattr(session, "profile", None),
+        )
+        return True
+    except Exception:
+        logger.warning("Lazy import of legacy WebUI session %s failed", sid, exc_info=True)
+        return False
+
+
+def _shared_session_detail_payload(
+    requested_sid: str,
+    *,
+    include_messages: bool = False,
+) -> dict | None:
+    db_path = _active_state_db_path()
+    canonical_sid = resolve_shared_session_id(db_path, requested_sid)
+    rows = read_shared_session_rows(db_path, include_archived=True)
+    row = next((item for item in rows if str(item.get("id")) == canonical_sid), None)
+    if row is None and canonical_sid != requested_sid:
+        row = next((item for item in rows if str(item.get("id")) == requested_sid), None)
+    if row is None and _lazy_import_legacy_webui_session(requested_sid):
+        canonical_sid = resolve_shared_session_id(db_path, requested_sid)
+        rows = read_shared_session_rows(db_path, include_archived=True)
+        row = next((item for item in rows if str(item.get("id")) == canonical_sid), None)
+    if row is None:
+        return None
+
+    sidecar = _shared_session_sidecar(canonical_sid) or _shared_session_sidecar(requested_sid)
+    state_messages = get_state_db_session_messages(
+        canonical_sid,
+        stitch_continuations=True,
+        compression_only=True,
+    )
+    messages = []
+    if include_messages:
+        sidecar_messages = list(getattr(sidecar, "messages", []) or []) if sidecar else []
+        messages = merge_session_messages_append_only(sidecar_messages, state_messages)
+
+    title = str(row.get("title") or "").strip() or getattr(sidecar, "title", None) or "Untitled"
+    workspace = row.get("cwd") or getattr(sidecar, "workspace", None) or str(get_last_workspace())
+    message_count = max(0, int(row.get("message_count") or row.get("actual_message_count") or 0))
+    last_activity = row.get("last_activity") or row.get("started_at") or 0
+    payload = {
+        "id": canonical_sid,
+        "session_id": canonical_sid,
+        "requested_session_id": requested_sid,
+        "canonical_session_id": canonical_sid,
+        "title": title,
+        "source": row.get("source") or "webui",
+        "source_tag": row.get("raw_source") or row.get("source") or "webui",
+        "started_at": row.get("started_at") or 0,
+        "created_at": row.get("started_at") or 0,
+        "ended_at": row.get("ended_at"),
+        "updated_at": last_activity,
+        "last_activity_at": last_activity,
+        "last_message_at": last_activity,
+        "message_count": message_count,
+        "model": row.get("model") or getattr(sidecar, "model", None),
+        "cwd": workspace,
+        "workspace": workspace,
+        "archived": bool(row.get("archived")),
+        "pinned": bool(row.get("pinned")),
+        "parent_session_id": row.get("parent_session_id"),
+        "end_reason": row.get("end_reason"),
+        "lineage": {
+            "root_id": row.get("_lineage_root_id") or canonical_sid,
+            "tip_id": row.get("_lineage_tip_id") or canonical_sid,
+            "segment_count": row.get("_compression_segment_count") or 1,
+        },
+        "lineage_root_id": row.get("_lineage_root_id") or canonical_sid,
+        "lineage_tip_id": row.get("_lineage_tip_id") or canonical_sid,
+        "compression_segment_count": row.get("_compression_segment_count") or 1,
+    }
+    if include_messages:
+        payload["messages"] = messages
+    return payload
 
 
 def _handle_session_export(handler, parsed):
@@ -22345,28 +22687,27 @@ def _handle_chat_sync(handler, body):
         if s.title == "Untitled":
             s.title = title_from(s.messages, s.title)
         s.save()
-    # Sync to state.db for /insights (opt-in setting)
+    # Persist the shared conversation projection. ``sync_to_insights`` remains
+    # a compatibility setting, but must not gate state.db conversation state.
     try:
-        if load_settings().get("sync_to_insights"):
-            from api.state_sync import sync_session_usage
+        from api.state_sync import sync_session_usage
 
-            sync_session_usage(
-                session_id=s.session_id,
-                input_tokens=s.input_tokens or 0,
-                output_tokens=s.output_tokens or 0,
-                estimated_cost=s.estimated_cost,
-                model=s.model,
-                title=s.title,
-                message_count=len(s.messages),
-                cache_read_tokens=s.cache_read_tokens or 0,
-                cache_write_tokens=s.cache_write_tokens or 0,
-                # #2762 / #2827 parity with api/streaming.py:5078: pass the
-                # session's profile explicitly so a future refactor that
-                # backgrounds this handler doesn't silently leak writes to
-                # the wrong profile's state.db. HTTP thread today, but
-                # defense-in-depth. Opus pre-release advisor MUST-FIX.
-                profile=getattr(s, 'profile', None),
-            )
+        sync_session_usage(
+            session_id=s.session_id,
+            input_tokens=s.input_tokens or 0,
+            output_tokens=s.output_tokens or 0,
+            estimated_cost=s.estimated_cost,
+            model=s.model,
+            title=s.title,
+            message_count=len(s.messages),
+            cache_read_tokens=s.cache_read_tokens or 0,
+            cache_write_tokens=s.cache_write_tokens or 0,
+            # #2762 / #2827 parity with api/streaming.py: pass the session's
+            # profile explicitly so detached work cannot write another DB.
+            profile=getattr(s, 'profile', None),
+            cwd=getattr(s, 'workspace', None),
+            archived=getattr(s, 'archived', None),
+        )
     except Exception:
         logger.debug("Failed to update session cost tracking")
     return j(
