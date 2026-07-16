@@ -87,13 +87,28 @@ transcript fingerprint, and recovery claim token. The WebUI validates the HMAC,
 request age, loopback origin, canonical `state.db` turn, and matching journal
 reservation before returning lifecycle state.
 
+Status evaluation acquires the same per-session agent lock used by recovery
+start and holds it while reading the journal and live registries. Recovery start
+must durably append the reservation and register its stream/worker before
+releasing that lock. Therefore status cannot observe the launch window between
+an accepted reservation and live-owner registration as `absent`.
+
+The reservation fingerprint is immutable launch identity. Status compares the
+request fingerprint to the slot and submitted journal reservation; it does not
+recompute that fingerprint from the post-recovery transcript, which may already
+contain new assistant output. The canonical database check still requires the
+same profile and logical last-user-message ID, so a newer human turn makes the
+status unknown instead of binding it to the old reservation.
+
 The response is one of these bounded states:
 
 - `live`: the reservation's stream is present in `STREAMS` or `ACTIVE_RUNS`;
 - `terminal_recovered`: the matching non-live reservation has exactly one valid
   completed event and a strict `RECOVERED: ...` marker;
 - `terminal_blocked`: the matching non-live reservation has exactly one valid
-  blocked or interrupted terminal outcome;
+  completed event and a strict `RECOVERY_BLOCKED: ...` marker;
+- `terminal_uncertain`: the matching non-live reservation has one explicit
+  interrupted terminal event or a completed event without a strict marker;
 - `absent`: the matching reservation exists, has no live stream or worker, and
   has no terminal event;
 - `unknown`: reservation binding, journal structure, sidecar state, or worker
@@ -108,7 +123,8 @@ Evidence precedence is explicit:
 |---|---|
 | Any matching live stream or worker, even with a terminal journal row | Retain the slot and alert on the contradiction |
 | Non-live, uniquely bound, strict recovered terminal | Finalize recovered and release the slot |
-| Non-live, uniquely bound, blocked/interrupted terminal | Finalize blocked and release the slot |
+| Non-live, uniquely bound, strict blocked terminal | Finalize blocked and release the slot |
+| Non-live, uniquely bound, explicit interrupted or marker-less terminal | Quarantine manual and release the slot |
 | Non-live, uniquely bound, non-terminal, within abandonment age | Retain the slot |
 | Non-live, uniquely bound, non-terminal, past abandonment age | Quarantine the session and release the slot |
 | Malformed, contradictory, unavailable, or unbound evidence | Retain the slot and emit manual action |
@@ -139,7 +155,10 @@ event reuses the existing strict completion-marker validation:
 
 - `RECOVERED: ...` marks the claim `recovered`;
 - `RECOVERY_BLOCKED: ...` marks the claim `blocked`;
-- an interrupted or malformed terminal remains uncertain and is quarantined.
+- an explicit interrupted or marker-less terminal marks the claim `manual` with
+  a terminal-uncertain reason and releases the slot without replay; and
+- malformed or contradictory lifecycle evidence remains `unknown`, retains the
+  slot, and requires manual action.
 
 Finalization clears the global slot and appends a durable recovery event.
 
@@ -242,8 +261,13 @@ Write failing WebUI tests before implementation for:
   rejection without leaking transcript content;
 - live registry ownership taking precedence over terminal-looking journal
   evidence;
+- a status request racing reservation-to-worker launch serializing on the
+  per-session lock and never returning `absent`;
 - strict recovered and blocked terminal classification only after ownership is
   non-live;
+- immutable reservation-fingerprint validation after assistant output extends
+  the canonical transcript;
+- interrupted and marker-less terminal state returning `terminal_uncertain`;
 - exact-reservation non-terminal state returning `absent`; and
 - malformed, contradictory, or missing evidence returning `unknown` rather
   than `absent`.
