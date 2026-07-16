@@ -30,6 +30,7 @@ def _make_db(path):
             content TEXT,
             timestamp REAL
         );
+        CREATE INDEX idx_sessions_parent ON sessions(parent_session_id);
         """
     )
     rows = [

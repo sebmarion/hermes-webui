@@ -1,4 +1,5 @@
 """Shared helpers for reading Hermes Agent sessions from state.db."""
+import hashlib
 import logging
 import os
 import json
@@ -6,7 +7,10 @@ import sqlite3
 import time
 from collections.abc import Iterable
 from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
+from typing import Literal, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -442,6 +446,42 @@ def _is_continuation_session(
         return False
 
 
+def _continuation_child_semantic_key(child: dict) -> tuple:
+    """Rank a valid continuation without using its id as a tie-break.
+
+    The shared collection projection and bounded entity resolver must choose
+    the same continuation branch.  Keeping the semantic portion separate lets
+    the entity resolver fail closed when two branches are indistinguishable
+    except for their arbitrary physical ids.
+    """
+    if child.get('end_reason') == 'compression':
+        priority = 0
+    elif child.get('ended_at') is None:
+        priority = 1
+    else:
+        priority = 2
+    return (
+        priority,
+        0 if (child.get('actual_message_count') or 0) > 0 else 1,
+        -_as_score(child.get('last_activity'), child.get('started_at')),
+        -(child.get('started_at') or 0),
+    )
+
+
+def _continuation_child_key(child: dict) -> tuple:
+    """Return the collection-compatible total ordering for continuations."""
+    return (*_continuation_child_semantic_key(child), str(child.get('id') or ''))
+
+
+def _selected_importable_continuation(root: dict, selected: dict) -> dict | None:
+    """Apply the shared projection's messageful-tip fallback exactly once."""
+    if selected is not root and (selected.get('actual_message_count') or 0) > 0:
+        return selected
+    if (root.get('actual_message_count') or 0) > 0:
+        return root
+    return None
+
+
 def _continuation_root_id(
     rows_by_id: dict[str, dict],
     session_id: str | None,
@@ -526,18 +566,6 @@ def _project_agent_session_rows(
         deeper descendant has the actual latest activity. Walk all reachable
         continuation descendants and select by real message activity instead.
         """
-        allowed_end_reasons = (
-            {'compression'} if compression_only else {'compression', 'cli_close'}
-        )
-        # A segment that ended by compression is not itself the visible tip
-        # when a valid continuation exists. Do not let a late message timestamp
-        # on the old row (for example a delayed tool write) make the physical
-        # root outrank its continuation.
-        latest_importable = (
-            None
-            if row.get('end_reason') in allowed_end_reasons
-            else row if (row.get('actual_message_count') or 0) > 0 else None
-        )
         segment_count = 0
         stack: list[tuple[dict, int]] = [(row, 1)]
         seen: set[str] = set()
@@ -560,21 +588,6 @@ def _project_agent_session_rows(
                     continue
                 stack.append((child, depth + 1))
 
-        def continuation_key(child: dict) -> tuple:
-            if child.get('end_reason') == 'compression':
-                priority = 0
-            elif child.get('ended_at') is None:
-                priority = 1
-            else:
-                priority = 2
-            return (
-                priority,
-                0 if (child.get('actual_message_count') or 0) > 0 else 1,
-                -_as_score(child.get('last_activity'), child.get('started_at')),
-                -(child.get('started_at') or 0),
-                str(child.get('id') or ''),
-            )
-
         # Follow the same deterministic branch preference as Hermes One:
         # continue through a compression child before a newer direct live
         # sibling, then use activity/messagefulness to choose among equivalent
@@ -592,14 +605,10 @@ def _project_agent_session_rows(
             ]
             if not candidates:
                 break
-            next_child = sorted(candidates, key=continuation_key)[0]
+            next_child = sorted(candidates, key=_continuation_child_key)[0]
             path_seen.add(str(next_child.get('id')))
             selected = next_child
-        if selected is not row and (selected.get('actual_message_count') or 0) > 0:
-            latest_importable = selected
-
-        if latest_importable is None and (row.get('actual_message_count') or 0) > 0:
-            latest_importable = row
+        latest_importable = _selected_importable_continuation(row, selected)
         return latest_importable, max(segment_count, 1), seen
 
     projected = []
@@ -742,6 +751,440 @@ def read_shared_session_rows(
     return projected
 
 
+_SHARED_RESOLUTION_MAX_ROWS = 256
+_SHARED_RESOLUTION_REQUIRED_COLUMNS = {
+    'id',
+    'source',
+    'started_at',
+    'ended_at',
+    'end_reason',
+    'parent_session_id',
+}
+_SHARED_RESOLUTION_FINGERPRINT_FIELDS = (
+    'id',
+    'parent_session_id',
+    'source',
+    'session_source',
+    'started_at',
+    'ended_at',
+    'end_reason',
+    'model_config',
+    'message_count',
+    'last_activity',
+)
+
+
+@dataclass(frozen=True)
+class SharedSessionResolution:
+    """One immutable, request-scoped result for a shared conversation id."""
+
+    requested_id: str
+    canonical_id: str
+    root_id: str
+    tip_id: str
+    member_ids: tuple[str, ...]
+    canonical_row: Mapping[str, object] | None
+    lineage_fingerprint: str
+    global_projection_generation_hint: int | None
+    mode: Literal['navigation', 'history']
+    status: Literal['found', 'missing', 'degraded', 'ambiguous']
+
+
+def _shared_resolution_fingerprint(rows: list[dict]) -> str:
+    payload = [
+        {key: row.get(key) for key in _SHARED_RESOLUTION_FINGERPRINT_FIELDS}
+        for row in rows
+    ]
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+        default=str,
+    ).encode('utf-8')
+    return 'sha256:' + hashlib.sha256(encoded).hexdigest()
+
+
+def _freeze_shared_resolution_row(row: dict | None) -> Mapping[str, object] | None:
+    return MappingProxyType(dict(row)) if row is not None else None
+
+
+def _shared_resolution_terminal(
+    sid: str,
+    *,
+    mode: Literal['navigation', 'history'],
+    status: Literal['missing', 'degraded', 'ambiguous'],
+    row: dict | None = None,
+    generation_hint: int | None = None,
+) -> SharedSessionResolution:
+    rows = [row] if row is not None else []
+    canonical_row = _shared_resolution_canonical_row(rows) if rows else None
+    return SharedSessionResolution(
+        requested_id=sid,
+        canonical_id=sid,
+        root_id=sid,
+        tip_id=sid,
+        member_ids=(sid,) if sid else (),
+        canonical_row=_freeze_shared_resolution_row(canonical_row),
+        lineage_fingerprint=_shared_resolution_fingerprint(rows),
+        global_projection_generation_hint=generation_hint,
+        mode=mode,
+        status=status,
+    )
+
+
+def _shared_resolution_select_sql(session_cols: set[str]) -> str:
+    session_source_expr = _optional_col('session_source', session_cols)
+    title_expr = _optional_col('title', session_cols)
+    model_expr = _optional_col('model', session_cols)
+    model_config_expr = _optional_col('model_config', session_cols)
+    message_count_expr = _optional_col('message_count', session_cols, '0')
+    cwd_expr = _optional_col('cwd', session_cols)
+    archived_expr = _optional_col('archived', session_cols, '0')
+    pinned_expr = _optional_col('pinned', session_cols, '0')
+    last_activity_expr = (
+        's.last_activity_at AS last_activity'
+        if 'last_activity_at' in session_cols
+        else 's.started_at AS last_activity'
+    )
+    return (
+        'SELECT s.id, s.source, '
+        f'{session_source_expr}, {title_expr}, {model_expr}, {model_config_expr}, '
+        's.started_at, s.ended_at, s.end_reason, s.parent_session_id, '
+        f'{message_count_expr}, {cwd_expr}, {archived_expr}, {pinned_expr}, '
+        f'{last_activity_expr} FROM sessions s'
+    )
+
+
+def _shared_resolution_has_parent_index(
+    conn: sqlite3.Connection,
+    select_sql: str,
+) -> bool:
+    expected_name = 'idx_sessions_parent'
+    index_row = None
+    for raw_index in conn.execute('PRAGMA index_list(sessions)').fetchall():
+        try:
+            index_name = str(raw_index['name'])
+        except (KeyError, TypeError, IndexError):
+            index_name = str(raw_index[1])
+        if index_name == expected_name:
+            index_row = raw_index
+            break
+    if index_row is None:
+        return False
+    try:
+        is_partial = bool(index_row['partial'])
+    except (KeyError, TypeError, IndexError):
+        is_partial = bool(index_row[4]) if len(index_row) > 4 else False
+    if is_partial:
+        return False
+
+    columns = conn.execute('PRAGMA index_info("idx_sessions_parent")').fetchall()
+    if not columns:
+        return False
+    try:
+        first_name = str(columns[0]['name'])
+    except (KeyError, TypeError, IndexError):
+        first_name = str(columns[0][2])
+    if first_name != 'parent_session_id':
+        return False
+
+    try:
+        plan_rows = conn.execute(
+            f'EXPLAIN QUERY PLAN {select_sql} '
+            'WHERE s.parent_session_id = ? LIMIT ?',
+            ('__hermes_resolution_index_probe__', 1),
+        ).fetchall()
+    except sqlite3.Error:
+        return False
+    plan = ' '.join(
+        str(row['detail'] if isinstance(row, sqlite3.Row) else row[3])
+        for row in plan_rows
+    ).upper()
+    return (
+        'SEARCH ' in plan
+        and expected_name.upper() in plan
+        and 'SCAN ' not in plan
+    )
+
+
+def _shared_resolution_generation_hint(conn: sqlite3.Connection) -> int | None:
+    try:
+        raw = conn.execute(
+            'SELECT generation FROM session_projection_meta WHERE id = 1'
+        ).fetchone()
+        if raw is None:
+            return None
+        value = raw['generation'] if isinstance(raw, sqlite3.Row) else raw[0]
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, float) and not value.is_integer():
+            return None
+        generation = int(value)
+        return generation if generation >= 0 else None
+    except (sqlite3.Error, TypeError, ValueError, KeyError, IndexError):
+        return None
+
+
+def _shared_resolution_canonical_row(path_rows: list[dict]) -> dict:
+    root = path_rows[0]
+    tip = path_rows[-1]
+    if tip is root:
+        direct = dict(root)
+        direct['archived'] = bool(direct.get('archived'))
+        direct['pinned'] = bool(direct.get('pinned'))
+        return direct
+
+    merged = dict(root)
+    for key in (
+        'id',
+        'model',
+        'message_count',
+        'actual_message_count',
+        'ended_at',
+        'end_reason',
+        'last_activity',
+        'cwd',
+        'archived',
+        'pinned',
+    ):
+        if key in tip:
+            merged[key] = tip[key]
+
+    root_title = str(root.get('title') or '').strip()
+    tip_title = str(tip.get('title') or '').strip()
+    if tip_title:
+        merged['title'] = (
+            root_title
+            if _is_generated_continuation_title(tip_title, root_title)
+            else tip_title
+        )
+    elif not merged.get('title'):
+        merged['title'] = tip.get('title')
+    if not merged.get('source'):
+        merged['source'] = tip.get('source')
+    if any(bool(row.get('pinned')) for row in path_rows):
+        merged['pinned'] = True
+    merged['archived'] = bool(merged.get('archived'))
+    merged['pinned'] = bool(merged.get('pinned'))
+    merged['_lineage_root_id'] = root['id']
+    merged['_lineage_tip_id'] = tip['id']
+    merged['_compression_segment_count'] = len(path_rows)
+    merged['_lineage_member_ids'] = tuple(row['id'] for row in path_rows)
+    return merged
+
+
+def resolve_shared_session(
+    db_path: Path,
+    session_id: str,
+    *,
+    mode: Literal['navigation', 'history'] = 'navigation',
+) -> SharedSessionResolution:
+    """Resolve one physical session through bounded indexed compression edges.
+
+    This is deliberately an entity lookup, not a collection projection.  It
+    never reads messages, rebuilds session lists, or repairs Agent schema.
+    """
+    if mode not in {'navigation', 'history'}:
+        raise ValueError("mode must be 'navigation' or 'history'")
+    sid = str(session_id or '').strip()
+    path = Path(db_path)
+    if not sid or not path.exists():
+        return _shared_resolution_terminal(sid, mode=mode, status='missing')
+
+    try:
+        with closing(open_state_db_readonly(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute('BEGIN')
+            session_cols = {
+                str(row['name'])
+                for row in conn.execute('PRAGMA table_info(sessions)').fetchall()
+            }
+            if not _SHARED_RESOLUTION_REQUIRED_COLUMNS.issubset(session_cols):
+                return _shared_resolution_terminal(sid, mode=mode, status='degraded')
+            select_sql = _shared_resolution_select_sql(session_cols)
+            if not _shared_resolution_has_parent_index(conn, select_sql):
+                return _shared_resolution_terminal(sid, mode=mode, status='degraded')
+
+            generation_hint = _shared_resolution_generation_hint(conn)
+
+            def fetch_one(row_id: str) -> dict | None:
+                raw = conn.execute(
+                    f'{select_sql} WHERE s.id = ?',
+                    (row_id,),
+                ).fetchone()
+                if raw is None:
+                    return None
+                row = dict(raw)
+                row['actual_message_count'] = int(row.get('message_count') or 0)
+                return row
+
+            requested = fetch_one(sid)
+            if requested is None:
+                return _shared_resolution_terminal(
+                    sid,
+                    mode=mode,
+                    status='missing',
+                    generation_hint=generation_hint,
+                )
+
+            discovered: dict[str, dict] = {sid: requested}
+            reverse_path = [requested]
+            seen = {sid}
+            current = requested
+            while current.get('parent_session_id'):
+                parent_id = str(current.get('parent_session_id') or '')
+                if not parent_id or parent_id in seen:
+                    return _shared_resolution_terminal(
+                        sid,
+                        mode=mode,
+                        status='degraded',
+                        row=requested,
+                        generation_hint=generation_hint,
+                    )
+                parent = fetch_one(parent_id)
+                if parent is None:
+                    return _shared_resolution_terminal(
+                        sid,
+                        mode=mode,
+                        status='degraded',
+                        row=requested,
+                        generation_hint=generation_hint,
+                    )
+                discovered[parent_id] = parent
+                if len(discovered) > _SHARED_RESOLUTION_MAX_ROWS:
+                    return _shared_resolution_terminal(
+                        sid,
+                        mode=mode,
+                        status='degraded',
+                        row=requested,
+                        generation_hint=generation_hint,
+                    )
+                # Detect a raw parent cycle even when one edge would otherwise
+                # be rejected by continuation semantics.
+                if str(parent.get('parent_session_id') or '') in seen:
+                    return _shared_resolution_terminal(
+                        sid,
+                        mode=mode,
+                        status='degraded',
+                        row=requested,
+                        generation_hint=generation_hint,
+                    )
+                if not _is_continuation_session(
+                    parent,
+                    current,
+                    compression_only=True,
+                ):
+                    break
+                reverse_path.append(parent)
+                seen.add(parent_id)
+                current = parent
+
+            path_rows = list(reversed(reverse_path))
+            if mode == 'navigation' and requested.get('end_reason') == 'compression':
+                current = requested
+                while current.get('end_reason') == 'compression':
+                    children = []
+                    remaining = _SHARED_RESOLUTION_MAX_ROWS - len(discovered)
+                    if remaining <= 0:
+                        return _shared_resolution_terminal(
+                            sid,
+                            mode=mode,
+                            status='degraded',
+                            row=requested,
+                            generation_hint=generation_hint,
+                        )
+                    for raw in conn.execute(
+                        f'{select_sql} WHERE s.parent_session_id = ? LIMIT ?',
+                        (current['id'], remaining + 1),
+                    ).fetchall():
+                        child = dict(raw)
+                        child['actual_message_count'] = int(child.get('message_count') or 0)
+                        child_id = str(child.get('id') or '')
+                        if not child_id:
+                            continue
+                        discovered[child_id] = child
+                        children.append(child)
+                    if len(discovered) > _SHARED_RESOLUTION_MAX_ROWS:
+                        return _shared_resolution_terminal(
+                            sid,
+                            mode=mode,
+                            status='degraded',
+                            row=requested,
+                            generation_hint=generation_hint,
+                        )
+                    candidates = [
+                        child
+                        for child in children
+                        if _is_continuation_session(
+                            current,
+                            child,
+                            compression_only=True,
+                        )
+                    ]
+                    if not candidates:
+                        break
+                    ranked = sorted(candidates, key=_continuation_child_key)
+                    if (
+                        len(ranked) > 1
+                        and _continuation_child_semantic_key(ranked[0])
+                        == _continuation_child_semantic_key(ranked[1])
+                    ):
+                        return _shared_resolution_terminal(
+                            sid,
+                            mode=mode,
+                            status='ambiguous',
+                            row=requested,
+                            generation_hint=generation_hint,
+                        )
+                    selected = ranked[0]
+                    selected_id = str(selected['id'])
+                    if selected_id in seen:
+                        return _shared_resolution_terminal(
+                            sid,
+                            mode=mode,
+                            status='degraded',
+                            row=requested,
+                            generation_hint=generation_hint,
+                        )
+                    path_rows.append(selected)
+                    seen.add(selected_id)
+                    current = selected
+
+                importable = _selected_importable_continuation(
+                    path_rows[0],
+                    path_rows[-1],
+                )
+                if importable is None:
+                    return _shared_resolution_terminal(
+                        sid,
+                        mode=mode,
+                        status='degraded',
+                        row=requested,
+                        generation_hint=generation_hint,
+                    )
+                if importable is path_rows[0]:
+                    path_rows = [path_rows[0]]
+
+            canonical = path_rows[-1]
+            canonical_row = _shared_resolution_canonical_row(path_rows)
+            return SharedSessionResolution(
+                requested_id=sid,
+                canonical_id=str(canonical['id']),
+                root_id=str(path_rows[0]['id']),
+                tip_id=str(canonical['id']),
+                member_ids=tuple(str(row['id']) for row in path_rows),
+                canonical_row=_freeze_shared_resolution_row(canonical_row),
+                lineage_fingerprint=_shared_resolution_fingerprint(path_rows),
+                global_projection_generation_hint=generation_hint,
+                mode=mode,
+                status='found',
+            )
+    except Exception:
+        logger.debug('bounded shared session resolution failed for %s', sid, exc_info=True)
+        return _shared_resolution_terminal(sid, mode=mode, status='degraded')
+
+
 def resolve_shared_session_id(
     db_path: Path,
     session_id: str,
@@ -752,30 +1195,7 @@ def resolve_shared_session_id(
     404 behavior. The lineage metadata lookup is intentionally bounded and uses
     the same source/branch guards as the list projection.
     """
-    sid = str(session_id or "").strip()
-    if not sid or not Path(db_path).exists():
-        return sid
-    # Resolve through the exact shared projection rather than the older
-    # general-purpose lineage metadata helper. That helper also understands
-    # ``cli_close`` continuations for legacy WebUI import behavior; the shared
-    # contract must canonicalize compression segments only.
-    try:
-        for row in read_shared_session_rows(Path(db_path), include_archived=True):
-            aliases = {
-                str(row.get("id") or ""),
-                str(row.get("_lineage_root_id") or ""),
-                str(row.get("_lineage_tip_id") or ""),
-            }
-            aliases.update(
-                str(member_id)
-                for member_id in (row.get("_lineage_member_ids") or [])
-                if member_id
-            )
-            if sid in aliases:
-                return str(row.get("id") or sid)
-    except Exception:
-        logger.debug("shared session projection fallback failed for %s", sid, exc_info=True)
-    return sid
+    return resolve_shared_session(Path(db_path), session_id).canonical_id
 
 
 def read_importable_agent_session_rows(
