@@ -114,6 +114,35 @@ def _transcript_hash(messages: list[dict], last_user_id: int) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
 
 
+def _is_branch_or_delegate_config(raw) -> bool:
+    if not raw:
+        return False
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    return bool(payload.get("_branched_from") or payload.get("_delegate_from"))
+
+
+def _session_message_from_db(row: sqlite3.Row) -> dict:
+    message = {
+        key: row[key]
+        for key in row.keys()
+        if row[key] is not None
+    }
+    raw_tool_calls = message.get("tool_calls")
+    if isinstance(raw_tool_calls, str):
+        try:
+            message["tool_calls"] = json.loads(raw_tool_calls)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    if message.get("role") == "tool" and message.get("tool_name") and not message.get("name"):
+        message["name"] = message["tool_name"]
+    return message
+
+
 def _read_db_turn(session_id: str, profile: str) -> dict:
     db_path = _state_db_path(profile)
     if not db_path.is_file():
@@ -122,12 +151,54 @@ def _read_db_turn(session_id: str, profile: str) -> dict:
         con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         con.row_factory = sqlite3.Row
         with con:
+            session_columns = {
+                str(row[1])
+                for row in con.execute("PRAGMA table_info(sessions)").fetchall()
+            }
+
+            def optional_column(name: str, fallback: str = "NULL") -> str:
+                return name if name in session_columns else f"{fallback} AS {name}"
+
             session = con.execute(
-                "SELECT id, source, model, cwd, git_repo_root FROM sessions WHERE id = ?",
+                f"""
+                SELECT id, source, model, cwd, git_repo_root,
+                       {optional_column('title')},
+                       {optional_column('started_at', '0')},
+                       {optional_column('parent_session_id')},
+                       {optional_column('model_config')},
+                       {optional_column('end_reason')},
+                       {optional_column('archived', '0')},
+                       {optional_column('pinned', '0')}
+                FROM sessions WHERE id = ?
+                """,
                 (session_id,),
             ).fetchone()
             if session is None:
                 raise ValueError("authoritative session is missing")
+            if (
+                "parent_session_id" in session_columns
+                and str(session["end_reason"] or "").strip().lower() == "compression"
+            ):
+                children = con.execute(
+                    f"""
+                    SELECT id, source, {optional_column('model_config')}
+                    FROM sessions
+                    WHERE parent_session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchall()
+                requested_source = str(session["source"] or "").strip().lower()
+                valid_children = [
+                    child
+                    for child in children
+                    if str(child["source"] or "").strip().lower() == requested_source
+                    and requested_source != "tool"
+                    and not _is_branch_or_delegate_config(child["model_config"])
+                ]
+                if valid_children:
+                    raise ValueError(
+                        "requested session is not the canonical compression tip"
+                    )
             last_user = con.execute(
                 """
                 SELECT id, content, timestamp FROM messages
@@ -144,16 +215,46 @@ def _read_db_turn(session_id: str, profile: str) -> dict:
             except (TypeError, ValueError) as exc:
                 raise ValueError("authoritative logical turn is malformed") from exc
             last_user_text = str(last_user["content"] or "")
-            rows = con.execute(
+            all_rows = con.execute(
                 """
                 SELECT id, role, content, tool_calls, tool_name, tool_call_id,
                        timestamp, finish_reason
                 FROM messages
-                WHERE session_id = ? AND id >= ?
+                WHERE session_id = ?
                 ORDER BY id ASC
                 """,
-                (session_id, last_user_id),
+                (session_id,),
             ).fetchall()
+            rows = [row for row in all_rows if int(row["id"] or 0) >= last_user_id]
+
+            compression_ancestors: list[str] = []
+            current = session
+            seen = {session_id}
+            while current is not None and len(compression_ancestors) < 20:
+                parent_id = str(current["parent_session_id"] or "").strip()
+                if not parent_id or parent_id in seen:
+                    break
+                if _is_branch_or_delegate_config(current["model_config"]):
+                    break
+                parent = con.execute(
+                    f"""
+                    SELECT id, source,
+                           {optional_column('parent_session_id')},
+                           {optional_column('model_config')},
+                           {optional_column('end_reason')}
+                    FROM sessions WHERE id = ?
+                    """,
+                    (parent_id,),
+                ).fetchone()
+                if parent is None:
+                    break
+                if str(parent["end_reason"] or "").strip().lower() != "compression":
+                    break
+                if str(parent["source"] or "").strip().lower() != str(session["source"] or "").strip().lower():
+                    break
+                compression_ancestors.append(parent_id)
+                seen.add(parent_id)
+                current = parent
     except sqlite3.Error as exc:
         raise ValueError("authoritative state database is malformed") from exc
     finally:
@@ -162,29 +263,78 @@ def _read_db_turn(session_id: str, profile: str) -> dict:
         except UnboundLocalError:
             pass
     messages = [dict(row) for row in rows]
+    session_messages = [_session_message_from_db(row) for row in all_rows]
     return {
         "source": str(session["source"] or ""),
         "model": session["model"],
         "cwd": session["cwd"],
         "git_repo_root": session["git_repo_root"],
+        "title": session["title"],
+        "started_at": session["started_at"],
+        "parent_session_id": session["parent_session_id"],
+        "archived": bool(session["archived"]),
+        "pinned": bool(session["pinned"]),
         "last_user_id": last_user_id,
         "last_user_at": last_user_at,
         "last_user_text": last_user_text,
         "transcript_hash": _transcript_hash(messages, last_user_id),
+        "messages": session_messages,
+        "compression_ancestors": compression_ancestors,
     }
 
 
-def _read_sidecar(session_id: str) -> dict:
+def _read_sidecar(session_id: str, compression_ancestors: list[str] | None = None) -> dict:
     from api.models import SESSION_DIR
 
-    path = Path(SESSION_DIR) / f"{session_id}.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ValueError("authoritative WebUI sidecar is malformed") from exc
-    if not isinstance(payload, dict) or str(payload.get("session_id") or "") != session_id:
-        raise ValueError("authoritative WebUI sidecar is malformed")
-    return payload
+    candidates = [session_id, *(compression_ancestors or [])]
+    for candidate_id in candidates:
+        path = Path(SESSION_DIR) / f"{candidate_id}.json"
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError("authoritative WebUI sidecar is malformed") from exc
+        if not isinstance(payload, dict) or str(payload.get("session_id") or "") != candidate_id:
+            raise ValueError("authoritative WebUI sidecar is malformed")
+        payload = dict(payload)
+        payload["_recovery_sidecar_session_id"] = candidate_id
+        return payload
+    raise ValueError("authoritative WebUI sidecar is malformed")
+
+
+def _session_from_compression_ancestor(Session, session_id: str, profile: str, db_state: dict, sidecar: dict):
+    payload = {
+        key: value
+        for key, value in sidecar.items()
+        if not str(key).startswith("_recovery_")
+    }
+    messages = list(db_state.get("messages") or [])
+    payload.update(
+        {
+            "session_id": session_id,
+            "title": db_state.get("title") or payload.get("title") or "Recovered WebUI Session",
+            "workspace": db_state.get("cwd"),
+            "model": db_state.get("model"),
+            "messages": messages,
+            "context_messages": list(messages),
+            "created_at": db_state.get("started_at") or payload.get("created_at"),
+            "updated_at": db_state.get("last_user_at") or payload.get("updated_at"),
+            "pinned": bool(db_state.get("pinned")),
+            "archived": bool(db_state.get("archived")),
+            "profile": profile,
+            "active_stream_id": None,
+            "pending_user_message": None,
+            "pending_attachments": [],
+            "pending_started_at": None,
+            "pending_user_source": None,
+            "pre_compression_snapshot": False,
+            "parent_session_id": db_state.get("parent_session_id"),
+            "is_cli_session": False,
+            "read_only": False,
+        }
+    )
+    return Session(**payload)
 
 
 def _normalized_turn_text(value) -> str:
@@ -389,7 +539,10 @@ def start_atomic_webui_recovery(body: dict) -> dict:
     with session_lock:
         try:
             db_state = _read_db_turn(session_id, profile)
-            sidecar = _read_sidecar(session_id)
+            sidecar = _read_sidecar(
+                session_id,
+                db_state.get("compression_ancestors"),
+            )
             journal = _read_journal_state(session_id, db_state["last_user_text"])
             requested_workspace = _resolved_existing_directory(body.get("workspace"), "requested")
             sidecar_workspace = _resolved_existing_directory(
@@ -438,6 +591,20 @@ def start_atomic_webui_recovery(body: dict) -> dict:
             session = Session.load(session_id)
         except Exception:
             return _blocked("Authoritative WebUI session is malformed")
+        sidecar_session_id = str(sidecar.get("_recovery_sidecar_session_id") or session_id)
+        if session is None and sidecar_session_id != session_id:
+            if sidecar.get("active_stream_id") or sidecar.get("pending_user_message"):
+                return _blocked("Recovery blocked by compression ancestor sidecar owner")
+            try:
+                session = _session_from_compression_ancestor(
+                    Session,
+                    session_id,
+                    profile,
+                    db_state,
+                    sidecar,
+                )
+            except Exception:
+                return _blocked("Authoritative WebUI continuation could not be rebuilt")
         if session is None:
             return _blocked("Authoritative WebUI session is missing")
         session_profile = str(getattr(session, "profile", None) or "default").strip() or "default"

@@ -865,6 +865,9 @@ def test_auto_compression_rotation_tracks_origin_and_continuation_ids_for_sse():
     assert "_compression_origin_session_id = old_sid" in block
     assert "_compression_continuation_session_id = new_sid" in block
     assert "'new_session_id': _compression_continuation_session_id" in block
+    assert "update_active_run(" in block
+    assert "session_id=new_sid" in block
+    assert "workspace=str(s.workspace)" in block
 
 
 def test_auto_compression_card_reuses_compression_card_renderer():

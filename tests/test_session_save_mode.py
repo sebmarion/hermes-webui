@@ -91,6 +91,30 @@ def test_eager_chat_start_checkpoints_first_user_message_before_thread(_isolate_
     assert on_disk["pending_user_message"] == "hello eager"
 
 
+def test_goal_continuation_prompt_is_hidden_from_pending_and_display_state(
+    _isolate_state, monkeypatch
+):
+    monkeypatch.setattr(config, "cfg", {"webui": {"session_save_mode": "eager"}})
+    s = new_session(workspace=str(_isolate_state.parent))
+    routes._prepare_chat_start_session_for_stream(
+        s,
+        msg="[Continuing toward your standing goal] hidden control prompt",
+        attachments=[],
+        workspace=str(_isolate_state.parent),
+        model=s.model,
+        model_provider=s.model_provider,
+        stream_id="goal_continuation_stream",
+        started_at=789.0,
+        source="goal_continuation",
+    )
+
+    on_disk = json.loads(s.path.read_text(encoding="utf-8"))
+    assert on_disk["messages"] == []
+    assert on_disk["pending_user_message"] is None
+    assert on_disk["pending_user_source"] == "goal_continuation"
+    assert on_disk["title"] == "Untitled"
+
+
 def test_eager_wal_repair_does_not_duplicate_checkpointed_user_message(_isolate_state, monkeypatch):
     s = Session(session_id="eager_repair", messages=[{"role": "user", "content": "survive"}])
     s.pending_user_message = "survive"

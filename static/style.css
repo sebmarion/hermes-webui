@@ -1691,6 +1691,11 @@
     width:8px;
     height:8px;
   }
+  @media (hover:hover){
+    .session-item:hover .session-attention-indicator.is-streaming,
+    .session-item:focus-within .session-attention-indicator.is-streaming,
+    .session-item.menu-open .session-attention-indicator.is-streaming{opacity:1;visibility:visible;right:34px;}
+  }
   /* Timestamp lives in the flex flow of .session-title-row (not absolute) so
      the title's flex:1 bound stops at the timestamp's left edge and stops
      running underneath it. margin-left:auto pushes it to the row's right
@@ -3676,8 +3681,15 @@ body.resizing .sidebar{transition:none!important;}
 .tool-worklog-group[data-tool-worklog-group="1"]:not([data-run-activity-group="1"]) .tool-worklog-summary:hover{
   background:transparent;
 }
-.tool-worklog-group[data-tool-worklog-group="1"]:not([data-run-activity-group="1"]) .as-dot{
+.tool-worklog-group[data-tool-worklog-group="1"]:not([data-run-activity-group="1"]):not([data-live-tool-call-group="1"]) .as-dot{
   display:none;
+}
+.tool-worklog-group[data-live-tool-call-group="1"] .as-dot{display:block;background:var(--accent);opacity:.78;animation:pulse 1.4s ease-in-out infinite;}
+@media (prefers-reduced-motion:reduce){
+  .tool-worklog-group[data-live-tool-call-group="1"] .as-dot{
+    animation:none;
+    opacity:.78;
+  }
 }
 .tool-worklog-running-label{display:none;color:var(--accent-text);font-family:'SF Mono',ui-monospace,monospace;font-size:12px;font-weight:600;line-height:1.4;}
 .tool-worklog-group[data-tool-worklog-running="1"] .tool-worklog-running-label{display:inline-flex;}

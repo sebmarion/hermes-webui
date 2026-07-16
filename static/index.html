@@ -1461,6 +1461,12 @@
             <div id="providersList" style="display:flex;flex-direction:column;margin-top:4px">
               <!-- Populated dynamically by loadProvidersPanel() -->
             </div>
+            <div class="settings-card" id="modelAliasesCard" style="margin-top:16px">
+              <div class="settings-section-title">Shared model aliases</div>
+              <div class="settings-section-meta">One per line as <code>alias=model-id</code>. Shared with Hermes One through this profile.</div>
+              <textarea id="modelAliasesInput" rows="6" spellcheck="false" placeholder="sol=gpt-5.6-sol" style="width:100%;margin-top:10px;font-family:monospace"></textarea>
+              <div style="display:flex;justify-content:flex-end;margin-top:8px"><button type="button" class="btn-primary" id="modelAliasesSaveBtn">Save aliases</button></div>
+            </div>
             <div id="providersEmpty" style="display:none;text-align:center;padding:32px 0;color:var(--muted);font-size:13px" data-i18n="providers_empty">
               No configurable providers found.
             </div>

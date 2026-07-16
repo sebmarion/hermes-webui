@@ -226,6 +226,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Create a public read-only share link for the active conversation from the Control Center; shared pages show a sanitized transcript snapshot without workspace, profile, or live controls
 - Sessions persist across page reloads and SSH tunnel reconnects
 - Hermes One, WebUI, CLI, TUI, and ACP interactive conversations share one sidebar list through `~/.hermes/state.db`; source badges show where a conversation originated without splitting it into a separate tab. WebUI sidecars remain the streaming/recovery and legacy-archive layer, with archived sidecar-only history imported one conversation at a time when resumed
+- Hermes One/WebUI share live task activity through a short-lived `session_activity` heartbeat overlay in the same profile database; stale heartbeats expire after 20 seconds and never alter conversation metadata
 - Browser tab title reflects the active session name
 - Optional external-session bridge -- channel, cron, webhook, Claude Code, and other imported sessions can be enabled separately; shared interactive Hermes conversations are always visible
 - Token/cost display -- input tokens, output tokens, estimated cost shown per conversation (toggle in Settings or `/usage` command)

@@ -2176,6 +2176,7 @@ $('msg').addEventListener('input',()=>{
   // Persist composer draft to server (debounced in _saveComposerDraft).
   const sid = S && S.session && S.session.session_id;
   if (sid && typeof _saveComposerDraft === 'function') {
+    if(typeof _claimComposerDraftOwner==='function') _claimComposerDraftOwner(sid);
     _saveComposerDraft(sid, $('msg').value, S.pendingFiles ? [...S.pendingFiles] : []);
   }
   const text=$('msg').value;

@@ -120,6 +120,7 @@ def _run_reentrant_guard_in_node(composer_value: str):
         pytest.skip("node not available")
 
     helper = _function_body(MESSAGES_JS, "_composerTextWithPendingSelections")
+    ownership_helper = _function_body(MESSAGES_JS, "_composerOwnershipSnapshot")
     guard = _extract_reentrancy_guard()
 
     harness = textwrap.dedent(
@@ -133,6 +134,7 @@ def _run_reentrant_guard_in_node(composer_value: str):
         function _formatSelectedTextReplyQuote(t){ return t; }
         // Real helper the guard uses to read the live composer.
         function _composerTextWithPendingSelections(){%(helper)s}
+        function _composerOwnershipSnapshot(text, files){%(ownership_helper)s}
 
         // Minimal in-flight state: a send is already running for sid-1.
         let _sendInProgress = true;
@@ -158,6 +160,7 @@ def _run_reentrant_guard_in_node(composer_value: str):
     ) % {
         "composer_value": json.dumps(composer_value),
         "helper": helper,
+        "ownership_helper": ownership_helper,
         "guard": guard,
     }
 

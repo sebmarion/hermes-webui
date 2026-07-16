@@ -28,6 +28,7 @@ from api.config import (
     STREAMS, STREAMS_LOCK, CANCEL_FLAGS, AGENT_INSTANCES, STREAM_PARTIAL_TEXT,
     STREAM_REASONING_TEXT, STREAM_LIVE_TOOL_CALLS,
     STREAM_GOAL_RELATED, PENDING_GOAL_CONTINUATION,
+    PENDING_GOAL_CONTINUATION_GUARDS,
     STREAM_LAST_EVENT_ID,
     LOCK, SESSIONS, SESSIONS_MAX, SESSION_DIR,
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
@@ -1323,15 +1324,40 @@ def _is_synthetic_max_iteration_summary_request(message) -> bool:
     return text == expected
 
 
-def _drop_synthetic_max_iteration_summary_requests(messages, *, enabled: bool = True):
-    """Remove Agent-internal max-iteration summary prompts from WebUI state."""
+def _drop_synthetic_max_iteration_summary_requests(
+    messages,
+    *,
+    enabled: bool = True,
+    previous_messages=None,
+):
+    """Remove only the current Agent-internal max-iteration summary prompt.
+
+    Text alone is not ownership proof: a user can legitimately submit the same
+    sentence. The synthetic row is the newest matching current-turn row after
+    tool activity, while any identical rows from the prior context or the
+    current user prompt remain durable user history.
+    """
     if not enabled:
         return list(messages or [])
-    return [
-        msg
-        for msg in list(messages or [])
-        if not _is_synthetic_max_iteration_summary_request(msg)
-    ]
+    source = list(messages or [])
+    previous = list(previous_messages or [])
+    boundary = len(previous) if _messages_have_prefix(source, previous) else 0
+    saw_tool_activity = False
+    synthetic_index = None
+    for index, message in enumerate(source):
+        if index < boundary:
+            continue
+        if isinstance(message, dict) and (
+            message.get('role') == 'tool'
+            or (message.get('role') == 'assistant' and message.get('tool_calls'))
+        ):
+            saw_tool_activity = True
+            continue
+        if saw_tool_activity and _is_synthetic_max_iteration_summary_request(message):
+            synthetic_index = index
+    if synthetic_index is None:
+        return source
+    return [message for index, message in enumerate(source) if index != synthetic_index]
 
 
 # Structured markers the Hermes Agent stamps on synthetic scaffolding turns that
@@ -1809,9 +1835,10 @@ def _set_turn_session_identity(session_id: str):
     still written to os.environ at turn-start) to an explicit ``""`` — which
     would break the ``notify_on_complete`` watcher registration gate in
     terminal_tool.py:~1966. Only the session-key identity is bound; every
-    other session var keeps its existing os.environ fallback (CLI/cron compat
-    preserved — when these contextvars are _UNSET, get_session_env still falls
-    back to os.environ).
+    other session var keeps its existing os.environ fallback. The one exception
+    is ``_SESSION_ASYNC_DELIVERY=False``: a WebUI request turn cannot guarantee
+    that a deferred subagent result will re-enter after the turn/session is
+    stopped or recovered, so delegate_task must use its synchronous fallback.
     """
     sid = str(session_id or "")
     tokens: dict = {}
@@ -1825,6 +1852,11 @@ def _set_turn_session_identity(session_id: str):
         tokens["session_key"] = _SK.set(sid)
     except Exception:
         logger.debug("per-turn _SESSION_KEY bind failed", exc_info=True)
+    try:
+        from gateway.session_context import _SESSION_ASYNC_DELIVERY as _SAD
+        tokens["async_delivery"] = _SAD.set(False)
+    except Exception:
+        logger.debug("per-turn async-delivery capability bind failed", exc_info=True)
     return tokens
 
 
@@ -1839,6 +1871,13 @@ def _reset_turn_session_identity(tokens) -> None:
     """
     if not tokens:
         return
+    tok = tokens.get("async_delivery")
+    if tok is not None:
+        try:
+            from gateway.session_context import _SESSION_ASYNC_DELIVERY as _SAD
+            _SAD.reset(tok)
+        except Exception:
+            logger.debug("per-turn async-delivery capability reset failed", exc_info=True)
     tok = tokens.get("session_key")
     if tok is not None:
         try:
@@ -2621,6 +2660,113 @@ def _looks_like_current_user_turn(msg, msg_text) -> bool:
         for match in pattern.finditer(text):
             candidates.append(text[match.end():])
     return any(" ".join(str(candidate or '').split()) == needle for candidate in candidates)
+
+
+def _internal_control_prompt_matches(message, prompt: str) -> bool:
+    """Match one synthetic control prompt with or without a workspace prefix."""
+    if not isinstance(message, dict) or message.get('role') != 'user':
+        return False
+    expected = " ".join(str(prompt or '').split())
+    if not expected:
+        return False
+    actual = _strip_workspace_prefix(
+        _message_text(message.get('content', '')),
+        include_legacy=True,
+    )
+    return " ".join(actual.split()) == expected
+
+
+def _drop_internal_control_prompts_from_history(messages, prompt: str, control_key: str):
+    """Remove structured controls without granting prompt text ownership."""
+    source = list(messages or [])
+    remove = {
+        index
+        for index, message in enumerate(source)
+        if isinstance(message, dict)
+        and message.get('role') == 'user'
+        and control_key in message
+    }
+    return [message for index, message in enumerate(source) if index not in remove]
+
+
+def _canonicalize_internal_control_context(
+    messages,
+    prompt: str,
+    control_key: str,
+    control: dict,
+    *,
+    previous_messages=None,
+):
+    """Persist one structured current control row after agent result replay.
+
+    The previous-context boundary, not exact text, identifies the current row.
+    This preserves historical user turns even when their text and workspace
+    prefix are byte-for-byte identical to the continuation instruction.
+    """
+    source = list(messages or [])
+    previous = list(previous_messages or [])
+    matches = [
+        index
+        for index, message in enumerate(source)
+        if _internal_control_prompt_matches(message, prompt)
+    ]
+    marked = [
+        index
+        for index, message in enumerate(source)
+        if isinstance(message, dict)
+        and message.get('role') == 'user'
+        and control_key in message
+    ]
+    if _messages_have_prefix(source, previous):
+        boundary = len(previous)
+        current_matches = [index for index in matches if index >= boundary]
+    else:
+        # Append-only reconciliation can rebuild equivalent dicts without a
+        # strict prefix. Consume the number of historical matches from the
+        # front; only later occurrences may belong to this current turn.
+        prior_match_count = sum(
+            1 for message in previous
+            if _internal_control_prompt_matches(message, prompt)
+        )
+        current_matches = matches[prior_match_count:]
+        boundary = len(source)
+
+    unmarked_current = [index for index in current_matches if index not in marked]
+    marked_current = [index for index in current_matches if index in marked]
+    candidates = unmarked_current or marked_current
+    if not candidates:
+        remove_indexes = set(marked)
+        canonical = [
+            message for index, message in enumerate(source)
+            if index not in remove_indexes
+        ]
+        insert_at = min(boundary, len(canonical))
+        canonical.insert(insert_at, {
+            'role': 'user',
+            'content': prompt,
+            control_key: dict(control or {}),
+        })
+        return canonical
+
+    # Prefer the provider-facing, workspace-decorated current row over the
+    # durable seed. Both are after the proven previous-context boundary.
+    chosen_index = candidates[-1]
+    for index in reversed(candidates):
+        content = _message_text(source[index].get('content', ''))
+        if _WORKSPACE_PREFIX_RE.match(content) or _LEGACY_WORKSPACE_PREFIX_RE.match(content):
+            chosen_index = index
+            break
+    chosen = copy.deepcopy(source[chosen_index])
+    chosen[control_key] = dict(control or {})
+    remove_indexes = set(marked)
+    remove_indexes.add(chosen_index)
+    insert_at = sum(1 for index in range(chosen_index) if index not in remove_indexes)
+    canonical = [
+        message for index, message in enumerate(source)
+        if index not in remove_indexes
+    ]
+    canonical.insert(insert_at, chosen)
+    return canonical
 
 
 def _first_exchange_snippets(messages):
@@ -5245,6 +5391,10 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
     the current user turn onward. Synthetic compaction/reference markers remain
     internal recovery material and must not become visible user/assistant turns.
     """
+    internal_control_source = source in (
+        'tool_limit_continuation',
+        'goal_continuation',
+    )
     previous_display = [
         m for m in list(previous_display or [])
         if not _is_context_compression_marker(m)
@@ -5468,6 +5618,8 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         )
     )
     if (
+        not internal_control_source
+        and
         current_user_key is not None
         and not current_user_in_candidates
         and not current_user_already_checkpointed
@@ -5498,6 +5650,13 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
             continue
         key = _message_identity(msg)
         is_current_user_turn = _looks_like_current_user_turn(msg, msg_text)
+        if (
+            internal_control_source
+            and isinstance(msg, dict)
+            and msg.get('role') == 'user'
+            and ((key is not None and key == current_user_key) or is_current_user_turn)
+        ):
+            continue
         if (
             ((key is not None and key == current_user_key) or is_current_user_turn)
             and merged
@@ -5679,6 +5838,16 @@ def _merged_transcript_lacks_final_assistant_answer(
     drop_replayed_assistant: bool = False,
 ) -> bool:
     """Return True when the current turn still lacks a final assistant answer."""
+    if source in ('tool_limit_continuation', 'goal_continuation'):
+        # Internal continuation prompts intentionally have no visible user row.
+        # Running the display-boundary classifier below would append that hidden
+        # prompt *after* the valid assistant delta and falsely report a terminal
+        # no-response. Judge the model-context delta directly instead.
+        return not _assistant_reply_added_after_current_turn(
+            result_messages,
+            previous_context,
+            msg_text,
+        )
     previous_display = list(previous_display or [])
     merged_messages = _merge_display_messages_after_agent_result(
         previous_display,
@@ -6573,6 +6742,7 @@ def _run_agent_streaming(
     model_provider=None,
     goal_related=False,
     moa_config=None,
+    profile=None,
 ):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
 
@@ -6597,6 +6767,7 @@ def _run_agent_streaming(
         model=model,
         provider=model_provider,
         ephemeral=bool(ephemeral),
+        profile=profile,
     )
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
@@ -6613,6 +6784,7 @@ def _run_agent_streaming(
         except Exception:
             logger.debug("Failed to append worker_started turn journal event", exc_info=True)
     s = None
+    _tool_limit_reached = False
     _rt = {}
     old_cwd = None
     old_exec_ask = None
@@ -7048,7 +7220,7 @@ def _run_agent_streaming(
         _turn_session_identity_tokens = _set_turn_session_identity(session_id)
         s = get_session(session_id)
         _turn_pending_source = getattr(s, 'pending_user_source', None) or 'webui'
-        update_active_run(stream_id, phase="running", session_id=session_id)
+        update_active_run(stream_id, phase="running", session_id=session_id, profile=getattr(s, "profile", None) or profile)
         s.workspace = str(Path(workspace).expanduser().resolve())
         _last_persisted_model = None
         _last_persisted_provider = None
@@ -8373,6 +8545,27 @@ def _run_agent_streaming(
                 ),
                 msg_text,
             )
+            _turn_internal_control = {
+                'tool_limit_continuation': (
+                    'tool_limit_continuation', '_tool_limit_continuation_control'
+                ),
+                'goal_continuation': (
+                    'goal_continuation', '_goal_continuation_control'
+                ),
+            }.get(_turn_pending_source)
+            if _turn_internal_control:
+                # The child snapshot contains a durable seed row so a crash
+                # cannot lose the instruction. The current run supplies that
+                # same instruction as its user_message, so remove the seed and
+                # any prior segment copies from history before model dispatch.
+                # Result writeback reattaches one structured marker to the
+                # workspace-prefixed current row below.
+                _control_attr, _control_key = _turn_internal_control
+                _previous_context_messages = _drop_internal_control_prompts_from_history(
+                    _previous_context_messages,
+                    msg_text,
+                    _control_key,
+                )
             # Dedup before feeding to agent — merge_session_messages_append_only
             # can produce duplicates when context_messages and state.db share
             # messages with different timestamps.
@@ -8541,6 +8734,7 @@ def _run_agent_streaming(
                     _result_messages = _drop_synthetic_max_iteration_summary_requests(
                         _result_messages,
                         enabled=_tool_limit_reached,
+                        previous_messages=_previous_context_messages,
                     )
                     # #5494 — parity with hermes-agent's handle_max_iterations() return
                     # value. When the agent produced no usable summary assistant
@@ -8596,6 +8790,17 @@ def _run_agent_streaming(
                         msg_text,
                     )
                     s.context_messages = _deduplicate_context_messages(_next_context_messages)
+                    _internal_control = _turn_internal_control
+                    if _internal_control:
+                        _control_attr, _control_key = _internal_control
+                        _control = getattr(s, _control_attr, None)
+                        s.context_messages = _canonicalize_internal_control_context(
+                            s.context_messages,
+                            msg_text,
+                            _control_key,
+                            _control,
+                            previous_messages=_previous_context_messages,
+                        )
                     s.messages = _merge_display_messages_after_agent_result(
                         _previous_messages,
                         _previous_context_messages,
@@ -8693,6 +8898,16 @@ def _run_agent_streaming(
                     # over the just-preserved snapshot back to the original fork
                     # parent, losing access to the recoverable history in old_sid.json.
                     s.parent_session_id = old_sid
+                    # The worker remains the same physical run, but its canonical
+                    # conversation identity is now the continuation tip. Move the
+                    # live heartbeat immediately so state.db receives the tip's
+                    # workspace even if the process exits before normal writeback.
+                    update_active_run(
+                        stream_id,
+                        session_id=new_sid,
+                        workspace=str(s.workspace),
+                        profile=getattr(s, "profile", None) or profile,
+                    )
                     with LOCK:
                         cached_old_session = SESSIONS.pop(old_sid, None)
                         if cached_old_session is not None and cached_old_session is not s:
@@ -8811,10 +9026,14 @@ def _run_agent_streaming(
                     and not _saved_transcript_lacks_final_answer
                 ):
                     _terminal_failure = False
-                if _terminal_failure:
+                if _tool_limit_reached:
+                    # A durable successor, rather than a terminal error card,
+                    # owns this state. The teardown hook claims it only after
+                    # the parent worker has fully settled.
+                    _assistant_added = True
+                    _terminal_failure = False
+                elif _terminal_failure:
                     _assistant_added = False
-                elif _tool_limit_reached and not _session_lacks_final_assistant_answer(s.messages):
-                    _mark_latest_assistant_tool_limit_status(s.messages)
                 # _token_sent tracks whether on_token() was called (any streamed text)
                 if _terminal_failure or (not _assistant_added and not _token_sent):
                     if cancel_event.is_set():
@@ -8920,6 +9139,7 @@ def _run_agent_streaming(
                                 _result_messages = _drop_synthetic_max_iteration_summary_requests(
                                     _result_messages,
                                     enabled=_agent_result_tool_limit_reached(result),
+                                    previous_messages=_previous_context_messages,
                                 )
                                 _next_context_messages = _restore_reasoning_metadata(
                                     _previous_context_messages,
@@ -9019,6 +9239,7 @@ def _run_agent_streaming(
                         s.pending_attachments = []
                         s.pending_started_at = None
                         s.pending_user_source = None
+                        s.pending_server_instance_id = None
                         try:
                             _snapshot_and_append_partial_on_error(s, stream_id)
                         except Exception:
@@ -9159,8 +9380,10 @@ def _run_agent_streaming(
                 # Stamp 'timestamp' on any messages that don't have one yet,
                 # preserving transcript order across compacted/reconciled batches.
                 _stamp_missing_message_timestamps(s.messages)
-                # Only auto-generate title when still default; preserves user renames
-                if s.title == 'Untitled' or s.title == 'New Chat' or not s.title:
+                # Only auto-generate title when still default; preserves user renames.
+                # Internal continuation control must never become a visible title.
+                if (_turn_pending_source not in ('tool_limit_continuation', 'goal_continuation')
+                        and (s.title == 'Untitled' or s.title == 'New Chat' or not s.title)):
                     s.title = title_from(s.messages, s.title)
                 _looks_default = (s.title == 'Untitled' or s.title == 'New Chat' or not s.title)
                 _looks_provisional = _is_provisional_title(s.title, s.messages)
@@ -9218,6 +9441,7 @@ def _run_agent_streaming(
                 s.pending_attachments = []
                 s.pending_started_at = None
                 s.pending_user_source = None
+                s.pending_server_instance_id = None
                 # Tag the matching user message with attachment filenames for display on reload
                 # Only tag a user message whose content relates to this turn's text
                 # (msg_text is the full message including the [Attached files: ...] suffix)
@@ -9562,30 +9786,29 @@ def _run_agent_streaming(
                             })
                     except Exception:
                         logger.debug("Persistent state change detection failed for session %s", s.session_id, exc_info=True)
-            # Sync to state.db for /insights (opt-in setting)
+            # Persist the shared conversation projection. ``sync_to_insights``
+            # remains a compatibility setting and does not gate this write.
             with _stream_writeback_stage(_writeback_timings, "state_sync"):
                 try:
-                    from api.config import load_settings as _load_settings
-                    if _load_settings().get('sync_to_insights'):
-                        from api.state_sync import sync_session_usage
-                        sync_session_usage(
-                            session_id=s.session_id,
-                            input_tokens=s.input_tokens or 0,
-                            output_tokens=s.output_tokens or 0,
-                            estimated_cost=s.estimated_cost,
-                            model=model,
-                            title=s.title,
-                            message_count=len(s.messages),
-                            cache_read_tokens=s.cache_read_tokens or 0,
-                            cache_write_tokens=s.cache_write_tokens or 0,
-                            api_call_count=getattr(agent, 'session_api_calls', None),
-                            # #2762: pass the session's profile explicitly so the
-                            # background-thread state.db lookup doesn't fall
-                            # through to the process-global active profile and
-                            # write to the wrong DB (TLS profile is set on the
-                            # HTTP thread but not propagated to this worker).
-                            profile=getattr(s, 'profile', None),
-                        )
+                    from api.state_sync import sync_session_usage
+                    sync_session_usage(
+                        session_id=s.session_id,
+                        input_tokens=s.input_tokens or 0,
+                        output_tokens=s.output_tokens or 0,
+                        estimated_cost=s.estimated_cost,
+                        model=model,
+                        title=s.title,
+                        message_count=len(s.messages),
+                        cache_read_tokens=s.cache_read_tokens or 0,
+                        cache_write_tokens=s.cache_write_tokens or 0,
+                        api_call_count=getattr(agent, 'session_api_calls', None),
+                        # #2762: pass the session's profile explicitly so the
+                        # background-thread state.db lookup cannot fall through
+                        # to the process-global active profile.
+                        profile=getattr(s, 'profile', None),
+                        cwd=getattr(s, 'workspace', None),
+                        archived=getattr(s, 'archived', None),
+                    )
                 except Exception:
                     logger.debug("Failed to sync session to insights")
             # A late cancel can land during memory/state-sync writeback. Do not
@@ -9873,16 +10096,24 @@ def _run_agent_streaming(
                         'session_id': session_id,
                         'state': 'continuing' if decision.get('should_continue') else 'idle',
                         'message': _goal_message,
-                        'message_key': decision.get('message_key') or ('goal_continuing' if _goal_message else ''),
+                        'message_key': decision.get('message_key') or (
+                            'goal_continuing' if decision.get('should_continue') else ''
+                        ),
                         'message_args': decision.get('message_args') or [],
                         'decision': decision,
                     })
                 if decision.get('should_continue'):
                     continuation_prompt = str(decision.get('continuation_prompt') or '').strip()
                     if continuation_prompt:
-                        # #1932: mark this session as pending a goal continuation
-                        # so the next /chat/start creates a goal-related stream.
-                        PENDING_GOAL_CONTINUATION.add(session_id)
+                        from api.goal_continuation import claim_goal_continuation
+
+                        claim_goal_continuation(
+                            session_id=session_id,
+                            parent_run_id=stream_id,
+                            prompt=continuation_prompt,
+                            goal_revision=decision.get("goal_revision"),
+                            profile_home=_profile_home,
+                        )
                         put('goal_continue', {
                             'session_id': session_id,
                             'continuation_prompt': continuation_prompt,
@@ -9900,6 +10131,11 @@ def _run_agent_streaming(
                 if _tool_limit_reached:
                     _done_payload['terminal_state'] = 'tool_limit_reached'
                     _done_payload['terminal_reason'] = 'max_iterations'
+                    # The durable claim happens only after this parent stream
+                    # is removed from STREAMS/ACTIVE_RUNS below. Do not claim a
+                    # successor already exists; the continuation control frame
+                    # is the authoritative acceptance signal.
+                    _done_payload['continuation_pending'] = True
                 put('done', _done_payload)
                 # Emit one last metering packet for the live message-header TPS label.
                 meter_stats = meter().get_stats()
@@ -10236,6 +10472,7 @@ def _run_agent_streaming(
                 s.pending_attachments = []
                 s.pending_started_at = None
                 s.pending_user_source = None
+                s.pending_server_instance_id = None
                 try:
                     _snapshot_and_append_partial_on_error(s, stream_id)
                 except Exception:
@@ -10331,15 +10568,49 @@ def _run_agent_streaming(
             STREAM_GOAL_RELATED.pop(stream_id, None)  # Clean up goal-related flag (#1932)
             STREAM_LAST_EVENT_ID.pop(stream_id, None)  # Clean up event_id pointer (stage-364)
             unregister_active_run(stream_id)
-            # NOTE: do NOT discard PENDING_GOAL_CONTINUATION here. The marker
-            # is set by goal_continue (line ~3328) inside the SAME function
-            # call and consumed atomically by `_start_chat_stream_for_session`
-            # in routes.py (around line 6522) when the next stream starts.
-            # Discarding here in the streaming worker's `finally` would
-            # almost always race ahead of the frontend's SSE-receive →
-            # POST /api/chat/start round-trip and erase the marker before
-            # the next stream can read it, breaking the goal-continuation
-            # chain. Stage-326 critical fix per Opus advisor review.
+
+        # This is the deterministic parent-settled boundary: the stream channel
+        # and ACTIVE_RUNS row are both gone before any successor is started.
+        try:
+            from api.goal_continuation import (
+                recover_pending_goal_continuations,
+                settle_goal_continuation,
+            )
+
+            settle_goal_continuation(session_id, stream_id)
+            recover_pending_goal_continuations(session_id=session_id)
+        except Exception:
+            logger.exception(
+                "goal continuation settle hook failed for session %s stream %s",
+                session_id,
+                stream_id,
+            )
+
+        if s is not None:
+            try:
+                from api.tool_limit_continuation import handle_terminal
+
+                handle_terminal(
+                    s,
+                    stream_id,
+                    tool_limit_reached=bool(_tool_limit_reached),
+                )
+            except Exception:
+                logger.exception(
+                    "tool-limit continuation settle hook failed for session %s stream %s",
+                    getattr(s, "session_id", session_id),
+                    stream_id,
+                )
+                try:
+                    from api.tool_limit_continuation import persist_terminal_failure
+
+                    persist_terminal_failure(s, stream_id)
+                except Exception:
+                    logger.exception(
+                        "tool-limit continuation failure disclosure failed for session %s stream %s",
+                        getattr(s, "session_id", session_id),
+                        stream_id,
+                    )
 
         # ── Defer-path fix: turn-teardown idle-hook ────────────────────────
         # The session has just transitioned active→idle: unregister_active_run
@@ -10780,6 +11051,7 @@ def cancel_stream(stream_id: str) -> bool:
                 _cs.pending_attachments = []
                 _cs.pending_started_at = None
                 _cs.pending_user_source = None
+                _cs.pending_server_instance_id = None
                 # Persist any partial assistant text that was streamed before cancel (#893).
                 # Preserving partial content means the user sees what the agent had
                 # produced rather than losing it entirely.  The marker is _partial=True

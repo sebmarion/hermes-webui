@@ -1,4 +1,7 @@
 import sqlite3
+import time
+
+import pytest
 
 
 def _make_db(path):
@@ -115,6 +118,29 @@ def test_shared_projection_uses_tip_title_when_continuation_renamed(tmp_path):
     assert tip["title"] == "Tip title"
 
 
+@pytest.mark.parametrize("source", ["webui", "tui"])
+def test_shared_projection_uses_root_title_for_generated_continuation_suffix(
+    tmp_path,
+    source,
+):
+    from api.agent_sessions import read_shared_session_rows
+
+    db = tmp_path / "state.db"
+    _make_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE sessions SET source = ? WHERE id IN ('root', 'tip')",
+            (source,),
+        )
+        conn.execute("UPDATE sessions SET title = 'Shared title #2' WHERE id = 'tip'")
+        conn.commit()
+
+    rows = read_shared_session_rows(db, source=source)
+
+    tip = next(row for row in rows if row["id"] == "tip")
+    assert tip["title"] == "Shared title"
+
+
 def test_shared_projection_preserves_non_compression_children(tmp_path):
     from api.agent_sessions import read_shared_session_rows
 
@@ -156,6 +182,61 @@ def test_shared_projection_resolves_old_compression_id_to_tip(tmp_path):
     assert resolve_shared_session_id(db, "root") == "tip"
     assert resolve_shared_session_id(db, "tip") == "tip"
     assert resolve_shared_session_id(db, "branch") == "branch"
+
+
+def test_shared_pin_is_stored_only_on_logical_lineage_root(tmp_path, monkeypatch):
+    import api.state_sync as state_sync
+
+    db_path = tmp_path / "state.db"
+    _make_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+        )
+        # Reproduce the stale duplicate bits written by older WebUI builds.
+        conn.execute("UPDATE sessions SET pinned = 1 WHERE id IN ('root', 'tip')")
+        conn.commit()
+
+    class SQLiteStateDB:
+        def __init__(self, path):
+            self.conn = sqlite3.connect(path)
+
+        def ensure_session(self, **_kwargs):
+            return None
+
+        def set_session_pinned(self, session_id, pinned):
+            self.conn.execute(
+                "UPDATE sessions SET pinned = ? WHERE id = ?",
+                (1 if pinned else 0, session_id),
+            )
+            self.conn.commit()
+
+        def _execute_write(self, callback):
+            result = callback(self.conn)
+            self.conn.commit()
+            return result
+
+        def close(self):
+            return None
+
+    state_db = SQLiteStateDB(db_path)
+    monkeypatch.setattr(state_sync, "_get_state_db", lambda profile=None: state_db)
+
+    state_sync.sync_session_pinned("tip", True, profile="default")
+
+    with sqlite3.connect(db_path) as conn:
+        pins = dict(conn.execute("SELECT id, pinned FROM sessions").fetchall())
+    assert pins["root"] == 1
+    assert pins["tip"] == 0
+    assert pins["branch"] == 0
+
+    state_sync.sync_session_pinned("tip", False, profile="default")
+
+    with sqlite3.connect(db_path) as conn:
+        pins = dict(conn.execute("SELECT id, pinned FROM sessions").fetchall())
+    assert pins["root"] == 0
+    assert pins["tip"] == 0
+    assert pins["branch"] == 0
 
 
 def test_shared_metadata_writeback_does_not_depend_on_insights_toggle(monkeypatch):
@@ -303,6 +384,47 @@ def test_sidebar_projection_does_not_repin_after_state_db_unpin(tmp_path, monkey
 
     tip = next(row for row in rows if row["session_id"] == "tip")
     assert tip["pinned"] is False
+
+
+def test_sidebar_projection_overlays_fresh_shared_activity(tmp_path, monkeypatch):
+    import api.models as models
+
+    db = tmp_path / "state.db"
+    _make_db(db)
+    with sqlite3.connect(db) as conn:
+        now = time.time()
+        conn.executescript(
+            """
+            CREATE TABLE session_activity (
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                heartbeat_at REAL NOT NULL,
+                PRIMARY KEY (session_id, run_id)
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO session_activity VALUES (?, ?, ?, ?, ?, ?)",
+            ("tip", "run-1", "webui", "tool", now - 5, now),
+        )
+        conn.commit()
+
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    monkeypatch.setattr(models, "get_last_workspace", lambda: "/fallback")
+    monkeypatch.setattr(models, "_active_stream_ids", lambda: {"stream-1"})
+
+    rows, _legacy = models.shared_webui_sidebar_projection(
+        [{"session_id": "tip", "title": "sidecar", "message_count": 2}],
+        profile="default",
+    )
+
+    tip = next(row for row in rows if row["session_id"] == "tip")
+    assert tip["is_working"] is True
+    assert tip["activity_phase"] == "tool"
+    assert tip["activity_heartbeat_at"] == now
 
 
 

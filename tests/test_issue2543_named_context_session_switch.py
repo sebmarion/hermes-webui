@@ -16,10 +16,10 @@ def test_loadsession_clears_pending_named_context_before_saving_old_draft():
     block = SESSIONS_JS[start:end]
 
     clear_idx = block.find("window._clearPendingSelections()")
-    save_idx = block.find("await _saveComposerDraftNow(currentSid")
+    save_idx = block.find("await _saveComposerDraftNow(_switchDraftSid")
 
     assert clear_idx != -1, "loadSession() must clear pending named context blocks on real session switches"
-    assert save_idx != -1, "loadSession() switch block must still persist the old draft before leaving"
+    assert save_idx != -1, "loadSession() switch block must persist the confirmed-owner draft before leaving"
     assert clear_idx < save_idx, "pending named context blocks should disappear before the switch draft save yields"
 
 

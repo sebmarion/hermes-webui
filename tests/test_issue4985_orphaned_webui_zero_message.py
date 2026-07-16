@@ -330,6 +330,106 @@ def test_webui_titled_orphan_in_state_db_is_pruned(monkeypatch):
     assert pruned == ["webui-orphan"]
 
 
+@pytest.mark.parametrize(
+    "draft",
+    [
+        {"text": "Recovered next step", "files": []},
+        {"text": "", "files": [{"name": "recovery-notes.md"}]},
+    ],
+)
+def test_webui_zero_message_session_with_composer_draft_is_retained(monkeypatch, draft):
+    """A recovery successor can own unsent work before its first model turn.
+
+    The session-owned draft is durable user state, so the zero-message orphan
+    pass must keep the row visible without requiring a synthetic message.
+    """
+    import api.routes as routes
+
+    monkeypatch.setattr(
+        routes, "_load_webui_zero_message_orphan_tombstone", lambda: frozenset()
+    )
+    monkeypatch.setattr(
+        routes, "_record_webui_zero_message_orphan_tombstone", lambda sid: None
+    )
+
+    recovered = {
+        "session_id": "webui-recovered-draft",
+        "title": "Recovered successor",
+        "profile": "default",
+        "updated_at": 20,
+        "last_message_at": 20,
+        "message_count": 0,
+        "read_only": False,
+        "source_tag": "webui",
+        "raw_source": "webui",
+        "session_source": "webui",
+        "source_label": "WebUI",
+        "is_cli_session": False,
+        "composer_draft": draft,
+    }
+    empty_ghost = {
+        **recovered,
+        "session_id": "webui-empty-ghost",
+        "title": "Truly empty ghost",
+        "composer_draft": {"text": "", "files": []},
+    }
+
+    payload, pruned = _payload_for_rows_webui(
+        monkeypatch,
+        [recovered, empty_ghost],
+        zero_message_ids=["webui-recovered-draft", "webui-empty-ghost"],
+    )
+
+    assert [session["session_id"] for session in payload["sessions"]] == [
+        "webui-recovered-draft"
+    ]
+    assert pruned == ["webui-empty-ghost"]
+
+
+def test_webui_zero_message_draft_self_heals_existing_orphan_tombstone(monkeypatch):
+    import api.routes as routes
+
+    sid = "webui-recovered-tombstoned-draft"
+    row = {
+        "session_id": sid,
+        "title": "Recovered successor",
+        "profile": "default",
+        "message_count": 0,
+        "source_tag": "webui",
+        "raw_source": "webui",
+        "session_source": "webui",
+        "composer_draft": {"text": "Continue recovery", "files": []},
+    }
+    cleared = []
+    pruned = []
+    monkeypatch.setattr(
+        routes,
+        "agent_session_zero_message_sids",
+        lambda ids, profile=None: frozenset({sid}),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_load_webui_zero_message_orphan_tombstone",
+        lambda: frozenset({sid}),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_clear_webui_zero_message_orphan_tombstone",
+        lambda value: cleared.append(value),
+    )
+    monkeypatch.setattr(
+        routes,
+        "prune_session_from_index",
+        lambda value: pruned.append(value),
+    )
+
+    result = routes._prune_orphaned_webui_zero_message_sessions([row])
+
+    assert [item["session_id"] for item in result] == [sid]
+    assert cleared == [sid]
+    assert pruned == []
+
+
 # 2. Titled Webui row with state.db.messages NON-empty -> RETAINED. The gate
 #    fires, the helper confirms messages exist, the row is NOT in the missing
 #    set, prune_session_from_index is NOT called.
@@ -828,6 +928,7 @@ def _write_webui_sidecar(
     worktree_path: str | None = None,
     profile: str = "default",
     messages: list[dict] | None = None,
+    composer_draft: dict | None = None,
 ) -> None:
     """Write a sidecar JSON file that ``all_sessions()`` will pick up via
     the index/full-scan path and that survives the #1171 keep-filter (i.e.
@@ -877,6 +978,8 @@ def _write_webui_sidecar(
         sidecar["has_pending_user_message"] = True
     if worktree_path:
         sidecar["worktree_path"] = worktree_path
+    if composer_draft is not None:
+        sidecar["composer_draft"] = dict(composer_draft)
     (session_dir / f"{session_id}.json").write_text(
         json.dumps(sidecar, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -956,6 +1059,40 @@ def _run_payload(pruned: list[str], *, show_cli_sessions: bool = True):
         show_cron_sessions=False,
     )
     return payload
+
+
+def test_real_pipeline_retains_zero_message_recovery_successor_with_draft(
+    _real_pipeline, monkeypatch,
+):
+    import api.routes as routes
+
+    tmp_path = _real_pipeline
+    sid = "webui-real-recovered-draft"
+    _write_webui_sidecar(
+        tmp_path / "sessions",
+        session_id=sid,
+        title="Recovered successor",
+        message_count=0,
+        composer_draft={"text": "Continue the recovered task", "files": []},
+    )
+    _write_state_db(
+        tmp_path / "hermes_home",
+        sessions={sid: {"source": "webui", "title": "Recovered successor", "messages": 0}},
+    )
+    pruned: list[str] = []
+    monkeypatch.setattr(
+        routes, "prune_session_from_index", lambda value: pruned.append(value)
+    )
+    monkeypatch.setattr(
+        routes,
+        "_reconcile_stale_stream_state_for_session_rows",
+        lambda _rows: False,
+    )
+
+    payload = _run_payload(pruned, show_cli_sessions=False)
+
+    assert sid in [session["session_id"] for session in payload["sessions"]]
+    assert pruned == []
 
 
 # 13. A genuinely-surviving titled orphan: title is non-Untitled so #1171

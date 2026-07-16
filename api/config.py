@@ -74,6 +74,7 @@ TLS_ENABLED = TLS_CERT is not None and TLS_KEY is not None
 
 # ── State directory (env-overridable, never inside repo) ──────────────────────
 _DEFAULT_HERMES_HOME = _platform_default_hermes_home()
+_PRODUCTION_HERMES_HOME = (Path.home() / ".hermes").expanduser().resolve()
 _DEFAULT_STATE_HOME = Path(os.getenv("HERMES_HOME") or _DEFAULT_HERMES_HOME).expanduser()
 
 STATE_DIR = (
@@ -4429,6 +4430,54 @@ def set_hermes_default_model(model_id: str, provider: str | None = None, advance
     return {"ok": True, "model": persisted_model, "provider": persisted_provider or None}
 
 
+def set_model_aliases(aliases: dict, *, config_path: Path | None = None) -> dict:
+    """Replace aliases shared by WebUI and Hermes One for one profile."""
+    if not isinstance(aliases, dict):
+        raise ValueError("aliases must be an object")
+    normalized: dict[str, str] = {}
+    seen: set[str] = set()
+    for raw_alias, raw_model in aliases.items():
+        alias = str(raw_alias or "").strip()
+        model = str(raw_model or "").strip()
+        if not alias or not model:
+            raise ValueError("alias names and model IDs must not be empty")
+        if any(ch.isspace() for ch in alias) or "/" in alias or alias.startswith("-"):
+            raise ValueError(f"invalid alias: {alias}")
+        if alias.lower() in seen:
+            raise ValueError(f"duplicate alias: {alias}")
+        seen.add(alias.lower())
+        normalized[alias] = model
+
+    config_path = Path(config_path) if config_path is not None else _get_config_path()
+    with _cfg_lock:
+        config_data = _load_yaml_config_file(config_path)
+        existing = config_data.get("model_aliases", {})
+        if not isinstance(existing, dict):
+            existing = {}
+        structured = {}
+        for alias, model in normalized.items():
+            previous = existing.get(alias, {})
+            entry = dict(previous) if isinstance(previous, dict) else {}
+            entry["model"] = model
+            if not str(entry.get("provider") or "").strip():
+                _, provider, base_url = resolve_model_provider(model)
+                if provider:
+                    entry["provider"] = provider
+                if base_url:
+                    entry["base_url"] = base_url
+            structured[alias] = entry
+        config_data["model_aliases"] = structured
+        # Remove the obsolete parallel shape if it exists: one registry avoids
+        # WebUI/Hermes One drift.
+        model_cfg = config_data.get("model")
+        if isinstance(model_cfg, dict):
+            model_cfg.pop("aliases", None)
+        _save_yaml_config_file(config_path, config_data)
+    reload_config()
+    invalidate_models_cache()
+    return {"ok": True, "aliases": normalized}
+
+
 # ── Auxiliary model configuration ──────────────────────────────────────────
 
 # Canonical auxiliary task catalog.
@@ -5354,17 +5403,7 @@ def _static_models_catalog_without_live_probes() -> dict:
 
         groups.sort(key=_group_sort_key)
 
-        model_aliases: dict[str, str] = {}
-        try:
-            raw_aliases = cfg.get("model", {}).get("aliases", {})
-            if isinstance(raw_aliases, dict):
-                model_aliases = {
-                    str(k).strip(): str(v).strip()
-                    for k, v in raw_aliases.items()
-                    if k and v
-                }
-        except Exception:
-            pass
+        model_aliases = _model_aliases_from_config()
 
         if not groups and default_model:
             return copy.deepcopy(_minimal_static_models_catalog())
@@ -5920,6 +5959,15 @@ def _model_aliases_from_config() -> dict[str, str]:
     disk cache that never persisted them).
     """
     try:
+        raw_aliases = cfg.get("model_aliases", {})
+        if isinstance(raw_aliases, dict):
+            normalized_aliases = {
+                str(alias).strip(): str(entry.get("model") or "").strip()
+                for alias, entry in raw_aliases.items()
+                if alias and isinstance(entry, dict) and entry.get("model")
+            }
+            if normalized_aliases:
+                return normalized_aliases
         raw_aliases = cfg.get("model", {}).get("aliases", {})
         if isinstance(raw_aliases, dict):
             return {
@@ -8489,6 +8537,7 @@ STREAM_LIVE_TOOL_CALLS: dict = {}  # stream_id -> live tool calls accumulated du
 STREAM_GOAL_RELATED: dict = {}  # stream_id -> bool: only evaluate goal for goal-related turns (#1932)
 STREAM_LAST_EVENT_ID: dict = {}  # stream_id -> latest journal event_id for `id:` field on live SSE frames (stage-364)
 PENDING_GOAL_CONTINUATION: set = set()  # session_ids awaiting a goal continuation turn (#1932)
+PENDING_GOAL_CONTINUATION_GUARDS: dict = {}  # session_id -> {revision, profile_home}
 
 
 def register_stream_owner(stream_id: str, session_id: str) -> None:
@@ -8671,6 +8720,176 @@ ACTIVE_RUNS: dict = {}
 ACTIVE_RUNS_LOCK = threading.Lock()
 LAST_RUN_FINISHED_AT: float | None = None
 SERVER_START_TIME = time.time()
+_ACTIVE_ACTIVITY_HEARTBEAT_INTERVAL_SECONDS = 5.0
+_ACTIVE_ACTIVITY_HEARTBEAT_THREAD: threading.Thread | None = None
+_ACTIVE_ACTIVITY_HEARTBEAT_WAKE = threading.Event()
+_SESSION_ACTIVITY_PROFILE_HINTS: dict[str, str] = {}
+_SESSION_ACTIVITY_PROFILE_HINTS_MAX = 1_000
+_ACTIVE_DELEGATION_ACTIVITY_ROWS: dict[str, tuple[str, str, str]] = {}
+_ACTIVE_DELEGATION_ACTIVITY_LOCK = threading.Lock()
+
+
+def _remember_session_activity_profile_locked(entry: dict) -> None:
+    """Retain a bounded explicit profile hint for post-turn delegated work."""
+    session_id = str(entry.get("session_id") or "").strip()
+    profile = str(entry.get("profile") or "").strip()
+    if not session_id or not profile:
+        return
+    _SESSION_ACTIVITY_PROFILE_HINTS[session_id] = profile
+    while len(_SESSION_ACTIVITY_PROFILE_HINTS) > _SESSION_ACTIVITY_PROFILE_HINTS_MAX:
+        _SESSION_ACTIVITY_PROFILE_HINTS.pop(next(iter(_SESSION_ACTIVITY_PROFILE_HINTS)))
+
+
+def _sync_active_run_activity(entry: dict, *, clear: bool = False) -> None:
+    """Best-effort bridge from the in-memory worker registry to state.db."""
+    session_id = str(entry.get("session_id") or "").strip()
+    stream_id = str(entry.get("stream_id") or "").strip()
+    if not session_id or not stream_id:
+        return
+    try:
+        from api.state_sync import clear_session_activity, sync_session_activity
+
+        profile = entry.get("profile")
+        if clear:
+            clear_session_activity(session_id, stream_id, profile=profile)
+        else:
+            sync_session_activity(
+                session_id,
+                stream_id,
+                phase=str(entry.get("phase") or "running"),
+                started_at=float(entry.get("started_at") or time.time()),
+                heartbeat_at=time.time(),
+                source=str(entry.get("source") or "webui"),
+                model=entry.get("model"),
+                cwd=entry.get("workspace"),
+                profile=profile,
+            )
+    except Exception:
+        logger.debug("Failed to mirror active run activity to state.db", exc_info=True)
+
+
+def _publish_active_run_activity_change(entry: dict) -> None:
+    """Invalidate WebUI sidebar caches when a run changes active/idle state."""
+    try:
+        from api.session_events import publish_session_list_changed
+
+        publish_session_list_changed(
+            "session_activity",
+            profile=entry.get("profile"),
+            session_id=str(entry.get("session_id") or "") or None,
+        )
+    except Exception:
+        logger.debug("Failed to publish session activity change", exc_info=True)
+
+
+def _sync_active_delegation_activity() -> None:
+    """Keep a parent conversation active while asynchronous children run.
+
+    Async delegations outlive the parent agent turn. They remain distinct
+    execution records, but sidebar activity belongs to the initiating
+    conversation so Hermes One and WebUI do not expose child rows as duplicate
+    chats. Explicit profile hints prevent a background thread from writing to
+    whichever profile happens to be globally active.
+    """
+    try:
+        from tools.async_delegation import list_async_delegations
+
+        records = list_async_delegations()
+    except Exception:
+        logger.debug("Failed to inspect async delegation activity", exc_info=True)
+        return
+
+    try:
+        from api.state_sync import clear_session_activity, sync_session_activity
+    except Exception:
+        logger.debug("Failed to load shared activity bridge for delegations", exc_info=True)
+        return
+
+    with ACTIVE_RUNS_LOCK:
+        profile_hints = dict(_SESSION_ACTIVITY_PROFILE_HINTS)
+
+    now = time.time()
+    with _ACTIVE_DELEGATION_ACTIVITY_LOCK:
+        previous = dict(_ACTIVE_DELEGATION_ACTIVITY_ROWS)
+        current: dict[str, tuple[str, str, str]] = {}
+        running_records: dict[str, dict] = {}
+        for raw in records or []:
+            if not isinstance(raw, dict) or str(raw.get("status") or "") != "running":
+                continue
+            delegation_id = str(raw.get("delegation_id") or "").strip()
+            session_id = str(
+                raw.get("origin_ui_session_id") or raw.get("session_key") or ""
+            ).strip()
+            if not delegation_id or not session_id:
+                continue
+            prior = previous.get(delegation_id)
+            profile = profile_hints.get(session_id) or (prior[1] if prior else "")
+            if not profile:
+                continue
+            run_id = f"delegation:{delegation_id}"
+            current[delegation_id] = (session_id, profile, run_id)
+            running_records[delegation_id] = raw
+
+        for delegation_id, old in previous.items():
+            if current.get(delegation_id) == old:
+                continue
+            old_session_id, old_profile, old_run_id = old
+            clear_session_activity(
+                old_session_id,
+                old_run_id,
+                profile=old_profile,
+            )
+            _publish_active_run_activity_change(
+                {"session_id": old_session_id, "profile": old_profile}
+            )
+
+        for delegation_id, row in current.items():
+            session_id, profile, run_id = row
+            record = running_records[delegation_id]
+            sync_session_activity(
+                session_id,
+                run_id,
+                phase="delegated",
+                started_at=float(record.get("dispatched_at") or now),
+                heartbeat_at=now,
+                source="webui",
+                model=record.get("model"),
+                profile=profile,
+            )
+            if previous.get(delegation_id) != row:
+                _publish_active_run_activity_change(
+                    {"session_id": session_id, "profile": profile}
+                )
+
+        _ACTIVE_DELEGATION_ACTIVITY_ROWS.clear()
+        _ACTIVE_DELEGATION_ACTIVITY_ROWS.update(current)
+
+
+def _active_activity_heartbeat_loop() -> None:
+    """Refresh all live worker rows so provider/tool waits stay observable."""
+    while True:
+        _ACTIVE_ACTIVITY_HEARTBEAT_WAKE.wait(_ACTIVE_ACTIVITY_HEARTBEAT_INTERVAL_SECONDS)
+        _ACTIVE_ACTIVITY_HEARTBEAT_WAKE.clear()
+        with ACTIVE_RUNS_LOCK:
+            entries = [dict(entry) for entry in (ACTIVE_RUNS or {}).values()]
+        for entry in entries:
+            _sync_active_run_activity(entry)
+        _sync_active_delegation_activity()
+
+
+def _ensure_active_activity_heartbeat_thread() -> None:
+    global _ACTIVE_ACTIVITY_HEARTBEAT_THREAD
+    thread = _ACTIVE_ACTIVITY_HEARTBEAT_THREAD
+    if thread is not None and thread.is_alive():
+        _ACTIVE_ACTIVITY_HEARTBEAT_WAKE.set()
+        return
+    thread = threading.Thread(
+        target=_active_activity_heartbeat_loop,
+        name="session-activity-heartbeat",
+        daemon=True,
+    )
+    _ACTIVE_ACTIVITY_HEARTBEAT_THREAD = thread
+    thread.start()
 
 
 def register_active_run(stream_id: str, **metadata) -> None:
@@ -8684,6 +8903,10 @@ def register_active_run(stream_id: str, **metadata) -> None:
     entry.setdefault("phase", "running")
     with ACTIVE_RUNS_LOCK:
         ACTIVE_RUNS[stream_id] = entry
+        _remember_session_activity_profile_locked(entry)
+    _ensure_active_activity_heartbeat_thread()
+    _sync_active_run_activity(entry)
+    _publish_active_run_activity_change(entry)
 
 
 def update_active_run(stream_id: str, **metadata) -> None:
@@ -8693,7 +8916,29 @@ def update_active_run(stream_id: str, **metadata) -> None:
     with ACTIVE_RUNS_LOCK:
         entry = ACTIVE_RUNS.get(stream_id)
         if entry is not None:
+            previous = dict(entry)
             entry.update(metadata)
+            _remember_session_activity_profile_locked(entry)
+            snapshot = dict(entry)
+        else:
+            previous = None
+            snapshot = None
+    if snapshot is not None:
+        if (
+            previous is not None
+            and str(previous.get("session_id") or "")
+            and str(previous.get("session_id") or "")
+            != str(snapshot.get("session_id") or "")
+        ):
+            # Compression keeps the physical worker/run id but moves its
+            # canonical conversation identity. Remove the old composite key
+            # before publishing the tip so both clients never see duplicate
+            # live conversations during the activity TTL window.
+            _sync_active_run_activity(previous, clear=True)
+            _publish_active_run_activity_change(previous)
+        _sync_active_run_activity(snapshot)
+        _publish_active_run_activity_change(snapshot)
+        _ACTIVE_ACTIVITY_HEARTBEAT_WAKE.set()
 
 
 def unregister_active_run(stream_id: str) -> None:
@@ -8702,8 +8947,12 @@ def unregister_active_run(stream_id: str) -> None:
         return
     global LAST_RUN_FINISHED_AT
     with ACTIVE_RUNS_LOCK:
-        ACTIVE_RUNS.pop(stream_id, None)
+        entry = ACTIVE_RUNS.pop(stream_id, None)
         LAST_RUN_FINISHED_AT = time.time()
+    if entry is not None:
+        _sync_active_run_activity(dict(entry), clear=True)
+        _publish_active_run_activity_change(dict(entry))
+        _sync_active_delegation_activity()
     unregister_stream_owner(stream_id)
 
 # Agent cache: reuse AIAgent across messages in the same WebUI session so that
@@ -9238,6 +9487,14 @@ def _atomic_write_settings_text(path: Path, text: str) -> None:
     itself with a regular file.
     """
     path = Path(path)
+    if os.getenv("HERMES_WEBUI_TEST_STATE_DIR"):
+        resolved_path = path.expanduser().resolve(strict=False)
+        production_home = Path(_PRODUCTION_HERMES_HOME).expanduser().resolve(strict=False)
+        if resolved_path == production_home or production_home in resolved_path.parents:
+            raise RuntimeError(
+                "Refusing test process settings write into production Hermes state: "
+                f"{resolved_path}"
+            )
     write_path = path.resolve(strict=False) if path.is_symlink() else path
     tmp = write_path.with_name(
         f".{write_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"

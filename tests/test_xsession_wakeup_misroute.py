@@ -167,6 +167,7 @@ def test_turn_identity_binder_restores_previous_value():
     assert sc._SESSION_PLATFORM.get() is sc._UNSET
     with bind("sid-outer"):
         assert get_current_session_key(default="") == "sid-outer"
+        assert sc.async_delivery_supported() is False
         with bind("sid-inner"):
             assert get_current_session_key(default="") == "sid-inner"
         # Reset-token restores the OUTER value (composes under nesting),
@@ -177,6 +178,7 @@ def test_turn_identity_binder_restores_previous_value():
     # Full exit restores _UNSET → env fallback resumes (CLI/cron compat).
     assert sc._SESSION_KEY.get() is sc._UNSET
     assert sc._SESSION_PLATFORM.get() is sc._UNSET
+    assert sc._SESSION_ASYNC_DELIVERY.get() is sc._UNSET
 
 
 # ---------------------------------------------------------------------------

@@ -88,9 +88,11 @@ correct visible session target, not moving execution ownership.
 
 8. **Only valid compression continuations collapse.** Parent/child links are
    not sufficient: source must match and branch, delegate, tool, and
-   cross-source children remain distinct conversations. The visible row uses
-   the tip's message count and activity timestamp; segment counts are never
-   summed.
+   cross-source children remain distinct, directly addressable conversations.
+   The main sidebar remains parent-only: child rows can contribute actionable
+   state to a visible parent but do not render as nested subthreads. The visible
+   row uses the tip's message count and activity timestamp; segment counts are
+   never summed.
 
 9. **Legacy sidecars are lazy.** A sidecar-only archived, messageful session is
    browseable under Legacy WebUI Archive and imported into state.db only when
@@ -100,9 +102,22 @@ correct visible session target, not moving execution ownership.
 10. **Shared organization metadata is state.db-owned.** Titles, agent workspace,
     archive state, and pins are read from the canonical projection. Legacy
     sidecar pins are migrated once; they are not re-applied after an explicit
-    state.db unpin.
+    state.db unpin. A logical pin is stored only on the compression-lineage root;
+    pin/unpin clears stale pin bits from the hidden physical segments. A
+    meaningful canonical title also wins over surface-generated placeholders
+    such as `Untitled`, `Cli Session`, `TUI Session`, or a generic continuation
+    label; the original sidecar title remains unchanged and the canonical value
+    is exposed as display metadata.
 
-11. **Interactive sources share one list.** Messageful `webui`, `cli`, `tui`,
+11. **Runtime activity is an overlay, not conversation metadata.** WebUI and
+    Hermes One write fresh `(session_id, run_id)` heartbeats to the additive
+    `session_activity` table in the profile's `state.db`. Reads expose activity
+    only while the heartbeat is less than 20 seconds old; stale rows are
+    ignored. The overlay carries a phase such as `running`, `thinking`,
+    `tool`, or `clarification` and is never included in message counts or
+    lineage ordering.
+
+12. **Interactive sources share one list.** Messageful `webui`, `cli`, `tui`,
     and `acp` rows are projected from each profile's `state.db` together. Source
     is presentation metadata, not a browser list partition. The browser does
     not send `sidebar_source`; the parameter remains available only for older

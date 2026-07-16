@@ -1296,6 +1296,40 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
   return restoredVisible;
 }
 
+function _composerOwnershipSnapshot(text, files){
+  const targetSid=(S.session&&S.session.session_id)||null;
+  const ownerApiAvailable=typeof _composerDraftOwnerSessionId==='function';
+  const ownerSid=ownerApiAvailable?_composerDraftOwnerSessionId():targetSid;
+  const loadingSid=typeof _loadingSessionId!=='undefined'&&_loadingSessionId
+    ? String(_loadingSessionId)
+    : null;
+  const switching=!!(loadingSid&&loadingSid!==targetSid);
+  const hasPayload=!!String(text||'').trim()||(Array.isArray(files)&&files.length>0);
+  const unboundNewSession=!targetSid&&!ownerSid;
+  const valid=!hasPayload||(!switching&&(unboundNewSession||!!ownerSid&&ownerSid===targetSid));
+  return {ownerSid,targetSid,loadingSid,switching,hasPayload,valid};
+}
+
+function _warnComposerOwnershipMismatch(ownership, text, files){
+  const ownerSid=ownership&&ownership.ownerSid;
+  if(ownerSid&&typeof _saveComposerDraftNow==='function'){
+    try{void _saveComposerDraftNow(ownerSid,String(text||''),Array.isArray(files)?[...files]:[]);}catch(_){ }
+  }
+  if(typeof showToast==='function'){
+    const message=ownership&&ownership.switching
+      ? 'Send paused while the conversation switch finishes. Your draft was kept.'
+      : 'Send paused because this draft has no confirmed conversation owner. Your draft was kept.';
+    showToast(message,4000);
+  }
+  try{
+    console.warn('[webui] blocked cross-session composer send',{
+      owner_session_id:ownerSid||null,
+      target_session_id:ownership&&ownership.targetSid||null,
+      loading_session_id:ownership&&ownership.loadingSid||null,
+    });
+  }catch(_){ }
+}
+
 async function send(){
   // Static guards expect _defaultMessageMode to stay near send() while the actual
   // read remains in the S.busy branch below.
@@ -1305,9 +1339,16 @@ async function send(){
   // instead of silently dropping it.
   if (_sendInProgress) {
     const _text=_composerTextWithPendingSelections().trim();
-    // Use the in-flight session's sid, not the currently viewed session,
-    // so the queued message goes to the chat that owns the active stream.
-    const _targetSid=_sendInProgressSid||(S.session&&S.session.session_id);
+    // Re-entrant sends remain text-gated: staged files may belong to an
+    // in-flight steer upload and must not be queued a second time.
+    const _ownership=_composerOwnershipSnapshot(_text,[]);
+    const _targetSid=_ownership.valid?_ownership.targetSid:null;
+    if(_text&&!_ownership.valid){
+      _warnComposerOwnershipMismatch(_ownership,_text,S.pendingFiles);
+      return;
+    }
+    // The queued payload belongs to the currently visible composer's recorded
+    // owner, not to whichever earlier session happens to own the in-flight send.
     if(_text && _targetSid){
       const _modelState=_chatPayloadModelState();
       queueSessionMessage(_targetSid,{text:_text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
@@ -1330,6 +1371,12 @@ async function send(){
   _flushSelectionBlocksToComposer();
   text=$('msg').value.trim();
   if(!text&&!S.pendingFiles.length){_sendInProgress=false;_sendInProgressSid=null;return;}
+  const _sendOwnership=_composerOwnershipSnapshot(text,S.pendingFiles);
+  if(!_sendOwnership.valid){
+    _warnComposerOwnershipMismatch(_sendOwnership,text,S.pendingFiles);
+    _sendInProgress=false;_sendInProgressSid=null;
+    return;
+  }
   if(typeof shouldInterceptCompressionRecoveryContinuation==='function'&&shouldInterceptCompressionRecoveryContinuation(text,S.pendingFiles)){
     if(typeof showCompressionRecoveryContinuationHint==='function') showCompressionRecoveryContinuationHint();
     _sendInProgress=false;_sendInProgressSid=null;
@@ -1549,9 +1596,26 @@ async function send(){
       }
     }
   }
+  if(_sendOwnership.targetSid){
+    const _currentOwnership=_composerOwnershipSnapshot(text,S.pendingFiles);
+    const _ownershipChanged=!_currentOwnership.valid
+      || _currentOwnership.ownerSid!==_sendOwnership.ownerSid
+      || _currentOwnership.targetSid!==_sendOwnership.targetSid;
+    if(_ownershipChanged){
+      _warnComposerOwnershipMismatch(_sendOwnership,text,S.pendingFiles);
+      return;
+    }
+  }
   if(!S.session){await newSession();await renderSessionList();}
 
   const activeSid=S.session.session_id;
+  if(_sendOwnership.targetSid&&activeSid!==_sendOwnership.targetSid){
+    _warnComposerOwnershipMismatch(_sendOwnership,text,S.pendingFiles);
+    return;
+  }
+  if(!_sendOwnership.targetSid&&typeof _claimComposerDraftOwner==='function'){
+    _claimComposerDraftOwner(activeSid);
+  }
   _sendInProgressSid=activeSid;
 
   // Salvage of #4750 (@harryazj): capture the composer text and clear the
@@ -1738,7 +1802,7 @@ async function send(){
     if(_pendingPickMatch && typeof _clearPendingSessionModel==='function') _clearPendingSessionModel(activeSid);
     explicitPickForPostStart=_explicitPick;
     const startData=await api('/api/chat/start',{method:'POST',body:JSON.stringify({
-      session_id:activeSid,message:msgText,
+      session_id:activeSid,composer_session_id:activeSid,message:msgText,
       // S.session.model remains authoritative; the helper only resolves a
       // matching provider fallback for the same outgoing model.
       model:_modelState.model,workspace:S.session.workspace,
@@ -2099,7 +2163,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let liveReasoningText = reasoningText;
   let visibleInterimSnippets=[];
   let _latestGoalStatus=null;
-  let _pendingGoalContinuation=null;
   let assistantRow=null;
   let assistantBody=null;
   // On reconnect with recorded burst anchors, the rendered DOM has multiple
@@ -5295,14 +5358,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const continuation_prompt=String(d.continuation_prompt||d.text||'').trim();
         if(!continuation_prompt||sid!==activeSid)return;
         _applyToAnchor('goal_continue',d,e);
-        const _modelState=_chatPayloadModelState();
-        _pendingGoalContinuation={
-          sid,
-          text:continuation_prompt,
-          model:_modelState.model,
-          model_provider:_modelState.model_provider,
-          profile:S.activeProfile||'default',
-        };
         const toast=t('goal_continuing_toast');
         const cmsg=_resolveGoalMessage(d);
         showToast((toast&&cmsg&&cmsg!==toast)?cmsg.split('\n')[0]:toast,2200);
@@ -5577,18 +5632,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         }
         if(!lastAsst&&d.session&&Array.isArray(d.session.messages)){
           lastAsst=[...d.session.messages].reverse().find(m=>m&&m.role==='assistant')||null;
-        }
-        if(isActiveSession&&_pendingGoalContinuation&&typeof queueSessionMessage==='function'){
-          const _goalNext=_pendingGoalContinuation;
-          _pendingGoalContinuation=null;
-          queueSessionMessage(_goalNext.sid,{
-            text:_goalNext.text,
-            files:[],
-            model:_goalNext.model,
-            model_provider:_goalNext.model_provider,
-            profile:_goalNext.profile,
-          });
-          if(typeof updateQueueBadge==='function')updateQueueBadge(_goalNext.sid);
         }
         if(isActiveSession) _queueDrainSid=activeSid;
         renderSessionList();
@@ -6933,6 +6976,319 @@ let _sessionStreamHiddenPollFalseStreamId = null;
 let _sessionStreamHiddenPollFalseCount = 0;
 const _SESSION_STREAM_HIDDEN_POLL_MAX_FALSE = 20; // ~2 min at the 6s cadence
 
+// Coordinate tool-limit handoffs, whose two control frames are deliberately
+// independent.  In particular, server_turn_started for the child may race
+// ahead of tool_limit_continuation.  Keep this logic transport-independent so
+// EventSource replay/reconnect cannot perform a second navigation or attach.
+function _createToolLimitContinuationCoordinator(deps) {
+  const records = new Map();
+  const startsByChild = new Map();
+  const attached = new Set();
+  const executionSegments = new Map();
+  const cap = 256;
+  const value = (v) => String(v || '');
+  const keyFor = (executionId, childSid) => value(executionId) + '|' + value(childSid);
+  const currentSid = () => value(deps.currentSessionId());
+  const trim = (map) => { while (map.size > cap) map.delete(map.keys().next().value); };
+
+  function rememberSegments(d) {
+    const executionId = value(d.execution_id);
+    if (!executionId) return null;
+    let segments = executionSegments.get(executionId);
+    if (!segments) {
+      segments = new Set();
+      executionSegments.set(executionId, segments);
+      trim(executionSegments);
+    }
+    [d.root_session_id, d.parent_session_id, d.child_session_id].forEach((sid) => {
+      sid = value(sid);
+      if (sid) segments.add(sid);
+    });
+    return segments;
+  }
+
+  function isDisplayedExecutionSegment(d, segments) {
+    // During cold page hydration the parent-scoped EventSource can deliver its
+    // durable replay before loadSession assigns S.session. The subscription id
+    // is a safe provisional identity; advance() still re-checks live state
+    // before it performs any navigation.
+    const sid = currentSid() || value(d && d._subscribed_session_id);
+    return !!sid && (
+      sid === value(d.root_session_id) ||
+      sid === value(d.parent_session_id) ||
+      sid === value(d.child_session_id) ||
+      !!(segments && segments.has(sid))
+    );
+  }
+
+  function blockedStatus(reason) {
+    const messages = {
+      disabled: 'Tool-limit continuation stopped because automatic continuation is disabled.',
+      max_segments: 'Tool-limit continuation stopped after reaching the maximum segment count.',
+      max_wall_seconds: 'Tool-limit continuation stopped after reaching the maximum continuation time.',
+      no_progress: 'Tool-limit continuation stopped because no machine-verifiable progress was detected.',
+      child_recovery_failed: 'Tool-limit continuation stopped because its durable child state could not be recovered.',
+      continuation_state_unavailable: 'Tool-limit continuation stopped because durable handoff state could not be claimed safely.',
+    };
+    deps.showBlocked(messages[value(reason)] || 'Tool-limit continuation stopped in the current session.');
+  }
+
+  function migrationDisposition(record) {
+    if (!deps.migrationDisposition) return 'allow';
+    const disposition = value(deps.migrationDisposition(record.continuation)).toLowerCase();
+    return disposition === 'wait' || disposition === 'reject' ? disposition : 'allow';
+  }
+
+  function scheduleMigrationRetry(record) {
+    record.migrationRetries = Number(record.migrationRetries || 0) + 1;
+    if (record.migrationRetries <= 80 && !record.migrationTimer) {
+      record.migrationTimer = setTimeout(() => {
+        record.migrationTimer = null;
+        void advance(record);
+      }, 50);
+    }
+  }
+
+  async function advance(record) {
+    if (
+      !record || record.blocked || record.migrationRejected ||
+      !record.continuation || !record.activeEligible
+    ) return;
+    const displayedSid = currentSid();
+    if (!displayedSid) {
+      // Cold-load replay won the race with session hydration. Retry for a
+      // bounded window instead of permanently latching the execution inactive.
+      // A navigation away is caught by the lineage check below on the retry.
+      record.hydrationRetries = Number(record.hydrationRetries || 0) + 1;
+      if (record.hydrationRetries <= 40 && !record.hydrationTimer) {
+        record.hydrationTimer = setTimeout(() => {
+          record.hydrationTimer = null;
+          void advance(record);
+        }, 50);
+      }
+      return;
+    }
+    record.hydrationRetries = 0;
+    const firstDisposition = migrationDisposition(record);
+    if (firstDisposition === 'reject') {
+      record.migrationRejected = true;
+      return;
+    }
+    if (firstDisposition === 'wait') {
+      scheduleMigrationRetry(record);
+      return;
+    }
+    record.migrationRetries = 0;
+    if (!record.migrated) {
+      if (record.migrating) return;
+      // Re-check before beginning the async switch. A user navigation after the
+      // control frame must win rather than being hijacked back to this execution.
+      const segments = executionSegments.get(record.executionId);
+      if (!segments || !segments.has(displayedSid)) return;
+      // The pane can acquire a newer turn between the first activity check and
+      // this navigation boundary. Re-check immediately before loadSession.
+      const finalDisposition = migrationDisposition(record);
+      if (finalDisposition === 'reject') {
+        record.migrationRejected = true;
+        return;
+      }
+      if (finalDisposition === 'wait') {
+        scheduleMigrationRetry(record);
+        return;
+      }
+      record.migrating = true;
+      try {
+        const canCommit = () => {
+          const disposition = migrationDisposition(record);
+          if (disposition !== 'allow') return false;
+          const liveSid = currentSid();
+          const liveSegments = executionSegments.get(record.executionId);
+          return !!liveSid && !!liveSegments && liveSegments.has(liveSid);
+        };
+        await deps.loadChild(record.childSid, canCommit);
+        const postLoadDisposition = migrationDisposition(record);
+        if (postLoadDisposition === 'reject') {
+          record.migrationRejected = true;
+          return;
+        }
+        if (postLoadDisposition === 'wait') {
+          scheduleMigrationRetry(record);
+          return;
+        }
+        record.migrated = currentSid() === record.childSid;
+      } finally {
+        record.migrating = false;
+      }
+      if (!record.migrated) return;
+    }
+    if (!record.start || !record.start.streamId) return;
+    const attachKey = keyFor(record.executionId, record.childSid) + '|' + record.start.streamId;
+    if (attached.has(attachKey)) return;
+    attached.add(attachKey);
+    trim(attached);
+    deps.attachChild(record.childSid, record.start.streamId, record.start.recovered);
+  }
+
+  function continuation(d) {
+    d = d || {};
+    const executionId = value(d.execution_id);
+    const childSid = value(d.child_session_id);
+    const parentSid = value(d.parent_session_id);
+    if (!executionId || !parentSid) return false;
+    const segments = rememberSegments(d);
+    const isBlocked = value(d.state).toLowerCase() === 'blocked';
+    // A genuine blocker intentionally creates no child. Handle that terminal
+    // control frame before the child-id gate so max-segment/no-progress stops
+    // remain visible and replay-deduplicated in the parent pane.
+    if (isBlocked) {
+      const blockedKey = executionId + '|blocked|' + parentSid + '|' + value(d.continuation_index);
+      let blockedRecord = records.get(blockedKey);
+      if (!blockedRecord) blockedRecord = {executionId, childSid: '', blocked: true};
+      if (blockedRecord.activeEligible === undefined) {
+        blockedRecord.activeEligible = isDisplayedExecutionSegment(d, segments);
+      }
+      blockedRecord.continuation = d;
+      records.set(blockedKey, blockedRecord);
+      trim(records);
+      if (blockedRecord.activeEligible && !blockedRecord.blockedShown) {
+        blockedRecord.blockedShown = true;
+        blockedStatus(d.blocked_reason);
+      }
+      return true;
+    }
+    if (!childSid) return false;
+    const key = keyFor(executionId, childSid);
+    let record = records.get(key);
+    if (!record) record = {executionId, childSid};
+    const queuedStart = startsByChild.get(childSid);
+    if (!record.start && queuedStart) record.start = queuedStart;
+    startsByChild.delete(childSid);
+    record.continuation = d;
+    // Eligibility is latched only by the authoritative continuation frame. A
+    // queued child-start from an inactive session must never navigate the pane.
+    if (record.activeEligible === undefined) {
+      record.activeEligible = isDisplayedExecutionSegment(d, segments);
+    }
+    record.blocked = false;
+    records.set(key, record);
+    trim(records);
+    if (record.blocked) {
+      if (record.activeEligible && !record.blockedShown) {
+        record.blockedShown = true;
+        blockedStatus(d.blocked_reason);
+      }
+      return true;
+    }
+    void advance(record);
+    return true;
+  }
+
+  function started(d) {
+    d = d || {};
+    const executionId = value(d.execution_id);
+    const childSid = value(d.child_session_id || d.session_id);
+    const streamId = value(d.stream_id);
+    if (!childSid || !streamId) return false;
+    // Some server_turn_started producers only include the child's session_id
+    // and stream_id. The parent-scoped listener identifies that cross-session
+    // shape before calling us; retain it by child until the continuation frame
+    // supplies the execution id needed for the final dedupe key.
+    if (!executionId) {
+      let matched = null;
+      for (const record of records.values()) {
+        if (record.childSid === childSid && record.continuation) matched = record;
+      }
+      if (matched) {
+        matched.start = {streamId, recovered: !!d.recovered};
+        if (!matched.blocked) void advance(matched);
+      } else {
+        startsByChild.set(childSid, {streamId, recovered: !!d.recovered});
+        trim(startsByChild);
+      }
+      return true;
+    }
+    const key = keyFor(executionId, childSid);
+    let record = records.get(key);
+    // execution_id marks the child start as part of this protocol. Queue it
+    // even if the continuation frame has not arrived yet.
+    if (!record) record = {executionId, childSid};
+    record.start = {streamId, recovered: !!d.recovered};
+    records.set(key, record);
+    trim(records);
+    if (record.blocked) return true;
+    void advance(record);
+    return true;
+  }
+
+  return {continuation, started};
+}
+
+async function _loadToolLimitContinuationChild(sid, canCommit) {
+  // loadSession paints a loading placeholder for ordinary manual cross-session
+  // navigation. A continuation is one logical execution, so retain the already
+  // rendered segment until the child's transcript is ready. MutationObserver
+  // callbacks run before the next paint, preventing an empty/loading frame while
+  // preserving loadSession's URL, lineage, and sidebar bookkeeping.
+  const host = (typeof $ === 'function') ? $('msgInner') : null;
+  const staleHtml = host ? host.innerHTML : '';
+  const staleText = host ? String(host.textContent || '').trim() : '';
+  let observer = null;
+  if (
+    host && staleHtml && staleText !== 'Loading conversation...' &&
+    typeof MutationObserver !== 'undefined'
+  ) {
+    observer = new MutationObserver(() => {
+      if (host.textContent && host.textContent.trim() === 'Loading conversation...') {
+        // Disconnect before restoration. Re-applying a captured loading
+        // placeholder would otherwise retrigger this observer indefinitely on
+        // cold replay and peg the renderer's main thread.
+        observer.disconnect();
+        observer = null;
+        host.innerHTML = staleHtml;
+      }
+    });
+    observer.observe(host, {childList: true});
+  }
+  try {
+    return await loadSession(sid, {
+      skipLineageResolve: true,
+      skipContinuationResolve: true,
+      keepStaleUntilLoaded: true,
+      acceptResult: canCommit,
+    });
+  } finally {
+    if (observer) observer.disconnect();
+  }
+}
+
+const _toolLimitContinuationCoordinator = _createToolLimitContinuationCoordinator({
+  currentSessionId: () => (S && S.session && S.session.session_id) || '',
+  migrationDisposition: (d) => {
+    const activeStreamId = String(
+      (S && S.activeStreamId) ||
+      (S && S.session && S.session.active_stream_id) ||
+      ''
+    );
+    const parentRunId = String((d && d.parent_run_id) || '');
+    if (activeStreamId) {
+      // Waiting is safe only for the exact parent run being handed off. Any
+      // other active stream is newer pane ownership and permanently vetoes
+      // this delayed/replayed navigation.
+      return parentRunId && activeStreamId === parentRunId ? 'wait' : 'reject';
+    }
+    return (S && S.busy) ? 'wait' : 'allow';
+  },
+  loadChild: (sid, canCommit) => _loadToolLimitContinuationChild(sid, canCommit),
+  attachChild: (sid, streamId, recovered) => {
+    _attachServerInitiatedStream(sid, streamId, recovered);
+  },
+  showBlocked: (message) => {
+    if (typeof setComposerStatus === 'function') setComposerStatus(message);
+    if (typeof setStatus === 'function') setStatus(message);
+    if (typeof showToast === 'function') showToast(message, 6000, 'error');
+  },
+});
+
 // Attach the existing chat-stream renderer to a server-created stream. Shared
 // by the `server_turn_started` SSE handler (visible tab) and the hidden-tab
 // active-stream poll. Idempotent per (sid, streamId): bails if this tab is
@@ -7195,6 +7551,20 @@ function startSessionStream(sid) {
         _handleBgTaskCompleteEvent(e, sid, {source: 'session'});
       }
     });
+    es.addEventListener('tool_limit_continuation', e => {
+      try {
+        const d = JSON.parse(e.data || '{}');
+        // The current parent and the execution root both receive durable
+        // handoff replay. A root reconnect may jump straight to a later/final
+        // child whose immediate parent is another hidden segment.
+        if (
+          String(d.parent_session_id || '') !== String(sid) &&
+          String(d.root_session_id || '') !== String(sid)
+        ) return;
+        d._subscribed_session_id = String(sid);
+        _toolLimitContinuationCoordinator.continuation(d);
+      } catch (_) {}
+    });
     // ── Visible-tab self-heal: a server-initiated turn finished during an SSE
     // gap ─────────────────────────────────────────────────────────────────
     // Distinct from `server_turn_started` (which attaches a LIVE stream): this
@@ -7241,7 +7611,13 @@ function startSessionStream(sid) {
     es.addEventListener('server_turn_started', e => {
       try {
         const d = JSON.parse(e.data || '{}');
-        const evSid = d.session_id || sid;
+        // A continuation child-start is valid on the parent's session stream,
+        // so route it before the ordinary evSid===sid guard. The coordinator
+        // queues it until the independently-delivered continuation frame proves
+        // that the currently displayed execution should migrate.
+        const evSid = String(d.child_session_id || d.session_id || sid);
+        const isContinuationChildStart = !!d.execution_id || evSid !== String(sid);
+        if (isContinuationChildStart && _toolLimitContinuationCoordinator.started(d)) return;
         const streamId = String(d.stream_id || '');
         if (!streamId || evSid !== sid) return;
         // `recovered` marks an on-subscribe replay from the server: the tab

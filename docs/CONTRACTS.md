@@ -76,6 +76,39 @@ read the relevant RFC before editing. In the PR description, name the state laye
 or event/control surface affected and include a regression test or manual
 verification for the relevant invariant.
 
+Current standing-goal continuation contract: a `continue` verdict is durably
+claimed before its live-view event, started by the server only after the parent
+run releases stream ownership, and recovered on restart. `goal_continue` is not
+an execution command for the browser. The receipt is guarded by the exact active
+goal revision, and the synthetic prompt is model-context-only. Changes to this
+path must prove duplicate-claim idempotency, stale-revision rejection, hidden
+prompt behavior, normal teardown ordering, and startup recovery.
+
+Current tool-limit continuation contract: an exhausted parent segment settles
+before one server-owned child is durably claimed and started. The browser may
+observe and follow the lineage, but it must never create the child or submit the
+synthetic prompt. Receipts are idempotent per parent run, preserve the execution
+root and segment index, and recover the exact child after process death. The
+receipt store fails closed on parse/schema/version errors, and a replayed 409 is
+accepted only with current-process live-worker proof; persisted sidecar ownership
+alone is insufficient. The parent terminal frame may say continuation is pending,
+but only the durable continuation event proves acceptance. If that claim fails,
+an explicit blocker must be persisted and disclosed. The
+control prompt is model-context-only and canonicalized to one current structured
+entry using the previous-context boundary, without deleting older or current
+identical legitimate user prose; visible transcript, composer, and title state
+remain clean. Reconnect may
+replay the newest active/final lineage receipt, but a settled receipt cannot
+override newer activity on an ancestor, and a live frame cannot navigate a pane
+owned by a newer stream. The ownership guard must survive the asynchronous child
+metadata load and veto its commit if a newer turn appears in flight. Genuine
+safety blockers persist an honest
+terminal status and do not continue. Changes to this path must prove competing
+claim/start deduplication, profile/workspace/model inheritance, restart recovery,
+pre-registration crash recovery, corrupt-store failure, multi-segment replay,
+hidden-control cardinality, pane-ownership/stale-receipt suppression, and blocker
+termination.
+
 Proposed RFCs are review guardrails, not implementation authorization. Do not
 implement RFC fragments unless the task or tracking issue explicitly asks for
 that slice.

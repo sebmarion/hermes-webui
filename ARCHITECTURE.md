@@ -130,13 +130,28 @@ is resumed. WebUI never bulk-migrates or deletes those sidecars, and Hermes One
 remote mode talks to the Mac WebUI API rather than transferring SQLite files.
 
 The browser projects messageful `webui`, `cli`, `tui`, and `acp` rows from that
-database into one interactive conversation list. Source metadata is a row badge,
-not a list partition. The legacy `sidebar_source` query parameter remains an API
+database into one parent-only interactive conversation list. Fork, delegate, and
+other child rows remain addressable by direct link and can bubble running, unread,
+or approval state to their visible parent, but they are not rendered as sidebar
+subthreads. Source metadata is a row badge, not a list partition. The legacy
+`sidebar_source` query parameter remains an API
 compatibility filter for older clients, but the browser does not send it. The
 `show_cli_sessions` setting name is also retained for compatibility; it now gates
 only optional channel/imported rows, never these shared interactive sources.
 Archived paging and the sidebar cap operate on the combined canonical list, so
 an archived Hermes One row cannot disappear behind a WebUI-only page or CLI cap.
+
+Runtime work visibility is a separate, additive `session_activity` table in the
+same profile database. Each client upserts `(session_id, run_id)` heartbeats
+while a task is running and removes the row when it finishes or is aborted.
+When a WebUI turn dispatches asynchronous delegates, the parent conversation
+keeps a `delegated` activity row until those children settle; delegate execution
+records remain distinct and are not promoted into duplicate sidebar chats.
+Reads ignore heartbeats older than 20 seconds, so a crashed client cannot leave
+a permanent spinner. Activity is an overlay only: it never changes message
+counts, ordering, titles, lineage, archive state, or pins. WebUI polls this
+overlay because a local Hermes One run cannot emit the WebUI SSE event; Hermes
+One refreshes its visible sidebar every five seconds.
 
 Log file:
 
@@ -264,6 +279,23 @@ discovery, stale-stream reconciliation, orphan pruning, sidecar repair, Agent
 session import, and lineage enrichment. Followers never start their own repair
 or SQLite scan.
 
+The primary `sessions` array is a parent-only, user-conversation list for every
+client, not just the browser renderer. Rows marked `relationship_type=child_session`
+are omitted from that array and may appear as `_sidebar_reference_only` rows in
+`sidebar_reference_sessions` so WebUI can bubble working/unread state to the
+visible parent. Compression lineages likewise expose only their freshest tip in
+the primary list; older physical segments are reference-only, and a root pin is
+projected onto that one visible tip without pinning the hidden segments. Internal
+`tool`, `tool_limit_continuation`, and
+`goal_continuation` rows never enter either list. A bare `/api/sessions` request
+also excludes `default_hidden` background/project rows; the WebUI explicitly
+uses `include_hidden=1` while a named project filter is active.
+
+UI-owned archive metadata is stronger than a raw external-session scan. If an
+imported Claude Code, cron, or webhook sidecar is archived, the CLI projection
+must preserve that bit so the underlying Agent row cannot resurrect it in the
+default list.
+
 Agent-backed invalidation uses the Agent-owned `session_projection_meta`
 generation. `api/session_projection.py` polls that one-row value off the request
 thread and exposes only an in-memory token to cache stamps. When Agent schema
@@ -278,8 +310,10 @@ The compatibility session API is state.db-first. `GET /api/sessions/{id}` and
 tip, return stable shared metadata (`title`, `cwd`/`workspace`, `archived`,
 counts, timestamps, and lineage), and merge state.db messages with sidecar
 messages append-only. `PATCH /api/sessions/{id}` updates title, shared agent
-workspace, archive state, or pin state without touching usage counters; archive,
-title, and pin mutations follow valid compression lineage. `sync_to_insights`
+workspace, archive state, or pin state without touching usage counters. Archive
+and title mutations follow valid compression lineage. A pin is stored once on
+the logical lineage root; each pin/unpin clears stale duplicate pin bits from
+the hidden physical segments. `sync_to_insights`
 remains a compatibility setting name but no longer controls persistence of the
 shared conversation projection.
 
@@ -306,6 +340,11 @@ For a WebUI-owned watchdog recovery, the internal endpoint acquires the existing
 per-session agent lock before re-reading state.db, the WebUI sidecar, and the turn
 journal. It retains that lock through `_start_run()` and stream reservation, so a
 concurrent human `/api/chat/start` and recovery start have exactly one winner.
+If a crash occurred after a valid compression continuation was written to
+state.db but before its tip sidecar was saved, recovery may rebuild that one tip
+from state.db plus the nearest validated same-source compression-ancestor
+sidecar. Existing malformed sidecars still fail closed, and branch, delegate,
+tool, or cross-source ancestry is never used for reconstruction.
 Malformed, stale, active, pending, terminal, duplicate, source-mismatched, or
 workspace-mismatched recovery candidates fail closed. `runner-local` is also
 rejected here because its reservation owner is outside the WebUI process. The
@@ -347,6 +386,53 @@ Stream cleanup: _run_agent_streaming() pops its stream_id from STREAMS in a fina
 block. If the browser disconnects mid-stream, the daemon thread runs to completion and
 then cleans up. The queue fills and the put_nowait() calls fail silently (queue.Full
 is caught).
+
+Standing-goal continuation is server-owned. After a goal-related turn is judged
+`continue`, `api/goal_continuation.py` atomically records a receipt keyed by
+`(session_id, parent_run_id)`. The worker emits `goal_continue` only as live-view
+status; the browser never posts the synthetic prompt. After the parent stream and
+`ACTIVE_RUNS` row are removed, teardown validates the exact active goal revision
+and starts one `source="goal_continuation"` successor through
+`start_session_turn()`. Claimed receipts are retried at later idle boundaries and
+on WebUI startup. The control prompt remains in `context_messages` under
+`_goal_continuation_control`, but is excluded from visible messages, pending
+composer state, and title generation. A valid hidden-control assistant result is
+classified as a completed reply from the model-context delta, not as a missing
+visible user/assistant pair.
+
+Tool-limit continuation is also server-owned, but preserves each exhausted
+segment's honest `tool_limit_reached` terminal state. `api/tool_limit_continuation.py`
+atomically claims a receipt keyed by `(parent_session_id, parent_run_id)`, creates
+one deterministic child sidecar with an embedded recovery snapshot, and starts it
+only through `start_session_turn(..., source="tool_limit_continuation")`. The
+receipt store is the durable execution/lineage layer; session sidecars remain the
+transcript and provider-context layer. A dead `starting` owner is reclaimable on
+startup, while a successful start is accepted only when the exact child stream
+and source can be proven live in the current process's stream/worker registries.
+A per-process pending-owner token protects the persist-before-register gap but
+becomes stale across restart; unreadable or incompatible receipt state fails
+closed instead of being replaced with an empty ownership store. Profile,
+workspace, model, provider, enabled toolsets, and root/parent/index lineage are
+copied to every child.
+
+The synthetic tool-limit prompt is absent from visible messages, pending composer
+state, and title input. Streaming and gateway writeback canonicalize inherited
+controls to exactly one structured, workspace-decorated context message for the
+current segment. Per-session SSE reconnect replays the newest durable receipt so
+a tab can migrate directly to the active or final child after restart; settled
+receipts are suppressed when the displayed ancestor has newer activity. The
+frontend deduplicates continuation/start event races by execution, child, and
+stream identity, and follows a live handoff only when no newer pane stream owns
+the displayed ancestor (the exact settling parent run may finish first). That
+ownership predicate is passed through the asynchronous session load and checked
+again at its metadata commit boundary, so a newer turn arriving while the child
+is in flight cannot replace the pane. The
+parent `done` frame reports `continuation_pending`; the durable continuation
+event is the acceptance signal. Safety-envelope stops and handoff-state failures
+persist and emit an explicit terminal status instead of scheduling another child.
+Structured markers and the current-turn context boundary, rather than prompt text
+alone, own cleanup. Older and current legitimate user messages identical to either
+the continuation control or max-iteration summary copy are retained.
 
 Fallback sync endpoint: POST /api/chat still exists and holds the connection open until
 the agent finishes. The frontend never uses it but it can be useful for debugging.

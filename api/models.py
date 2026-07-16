@@ -31,6 +31,7 @@ from api.agent_sessions import (
     normalize_agent_session_source,
     open_state_db_readonly,
     read_importable_agent_session_rows,
+    read_shared_session_activity,
     read_shared_session_rows,
     read_session_lineage_metadata,
 )
@@ -1100,6 +1101,7 @@ class Session:
                  pending_attachments=None,
                  pending_started_at=None,
                  pending_user_source: str=None,
+                 pending_server_instance_id: str=None,
                  context_messages=None,
                  compression_anchor_visible_idx=None,
                  compression_anchor_message_key=None,
@@ -1159,6 +1161,7 @@ class Session:
         self.pending_attachments = pending_attachments or []
         self.pending_started_at = pending_started_at
         self.pending_user_source = pending_user_source
+        self.pending_server_instance_id = pending_server_instance_id
         self.context_messages = context_messages if isinstance(context_messages, list) else []
         self.compression_anchor_visible_idx = compression_anchor_visible_idx
         self.compression_anchor_message_key = compression_anchor_message_key
@@ -1206,6 +1209,21 @@ class Session:
         self.session_source = kwargs.get('session_source')
         self.source_label = kwargs.get('source_label')
         self.read_only = bool(kwargs.get('read_only', False))
+        # Tool-limit continuation children persist their chain identity as
+        # extra session fields. Rehydrate those known fields explicitly so a
+        # save/load boundary does not reset the next segment to index 1 or
+        # discard the no-progress chain used by the durable receipt store.
+        tool_limit_continuation = kwargs.get('tool_limit_continuation')
+        if isinstance(tool_limit_continuation, dict):
+            self.tool_limit_continuation = copy.deepcopy(tool_limit_continuation)
+        for continuation_field in (
+            'continuation_execution_id',
+            'continuation_index',
+            'root_session_id',
+        ):
+            continuation_value = kwargs.get(continuation_field)
+            if continuation_value is not None:
+                setattr(self, continuation_field, continuation_value)
         self.enabled_toolsets = enabled_toolsets  # List[str] or None — per-session toolset override
         self.composer_draft = composer_draft if isinstance(composer_draft, dict) else {}
         self.anchor_activity_scenes = anchor_activity_scenes if isinstance(anchor_activity_scenes, dict) else {}
@@ -1265,6 +1283,7 @@ class Session:
             'cache_read_tokens', 'cache_write_tokens',
             'personality', 'active_stream_id',
             'pending_user_message', 'pending_attachments', 'pending_started_at', 'pending_user_source',
+            'pending_server_instance_id',
             'compression_anchor_visible_idx', 'compression_anchor_message_key',
             'compression_anchor_summary', 'pre_compression_snapshot',
             'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
@@ -5061,10 +5080,20 @@ def agent_session_row_exists(session_id: str, *, profile=None) -> bool:
 
 def _sidebar_title_is_generic_webui(title: str | None) -> bool:
     text = ' '.join(str(title or '').split())
-    if text == 'Hermes WebUI':
+    normalized = text.rstrip('.!?').casefold()
+    if normalized in {
+        'hermes webui',
+        'untitled',
+        'new chat',
+        'new conversation',
+        'cli session',
+        'tui session',
+        'acp session',
+        'continue the unfinished task from the parent',
+    }:
         return True
-    prefix = 'Hermes WebUI #'
-    return text.startswith(prefix) and text[len(prefix):].isdigit()
+    prefix = 'hermes webui #'
+    return normalized.startswith(prefix) and normalized[len(prefix):].isdigit()
 
 
 def _read_state_db_sidebar_overrides(
@@ -5072,11 +5101,12 @@ def _read_state_db_sidebar_overrides(
     session_ids: set[str],
     count_session_ids: set[str] | None = None,
 ) -> dict[str, dict]:
-    """Return cheap state.db source/title overrides for sidebar rows.
+    """Return cheap state.db organization overrides for sidebar rows.
 
     This intentionally does not chase lineage parents/children. It is used on
-    the /api/sessions hot path before CLI filtering so state.db can correct
-    stale JSON source flags without paying the full lineage-enrichment cost.
+    the /api/sessions hot path before filtering so state.db can correct stale
+    JSON source, title, archive, and pin flags without paying the full
+    lineage-enrichment cost.
 
     Two-tier cost split (#5132): the ``sessions``-table lookup (source/title/
     message_count) is an indexed primary-key fetch and is run for ALL
@@ -5113,6 +5143,8 @@ def _read_state_db_sidebar_overrides(
             session_source_expr = 's.session_source' if 'session_source' in session_cols else 'NULL AS session_source'
             title_expr = 's.title' if 'title' in session_cols else 'NULL AS title'
             message_count_expr = 's.message_count' if 'message_count' in session_cols else 'NULL AS message_count'
+            archived_expr = 's.archived' if 'archived' in session_cols else 'NULL AS archived'
+            pinned_expr = 's.pinned' if 'pinned' in session_cols else 'NULL AS pinned'
 
             cur.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'messages'")
             has_messages_table = cur.fetchone() is not None
@@ -5125,6 +5157,7 @@ def _read_state_db_sidebar_overrides(
                 messages_has_timestamp = 'timestamp' in message_cols
 
             overrides: dict[str, dict] = {}
+            messaging_ids: set[str] = set()
             ids = list(wanted)
             chunk_size = 500
             for i in range(0, len(ids), chunk_size):
@@ -5132,7 +5165,8 @@ def _read_state_db_sidebar_overrides(
                 placeholders = ','.join('?' * len(chunk))
                 cur.execute(
                     f"""
-                    SELECT s.id, {source_expr}, {session_source_expr}, {title_expr}, {message_count_expr}
+                    SELECT s.id, {source_expr}, {session_source_expr}, {title_expr},
+                           {message_count_expr}, {archived_expr}, {pinned_expr}
                     FROM sessions s
                     WHERE s.id IN ({placeholders})
                     """,
@@ -5148,6 +5182,12 @@ def _read_state_db_sidebar_overrides(
                     if state_source:
                         entry['_state_db_source'] = state_source
                         source_meta = normalize_agent_session_source(state_source)
+                        if source_meta.get('session_source') == 'messaging':
+                            # Messaging rows are runtime sidecar overlays, so
+                            # their canonical activity timestamp is needed even
+                            # when the row falls outside the general top-N
+                            # message-count budget.
+                            messaging_ids.add(sid)
                         entry['_state_db_source_tag'] = state_source
                         entry['_state_db_raw_source'] = source_meta.get('raw_source')
                         entry['_state_db_session_source'] = source_meta.get('session_source')
@@ -5157,10 +5197,17 @@ def _read_state_db_sidebar_overrides(
                             entry['_state_db_message_count'] = max(0, int(row['message_count'] or 0))
                         except (TypeError, ValueError):
                             pass
+                    if row['archived'] is not None:
+                        entry['_state_db_archived'] = bool(row['archived'])
+                    if row['pinned'] is not None:
+                        entry['_state_db_pinned'] = bool(row['pinned'])
                     if entry:
                         overrides[sid] = entry
                 if has_messages_table and messages_has_session_id:
-                    count_chunk = [sid for sid in chunk if sid in count_wanted]
+                    count_chunk = [
+                        sid for sid in chunk
+                        if sid in count_wanted or sid in messaging_ids
+                    ]
                     if not count_chunk:
                         continue
                     count_placeholders = ','.join('?' * len(count_chunk))
@@ -5229,7 +5276,64 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
     _apply_sidebar_state_db_override_metadata(sessions, metadata)
 
 
+def _apply_session_index_state_db_overrides(
+    sessions: list[dict],
+    *,
+    all_profiles: bool = False,
+) -> None:
+    """Overlay canonical organization metadata on the bounded index seed.
+
+    This performs primary-key ``sessions`` lookups only. It deliberately skips
+    the general message-count aggregation so a cold /api/sessions response can
+    remain bounded while never presenting stale archive or pin truth.
+    """
+    rows = [row for row in (sessions or []) if isinstance(row, dict)]
+    if not rows:
+        return
+
+    groups: list[tuple[Path, list[dict]]] = []
+    if all_profiles:
+        contexts, _cache_key = _all_profiles_cli_contexts()
+        by_profile: dict[str, list[dict]] = {}
+        for row in rows:
+            profile = str(row.get('profile') or 'default').strip() or 'default'
+            by_profile.setdefault(profile, []).append(row)
+        seen_profiles: set[str] = set()
+        for _home, db_path, profile in contexts:
+            profile_name = str(profile or 'default').strip() or 'default'
+            if profile_name in seen_profiles:
+                continue
+            seen_profiles.add(profile_name)
+            profile_rows = by_profile.get(profile_name)
+            if profile_rows:
+                groups.append((Path(db_path), profile_rows))
+    else:
+        groups.append((_active_state_db_path(), rows))
+
+    for db_path, group in groups:
+        session_ids = {
+            str(row.get('session_id'))
+            for row in group
+            if str(row.get('session_id') or '').strip()
+        }
+        if not session_ids:
+            continue
+        try:
+            metadata = _read_state_db_sidebar_overrides(
+                db_path,
+                session_ids,
+                count_session_ids=set(),
+            )
+            _apply_sidebar_state_db_override_metadata(group, metadata)
+        except Exception:
+            logger.debug(
+                "Failed to overlay canonical metadata on session index seed",
+                exc_info=True,
+            )
+
+
 def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: dict[str, dict]) -> None:
+    missing = object()
     for session in sessions:
         sid = session.get('session_id')
         if sid not in metadata:
@@ -5243,6 +5347,12 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
         state_db_source_label = entry.pop('_state_db_source_label', None)
         state_db_message_count = entry.pop('_state_db_message_count', None)
         state_db_last_message_at = entry.pop('_state_db_last_message_at', None)
+        state_db_archived = entry.pop('_state_db_archived', missing)
+        state_db_pinned = entry.pop('_state_db_pinned', missing)
+        if state_db_archived is not missing:
+            session['archived'] = bool(state_db_archived)
+        if state_db_pinned is not missing:
+            session['pinned'] = bool(state_db_pinned)
         if state_db_source == 'webui':
             session['source_tag'] = state_db_source_tag
             session['raw_source'] = state_db_raw_source
@@ -5294,11 +5404,29 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
                 if state_last > 0:
                     session['last_message_at'] = max(float(session.get('last_message_at') or 0), state_last)
                     session['updated_at'] = max(float(session.get('updated_at') or 0), state_last)
+        elif state_db_session_source == 'messaging' and state_db_last_message_at:
+            # Messaging sidecars are runtime overlays, not the source of
+            # conversation activity. Keep their sidebar ordering/timestamps
+            # anchored to the canonical state.db transcript even when the CLI
+            # projection cache is still converging after an external gateway
+            # commit.
+            try:
+                state_last = float(state_db_last_message_at or 0)
+            except (TypeError, ValueError):
+                state_last = 0.0
+            if state_last > 0:
+                session['last_message_at'] = state_last
+                session['updated_at'] = state_last
         title = session.get('title')
+        is_canonical_shared_lineage = bool(
+            session.get('_shared_interactive')
+            and session.get('_lineage_root_id')
+        )
         if (
             state_db_title
             and state_db_title != title
             and _sidebar_title_is_generic_webui(title)
+            and not is_canonical_shared_lineage
         ):
             session['_state_db_title'] = state_db_title
             session['display_title'] = state_db_title
@@ -5378,12 +5506,17 @@ def read_session_index_projection() -> list[dict]:
         for row in rows
         if str(row.get("session_id") or "").strip()
     }
+    # Snapshot object references under the lock, then compact outside it.
+    # Session.compact() walks the full in-memory transcript to derive its user
+    # count. Holding the global cache lock across that O(messages) work lets a
+    # sidebar projection block GET /api/session for the whole transcript pass.
     with LOCK:
-        for session in SESSIONS.values():
-            index_map[session.session_id] = session.compact(
-                include_runtime=True,
-                active_stream_ids=active_stream_ids,
-            )
+        live_sessions = list(SESSIONS.values())
+    for session in live_sessions:
+        index_map[session.session_id] = session.compact(
+            include_runtime=True,
+            active_stream_ids=active_stream_ids,
+        )
     projected = []
     for row in index_map.values():
         item = dict(row)
@@ -5468,12 +5601,17 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
             # Overlay any in-memory sessions that may be newer than the index
             _diag_stage(diag, "all_sessions.overlay_lock")
             index_map = {s['session_id']: s for s in index}
+            # Snapshot object references under the lock, then compact outside
+            # it. Session.compact() walks the full in-memory transcript; doing
+            # that while holding the global cache lock stalls session-detail
+            # loads behind the sidebar projection.
             with LOCK:
-                for s in SESSIONS.values():
-                    index_map[s.session_id] = s.compact(
-                        include_runtime=True,
-                        active_stream_ids=active_stream_ids,
-                    )
+                live_sessions = list(SESSIONS.values())
+            for s in live_sessions:
+                index_map[s.session_id] = s.compact(
+                    include_runtime=True,
+                    active_stream_ids=active_stream_ids,
+                )
             missing_persisted_ids = []
             if persisted_ids is not None:
                 indexed_ids = {str(sid) for sid in index_map.keys() if sid}
@@ -6153,6 +6291,59 @@ def _claude_code_title(messages: list[dict], summary_title: str | None) -> str:
     return 'Claude Code Session'
 
 
+def _claude_code_session_row(path: Path, workspace: str) -> dict | None:
+    """Build one Claude Code sidebar row without scanning sibling transcripts."""
+    messages, summary_title, first_ts, last_ts = _parse_claude_code_jsonl_cached(path)
+    if not messages:
+        return None
+    # Preserve the previous truthiness fallback for epoch-0 timestamps.
+    if not first_ts and not last_ts:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+    else:
+        mtime = None
+    created_at = first_ts or last_ts or mtime
+    updated_at = last_ts or first_ts or mtime
+    return {
+        'session_id': _claude_code_session_id(path),
+        'title': _claude_code_title(messages, summary_title),
+        'workspace': workspace,
+        'model': 'claude-code',
+        'message_count': len(messages),
+        'created_at': created_at,
+        'updated_at': updated_at,
+        'last_message_at': updated_at,
+        'pinned': False,
+        'archived': False,
+        'project_id': None,
+        'profile': None,
+        'source_tag': CLAUDE_CODE_SOURCE,
+        'raw_source': CLAUDE_CODE_SOURCE,
+        'session_source': 'external_agent',
+        'source_label': CLAUDE_CODE_SOURCE_LABEL,
+        'is_cli_session': True,
+        'read_only': True,
+    }
+
+
+def get_claude_code_session_metadata(
+    sid,
+    projects_dir: Path | str | None = None,
+) -> dict:
+    """Resolve one Claude Code session by path-derived id, parsing only its file."""
+    sid = str(sid or '')
+    if not sid.startswith(f'{CLAUDE_CODE_SOURCE}_'):
+        return {}
+    workspace = str(get_last_workspace())
+    for path in _iter_claude_code_jsonl_files(projects_dir) or []:
+        if _claude_code_session_id(path) != sid:
+            continue
+        return _claude_code_session_row(path, workspace) or {}
+    return {}
+
+
 def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_files: int = CLAUDE_CODE_MAX_FILES, max_file_bytes: int = CLAUDE_CODE_MAX_FILE_BYTES) -> list:
     """Read Claude Code JSONL sessions as read-only external-agent rows.
 
@@ -6168,45 +6359,9 @@ def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_file
     # sidebar build (#4718). Resolve it a single time.
     cc_workspace = str(get_last_workspace())
     for path in _iter_claude_code_jsonl_files(projects_dir, max_files=max_files, max_file_bytes=max_file_bytes) or []:
-        messages, summary_title, first_ts, last_ts = _parse_claude_code_jsonl_cached(path)
-        if not messages:
-            continue
-        sid = _claude_code_session_id(path)
-        # Match the truthiness fallback used in the assignments below: the old
-        # inline code was ``first_ts or last_ts or path.stat().st_mtime``, which
-        # also fell back to mtime for a falsy-but-not-None ``0.0`` timestamp
-        # (epoch-0 / 1970 transcripts). An identity (``is None``) guard would
-        # leave those rows with ``None`` instead of the file mtime, so use the
-        # same ``not`` test the assignments use to stay bug-for-bug compatible.
-        if not first_ts and not last_ts:
-            try:
-                _mtime = path.stat().st_mtime
-            except OSError:
-                _mtime = 0.0
-        else:
-            _mtime = None
-        created_at = first_ts or last_ts or _mtime
-        updated_at = last_ts or first_ts or _mtime
-        sessions.append({
-            'session_id': sid,
-            'title': _claude_code_title(messages, summary_title),
-            'workspace': cc_workspace,
-            'model': 'claude-code',
-            'message_count': len(messages),
-            'created_at': created_at,
-            'updated_at': updated_at,
-            'last_message_at': updated_at,
-            'pinned': False,
-            'archived': False,
-            'project_id': None,
-            'profile': None,
-            'source_tag': CLAUDE_CODE_SOURCE,
-            'raw_source': CLAUDE_CODE_SOURCE,
-            'session_source': 'external_agent',
-            'source_label': CLAUDE_CODE_SOURCE_LABEL,
-            'is_cli_session': True,
-            'read_only': True,
-        })
+        row = _claude_code_session_row(path, cc_workspace)
+        if row:
+            sessions.append(row)
     sessions.sort(key=lambda s: s.get('last_message_at') or s.get('updated_at') or 0, reverse=True)
     return sessions
 
@@ -6851,6 +7006,56 @@ def shared_interactive_sidebar_projection(
     except Exception:
         active_stream_ids = set()
 
+    # Runtime activity is stored separately from conversation metadata so a
+    # crashed worker cannot leave a permanent session-level streaming flag.
+    # Resolve activity through every physical lineage alias because a worker
+    # may still be finishing an older compression segment while the sidebar
+    # renders the visible tip.
+    activity_ids = set()
+    for canonical in canonical_rows:
+        activity_ids.add(str(canonical.get("id") or "").strip())
+        activity_ids.add(str(canonical.get("_lineage_root_id") or "").strip())
+        activity_ids.add(str(canonical.get("_lineage_tip_id") or "").strip())
+        activity_ids.update(
+            str(member_id).strip()
+            for member_id in (canonical.get("_lineage_member_ids") or [])
+            if str(member_id).strip()
+        )
+    activity_ids.discard("")
+    try:
+        activity_rows = read_shared_session_activity(state_db_path, activity_ids)
+    except Exception:
+        activity_rows = {}
+        logger.debug("Failed to read shared session activity", exc_info=True)
+    activity_by_canonical: dict[int, dict] = {}
+    for canonical in canonical_rows:
+        aliases = {
+            str(canonical.get("id") or "").strip(),
+            str(canonical.get("_lineage_root_id") or "").strip(),
+            str(canonical.get("_lineage_tip_id") or "").strip(),
+            *(
+                str(member_id).strip()
+                for member_id in (canonical.get("_lineage_member_ids") or [])
+                if str(member_id).strip()
+            ),
+        }
+        candidates = [activity_rows[alias] for alias in aliases if alias in activity_rows]
+        if candidates:
+            selected = max(
+                candidates,
+                key=lambda item: float(item.get("activity_heartbeat_at") or 0),
+            )
+            activity_by_canonical[id(canonical)] = {
+                "is_working": True,
+                "activity_phase": selected.get("activity_phase") or "running",
+                "activity_started_at": min(
+                    float(item.get("activity_started_at") or 0) for item in candidates
+                ),
+                "activity_heartbeat_at": max(
+                    float(item.get("activity_heartbeat_at") or 0) for item in candidates
+                ),
+            }
+
     def _is_webui_sidecar(row: dict) -> bool:
         markers = {
             str(row.get(key) or "").strip().lower()
@@ -6934,7 +7139,9 @@ def shared_interactive_sidebar_projection(
             logger.debug("Failed to migrate legacy WebUI pins", exc_info=True)
     # The shared projection owns interactive rows only. Cron, gateway,
     # messaging, and other externally-owned sidecars still belong to the
-    # existing source-specific merge pipeline.
+    # existing source-specific merge pipeline. They still receive the cheap
+    # canonical activity overlay below so a stale sidecar cannot win ordering
+    # over state.db.
     passthrough = [row for row in sidecar_rows if not _is_shared_interactive_sidecar(row)]
     if passthrough:
         try:
@@ -7065,6 +7272,22 @@ def shared_interactive_sidebar_projection(
             "_lineage_root_id": state_row.get("_lineage_root_id"),
             "_lineage_tip_id": state_row.get("_lineage_tip_id") or sid,
             "_compression_segment_count": state_row.get("_compression_segment_count"),
+            "is_working": bool(activity_by_canonical.get(id(state_row))),
+            "activity_phase": (
+                activity_by_canonical.get(id(state_row), {}).get("activity_phase")
+                if activity_by_canonical.get(id(state_row))
+                else None
+            ),
+            "activity_started_at": (
+                activity_by_canonical.get(id(state_row), {}).get("activity_started_at")
+                if activity_by_canonical.get(id(state_row))
+                else None
+            ),
+            "activity_heartbeat_at": (
+                activity_by_canonical.get(id(state_row), {}).get("activity_heartbeat_at")
+                if activity_by_canonical.get(id(state_row))
+                else None
+            ),
         }
         if overlay:
             overlay_stream_id = str(overlay.get("active_stream_id") or "").strip()
@@ -7192,15 +7415,39 @@ def _load_cli_sessions_uncached(
     cron_project_limit: int | None | bool = CRON_PROJECT_CHIP_LIMIT,
     webhook_project_limit: int | None | bool = WEBHOOK_PROJECT_CHIP_LIMIT,
     include_claude_code: bool = True,
+    target_session_id: str | None = None,
 ) -> list:
     cli_sessions = []
+
+    def _preserve_sidecar_archive(rows: list[dict]) -> list[dict]:
+        """Keep a UI archive decision stronger than a raw external scan."""
+        projected: list[dict] = []
+        for row in rows or []:
+            item = dict(row)
+            sid = str(item.get('session_id') or '').strip()
+            sidecar_meta = _state_projection_sidecar_metadata(sid) if sid else {}
+            item['archived'] = bool(
+                item.get('archived') or sidecar_meta.get('archived')
+            )
+            projected.append(item)
+        return projected
+
     if source_filter in (None, CLAUDE_CODE_SOURCE) and include_claude_code:
         try:
-            cli_sessions.extend(get_claude_code_sessions())
+            if target_session_id:
+                claude_row = get_claude_code_session_metadata(target_session_id)
+                if claude_row:
+                    cli_sessions.extend(_preserve_sidecar_archive([claude_row]))
+            else:
+                cli_sessions.extend(
+                    _preserve_sidecar_archive(get_claude_code_sessions())
+                )
         except Exception:
             logger.debug("Claude Code session scan failed", exc_info=True)
 
-    if source_filter == CLAUDE_CODE_SOURCE:
+    if source_filter == CLAUDE_CODE_SOURCE or (
+        target_session_id and str(target_session_id).startswith(f'{CLAUDE_CODE_SOURCE}_')
+    ):
         return cli_sessions
 
 
@@ -7288,17 +7535,22 @@ def _load_cli_sessions_uncached(
         _deleted_webui_tombstone = _load_webui_deleted_session_tombstone()
     except Exception:
         _deleted_webui_tombstone = frozenset()
-    for row in read_importable_agent_session_rows(
-        db_path,
-        limit=visible_session_limit if visible_session_limit is not None else (
+    _read_rows_kwargs = {
+        'limit': None if target_session_id else visible_session_limit if visible_session_limit is not None else (
             CRON_PROJECT_CHIP_LIMIT if source_filter == 'cron'
             else WEBHOOK_PROJECT_CHIP_LIMIT if source_filter == 'webhook'
             else CLI_VISIBLE_SESSION_LIMIT
         ),
-        log=logger,
-        exclude_sources=("cron", "webhook") if source_filter is None else None,
-        include_sources=None if source_filter is None else (source_filter,),
-    ):
+        'log': logger,
+        'exclude_sources': None if target_session_id else ("cron", "webhook") if source_filter is None else None,
+        'include_sources': None if source_filter is None else (source_filter,),
+    }
+    if target_session_id:
+        _read_rows_kwargs.update(
+            include_children=True,
+            session_ids=(target_session_id,),
+        )
+    for row in read_importable_agent_session_rows(db_path, **_read_rows_kwargs):
         sid = row['id']
         raw_ts = row['last_activity'] or row['started_at']
         # Prefer the CLI session's own profile from the DB; fall back to
@@ -7328,7 +7580,7 @@ def _load_cli_sessions_uncached(
         _sidecar_meta = _state_projection_sidecar_metadata(sid)
         if not _title and _sidecar_meta.get('title'):
             _title = _sidecar_meta['title']
-        _archived = bool(row.get('archived'))
+        _archived = bool(row.get('archived') or _sidecar_meta.get('archived'))
         _display_title = _title or f'{_source.title()} Session'
         cli_sessions.append({
             'session_id': sid,
@@ -7367,6 +7619,9 @@ def _load_cli_sessions_uncached(
             'is_cli_session': is_cli_session_row({**row, **_source_meta}),
         })
 
+    if target_session_id:
+        return cli_sessions
+
     if source_filter is not None:
         return cli_sessions
 
@@ -7401,7 +7656,7 @@ def _load_cli_sessions_uncached(
                 _sidecar_meta = _state_projection_sidecar_metadata(sid)
                 if not _title and _sidecar_meta.get('title'):
                     _title = _sidecar_meta['title']
-                _archived = bool(row.get('archived'))
+                _archived = bool(row.get('archived') or _sidecar_meta.get('archived'))
                 _display_title = _title or 'Cron Session'
                 cli_sessions.append({
                     'session_id': sid,
@@ -7467,7 +7722,7 @@ def _load_cli_sessions_uncached(
                 _sidecar_meta = _state_projection_sidecar_metadata(sid)
                 if not _title and _sidecar_meta.get('title'):
                     _title = _sidecar_meta['title']
-                _archived = bool(row.get('archived'))
+                _archived = bool(row.get('archived') or _sidecar_meta.get('archived'))
                 _display_title = _title or 'Webhook Session'
                 cli_sessions.append({
                     'session_id': sid,
@@ -7644,6 +7899,38 @@ def get_cli_sessions(
             "all profiles" if all_profiles else db_path, _cli_err,
         )
         return []
+
+
+def get_cli_session_metadata(session_id: str, *, all_profiles: bool = False) -> dict:
+    """Resolve one external session without rebuilding the full sidebar list."""
+    sid = str(session_id or '').strip()
+    if not sid:
+        return {}
+    if all_profiles:
+        contexts, _cache_key = _all_profiles_cli_contexts()
+    else:
+        hermes_home, db_path, cli_profile, _cache_key = _resolve_cli_sessions_context(None)
+        contexts = [(hermes_home, db_path, cli_profile)]
+    for idx, (hermes_home, db_path, cli_profile) in enumerate(contexts):
+        try:
+            rows = _load_cli_sessions_uncached(
+                hermes_home,
+                db_path,
+                cli_profile,
+                visible_session_limit=None,
+                cron_project_limit=False,
+                webhook_project_limit=False,
+                include_claude_code=(idx == 0),
+                target_session_id=sid,
+            )
+        except Exception:
+            logger.debug("Targeted CLI session lookup failed for %s", sid, exc_info=True)
+            continue
+        for row in rows:
+            if row.get('session_id') == sid:
+                return row
+    return {}
+
 
 def _json_loads_if_string(value):
     if not isinstance(value, str):

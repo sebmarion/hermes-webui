@@ -107,3 +107,21 @@ def test_save_settings_uses_atomic_writer(tmp_path: Path, monkeypatch) -> None:
 
     assert settings_file in calls, "save_settings must use the atomic writer"
     assert settings_file.exists()
+
+
+def test_test_process_refuses_settings_write_under_production_home(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A leaked config global must not let pytest overwrite real Hermes state."""
+    import api.config as config
+
+    production_home = tmp_path / "production-hermes-home"
+    target = production_home / "webui" / "settings.json"
+    monkeypatch.setattr(config, "_PRODUCTION_HERMES_HOME", production_home)
+    monkeypatch.setenv("HERMES_WEBUI_TEST_STATE_DIR", str(tmp_path / "test-state"))
+
+    with pytest.raises(RuntimeError, match="test process.*production Hermes state"):
+        config._atomic_write_settings_text(target, '{"must_not_write": true}')
+
+    assert not target.exists()

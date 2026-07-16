@@ -25,9 +25,11 @@ class TestTitleAutoGenerationCondition(unittest.TestCase):
 
     def _titles_that_trigger(self):
         """Extract the condition from the source so tests stay in sync with code."""
-        # Find the if-condition that calls title_from
+        # Find the default-title clause inside the guarded condition that calls
+        # title_from. Internal continuation prompts are deliberately excluded
+        # by the preceding source guard.
         m = re.search(
-            r'if\s+(s\.title\s*==.*?):\s*\n\s*s\.title\s*=\s*title_from',
+            r"and\s+\((s\.title\s*==.*?not s\.title)\)\):\s*\n\s*s\.title\s*=\s*title_from",
             STREAMING_PY,
             re.DOTALL,
         )

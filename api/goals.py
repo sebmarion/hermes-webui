@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 try:  # Exposed as a module attribute so tests can monkeypatch it directly.
     from hermes_cli.goals import (  # type: ignore
         CONTINUATION_PROMPT_TEMPLATE,
+        DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES,
         DEFAULT_MAX_TURNS,
         GoalManager as _NativeGoalManager,
         GoalState,
@@ -21,12 +22,18 @@ try:  # Exposed as a module attribute so tests can monkeypatch it directly.
     )
 except Exception:  # pragma: no cover - depends on installed hermes-agent
     CONTINUATION_PROMPT_TEMPLATE = ""  # type: ignore
+    DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3  # type: ignore
     DEFAULT_MAX_TURNS = 20  # type: ignore
     _NativeGoalManager = None  # type: ignore
     GoalState = None  # type: ignore
     judge_goal = None  # type: ignore
 
 GoalManager = _NativeGoalManager  # type: ignore
+
+
+class _StaleGoalEvaluation(RuntimeError):
+    pass
+
 
 _DB_CACHE: dict[str, Any] = {}
 
@@ -105,14 +112,38 @@ class _ProfileGoalManager:
             logger.warning("GoalManager profile state parse failed for %s: %s", self.session_id, exc)
             return None
 
-    def _save(self, state) -> None:
+    def _save(self, state, *, expected_revision: Optional[int] = None) -> None:
         db = _profile_db(self.profile_home)
-        if db is None or not self.session_id or state is None:
-            return
+        if not self.session_id or state is None:
+            raise RuntimeError("goal persistence requires session state")
+        if db is None:
+            self._state = self._load()
+            raise RuntimeError("goal state store unavailable")
         try:
-            db.set_meta(_meta_key(self.session_id), state.to_json())
+            if expected_revision is not None and hasattr(db, "update_meta"):
+                accepted = {"value": False}
+
+                def _commit(raw):
+                    current = GoalState.from_json(raw) if raw else None  # type: ignore[union-attr]
+                    if current is None or getattr(current, "revision", 0) != expected_revision:
+                        return raw
+                    state.revision = expected_revision + 1
+                    accepted["value"] = True
+                    return state.to_json()
+
+                db.update_meta(_meta_key(self.session_id), _commit)
+                if not accepted["value"]:
+                    raise _StaleGoalEvaluation("goal changed while evaluation was running")
+            else:
+                state.revision = int(getattr(state, "revision", 0) or 0) + 1
+                db.set_meta(_meta_key(self.session_id), state.to_json())
+        except _StaleGoalEvaluation:
+            self._state = self._load()
+            raise
         except Exception as exc:
-            logger.debug("GoalManager profile set_meta failed: %s", exc)
+            self._state = self._load()
+            logger.warning("GoalManager profile persistence failed: %s", exc)
+            raise RuntimeError("goal persistence failed") from exc
 
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
@@ -153,26 +184,29 @@ class _ProfileGoalManager:
     def pause(self, reason: str = "user-paused"):
         if not self._state:
             return None
+        expected_revision = int(getattr(self._state, "revision", 0) or 0)
         self._state.status = "paused"
         self._state.paused_reason = reason
-        self._save(self._state)
+        self._save(self._state, expected_revision=expected_revision)
         return self._state
 
     def resume(self, *, reset_budget: bool = True):
         if not self._state:
             return None
+        expected_revision = int(getattr(self._state, "revision", 0) or 0)
         self._state.status = "active"
         self._state.paused_reason = None
         if reset_budget:
             self._state.turns_used = 0
-        self._save(self._state)
+        self._save(self._state, expected_revision=expected_revision)
         return self._state
 
     def clear(self) -> None:
         if self._state is None:
             return
+        expected_revision = int(getattr(self._state, "revision", 0) or 0)
         self._state.status = "cleared"
-        self._save(self._state)
+        self._save(self._state, expected_revision=expected_revision)
         self._state = None
 
     def evaluate_after_turn(self, last_response: str, *, user_initiated: bool = True) -> Dict[str, Any]:
@@ -187,19 +221,120 @@ class _ProfileGoalManager:
                 "message": "",
             }
 
+        expected_revision = int(getattr(state, "revision", 0) or 0)
         state.turns_used += 1
         state.last_turn_at = time.time()
 
+        parse_failed = False
+        wait_directive = None
         if judge_goal is None:
             verdict, reason = "continue", "goal judge unavailable"
         else:
-            verdict, reason = judge_goal(state.goal, str(last_response or ""))
+            try:
+                try:
+                    judged = judge_goal(
+                        state.goal,
+                        str(last_response or ""),
+                        subgoals=getattr(state, "subgoals", None) or None,
+                        contract=(
+                            state.contract
+                            if callable(getattr(state, "has_contract", None)) and state.has_contract()
+                            else None
+                        ),
+                    )
+                except TypeError:
+                    judged = judge_goal(state.goal, str(last_response or ""))
+                if len(judged) == 4:
+                    verdict, reason, parse_failed, wait_directive = judged
+                elif len(judged) == 3:
+                    verdict, reason, parse_failed = judged
+                elif len(judged) == 2:
+                    verdict, reason = judged
+                else:
+                    raise ValueError(f"unsupported goal judge result length: {len(judged)}")
+            except Exception as exc:
+                # Fail-closed: an evaluation error must not silently pretend the
+                # goal is inactive with zero turns used. Log it visibly, mark the
+                # goal paused, and stop continuation so the user can inspect.
+                logger.warning("goal judge evaluation failed for session=%s: %s", self.session_id, exc)
+                state.status = "paused"
+                state.paused_reason = f"goal evaluation failed: {type(exc).__name__}"
+                self._save(state, expected_revision=expected_revision)
+                return {
+                    "status": "paused",
+                    "should_continue": False,
+                    "continuation_prompt": None,
+                    "verdict": "error",
+                    "reason": state.paused_reason,
+                    "message": (
+                        f"⏸ Goal paused — evaluation failed ({type(exc).__name__}). "
+                        "Use /goal resume to retry, or /goal clear to stop."
+                    ),
+                }
         state.last_verdict = verdict
         state.last_reason = reason
 
+        # Track consecutive parse failures the same way native GoalManager does.
+        if parse_failed:
+            state.consecutive_parse_failures = (getattr(state, "consecutive_parse_failures", 0) or 0) + 1
+        else:
+            state.consecutive_parse_failures = 0
+
+        # Profile-scoped WebUI sessions have no native process/session wake
+        # trigger. Pause visibly instead of persisting an active barrier that
+        # cannot schedule its own continuation.
+        if verdict == "wait":
+            state.status = "paused"
+            target = "the requested dependency"
+            if wait_directive:
+                if wait_directive.get("session_id"):
+                    target = f"session {wait_directive['session_id']}"
+                elif wait_directive.get("pid"):
+                    target = f"pid {wait_directive['pid']}"
+                elif wait_directive.get("seconds") is not None:
+                    target = f"{wait_directive['seconds']}s"
+            state.paused_reason = f"goal waiting requires manual resume: {reason}"
+            self._save(state, expected_revision=expected_revision)
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "wait",
+                "reason": reason,
+                "message": (
+                    f"⏸ Goal paused — waiting on {target} cannot auto-resume in this WebUI session: {reason}. "
+                    "Use /goal resume when the dependency is ready."
+                ),
+            }
+
+        # Auto-pause after repeated judge parse failures so a bad judge model
+        # doesn't burn the whole turn budget silently.
+        if (
+            parse_failed
+            and getattr(state, "consecutive_parse_failures", 0)
+            >= DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES
+        ):
+            state.status = "paused"
+            state.paused_reason = (
+                f"judge model returned unparseable output {state.consecutive_parse_failures} turns in a row"
+            )
+            self._save(state, expected_revision=expected_revision)
+            return {
+                "status": "paused",
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "continue",
+                "reason": reason,
+                "message": (
+                    f"⏸ Goal paused — the judge model ({state.consecutive_parse_failures} turns) "
+                    "isn't returning the required JSON verdict. "
+                    "Use /goal resume to retry, or /goal clear to stop."
+                ),
+            }
+
         if verdict == "done":
             state.status = "done"
-            self._save(state)
+            self._save(state, expected_revision=expected_revision)
             return {
                 "status": "done",
                 "should_continue": False,
@@ -212,7 +347,7 @@ class _ProfileGoalManager:
         if state.turns_used >= state.max_turns:
             state.status = "paused"
             state.paused_reason = f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
-            self._save(state)
+            self._save(state, expected_revision=expected_revision)
             return {
                 "status": "paused",
                 "should_continue": False,
@@ -225,11 +360,24 @@ class _ProfileGoalManager:
                 ),
             }
 
-        self._save(state)
+        self._save(state, expected_revision=expected_revision)
+        latest = self._load()
+        if latest is None or latest.status != "active" or latest.revision != state.revision:
+            self._state = latest
+            return {
+                "status": getattr(latest, "status", None),
+                "should_continue": False,
+                "continuation_prompt": None,
+                "verdict": "inactive",
+                "reason": "goal changed before continuation dispatch",
+                "message": "",
+            }
+        self._state = latest
         return {
             "status": "active",
             "should_continue": True,
             "continuation_prompt": self.next_continuation_prompt(),
+            "goal_revision": latest.revision,
             "verdict": "continue",
             "reason": reason,
             "message": f"↻ Continuing toward goal ({state.turns_used}/{state.max_turns}): {reason}",
@@ -238,6 +386,8 @@ class _ProfileGoalManager:
     def next_continuation_prompt(self) -> Optional[str]:
         if not self._state or self._state.status != "active":
             return None
+        if _NativeGoalManager is not None:
+            return _NativeGoalManager.next_continuation_prompt(self)
         return CONTINUATION_PROMPT_TEMPLATE.format(goal=self._state.goal)
 
 
@@ -255,6 +405,25 @@ def _manager(session_id: str, *, profile_home: str | Path | None = None):
             logger.debug("Profile-scoped GoalManager unavailable: %s", exc)
             return None
     return GoalManager(session_id=session_id, default_max_turns=_default_max_turns())
+
+
+def goal_revision_is_active(
+    session_id: str,
+    revision: Any,
+    *,
+    profile_home: str | Path | None = None,
+) -> bool:
+    """Fail-closed execution-time guard for a queued synthetic continuation."""
+    try:
+        mgr = _manager(session_id, profile_home=profile_home)
+        state = getattr(mgr, "state", None) if mgr is not None else None
+        return bool(
+            state is not None
+            and getattr(state, "status", None) == "active"
+            and int(getattr(state, "revision", -1)) == int(revision)
+        )
+    except Exception:
+        return False
 
 
 def _state_payload(state: Any) -> Optional[Dict[str, Any]]:
@@ -372,7 +541,8 @@ def _goal_decision_payload(
             "message_key": "goal_achieved",
             "message_args": [reason],
         }
-    if status == "paused":
+    paused_reason = str(getattr(state, "paused_reason", "") or "")
+    if status == "paused" and paused_reason.startswith("turn budget exhausted"):
         return {
             **decision,
             "message_key": "goal_paused_budget_exhausted",
@@ -588,15 +758,26 @@ def evaluate_goal_after_turn(
                 "message": "",
             }
         decision = mgr.evaluate_after_turn(str(last_response or ""), user_initiated=user_initiated)
-    except Exception as exc:
-        logger.debug("goal evaluation failed for session=%s: %s", sid, exc)
+    except _StaleGoalEvaluation:
+        mgr._state = mgr._load() if isinstance(mgr, _ProfileGoalManager) else getattr(mgr, "state", None)
         return {
-            "status": None,
+            "status": getattr(getattr(mgr, "state", None), "status", None),
+            "should_continue": False,
+            "continuation_prompt": None,
+            "verdict": "inactive",
+            "reason": "goal changed while evaluation was in progress",
+            "message": "",
+        }
+    except Exception as exc:
+        logger.warning("goal evaluation failed for session=%s: %s", sid, exc)
+        _state = getattr(mgr, "state", None)
+        return {
+            "status": getattr(_state, "status", None),
             "should_continue": False,
             "continuation_prompt": None,
             "verdict": "error",
             "reason": f"goal evaluation failed: {type(exc).__name__}",
-            "message": "",
+            "message": "⏸ Goal stopped — progress could not be persisted. Retry or resume after storage recovers.",
         }
     if not isinstance(decision, dict):
         decision = {}

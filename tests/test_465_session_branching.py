@@ -338,8 +338,8 @@ def test_branch_fork_sessions_nest_under_parent():
     resolve_block = resolve_fn.group(0)
     assert "row.session_source==='fork'" not in resolve_block, \
         "_resolveSessionIdFromSidebarLineage must not skip fork rows; they may now be active nested children"
-    assert "!_isChildSession(s)&&((s&&s.pinned)||!_isForkWithResolvableParent(s, sessionIdsInList))" in block, \
-        "Only unpinned resolvable fork rows should be filtered out of the top-level rows array"
+    assert "!_isChildSession(s)&&!_isForkWithResolvableParent(s, sessionIdsInList)" in block, \
+        "All resolvable fork rows, including pinned forks, must remain nested under their root parent"
 
 
 def test_branch_nested_fork_rows_keep_session_actions():
