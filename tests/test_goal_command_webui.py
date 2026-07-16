@@ -161,6 +161,242 @@ def test_goal_continuation_decision_emits_status_and_normal_user_prompt(monkeypa
     assert decision["continuation_prompt"].startswith("[Continuing toward your standing goal]")
 
 
+def test_profile_goal_manager_accepts_native_four_field_judge_contract(monkeypatch, tmp_path):
+    """Profile-scoped WebUI goals must track the current native judge contract."""
+    from api import goals as webui_goals
+
+    class FakeDB:
+        values = {}
+
+        def get_meta(self, key):
+            return self.values.get(key)
+
+        def set_meta(self, key, value):
+            self.values[key] = value
+
+    monkeypatch.setattr(webui_goals, "_profile_db", lambda home: FakeDB())
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    set_result = webui_goals.goal_command_payload(
+        "sid-profile-goal", "ship the feature", profile_home=profile_home
+    )
+    assert set_result["ok"] is True
+
+    monkeypatch.setattr(
+        webui_goals,
+        "judge_goal",
+        lambda *args, **kwargs: ("continue", "one step remains", False, None),
+    )
+    decision = webui_goals.evaluate_goal_after_turn(
+        "sid-profile-goal", "progress made", profile_home=profile_home
+    )
+
+    assert decision["verdict"] == "continue"
+    assert decision["should_continue"] is True
+    assert decision["status"] == "active"
+    status = webui_goals.goal_command_payload(
+        "sid-profile-goal", "status", profile_home=profile_home
+    )
+    assert status["goal"]["turns_used"] == 1
+
+
+def test_profile_goal_manager_surfaces_and_pauses_judge_contract_failure(monkeypatch, tmp_path):
+    """Adapter drift must produce a visible paused state, not a silent stop."""
+    from api import goals as webui_goals
+
+    class FakeDB:
+        values = {}
+
+        def get_meta(self, key):
+            return self.values.get(key)
+
+        def set_meta(self, key, value):
+            self.values[key] = value
+
+    monkeypatch.setattr(webui_goals, "_profile_db", lambda home: FakeDB())
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    webui_goals.goal_command_payload(
+        "sid-profile-goal-error", "ship the feature", profile_home=profile_home
+    )
+
+    def broken_judge(*args, **kwargs):
+        raise ValueError("judge contract drift")
+
+    monkeypatch.setattr(webui_goals, "judge_goal", broken_judge)
+    decision = webui_goals.evaluate_goal_after_turn(
+        "sid-profile-goal-error", "progress made", profile_home=profile_home
+    )
+
+    assert decision["verdict"] == "error"
+    assert decision["should_continue"] is False
+    assert decision["status"] == "paused"
+    assert "Goal paused" in decision["message"]
+    assert "message_key" not in decision
+    status = webui_goals.goal_command_payload(
+        "sid-profile-goal-error", "status", profile_home=profile_home
+    )
+    assert status["goal"]["status"] == "paused"
+
+
+def test_profile_goal_wait_pauses_instead_of_wedging_active_state(monkeypatch, tmp_path):
+    """Unsupported WebUI wake barriers fail closed as a resumable pause."""
+    from api import goals as webui_goals
+
+    class FakeDB:
+        values = {}
+
+        def get_meta(self, key):
+            return self.values.get(key)
+
+        def set_meta(self, key, value):
+            self.values[key] = value
+
+    monkeypatch.setattr(webui_goals, "_profile_db", lambda home: FakeDB())
+    profile_home = tmp_path / "profile-wait"
+    profile_home.mkdir()
+    webui_goals.goal_command_payload("sid-profile-wait", "ship", profile_home=profile_home)
+    monkeypatch.setattr(
+        webui_goals,
+        "judge_goal",
+        lambda *args, **kwargs: ("wait", "CI running", False, {"pid": 4242}),
+    )
+
+    decision = webui_goals.evaluate_goal_after_turn(
+        "sid-profile-wait", "watching CI", profile_home=profile_home
+    )
+
+    assert decision["verdict"] == "wait"
+    assert decision["status"] == "paused"
+    assert decision["should_continue"] is False
+    assert "manual resume" in decision["reason"] or "resume" in decision["message"].lower()
+    assert "message_key" not in decision
+    status = webui_goals.goal_command_payload(
+        "sid-profile-wait", "status", profile_home=profile_home
+    )
+    assert status["goal"]["status"] == "paused"
+    manager = webui_goals._manager("sid-profile-wait", profile_home=profile_home)
+    assert getattr(manager.state, "waiting_on_pid", None) is None
+
+
+@pytest.mark.parametrize("judge_result", [
+    ("wait", "dependency pending"),
+    ("wait", "dependency pending", False),
+    ("wait", "dependency pending", False, None),
+    ("wait", "dependency pending", False, {}),
+])
+def test_profile_goal_wait_without_directive_still_pauses(monkeypatch, tmp_path, judge_result):
+    """Every accepted WAIT shape stops continuation, even without a target."""
+    from api import goals as webui_goals
+
+    class FakeDB:
+        values = {}
+
+        def get_meta(self, key):
+            return self.values.get(key)
+
+        def set_meta(self, key, value):
+            self.values[key] = value
+
+        def update_meta(self, key, transform):
+            replacement = transform(self.values.get(key))
+            if replacement is None:
+                self.values.pop(key, None)
+            else:
+                self.values[key] = replacement
+            return replacement
+
+    monkeypatch.setattr(webui_goals, "_profile_db", lambda home: FakeDB())
+    profile_home = tmp_path / f"profile-wait-{len(judge_result)}"
+    profile_home.mkdir()
+    webui_goals.goal_command_payload("sid-wait-shape", "ship", profile_home=profile_home)
+    monkeypatch.setattr(webui_goals, "judge_goal", lambda *args, **kwargs: judge_result)
+
+    decision = webui_goals.evaluate_goal_after_turn(
+        "sid-wait-shape", "blocked", profile_home=profile_home
+    )
+
+    assert decision["verdict"] == "wait"
+    assert decision["status"] == "paused"
+    assert decision["should_continue"] is False
+    assert decision["continuation_prompt"] is None
+    assert decision.get("message_key", "") == ""
+
+
+def test_profile_goal_evaluation_persistence_failure_stops_continuation(monkeypatch, tmp_path):
+    """A failed CAS must not continue forever against unchanged durable state."""
+    from api import goals as webui_goals
+
+    class FakeDB:
+        values = {}
+        fail_updates = False
+
+        def get_meta(self, key):
+            return self.values.get(key)
+
+        def set_meta(self, key, value):
+            self.values[key] = value
+
+        def update_meta(self, key, transform):
+            if self.fail_updates:
+                raise OSError("database unavailable")
+            replacement = transform(self.values.get(key))
+            self.values[key] = replacement
+            return replacement
+
+    db = FakeDB()
+    monkeypatch.setattr(webui_goals, "_profile_db", lambda home: db)
+    profile_home = tmp_path / "profile-save-failure"
+    profile_home.mkdir()
+    webui_goals.goal_command_payload("sid-save-failure", "ship", profile_home=profile_home)
+    monkeypatch.setattr(
+        webui_goals,
+        "judge_goal",
+        lambda *args, **kwargs: ("continue", "more work", False, None),
+    )
+    db.fail_updates = True
+
+    decision = webui_goals.evaluate_goal_after_turn(
+        "sid-save-failure", "progress", profile_home=profile_home
+    )
+
+    assert decision["verdict"] == "error"
+    assert decision["should_continue"] is False
+    assert "persist" in decision["message"].lower()
+
+
+def test_goal_revision_guard_rejects_pause_after_enqueue(monkeypatch, tmp_path):
+    from api import goals as webui_goals
+
+    class FakeDB:
+        values = {}
+
+        def get_meta(self, key):
+            return self.values.get(key)
+
+        def set_meta(self, key, value):
+            self.values[key] = value
+
+        def update_meta(self, key, transform):
+            replacement = transform(self.values.get(key))
+            self.values[key] = replacement
+            return replacement
+
+    monkeypatch.setattr(webui_goals, "_profile_db", lambda home: FakeDB())
+    profile_home = tmp_path / "profile-revision-guard"
+    profile_home.mkdir()
+    webui_goals.goal_command_payload("sid-revision", "ship", profile_home=profile_home)
+    manager = webui_goals._manager("sid-revision", profile_home=profile_home)
+    revision = manager.state.revision
+    assert webui_goals.goal_revision_is_active(
+        "sid-revision", revision, profile_home=profile_home
+    )
+    manager.pause("user paused")
+    assert not webui_goals.goal_revision_is_active(
+        "sid-revision", revision, profile_home=profile_home
+    )
+
+
 def test_goal_endpoint_sets_goal_and_starts_kickoff_stream(monkeypatch, tmp_path):
     """POST /api/goal uses GoalManager state and launches the first goal turn."""
     from api import goals as webui_goals
@@ -466,7 +702,25 @@ def test_frontend_has_goal_slash_command_and_status_event_handler():
     assert "source.addEventListener('goal'" in MESSAGES_JS
     assert "source.addEventListener('goal_continue'" in MESSAGES_JS
     assert "['steer','interrupt','queue','terminal','goal','yolo'].includes(_pc.name)" in MESSAGES_JS
-    assert "queueSessionMessage" in MESSAGES_JS
+    goal_listener = MESSAGES_JS.split("source.addEventListener('goal_continue'", 1)[1].split(
+        "source.addEventListener(", 1
+    )[0]
+    assert "queueSessionMessage" not in goal_listener
+    assert "_pendingGoalContinuation" not in MESSAGES_JS
+
+
+def test_goal_continuation_is_claimed_then_started_at_server_teardown_boundary():
+    assert "claim_goal_continuation" in STREAMING_PY
+    assert "settle_goal_continuation" in STREAMING_PY
+    assert STREAMING_PY.index("claim_goal_continuation") < STREAMING_PY.index(
+        "put('goal_continue'"
+    )
+    cleanup = STREAMING_PY.index("unregister_active_run(stream_id)")
+    settle = STREAMING_PY.index("settle_goal_continuation", cleanup)
+    assert cleanup < settle
+    assert 'source == "goal_continuation"' in ROUTES_PY
+    assert "_recover_goal_continuations_on_startup" in ROUTES_PY
+    assert "recover_pending_goal_continuations" in ROUTES_PY
 
 
 def test_frontend_goal_evaluating_state_uses_calm_composer_indicator():

@@ -8,14 +8,13 @@ a linked delegate child that transiently reports ``message_count === 0`` between
 (``_sidebarRowHasVisibleMessages``). Before the fix it was filtered out *before*
 ``_attachChildSessionsToSidebarRows`` ever saw it, so it never entered
 ``sessionsRaw`` — the row vanished, then reappeared on the next refresh once its
-list metadata caught up (the flicker). The child must stay stacked under its
-parent across re-renders even at message_count 0.
+list metadata caught up (the flicker). The child stays available long enough to
+bubble actionable state to its parent, but it is never rendered as a subthread.
 
 #5305 (orphan): a delegated subagent child whose WebUI parent is filtered out of
 the current render (project/profile/source scope) must NOT be promoted to a
 contextless top-level "Subagent Session" orphan. It follows its parent's scope
-and is suppressed instead (re-stacking under the parent once that scope is
-active).
+and remains hidden even when that parent is active.
 
 The helpers under test are the *real* regions extracted from static/sessions.js
 and executed under node, matching the existing style in
@@ -103,10 +102,10 @@ def _preamble(js: str) -> str:
     return _PREAMBLE.format(js=js)
 
 
-def test_5306_active_parent_delegate_child_survives_zero_message_partition():
+def test_5306_active_parent_delegate_child_survives_partition_but_stays_hidden():
     """#5306 flicker root cause: the visibility predicate must keep a linked
     delegate child of the ACTIVE parent even when message_count===0, so it
-    reaches sessionsRaw and gets stacked under the parent instead of vanishing.
+    reaches sessionsRaw for state bubbling without becoming a nested row.
     """
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = _preamble(js) + """
@@ -135,20 +134,20 @@ console.log(JSON.stringify({
     out = json.loads(_run_node(source))
     # The zero-message delegate child of the active parent survives partitioning.
     assert "subagent_child" in out["sessionsRaw"]
-    # It is stacked UNDER the parent, not rendered as a top-level row.
+    # Only the parent is rendered; the child is internal metadata.
     assert out["topLevel"] == ["active_parent"]
-    assert out["childCount"] == 1
-    assert out["childSids"] == ["subagent_child"]
+    assert out["childCount"] == 0
+    assert out["childSids"] == []
     # The predicate keeps the active parent's child...
     assert out["childPredicate"] is True
     # ...but still hides a truly-empty UNRELATED session (no regression).
     assert out["unrelatedEmptyPredicate"] is False
 
 
-def test_5306_child_across_two_renders_stays_present():
+def test_5306_child_across_two_renders_stays_internal_without_flicker():
     """#5306 invariant across a re-render: two consecutive partitions of the
-    same active-parent + zero-message delegate child must BOTH keep the child
-    (no flicker between polls)."""
+    same active-parent + zero-message delegate child must keep the same parent-only
+    rendered shape while retaining the child in the raw partition."""
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = _preamble(js) + """
 global.S = { session: { session_id: 'active_parent', message_count: 5 }, busy: true, activeStreamId: 's1' };
@@ -163,15 +162,23 @@ function renderOnce(childMsgCount){
   const part = _partitionSidebarSessionRows(allMatched, 'active_parent');
   const rows = _renderSidebarRowsFromRawSessions(part.sessionsRaw, part.referenceRaw);
   const parent = rows.find(r=>r.session_id==='active_parent') || {};
-  return (parent._child_sessions||[]).map(c=>c.session_id);
+  return {
+    raw: part.sessionsRaw.map(s=>s.session_id),
+    topLevel: rows.map(r=>r.session_id),
+    childCount: (parent._child_sessions||[]).length,
+  };
 }
 // Poll A: list metadata lagging, child reports 0 messages.
 // Poll B: metadata caught up, child reports 2 messages.
 console.log(JSON.stringify({ pollA: renderOnce(0), pollB: renderOnce(2) }));
 """
     out = json.loads(_run_node(source))
-    assert out["pollA"] == ["subagent_child"], "child dropped on the zero-message poll (flicker)"
-    assert out["pollB"] == ["subagent_child"], "child dropped on the caught-up poll"
+    assert out["pollA"] == {
+        "raw": ["active_parent", "subagent_child"],
+        "topLevel": ["active_parent"],
+        "childCount": 0,
+    }
+    assert out["pollB"] == out["pollA"]
 
 
 def test_5306_zero_message_child_of_inactive_parent_is_still_hidden():
@@ -240,10 +247,9 @@ console.log(JSON.stringify(rows.map(r=>({sid:r.session_id, orphan:!!r._orphan_ch
     assert out == []
 
 
-def test_5305_visible_parent_still_stacks_subagent_child():
-    """Guard the common #5244 case still holds after the #5305 change: when the
-    WebUI parent IS visible in the same render, the delegate child stacks under
-    it (not suppressed, not orphaned)."""
+def test_5305_visible_parent_hides_subagent_child():
+    """When the WebUI parent is visible, its delegate remains internal rather
+    than becoming a nested row or an orphan."""
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = _preamble(js) + """
 global._showArchived = false;
@@ -261,7 +267,7 @@ console.log(JSON.stringify({
 """
     out = json.loads(_run_node(source))
     assert out["topLevel"] == ["webui_parent"]
-    assert out["childSids"] == ["subagent_child"]
+    assert out["childSids"] == []
 
 
 def test_5305_external_parent_child_still_orphans():

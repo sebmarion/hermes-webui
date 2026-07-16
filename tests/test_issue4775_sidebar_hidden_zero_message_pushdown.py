@@ -241,11 +241,57 @@ def test_zero_message_rows_with_visibility_signals_survive(monkeypatch):
     assert by_id["pending-user-row"]["title"] == "Pending user row"
 
 
-def test_omit_exclude_hidden_still_returns_default_hidden_rows(monkeypatch):
+def test_default_sidebar_keeps_zero_message_session_with_owned_draft(monkeypatch):
+    rows = _session_rows() + [
+        {
+            "session_id": "draft-owned-row",
+            "title": "Recovered draft-only task",
+            "profile": "default",
+            "archived": False,
+            "message_count": 0,
+            "composer_draft": {
+                "text": "Continue the recovered task",
+                "files": [],
+            },
+            "updated_at": 575,
+            "last_message_at": 575,
+            "source": "webui",
+            "raw_source": "webui",
+            "session_source": "webui",
+            "source_tag": "webui",
+            "default_hidden": False,
+        }
+    ]
+    _install_common_monkeypatches(monkeypatch, rows)
+
+    handler = _handle_sessions("http://example.com/api/sessions")
+    body = handler.json_body()
+    session_ids = {row["session_id"] for row in body["sessions"]}
+
+    assert handler.status == 200
+    assert "draft-owned-row" in session_ids
+    assert "zero-message" not in session_ids
+
+
+def test_omitted_hidden_flag_defaults_to_clean_sidebar(monkeypatch):
     rows = _session_rows()
     _install_common_monkeypatches(monkeypatch, rows)
 
     handler = _handle_sessions("http://example.com/api/sessions?sidebar_source=webui")
+    body = handler.json_body()
+
+    assert handler.status == 200
+    session_ids = {row["session_id"] for row in body["sessions"]}
+    assert "hidden-by-default" not in session_ids
+
+
+def test_include_hidden_opt_in_returns_project_background_rows(monkeypatch):
+    rows = _session_rows()
+    _install_common_monkeypatches(monkeypatch, rows)
+
+    handler = _handle_sessions(
+        "http://example.com/api/sessions?sidebar_source=webui&include_hidden=1"
+    )
     body = handler.json_body()
 
     assert handler.status == 200
@@ -280,7 +326,7 @@ console.log(JSON.stringify({{ default_query, unassigned_query, named_project_que
 
     assert body["default_query"] == "?exclude_hidden=1"
     assert body["unassigned_query"] == "?exclude_hidden=1"
-    assert body["named_project_query"] == "?"
+    assert body["named_project_query"] == "?include_hidden=1"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")

@@ -450,6 +450,27 @@ def _truncate(text: str, limit: int) -> str:
     return s[:limit] + "\n…(truncated)"
 
 
+def _async_delegation_id(evt: object) -> str:
+    """Return the durable async-delegation id carried by *evt*, if any."""
+    if not isinstance(evt, dict) or evt.get("type") != "async_delegation":
+        return ""
+    return str(evt.get("delegation_id") or "").strip()
+
+
+def _event_process_id(evt: object) -> str:
+    """Return the stable completion identity used by wakeup routing/dedupe.
+
+    Ordinary process events carry ``session_id`` as their process id. Async
+    delegation completions intentionally do not; their durable identity is
+    ``delegation_id``. Treating those as an empty process id bypassed every
+    dedupe layer, emitted an empty ``task_id``, and discarded the id before a
+    deferred wakeup could be acknowledged.
+    """
+    if not isinstance(evt, dict):
+        return ""
+    return str(evt.get("session_id") or "").strip() or _async_delegation_id(evt)
+
+
 def format_wakeup_prompt(evt: object) -> str | None:
     """Build the synthetic [IMPORTANT: …] message the agent will see.
 
@@ -543,7 +564,7 @@ def _build_payload(evt: dict, session_id: str) -> dict:
     # ProcessRegistry completion events use the field name ``session_id`` for
     # the process id. Alias it locally before exposing it as payload ``task_id``
     # to avoid confusing that wire-format name with the WebUI session id.
-    process_id = str(evt.get("session_id") or "")
+    process_id = _event_process_id(evt)
     payload: dict[str, Any] = {
         "session_id": str(session_id),
         "task_id": process_id,
@@ -802,6 +823,34 @@ def _mark_registry_completion_consumed(process_id: str) -> None:
         )
 
 
+def _ack_async_delegation_delivery(delegation_id: str) -> bool:
+    """ACK an async result only after its replacement turn was accepted.
+
+    Hermes Agent persists completed async delegations until a driver calls
+    ``mark_async_delegation_delivered``. WebUI previously consumed the queue
+    event and launched a server-side turn without making that call, so a restart
+    replayed an already-consumed result and could repeat continuation side
+    effects. Import/call failures deliberately leave the record replayable.
+    """
+    delegation_id = str(delegation_id or "").strip()
+    if not delegation_id:
+        return False
+    try:
+        from tools.async_delegation import mark_async_delegation_delivered
+
+        mark_async_delegation_delivered(
+            {"type": "async_delegation", "delegation_id": delegation_id}
+        )
+    except Exception:
+        logger.warning(
+            "async delegation delivery ACK failed for %s; record remains replayable",
+            delegation_id,
+            exc_info=True,
+        )
+        return False
+    return True
+
+
 # ── xsession wakeup misroute defense-in-depth (Option 3) ───────────────────
 # Option 1 (api/streaming._set_turn_session_identity) is the ROOT fix: it binds
 # the per-turn session identity to a contextvar so a notify_on_complete spawn
@@ -887,7 +936,8 @@ def _process_one(evt: dict) -> None:
     except Exception:
         _process_registry = None
 
-    process_id = str(evt.get("session_id") or "")
+    process_id = _event_process_id(evt)
+    async_delegation_id = _async_delegation_id(evt)
     session_key = str(evt.get("session_key") or "")
     # Root-cause fix (t_0f447014): the notify_on_complete completion event
     # enqueued by ProcessRegistry._move_to_finished() carries NO "session_key"
@@ -1032,7 +1082,12 @@ def _process_one(evt: dict) -> None:
                 # _completion_consumed marker (set above), so persisting it
                 # here cannot cause a double-fire — the atomic claim in
                 # ``claim_deferred_wakeups`` guarantees exactly one delivery.
-                record_deferred_wakeup(session_id, process_id, wakeup_prompt)
+                record_deferred_wakeup(
+                    session_id,
+                    process_id,
+                    wakeup_prompt,
+                    async_delegation_id=async_delegation_id,
+                )
                 logger.debug(
                     "server-side wakeup deferred: turn active for session %s "
                     "(persisted for turn-teardown idle-hook redelivery)",
@@ -1048,7 +1103,10 @@ def _process_one(evt: dict) -> None:
                 # path so a second 409 race cannot accumulate a duplicate
                 # deferred entry (which would deliver the same wakeup twice).
                 _start_server_side_wakeup_turn(
-                    session_id, wakeup_prompt, process_id=process_id
+                    session_id,
+                    wakeup_prompt,
+                    process_id=process_id,
+                    async_delegation_id=async_delegation_id,
                 )
     except Exception:
         logger.warning(
@@ -1056,7 +1114,13 @@ def _process_one(evt: dict) -> None:
         )
 
 
-def record_deferred_wakeup(session_id: str, process_id: str, wakeup_prompt: str) -> None:
+def record_deferred_wakeup(
+    session_id: str,
+    process_id: str,
+    wakeup_prompt: str,
+    *,
+    async_delegation_id: str = "",
+) -> None:
     """Persist a deferred process-completion wakeup for later redelivery.
 
     Called from ``_process_one`` when a completion arrives while a turn is
@@ -1077,13 +1141,19 @@ def record_deferred_wakeup(session_id: str, process_id: str, wakeup_prompt: str)
     try:
         with _cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
             entries = _cfg.DEFERRED_PROCESS_WAKEUPS.setdefault(session_id, [])
-            if process_id and any(
-                e.get("process_id") == process_id for e in entries
-            ):
-                return
-            entries.append(
-                {"process_id": process_id, "wakeup_prompt": wakeup_prompt}
-            )
+            if process_id:
+                existing = next(
+                    (e for e in entries if e.get("process_id") == process_id),
+                    None,
+                )
+                if existing is not None:
+                    if async_delegation_id and not existing.get("async_delegation_id"):
+                        existing["async_delegation_id"] = async_delegation_id
+                    return
+            entry = {"process_id": process_id, "wakeup_prompt": wakeup_prompt}
+            if async_delegation_id:
+                entry["async_delegation_id"] = async_delegation_id
+            entries.append(entry)
     except Exception:
         logger.debug(
             "record_deferred_wakeup failed for session %s", session_id, exc_info=True
@@ -1183,11 +1253,17 @@ def drain_deferred_wakeups_for_session(session_id: str) -> int:
                     session_id,
                     str((entry or {}).get("process_id") or ""),
                     str((entry or {}).get("wakeup_prompt") or "").strip(),
+                    async_delegation_id=str(
+                        (entry or {}).get("async_delegation_id") or ""
+                    ),
                 )
             _start_server_side_wakeup_turn(
                 session_id,
                 str((first or {}).get("wakeup_prompt") or "").strip(),
                 process_id=str((first or {}).get("process_id") or ""),
+                async_delegation_id=str(
+                    (first or {}).get("async_delegation_id") or ""
+                ),
             )
             started = 1
         if started:
@@ -1235,7 +1311,11 @@ def _session_has_active_turn(session_id: str) -> bool:
 
 
 def _start_server_side_wakeup_turn(
-    session_id: str, wakeup_prompt: str, *, process_id: str = ""
+    session_id: str,
+    wakeup_prompt: str,
+    *,
+    process_id: str = "",
+    async_delegation_id: str = "",
 ) -> None:
     """Start an agent turn server-side for a process_complete wakeup (Option Z).
 
@@ -1288,7 +1368,12 @@ def _start_server_side_wakeup_turn(
                 # delivery, and BG_TASK_COMPLETE_EVENTS_SEEN already deduped
                 # this process_id, so re-recording cannot double-fire.
                 if wakeup_prompt:
-                    record_deferred_wakeup(session_id, process_id, wakeup_prompt)
+                    record_deferred_wakeup(
+                        session_id,
+                        process_id,
+                        wakeup_prompt,
+                        async_delegation_id=async_delegation_id,
+                    )
                 logger.debug(
                     "server-side wakeup raced an active turn for session %s; "
                     "re-deferred for redelivery on next teardown/turn",
@@ -1302,10 +1387,15 @@ def _start_server_side_wakeup_turn(
                     (resp or {}).get("error"),
                 )
             else:
+                acked = False
+                if async_delegation_id:
+                    acked = _ack_async_delegation_delivery(async_delegation_id)
                 logger.info(
-                    "server-side wakeup turn started for session %s (stream_id=%s)",
+                    "server-side wakeup turn started for session %s "
+                    "(stream_id=%s, async_delivery_acked=%s)",
                     session_id,
                     (resp or {}).get("stream_id"),
+                    acked if async_delegation_id else "n/a",
                 )
         except Exception:
             logger.warning(

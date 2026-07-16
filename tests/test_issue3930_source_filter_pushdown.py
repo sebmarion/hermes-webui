@@ -377,6 +377,10 @@ def test_cron_source_filter_uses_cron_rescue_limit(monkeypatch, tmp_path):
 def test_api_sessions_passes_source_filter_only_on_sidebar_path(monkeypatch):
     captured = []
 
+    # This test stubs the compatibility builder rather than the canonical
+    # index projection, so disable the projection-v2 cold seed explicitly.
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
+
     def fake_get_cli_sessions(source_filter=None, *, all_profiles=False):
         captured.append({"source_filter": source_filter, "all_profiles": all_profiles})
         return []
@@ -401,17 +405,26 @@ def test_api_sessions_passes_source_filter_only_on_sidebar_path(monkeypatch):
     assert captured == [{"source_filter": "  TUI  ", "all_profiles": False}]
 
 
-def test_non_sidebar_cli_session_callers_keep_default_get_cli_sessions_signature(monkeypatch):
+def test_non_sidebar_cli_session_callers_use_targeted_lookup(monkeypatch):
     captured = []
 
     monkeypatch.setattr(
         routes,
+        "get_cli_session_metadata",
+        lambda session_id, *, all_profiles=False: captured.append(
+            (session_id, all_profiles)
+        ) or {"session_id": "cli-session", "title": "CLI Session"},
+    )
+    monkeypatch.setattr(
+        routes,
         "get_cli_sessions",
-        lambda *, all_profiles=False: captured.append(all_profiles) or [{"session_id": "cli-session", "title": "CLI Session"}],
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("bulk CLI scanner must not run for one-session lookup")
+        ),
     )
 
     assert routes._lookup_cli_session_metadata("cli-session") == {
         "session_id": "cli-session",
         "title": "CLI Session",
     }
-    assert captured == [False]
+    assert captured == [("cli-session", False)]

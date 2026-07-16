@@ -404,7 +404,8 @@ def test_frontend_recovered_frame_uses_reconnecting_attach():
     js = (REPO_ROOT / "static" / "messages.js").read_text()
     assert "recovered" in js
     h_ix = js.index("addEventListener('server_turn_started'")
-    h_src = js[h_ix:h_ix + 1600]
+    h_end = js.index("\n    es.onerror", h_ix)
+    h_src = js[h_ix:h_end]
     assert "d.recovered" in h_src
     assert "reconnecting" in h_src
     # Still reuses the single renderer — no second hand-rolled stream.
@@ -654,7 +655,8 @@ def test_session_sse_handler_wires_finished_during_gap_self_heal():
     turn that finished during the SSE gap still self-heals on a visible tab."""
     src = (REPO_ROOT / "api" / "routes.py").read_text()
     handler_ix = src.index("def _handle_session_sse_stream")
-    handler_src = src[handler_ix:handler_ix + 9000]
+    handler_end = src.index("\ndef _handle_clarify_inject", handler_ix)
+    handler_src = src[handler_ix:handler_end]
     # (a) the subscriber reports its last-known count.
     assert "known_count" in handler_src
     assert "subscriber_known_count" in handler_src
@@ -705,7 +707,8 @@ def test_sse_handler_uses_shared_emit_gate_not_inline_comparison():
     not a copy)."""
     src = (REPO_ROOT / "api" / "routes.py").read_text()
     handler_ix = src.index("def _handle_session_sse_stream")
-    handler_src = src[handler_ix:handler_ix + 9000]
+    handler_end = src.index("\ndef _handle_clarify_inject", handler_ix)
+    handler_src = src[handler_ix:handler_end]
     # The shared gate is imported and called in the emit branch.
     assert "should_emit_session_updated" in handler_src
     # And the inline form is GONE (the comparison lives only in the gate fn).
@@ -774,4 +777,3 @@ def test_loadsession_idle_cleanup_does_not_clobber_concurrent_live_stream():
     assert reread_ix != -1 and branch_ix != -1 and reread_ix < branch_ix, (
         "race-guard re-read must precede the attach/idle branch"
     )
-

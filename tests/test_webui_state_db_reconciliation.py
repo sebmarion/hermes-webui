@@ -156,6 +156,54 @@ def test_sidebar_state_db_overlay_preserves_numeric_actual_count():
     assert sessions[0]["actual_message_count"] == 5
 
 
+@pytest.mark.parametrize(
+    "placeholder",
+    [
+        "Untitled",
+        "Cli Session",
+        "TUI Session",
+        "Continue the unfinished task from the parent",
+    ],
+)
+def test_sidebar_state_db_title_replaces_cross_surface_placeholders(placeholder):
+    import api.models as models
+
+    sid = "cross_surface_placeholder_title"
+    sessions = [{"session_id": sid, "title": placeholder}]
+
+    models._apply_sidebar_state_db_override_metadata(
+        sessions,
+        {sid: {"_state_db_title": "Canonical state.db title"}},
+    )
+
+    assert sessions[0]["title"] == placeholder
+    assert sessions[0]["display_title"] == "Canonical state.db title"
+    assert sessions[0]["_state_db_title"] == "Canonical state.db title"
+
+
+def test_shared_lineage_title_ignores_physical_tip_title_override():
+    import api.models as models
+
+    sid = "continuation-tip"
+    sessions = [
+        {
+            "session_id": sid,
+            "title": "Untitled",
+            "_shared_interactive": True,
+            "_lineage_root_id": "conversation-root",
+        }
+    ]
+
+    models._apply_sidebar_state_db_override_metadata(
+        sessions,
+        {sid: {"_state_db_title": "Untitled #2"}},
+    )
+
+    assert sessions[0]["title"] == "Untitled"
+    assert "display_title" not in sessions[0]
+    assert "_state_db_title" not in sessions[0]
+
+
 def test_sidebar_state_db_overlay_counts_subagent_child_5308():
     """#5308: a delegated subagent child whose stale sidecar reports
     message_count == 0 must receive its real state.db message count so the

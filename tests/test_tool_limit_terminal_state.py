@@ -4,7 +4,7 @@ import sys
 import types
 from pathlib import Path
 
-from api import models
+from api import config, models
 from api import streaming
 from api.models import Session
 
@@ -24,6 +24,8 @@ def _run_streaming_with_fake_agent(
     session_dir.mkdir()
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(config, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(config, "SESSION_INDEX_FILE", session_dir / "_index.json")
     monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
     models.SESSIONS.clear()
     streaming.SESSIONS.clear()
@@ -81,8 +83,19 @@ def _run_streaming_with_fake_agent(
     fake_hermes_state.SessionDB = lambda *_args, **_kwargs: object()
 
     with monkeypatch.context() as m:
+        import api.routes as routes
+
         m.setattr(streaming, "get_session", lambda _sid: session)
         m.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
+        m.setattr(
+            routes,
+            "start_session_turn",
+            lambda sid, _prompt, source=None: {
+                "session_id": sid,
+                "stream_id": f"continuation-{sid}",
+                "source": source,
+            },
+        )
         m.setattr(streaming, "resolve_model_provider", lambda *_args, **_kwargs: ("gpt-4o", "openai", None))
         m.setattr("api.config.get_config", lambda *_args, **_kwargs: {})
         m.setattr("api.config._resolve_cli_toolsets", lambda *_args, **_kwargs: [])
@@ -211,6 +224,165 @@ def test_display_merge_does_not_render_synthetic_summary_prompt():
     assert "here is the summary" in merged[-1]["content"]
 
 
+def test_internal_control_prompt_is_removed_from_model_history_before_current_turn():
+    prompt = "Continue the unfinished task from the parent segment."
+    control_key = "_tool_limit_continuation_control"
+    history = [
+        {"role": "user", "content": "original task"},
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "legitimate historical answer"},
+        {"role": "user", "content": prompt, control_key: {"continuation_index": 1}},
+        {"role": "assistant", "content": "prior segment summary"},
+    ]
+
+    cleaned = streaming._drop_internal_control_prompts_from_history(
+        history,
+        prompt,
+        control_key,
+    )
+
+    assert cleaned == [
+        {"role": "user", "content": "original task"},
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "legitimate historical answer"},
+        {"role": "assistant", "content": "prior segment summary"},
+    ]
+
+
+def test_internal_control_prompt_markerless_history_is_not_removed_by_text_alone():
+    prompt = "Continue the unfinished task from the parent segment."
+    history = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "historical answer"},
+        {"role": "user", "content": f"[Workspace::v1: /tmp/work]\n{prompt}"},
+    ]
+
+    cleaned = streaming._drop_internal_control_prompts_from_history(
+        history,
+        prompt,
+        "_tool_limit_continuation_control",
+    )
+
+    assert cleaned == history
+
+
+def test_internal_control_context_keeps_one_workspace_decorated_prompt():
+    prompt = "Continue the unfinished task from the parent segment."
+    control_key = "_tool_limit_continuation_control"
+    control = {"continuation_index": 2}
+    workspace_prompt = f"[Workspace::v1: /tmp/work]\n{prompt}"
+    messages = [
+        {"role": "user", "content": "original task"},
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "legitimate historical answer"},
+        {"role": "user", "content": workspace_prompt},
+        {"role": "user", "content": prompt, control_key: {"continuation_index": 1}},
+        {"role": "assistant", "content": "current segment summary"},
+    ]
+
+    canonical = streaming._canonicalize_internal_control_context(
+        messages,
+        prompt,
+        control_key,
+        control,
+        previous_messages=messages[:3],
+    )
+
+    matching = [
+        message
+        for message in canonical
+        if message.get("role") == "user"
+        and streaming._internal_control_prompt_matches(message, prompt)
+    ]
+    assert len(matching) == 2
+    current = [message for message in matching if control_key in message]
+    assert len(current) == 1
+    assert current[0]["content"] == workspace_prompt
+    assert current[0][control_key] == control
+    assert matching[0] == {"role": "user", "content": prompt}
+
+
+def test_internal_control_context_uses_current_turn_boundary_for_identical_workspace_text():
+    prompt = "Continue the unfinished task from the parent segment."
+    control_key = "_tool_limit_continuation_control"
+    workspace_prompt = f"[Workspace::v1: /tmp/work]\n{prompt}"
+    previous = [
+        {"role": "user", "content": workspace_prompt},
+        {"role": "assistant", "content": "Legitimate historical answer."},
+    ]
+    result = [
+        *previous,
+        {"role": "user", "content": workspace_prompt},
+        {"role": "assistant", "content": "Current continuation answer."},
+    ]
+
+    canonical = streaming._canonicalize_internal_control_context(
+        result,
+        prompt,
+        control_key,
+        {"continuation_index": 2},
+        previous_messages=previous,
+    )
+
+    matches = [message for message in canonical if streaming._internal_control_prompt_matches(message, prompt)]
+    assert len(matches) == 2
+    assert control_key not in matches[0]
+    assert matches[1][control_key] == {"continuation_index": 2}
+
+
+def test_max_iteration_cleanup_preserves_legitimate_identical_user_turns():
+    prompt = streaming._MAX_ITERATION_SUMMARY_REQUEST
+    previous = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "Historical legitimate answer."},
+    ]
+    result = [
+        *previous,
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "Current summary."},
+    ]
+
+    cleaned = streaming._drop_synthetic_max_iteration_summary_requests(
+        result,
+        previous_messages=previous,
+    )
+
+    matching = [message for message in cleaned if message.get("content") == prompt]
+    assert len(matching) == 2
+    assert matching == [previous[0], result[2]]
+
+
+def test_internal_control_display_merge_preserves_older_identical_user_turn():
+    prompt = "Continue the unfinished task from the parent segment."
+    previous_display = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "That was a legitimate earlier request."},
+    ]
+    result = [
+        *previous_display,
+        {"role": "user", "content": f"[Workspace::v1: /tmp/work]\n{prompt}"},
+        {"role": "assistant", "content": "Current continuation result."},
+    ]
+
+    merged = streaming._merge_display_messages_after_agent_result(
+        previous_display,
+        previous_display,
+        result,
+        prompt,
+        source="tool_limit_continuation",
+    )
+
+    assert merged[0] == previous_display[0]
+    assert sum(
+        1 for message in merged
+        if message.get("role") == "user" and message.get("content") == prompt
+    ) == 1
+    assert merged[-1]["content"] == "Current continuation result."
+
+
 def test_frontend_handles_tool_limit_apperror_label():
     messages_js = (ROOT / "static" / "messages.js").read_text(encoding="utf-8")
     start = messages_js.find("source.addEventListener('apperror'")
@@ -223,7 +395,7 @@ def test_frontend_handles_tool_limit_apperror_label():
     assert "Terminal state details" in block
 
 
-def test_streaming_tool_limit_with_final_answer_persists_clean_done_state(tmp_path, monkeypatch):
+def test_streaming_tool_limit_with_final_answer_reports_continuation_pending(tmp_path, monkeypatch):
     result = {
         "turn_exit_reason": "max_iterations_reached(30/30)",
         "messages": [
@@ -241,6 +413,8 @@ def test_streaming_tool_limit_with_final_answer_persists_clean_done_state(tmp_pa
     assert done_payloads, "expected done SSE payload"
     assert done_payloads[-1]["terminal_state"] == "tool_limit_reached"
     assert done_payloads[-1]["terminal_reason"] == "max_iterations"
+    assert done_payloads[-1]["continuation_pending"] is True
+    assert "auto_continuing" not in done_payloads[-1]
     assert all(
         message.get("content") != streaming._MAX_ITERATION_SUMMARY_REQUEST
         for message in payload["messages"]
@@ -251,11 +425,11 @@ def test_streaming_tool_limit_with_final_answer_persists_clean_done_state(tmp_pa
     )
     assistant = payload["messages"][-1]
     assert assistant["role"] == "assistant"
-    assert assistant["_terminal_state"] == "tool_limit_reached"
-    assert assistant["_statusCard"]["title"] == "Tool iteration limit reached"
+    assert "_terminal_state" not in assistant
+    assert "_statusCard" not in assistant
 
 
-def test_streaming_tool_limit_without_final_answer_emits_no_final_apperror(tmp_path, monkeypatch):
+def test_streaming_tool_limit_without_final_answer_continues_without_apperror(tmp_path, monkeypatch):
     result = {
         "turn_exit_reason": "max_iterations_reached(30/30)",
         "messages": [
@@ -269,11 +443,12 @@ def test_streaming_tool_limit_without_final_answer_emits_no_final_apperror(tmp_p
     events, payload = _run_streaming_with_fake_agent(tmp_path, monkeypatch, result)
 
     apperror_payloads = [payload for event, payload in events if event == "apperror"]
-    assert apperror_payloads, "expected apperror SSE payload"
-    assert apperror_payloads[-1]["type"] == "tool_limit_reached"
-    assert apperror_payloads[-1]["terminal_state"] == "tool_limit_reached"
-    assert payload["messages"][-1]["_error"] is True
-    assert "Tool iteration limit reached" in payload["messages"][-1]["content"]
+    assert not apperror_payloads
+    done_payloads = [event_payload for event, event_payload in events if event == "done"]
+    assert done_payloads[-1]["terminal_state"] == "tool_limit_reached"
+    assert done_payloads[-1]["continuation_pending"] is True
+    assert "auto_continuing" not in done_payloads[-1]
+    assert not [message for message in payload["messages"] if message.get("_error")]
     assert all(
         message.get("content") != streaming._MAX_ITERATION_SUMMARY_REQUEST
         for message in payload["messages"]
@@ -316,13 +491,13 @@ def test_streaming_tool_limit_with_fallback_final_response_surfaces_closure_text
     assert done_payloads, "expected done SSE payload"
     assert done_payloads[-1]["terminal_state"] == "tool_limit_reached"
 
-    # Fallback text is shown as a final assistant message and is annotated
-    # with the status card so the UI can render the 'limit reached' chip.
+    # Fallback text remains visible as segment context, but it is not marked as
+    # the task's terminal answer because the durable successor owns completion.
     assistant = payload["messages"][-1]
     assert assistant["role"] == "assistant"
     assert assistant["content"] == graceful
-    assert assistant["_terminal_state"] == "tool_limit_reached"
-    assert assistant["_statusCard"]["title"] == "Tool iteration limit reached"
+    assert "_terminal_state" not in assistant
+    assert "_statusCard" not in assistant
     # Synthetic scaffolding turn was still dropped, even after fallback injection.
     assert all(
         message.get("content") != streaming._MAX_ITERATION_SUMMARY_REQUEST
@@ -357,7 +532,7 @@ def test_streaming_tool_limit_with_fallback_does_not_double_inject_when_assistan
         if m.get("role") == "assistant" and m.get("content") == summary
     ]
     assert len(assistant_msgs) == 1, "fallback must not duplicate the existing summary"
-    assert assistant_msgs[0]["_terminal_state"] == "tool_limit_reached"
+    assert "_terminal_state" not in assistant_msgs[0]
 
 
 def test_maybe_inject_max_iteration_summary_fallback_unit():
@@ -406,7 +581,7 @@ def test_maybe_inject_max_iteration_summary_fallback_skips_when_no_fallback():
     assert out == messages
 
 
-def test_streaming_tool_limit_terminal_failure_does_not_mark_final_answer(tmp_path, monkeypatch):
+def test_streaming_tool_limit_partial_result_still_requests_continuation(tmp_path, monkeypatch):
     result = {
         "status": "partial",
         "turn_exit_reason": "max_iterations_reached(30/30)",
@@ -419,9 +594,11 @@ def test_streaming_tool_limit_terminal_failure_does_not_mark_final_answer(tmp_pa
     events, payload = _run_streaming_with_fake_agent(tmp_path, monkeypatch, result)
 
     apperror_payloads = [payload for event, payload in events if event == "apperror"]
-    assert apperror_payloads, "expected terminal-failure apperror"
-    assert apperror_payloads[-1]["type"] == "tool_limit_reached"
-    assert not [payload for event, payload in events if event == "done"]
+    assert not apperror_payloads
+    done_payloads = [event_payload for event, event_payload in events if event == "done"]
+    assert done_payloads[-1]["terminal_state"] == "tool_limit_reached"
+    assert done_payloads[-1]["continuation_pending"] is True
+    assert "auto_continuing" not in done_payloads[-1]
     assistant = next(
         message
         for message in payload["messages"]
@@ -430,7 +607,33 @@ def test_streaming_tool_limit_terminal_failure_does_not_mark_final_answer(tmp_pa
     )
     assert "_terminal_state" not in assistant
     assert "_statusCard" not in assistant
-    assert payload["messages"][-1]["_error"] is True
+    assert not [message for message in payload["messages"] if message.get("_error")]
+
+
+def test_streaming_persists_visible_blocker_when_continuation_claim_fails(tmp_path, monkeypatch):
+    import api.tool_limit_continuation as tlc
+
+    def fail_claim(*_args, **_kwargs):
+        raise tlc.ContinuationReceiptStoreError("receipt unavailable")
+
+    monkeypatch.setattr(tlc, "handle_terminal", fail_claim)
+    result = {
+        "turn_exit_reason": "max_iterations_reached(30/30)",
+        "messages": [
+            {"role": "user", "content": "Do the long task."},
+            {"role": "assistant", "content": "Segment summary before handoff."},
+        ],
+    }
+
+    events, payload = _run_streaming_with_fake_agent(tmp_path, monkeypatch, result)
+
+    done_payloads = [event_payload for event, event_payload in events if event == "done"]
+    assert done_payloads[-1]["continuation_pending"] is True
+    assert "auto_continuing" not in done_payloads[-1]
+    terminal = payload["messages"][-1]
+    assert terminal["_terminal_state"] == "tool_limit_reached"
+    assert terminal["_terminal_reason"] == "continuation_state_unavailable"
+    assert terminal["_statusCard"]["title"] == "Tool-limit continuation stopped"
 
 
 def test_streaming_historical_synthetic_prompt_normal_result_does_not_emit_tool_limit(tmp_path, monkeypatch):

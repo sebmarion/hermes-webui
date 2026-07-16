@@ -17,61 +17,78 @@ any double-counting risk.
 """
 import logging
 import os
+import sqlite3
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+SESSION_ACTIVITY_TTL_SECONDS = 20.0
+_ACTIVITY_SQLITE_TIMEOUT_SECONDS = 1.0
+_ACTIVITY_SCHEMA_READY: set[str] = set()
+_ACTIVITY_SCHEMA_LOCK = threading.Lock()
 
-def _get_state_db(profile: Optional[str] = None):
-    """Get a SessionDB instance for a profile's state.db.
 
-    When ``profile`` is provided the function resolves *that* profile's
-    home directory directly (via ``_resolve_profile_home_for_name``).
-    If resolution fails (unknown profile name, IO error, etc.) the
-    function returns ``None`` rather than silently falling back to
-    ``HERMES_HOME`` — silently routing the write to the wrong DB
-    would defeat the point of the explicit-profile path (#2762).
+def _ensure_shared_activity_schema(db, *, db_key: str | None = None) -> bool:
+    """Create the additive runtime activity table on older state databases.
 
-    When ``profile`` is None it falls back to the TLS-based
-    ``get_active_hermes_home()`` lookup for backward compatibility,
-    with a final ``HERMES_HOME`` fallback only on that path. TLS may be
-    unset in background/worker threads, in which case the lookup falls
-    through to the process-global active profile and can write to the
-    wrong DB. Callers that know the session's profile (e.g.
-    ``sync_session_usage`` after a stream completes on a background
-    thread) should pass it explicitly to avoid that race.
-
-    Returns None if hermes_state is not importable, the explicit
-    profile cannot be resolved, or the DB is unavailable. Each caller
-    is responsible for calling db.close() when done.
+    Activity is deliberately kept off ``SessionDB``: constructing that wrapper
+    runs the full agent schema initialization, which is an unnecessary and
+    expensive operation for a five-second heartbeat on a large state.db.
     """
-    try:
-        from hermes_state import SessionDB
-    except ImportError:
-        return None
+    execute_write = getattr(db, "_execute_write", None)
 
+    def _write(conn):
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_activity (
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                heartbeat_at REAL NOT NULL,
+                PRIMARY KEY (session_id, run_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_session_activity_heartbeat
+            ON session_activity (heartbeat_at)
+            """
+        )
+
+    key = str(db_key or "")
+    with _ACTIVITY_SCHEMA_LOCK:
+        if key and key in _ACTIVITY_SCHEMA_READY:
+            return True
+        try:
+            if callable(execute_write):
+                execute_write(_write)
+            else:
+                _write(db)
+                db.commit()
+            if key:
+                _ACTIVITY_SCHEMA_READY.add(key)
+            return True
+        except Exception:
+            logger.debug("Failed to ensure state.db session activity schema", exc_info=True)
+            return False
+
+
+def _get_state_db_path(profile: Optional[str] = None) -> Path | None:
+    """Resolve a profile's state.db without constructing ``SessionDB``."""
     if profile is not None:
-        # Explicit-profile path — a resolution failure here MUST NOT
-        # silently fall back to HERMES_HOME or the caller's "write to
-        # the named profile" contract is broken (the original #2762
-        # symptom: writes leaking into the wrong profile's state.db).
-        #
-        # Defense-in-depth (per #2827 maintainer review): validate the
-        # name shape BEFORE handing it to ``_resolve_profile_home_for_name``.
-        # The resolver itself rarely raises — for an invalid-but-non-
-        # malicious name (e.g. one that fails ``_PROFILE_ID_RE``) it
-        # quietly returns ``_DEFAULT_HERMES_HOME``, which is the exact
-        # leak we're trying to prevent on the explicit-profile path.
-        # Validating up-front turns that quiet leak into an explicit
-        # "refuse + log + return None" so the contract is "write to
-        # the EXACT named profile, or write nowhere."
         try:
             from api.profiles import (
-                _resolve_profile_home_for_name,
                 _PROFILE_ID_RE,
                 _is_root_profile,
+                _resolve_profile_home_for_name,
             )
+
             if not (_is_root_profile(profile) or _PROFILE_ID_RE.fullmatch(profile)):
                 logger.warning(
                     "state_sync: refusing invalid profile name %r — skipping "
@@ -83,59 +100,192 @@ def _get_state_db(profile: Optional[str] = None):
         except Exception:
             logger.warning(
                 "state_sync: could not resolve profile %r — skipping write rather "
-                "than leaking to the active profile (#2762).", profile,
+                "than leaking to the active profile (#2762).",
+                profile,
             )
             return None
     else:
-        # Implicit / TLS-fallback path — preserves pre-#2762 behavior
-        # for any caller that doesn't pass profile= explicitly.
         try:
             from api.profiles import get_active_hermes_home
+
             hermes_home = Path(get_active_hermes_home()).expanduser().resolve()
         except Exception:
             logger.debug("Failed to resolve hermes home, using default")
-            hermes_home = Path(os.getenv('HERMES_HOME', str(Path.home() / '.hermes')))
+            hermes_home = Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes")))
 
-    db_path = hermes_home / 'state.db'
-    if not db_path.exists():
-        return None
+    db_path = hermes_home / "state.db"
+    return db_path if db_path.exists() else None
 
+
+def _open_activity_db(profile: Optional[str] = None):
+    """Open a short-lived lightweight writer for the activity overlay."""
+    db_path = _get_state_db_path(profile)
+    if db_path is None:
+        return None, None
     try:
-        return SessionDB(db_path)
+        db = sqlite3.connect(str(db_path), timeout=_ACTIVITY_SQLITE_TIMEOUT_SECONDS)
+        db.execute(
+            f"PRAGMA busy_timeout={int(_ACTIVITY_SQLITE_TIMEOUT_SECONDS * 1000)}"
+        )
+        return db, db_path
     except Exception:
-        logger.debug("Failed to open state.db")
-        return None
+        logger.debug("Failed to open state.db activity writer", exc_info=True)
+        return None, None
 
 
-def sync_session_start(session_id: str, model=None, profile: Optional[str] = None) -> None:
-    """Register a WebUI session in state.db (idempotent).
-    Called when a session's first message is sent.
+def _ensure_shared_session_row(
+    db,
+    session_id: str,
+    *,
+    source: str,
+    model: str | None,
+    cwd: str | None,
+    started_at: float,
+) -> None:
+    """Create a minimal canonical row before a first WebUI turn has messages.
 
-    ``profile`` lets the caller name the target state.db explicitly,
-    avoiding the TLS-vs-background-thread mismatch in #2762. When
-    omitted, the active profile is resolved from TLS (then process
-    globals) as before.
+    WebUI sidecars can be actively streaming before the normal completion
+    writeback creates their state.db row. Hermes One cannot list an activity
+    record that has no canonical session row, so create only the identity and
+    stable launch metadata here. Empty rows remain hidden once activity expires.
     """
-    db = _get_state_db(profile=profile)
+    try:
+        existing = db.execute(
+            "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+        ).fetchone()
+        columns = {
+            str(row[1])
+            for row in db.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if existing:
+            # Agent/WebUI startup may create the canonical row before the
+            # active-run bridge knows the selected workspace. A heartbeat is
+            # still stable launch metadata, so backfill an absent cwd before
+            # returning. A later state.db workspace mutation is authoritative
+            # and must not be overwritten by a stale run entry.
+            if "cwd" in columns and cwd is not None:
+                db.execute(
+                    """
+                    UPDATE sessions SET cwd = ?
+                    WHERE id = ? AND (cwd IS NULL OR TRIM(cwd) = '')
+                    """,
+                    (str(cwd), session_id),
+                )
+            return
+        values = {"id": session_id}
+        for name, value in (
+            ("source", source),
+            ("model", model),
+            ("cwd", cwd),
+            ("started_at", started_at),
+        ):
+            if name in columns and value is not None:
+                values[name] = value
+        names = list(values)
+        placeholders = ", ".join("?" for _ in names)
+        db.execute(
+            f"INSERT OR IGNORE INTO sessions ({', '.join(names)}) "
+            f"VALUES ({placeholders})",
+            tuple(values[name] for name in names),
+        )
+    except Exception:
+        logger.debug("Failed to create canonical session row for %s", session_id, exc_info=True)
+
+
+def sync_session_activity(
+    session_id: str,
+    run_id: str,
+    *,
+    phase: str = "running",
+    started_at: float | None = None,
+    heartbeat_at: float | None = None,
+    source: str = "webui",
+    model: str | None = None,
+    cwd: str | None = None,
+    profile: Optional[str] = None,
+) -> None:
+    """Upsert one live worker heartbeat without creating conversation history."""
+    sid = str(session_id or "").strip()
+    rid = str(run_id or "").strip()
+    if not sid or not rid:
+        return
+    now = float(heartbeat_at if heartbeat_at is not None else time.time())
+    started = float(started_at if started_at is not None else now)
+    db, db_path = _open_activity_db(profile)
     if not db:
         return
     try:
-        db.ensure_session(
-            session_id=session_id,
-            source='webui',
+        if not _ensure_shared_activity_schema(db, db_key=str(db_path)):
+            return
+        _ensure_shared_session_row(
+            db,
+            sid,
+            source=str(source or "webui"),
             model=model,
+            cwd=cwd,
+            started_at=started,
         )
+        db.execute(
+            """
+            INSERT INTO session_activity
+                (session_id, run_id, source, phase, started_at, heartbeat_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, run_id) DO UPDATE SET
+                source = excluded.source,
+                phase = excluded.phase,
+                started_at = MIN(session_activity.started_at, excluded.started_at),
+                heartbeat_at = excluded.heartbeat_at
+            """,
+            (sid, rid, str(source or "webui"), str(phase or "running"), started, now),
+        )
+        db.commit()
     except Exception:
-        logger.debug("Failed to sync session start to state.db")
+        logger.debug("Failed to sync session activity for %s", sid, exc_info=True)
     finally:
         try:
             db.close()
         except Exception:
-            logger.debug("Failed to close state.db")
+            logger.debug("Failed to close state.db after activity sync", exc_info=True)
+
+
+def clear_session_activity(
+    session_id: str,
+    run_id: str,
+    *,
+    profile: Optional[str] = None,
+) -> None:
+    """Remove one worker heartbeat when its run has finished or been cancelled."""
+    sid = str(session_id or "").strip()
+    rid = str(run_id or "").strip()
+    if not sid or not rid:
+        return
+    db, db_path = _open_activity_db(profile)
+    if not db:
+        return
+    try:
+        if not _ensure_shared_activity_schema(db, db_key=str(db_path)):
+            return
+        db.execute(
+            "DELETE FROM session_activity WHERE session_id = ? AND run_id = ?",
+            (sid, rid),
+        )
+        db.commit()
+    except Exception:
+        logger.debug("Failed to clear session activity for %s", sid, exc_info=True)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Failed to close state.db after activity clear", exc_info=True)
 
 
 def _ensure_shared_pinned_column(db) -> None:
-    """Add the shared pin bit to older Hermes Agent state databases."""
+    """Add the shared pin bit to older Hermes Agent state databases.
+
+    ``pinned`` is deliberately additive: Hermes Agent versions that predate
+    shared pins continue to work, and the WebUI can upgrade the live schema
+    without rewriting any session or message rows.
+    """
     execute_write = getattr(db, "_execute_write", None)
     if not callable(execute_write):
         return
@@ -175,14 +325,81 @@ def _set_shared_pinned(db, session_id: str, pinned: bool) -> None:
     execute_write(_write)
 
 
-def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> None:
-    """Mirror a shared metadata mutation across one valid compression lineage.
+def _get_state_db(profile: Optional[str] = None):
+    """Get a SessionDB instance for a profile's state.db.
 
-    Hermes Agent stores each compression segment as a physical row. Updating
-    only the visible tip would leave older IDs with stale title/archive state
-    and would let a later projection resurrect inconsistent metadata. Keep the
-    operation best-effort for older agent schemas and never follow branches,
-    delegates, tool rows, or cross-source children.
+    When ``profile`` is provided the function resolves *that* profile's
+    home directory directly (via ``_resolve_profile_home_for_name``).
+    If resolution fails (unknown profile name, IO error, etc.) the
+    function returns ``None`` rather than silently falling back to
+    ``HERMES_HOME`` — silently routing the write to the wrong DB
+    would defeat the point of the explicit-profile path (#2762).
+
+    When ``profile`` is None it falls back to the TLS-based
+    ``get_active_hermes_home()`` lookup for backward compatibility,
+    with a final ``HERMES_HOME`` fallback only on that path. TLS may be
+    unset in background/worker threads, in which case the lookup falls
+    through to the process-global active profile and can write to the
+    wrong DB. Callers that know the session's profile (e.g.
+    ``sync_session_usage`` after a stream completes on a background
+    thread) should pass it explicitly to avoid that race.
+
+    Returns None if hermes_state is not importable, the explicit
+    profile cannot be resolved, or the DB is unavailable. Each caller
+    is responsible for calling db.close() when done.
+    """
+    try:
+        from hermes_state import SessionDB
+    except ImportError:
+        return None
+
+    db_path = _get_state_db_path(profile)
+    if db_path is None:
+        return None
+
+    try:
+        return SessionDB(db_path)
+    except Exception:
+        logger.debug("Failed to open state.db")
+        return None
+
+
+def sync_session_start(session_id: str, model=None, profile: Optional[str] = None) -> None:
+    """Register a WebUI session in state.db (idempotent).
+    Called when a session's first message is sent.
+
+    ``profile`` lets the caller name the target state.db explicitly,
+    avoiding the TLS-vs-background-thread mismatch in #2762. When
+    omitted, the active profile is resolved from TLS (then process
+    globals) as before.
+    """
+    db = _get_state_db(profile=profile)
+    if not db:
+        return
+    try:
+        db.ensure_session(
+            session_id=session_id,
+            source='webui',
+            model=model,
+        )
+        _ensure_shared_pinned_column(db)
+    except Exception:
+        logger.debug("Failed to sync session start to state.db")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Failed to close state.db")
+
+
+def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> None:
+    """Apply shared metadata consistently within one compression lineage.
+
+    Hermes Agent stores each compression segment as a physical row. Title and
+    archive changes mirror across valid members so older IDs cannot resurrect
+    stale metadata; pins are cleared across the lineage and stored only on its
+    logical root. Keep the operation best-effort for older agent schemas and
+    never follow branches, delegates, tool rows, or cross-source children.
     """
     if field not in {"title", "archived", "pinned"}:
         return
@@ -236,6 +453,32 @@ def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> N
             return
 
         placeholders = ", ".join("?" for _ in lineage_ids)
+        if field == "pinned":
+            # A pin belongs to the logical conversation, not every physical
+            # compression segment. Keep one durable bit on the lineage root so
+            # raw state.db clients cannot render every hidden segment as pinned.
+            # Clearing the full lineage first also repairs pins written by older
+            # WebUI builds when the user next pins or unpins the conversation.
+            root_row = conn.execute(
+                f"SELECT id FROM sessions "
+                f"WHERE id IN ({placeholders}) "
+                f"AND (parent_session_id IS NULL "
+                f"OR parent_session_id NOT IN ({placeholders})) "
+                f"LIMIT 1",
+                (*lineage_ids, *lineage_ids),
+            ).fetchone()
+            root_id = root_row[0] if root_row is not None else session_id
+            conn.execute(
+                f"UPDATE sessions SET pinned = 0 WHERE id IN ({placeholders})",
+                tuple(lineage_ids),
+            )
+            if bool(value):
+                conn.execute(
+                    "UPDATE sessions SET pinned = 1 WHERE id = ?",
+                    (root_id,),
+                )
+            return
+
         if field == "title":
             # Titles are unique in state.db, but several old physical
             # compression rows can carry the same WebUI title. Keep the title

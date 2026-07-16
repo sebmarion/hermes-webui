@@ -95,8 +95,8 @@ def test_session_switch_awaits_immediate_draft_flush_before_loading_target():
     assert "return api('/api/session/draft'" in SESSIONS_JS, (
         "_saveComposerDraftNow should return its POST promise so switch-away can await it"
     )
-    assert "await _saveComposerDraftNow(currentSid" in SESSIONS_JS, (
-        "loadSession must flush the current draft before fetching the next session"
+    assert "await _saveComposerDraftNow(_switchDraftSid" in SESSIONS_JS, (
+        "loadSession must flush the confirmed-owner draft before fetching the next session"
     )
 
 
@@ -128,7 +128,7 @@ def test_pre_switch_draft_flush_rechecks_stale_loading_guard():
     placed AFTER the awaited save and BEFORE the `S.messages = []` clear
     (Codex pre-release CORE catch, #3471)."""
     body = _load_session_clear_block()
-    await_idx = body.find("await _saveComposerDraftNow(currentSid")
+    await_idx = body.find("await _saveComposerDraftNow(_switchDraftSid")
     guard_idx = body.find("if (!_isCurrentLoad()) return;", await_idx)
     clear_idx = body.find("S.messages = [];", await_idx)
     assert await_idx != -1, "pre-switch awaited draft save not found"

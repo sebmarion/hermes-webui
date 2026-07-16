@@ -38,9 +38,32 @@ let _pendingCarryForwardSnapshot = null;
 let _draftSaveTimer = null;
 const _DRAFT_SAVE_DELAY_MS = 400;
 const NEW_CHAT_DRAFT_SESSION_KEY = 'hermes-new-chat-draft-session';
+let _composerDraftOwnerSid = null;
 const _composerDraftKnownPayloadSessions = new Set();
 const _composerDraftRestoreSuppressedUntilBySid = new Map();
 const _COMPOSER_DRAFT_RESTORE_SUPPRESS_MS = 30000;
+
+function _claimComposerDraftOwner(sid) {
+  const normalized = String(sid || '').trim();
+  _composerDraftOwnerSid = normalized || null;
+  return _composerDraftOwnerSid;
+}
+
+function _composerDraftOwnerSessionId() {
+  return _composerDraftOwnerSid;
+}
+
+function _composerDraftSessionForSave(currentSid, text, files) {
+  const ownerSid = _composerDraftOwnerSessionId();
+  const visibleSid = String(currentSid || '').trim();
+  const hasPayload = _composerDraftHasPayload(text, files);
+  if (ownerSid && (hasPayload || ownerSid === visibleSid)) return ownerSid;
+  // An empty, previously unowned composer can safely inherit the visible
+  // session. Non-empty content cannot: inferring an owner is the exact class of
+  // cross-thread write this guard exists to prevent.
+  if (hasPayload) return null;
+  return visibleSid || null;
+}
 
 function _composerDraftFileSignature(file) {
   if (typeof file === 'string') return { value: file };
@@ -285,11 +308,12 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
   // targetSid is the session that was requested — if it no longer matches
   // _loadingSessionId, a newer session switch has already begun, so skip.
   if (targetSid && _loadingSessionId !== null && _loadingSessionId !== targetSid) return;
+  const restoreSid = targetSid || (S.session && S.session.session_id);
+  if (restoreSid) _claimComposerDraftOwner(restoreSid);
   const text = (draft && typeof draft.text === 'string') ? draft.text : '';
   const files = (draft && Array.isArray(draft.files)) ? draft.files : [];
   const current = ta.value || '';
   const preserveActiveInput = !!(opts && opts.preserveActiveInput);
-  const restoreSid = targetSid || (S.session && S.session.session_id);
   const hasServerDraftPayload = _composerDraftHasPayload(text, files);
 
   if (restoreSid && hasServerDraftPayload && _isComposerDraftRestoreSuppressed(restoreSid, text, files)) return;
@@ -624,6 +648,7 @@ function _syncSessionListSnapshotOnVisit(sid, messageCount, lastMessageAt) {
   const isStreaming = Boolean(
     target && (
       target.is_streaming ||
+      target.is_working ||
       target.active_stream_id ||
       target.pending_user_message ||
       target.has_pending_user_message
@@ -679,6 +704,7 @@ function _isSessionLocallyStreaming(s) {
 function _isSessionEffectivelyStreaming(s) {
   return Boolean(s && (
     s.is_streaming ||
+    s.is_working ||
     _hasPendingUserMessageSignal(s) ||
     _isSessionLocallyStreaming(s)
   ));
@@ -689,7 +715,7 @@ function _hasPendingUserMessageSignal(s) {
 }
 
 function _isServerIdleSessionRow(s) {
-  return Boolean(s && s.session_id && !s.is_streaming && !s.active_stream_id && !s.pending_user_message && !s.has_pending_user_message && !s.pending_started_at);
+  return Boolean(s && s.session_id && !s.is_streaming && !s.is_working && !s.active_stream_id && !s.pending_user_message && !s.has_pending_user_message && !s.pending_started_at);
 }
 
 function _reconcileActiveSessionIdleStateFromList(serverRows) {
@@ -793,7 +819,7 @@ function _purgeStaleInflightEntries() {
       continue;
     }
     const s = sessionsById.get(sid);
-    if (!s.is_streaming) {
+    if (!s.is_streaming && !s.is_working) {
       // Session exists but is not streaming — purge it.
       delete INFLIGHT[sid];
       if (typeof clearInflightState === 'function') clearInflightState(sid);
@@ -1009,7 +1035,7 @@ function _markPollingCompletionUnreadTransitions(sessions) {
     const observedStreaming = _getSessionObservedStreaming()[sid];
     const messageCount = Number(s.message_count || 0);
     const lastMessageAt = Number(s.last_message_at || 0);
-    const hasServerRunSignal=Boolean(s.is_streaming||_hasPendingUserMessageSignal(s));
+    const hasServerRunSignal=Boolean(s.is_streaming||s.is_working||_hasPendingUserMessageSignal(s));
     const canMarkCompletedStream=Boolean(hasServerRunSignal||previousSnapshot||observedStreaming);
     const completedObservedStream = canMarkCompletedStream&&wasStreaming === true && !isStreaming;
     const completedWithNewMessages = Boolean(
@@ -1437,6 +1463,10 @@ async function _switchProfileForSessionLoad(profile){
 
 async function loadSession(sid){
   const opts = arguments[1] || {};
+  const _acceptResult = () => (
+    typeof opts.acceptResult !== 'function' || opts.acceptResult() !== false
+  );
+  if (!_acceptResult()) return false;
   if(!opts.skipLineageResolve && typeof _resolveSessionIdFromSidebarLineage==='function'){
     const resolvedSid=_resolveSessionIdFromSidebarLineage(sid);
     if(resolvedSid&&resolvedSid!==sid) sid=resolvedSid;
@@ -1455,6 +1485,7 @@ async function loadSession(sid){
   // failed loadSession killed; no-ops on real switches.
   _rearmActiveSessionStream();
   if(currentSid===sid && !forceReload && (!_loadingSessionId || _loadingSessionId===sid)){
+    _claimComposerDraftOwner(currentSid);
     // Re-selecting the already-open session is a no-op for transcript/scroll, but
     // it is still a *visit*: clear a stale sidebar unread dot (e.g. one a
     // background completion left on the open, unfocused pane) before returning.
@@ -1466,6 +1497,20 @@ async function loadSession(sid){
       );
     }
     return;
+  }
+  let _switchDraftText='';
+  let _switchDraftFiles=[];
+  let _switchDraftSid=currentSid;
+  if(currentSid&&currentSid!==sid){
+    _switchDraftText=($('msg')||{}).value||'';
+    _switchDraftFiles=S.pendingFiles?[...S.pendingFiles]:[];
+    _switchDraftSid=_composerDraftSessionForSave(currentSid,_switchDraftText,_switchDraftFiles);
+    if(!_switchDraftSid){
+      if(typeof showToast==='function'){
+        showToast('Session switch paused: this draft has no confirmed conversation owner. Your text was kept.',4000);
+      }
+      return false;
+    }
   }
   // Mark this session as the in-flight load. Subsequent loadSession() calls
   // will overwrite this; stale awaits use the mismatch to bail out (#1060).
@@ -1493,7 +1538,7 @@ async function loadSession(sid){
   if (currentSid && currentSid !== sid) {
     if(typeof window._clearPendingSelections==='function') window._clearPendingSelections();
     if(typeof _clearQueueCardDisplay==='function') _clearQueueCardDisplay(currentSid);
-    await _saveComposerDraftNow(currentSid, ($('msg') || {}).value || '', S.pendingFiles ? [...S.pendingFiles] : []);
+    await _saveComposerDraftNow(_switchDraftSid, _switchDraftText, _switchDraftFiles);
     // The awaited draft save above yields the event loop. If another
     // loadSession() started for a different session while we were waiting
     // (rapid switch B→C), _loadingSessionId now points at that newer load —
@@ -1699,6 +1744,16 @@ async function loadSession(sid){
     // newer load arms its own sid).
     _rearmActiveSessionStream();
     return;
+  }
+  // A server-owned continuation may begin loading while its parent pane is
+  // idle, then lose ownership to a newer turn before metadata returns. Keep
+  // the ordinary load-generation guard and add the caller's live ownership
+  // predicate at the final pre-commit boundary. A rejected result never
+  // replaces S.session, URL, localStorage, or the child renderer.
+  if (!_acceptResult()) {
+    if (_isCurrentLoad()) _loadingSessionId = null;
+    _rearmActiveSessionStream();
+    return false;
   }
   // #2980: if this (current) load resolved a hidden pre-compression snapshot,
   // follow the backend's continuation hint to the visible continuation so a
@@ -2099,8 +2154,8 @@ async function loadSession(sid){
   // Pass sid so _restoreComposerDraft can skip if this session is mid-load (guards
   // against stale writes from slow responses racing to restore the previous draft).
   const _draft = S.session && S.session.composer_draft;
-  if (_draft && (typeof _restoreComposerDraft === 'function')) {
-    _restoreComposerDraft(_draft, sid, {preserveActiveInput:!!opts.preserveActiveInput || (currentSid===sid&&forceReload)});
+  if (typeof _restoreComposerDraft === 'function') {
+    _restoreComposerDraft(_draft||null, sid, {preserveActiveInput:!!opts.preserveActiveInput || (currentSid===sid&&forceReload)});
   }
 
   // Clear the in-flight session marker now that this load has completed (#1060).
@@ -2287,6 +2342,7 @@ function _sessionArchivePagingFilterActive() {
 function _sessionListQueryString() {
   const qs = new URLSearchParams();
   if(_sessionListExcludeHiddenEnabled()) qs.set('exclude_hidden','1');
+  else qs.set('include_hidden','1');
   if(_showAllProfiles) qs.set('all_profiles','1');
   if(_showArchived){
     qs.set('include_archived','1');
@@ -4824,6 +4880,7 @@ function _mergeOptimisticFirstTurnSessions(fetchedSessions){
         pending_user_message:fetchedIsServerIdle?null:(keepLocalOptimistic?(fetched.pending_user_message||local.pending_user_message||null):null),
         pending_started_at:fetchedIsServerIdle?null:(keepLocalOptimistic?(fetched.pending_started_at||local.pending_started_at||null):null),
         is_streaming:fetchedIsServerIdle?false:Boolean(fetched.is_streaming||(keepLocalOptimistic&&(local.is_streaming||_isSessionLocallyStreaming(local)))),
+        is_working:fetchedIsServerIdle?false:Boolean(fetched.is_working||(keepLocalOptimistic&&local.is_working)),
       };
     }else{
       if(_shouldKeepLocalOnlyOptimisticSessionRow(local)){
@@ -4997,6 +5054,7 @@ function _applySessionListPayload(sessData, projData){
     stopStreamingPoll();
   }
   ensureSessionTimeRefreshPoll();
+  if(typeof ensureSessionActivityPoll==='function') ensureSessionActivityPoll();
   ensureActiveSessionExternalRefreshPoll();
   if(!_sessionListFirstRenderAnimated&&Array.isArray(_allSessions)&&_allSessions.length){
     animateNextSessionListRefresh({enterAll:true});
@@ -5270,7 +5328,10 @@ let _gatewayProbeInFlight = false;
 let _gatewaySSEWarningShown = false;
 const _gatewayFallbackPollMs = 30000;
 const _streamingPollMs = 30000;
+const _sessionActivityPollMs = 5000;
 const _sessionTimeRefreshMs = 60000;
+let _sessionActivityPollTimer = null;
+let _sessionActivityPollVisibilityHandler = null;
 // #3107: the active-session "is it externally updated?" poll used to fire
 // every 5 s. On long sessions this caused visible scroll jitter and a
 // noticeable network/CPU floor because the SSE session-events stream
@@ -5357,6 +5418,24 @@ function ensureSessionTimeRefreshPoll(){
       if(!document.hidden) renderSessionListFromCache();
     };
     document.addEventListener('visibilitychange', _sessionTimeRefreshVisibilityHandler);
+  }
+}
+
+// Hermes One local runs update state.db directly, so they cannot emit the
+// WebUI session-events SSE notification. Keep a lightweight visible-page poll
+// for the shared activity overlay; the server-side cache still bounds the
+// expensive projection rebuilds.
+function ensureSessionActivityPoll(){
+  if(_sessionActivityPollTimer) return;
+  _sessionActivityPollTimer=setInterval(()=>{
+    if(typeof document!=='undefined'&&document.hidden) return;
+    void renderSessionList({deferWhileInteracting:true});
+  },_sessionActivityPollMs);
+  if(typeof document!=='undefined'&&!_sessionActivityPollVisibilityHandler){
+    _sessionActivityPollVisibilityHandler=()=>{
+      if(!document.hidden) void renderSessionList({deferWhileInteracting:false});
+    };
+    document.addEventListener('visibilitychange',_sessionActivityPollVisibilityHandler);
   }
 }
 
@@ -6496,7 +6575,7 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
     return row;
   };
   const rows=(collapsedRows||[])
-    .filter(s=>!_isChildSession(s)&&((s&&s.pinned)||!_isForkWithResolvableParent(s, sessionIdsInList)))
+    .filter(s=>!_isChildSession(s)&&!_isForkWithResolvableParent(s, sessionIdsInList))
     .map(cleanSidebarRow);
   const isChildStreaming=(childRow)=>typeof _isSessionEffectivelyStreaming==='function'
     ? _isSessionEffectivelyStreaming(childRow)
@@ -6537,7 +6616,7 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
     seen.add(session.session_id);
     const parent=session.parent_session_id&&rawSessionsById.get(session.parent_session_id);
     let depth=0;
-    if(parent&&(_isChildSession(session)||(_isForkWithResolvableParent(session, sessionIdsInList)&&!(session&&session.pinned)))){
+    if(parent&&(_isChildSession(session)||_isForkWithResolvableParent(session, sessionIdsInList))){
       depth=1+attachDepthFor(parent, seen);
     }
     attachDepthCache.set(session.session_id, depth);
@@ -6578,7 +6657,7 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
   for(const child of attachQueue){
     const childRenderable=!!(child&&child.session_id&&renderableChildIds.has(child.session_id));
     if(child&&child.session_id&&visibleBySid.has(child.session_id)) continue;
-    const isForkChild=_isForkWithResolvableParent(child, sessionIdsInList)&&!(child&&child.pinned);
+    const isForkChild=_isForkWithResolvableParent(child, sessionIdsInList);
     const childLineageKey=child&&(child._lineage_root_id||child.lineage_root_id||child.parent_session_id);
     const isHiddenLineageReferenceChild=!!(child&&child.archived&&child.parent_session_id&&childLineageKey&&!child.pinned&&!childRenderable);
     if(!_isChildSession(child)&&!isForkChild&&!isHiddenLineageReferenceChild) continue;
@@ -6604,10 +6683,9 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       continue;
     }
     // Cross-surface rows (for example a WebUI continuation from a Telegram
-    // conversation) should remain top-level when there is no WebUI-owned parent
-    // row to stack under.  But if the parent is visible in this same sidebar
-    // render, attach normally — delegated subagent rows are also cross-source
-    // relative to their WebUI parent and should not be forced into orphans.
+    // conversation) should remain top-level when there is no WebUI-owned parent.
+    // When the parent is visible, use it as the state-bubbling target instead —
+    // delegated subagent rows are cross-source too, but stay hidden as children.
     const parentSourceMarker=String(parentRow&&(
       parentRow.session_source||parentRow.raw_source||parentRow.source_tag||parentRow.source
     )||'').toLowerCase();
@@ -6628,11 +6706,9 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
         childCopy._parent_segment_id=parentSegment.session_id;
         childCopy._parent_segment_title=_sessionDisplayTitle(parentSegment)||child.parent_title||'Untitled';
       }
-      if(childRenderable&&!isHiddenLineageReferenceChild){
-        if(!Array.isArray(parentRow._child_sessions)) parentRow._child_sessions=[];
-        parentRow._child_sessions.push(childCopy);
-        parentRow._child_session_count=parentRow._child_sessions.length;
-      }
+      // Child/fork sessions remain addressable by direct link, but the sidebar
+      // is a list of top-level conversations. Bubble actionable state to the
+      // parent without exposing a nested subthread row.
       bubbleSidebarState(parentRow, childCopy);
       visibleBySegmentSid.set(childCopy.session_id,{row: parentRow, seg: childCopy});
     } else if(childRenderable) {
@@ -6642,8 +6718,8 @@ function _attachChildSessionsToSidebarRows(collapsedRows, rawSessions, rawRefere
       // top-level "Subagent Session" orphan — that is the confusing orphan #5244
       // set out to remove for the common case. The parent still exists; it is
       // simply out of the current view, so the child follows its parent's scope
-      // and is suppressed here (it re-stacks under the parent once that scope is
-      // active). This mirrors the archived-hidden-parent suppression above
+      // and is suppressed here (it resumes bubbling state once that parent is
+      // visible). This mirrors the archived-hidden-parent suppression above
       // (hasHiddenArchivedAncestor / #4293), generalizing the "parent hidden"
       // trigger from archived to filtered-out. A cross-surface WebUI child of a
       // genuinely external (messaging/CLI) parent is handled by the parentIsExternal
@@ -6971,6 +7047,7 @@ function _sidebarRowHasVisibleMessages(s, activeSidForSidebar){
   return (s.message_count||0)>0 ||
     _sessionAttentionState(s) ||
     _isSessionEffectivelyStreaming(s) ||
+    !!s.is_working ||
     !!s.active_stream_id ||
     !!s.pending_user_message ||
     !!s.has_pending_user_message ||

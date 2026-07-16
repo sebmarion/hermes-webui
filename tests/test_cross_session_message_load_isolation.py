@@ -220,6 +220,8 @@ function createEnvironment() {
   globalThis.stopClarifyPolling = () => {};
   globalThis.hideClarifyCard = () => {};
   globalThis._saveComposerDraftNow = () => Promise.resolve();
+  globalThis._claimComposerDraftOwner = () => {};
+  globalThis._composerDraftSessionForSave = (sid) => sid;
   globalThis._sessionProfileMismatchFromError = () => null;
   globalThis._switchProfileForSessionLoad = async () => {};
   globalThis._clearSameSessionForceReloadHint = () => { clearHintCalls += 1; };

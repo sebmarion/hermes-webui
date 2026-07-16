@@ -12,7 +12,6 @@ from typing import Any
 
 from api.config import (
     CANCEL_FLAGS,
-    PENDING_GOAL_CONTINUATION,
     STREAM_GOAL_RELATED,
     STREAMS,
     STREAMS_LOCK,
@@ -555,6 +554,7 @@ def _clear_gateway_pending_state(session: Any, stream_id: str) -> None:
     session.pending_attachments = None
     session.pending_started_at = None
     session.pending_user_source = None
+    session.pending_server_instance_id = None
     session.save()
 
 
@@ -583,6 +583,7 @@ def _run_gateway_chat_streaming(
     *,
     model_provider=None,
     goal_related=False,
+    profile=None,
 ):
     """Bridge a WebUI chat turn through Hermes Gateway's API server.
 
@@ -607,6 +608,7 @@ def _run_gateway_chat_streaming(
         model=model,
         provider=model_provider,
         backend="gateway",
+        profile=profile,
     )
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
@@ -650,6 +652,11 @@ def _run_gateway_chat_streaming(
     usage = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": 0}
     try:
         s = get_session(session_id)
+        update_active_run(
+            stream_id,
+            session_id=session_id,
+            profile=getattr(s, "profile", None) or profile,
+        )
         from api.config import get_config  # imported lazily to avoid config-cycle churn
 
         cfg = get_config()
@@ -923,12 +930,34 @@ def _run_gateway_chat_streaming(
                 user_msg["_source"] = pending_source
             if attachments:
                 user_msg["attachments"] = list(attachments)
+            _internal_control = {
+                "tool_limit_continuation": (
+                    "tool_limit_continuation",
+                    "_tool_limit_continuation_control",
+                ),
+                "goal_continuation": (
+                    "goal_continuation",
+                    "_goal_continuation_control",
+                ),
+            }.get(pending_source)
+            if _internal_control:
+                _control_attr, _control_key = _internal_control
+                user_msg[_control_key] = dict(getattr(s, _control_attr, None) or {})
             assistant_msg = {"role": "assistant", "content": assistant_text, "timestamp": assistant_ts}
             saved_reasoning = STREAM_REASONING_TEXT.get(stream_id, "")
             if saved_reasoning:
                 assistant_msg["reasoning"] = saved_reasoning
             previous_messages = list(getattr(s, "messages", None) or [])
             previous_context = list(getattr(s, "context_messages", None) or getattr(s, "messages", None) or [])
+            if _internal_control:
+                from api.streaming import _drop_internal_control_prompts_from_history
+
+                _control_attr, _control_key = _internal_control
+                previous_context = _drop_internal_control_prompts_from_history(
+                    previous_context,
+                    str(msg_text or ""),
+                    _control_key,
+                )
             previous_process_wakeup_pause = dict(getattr(s, "process_wakeup_pause", {}) or {})
             # Stamp stable ids on the two new rows (shared with the display merge
             # below) so display and model-context copies share an id for the
@@ -944,6 +973,17 @@ def _run_gateway_chat_streaming(
             except Exception:
                 logger.debug("Failed to stamp stable ids on gateway turn rows", exc_info=True)
             s.context_messages = previous_context + [user_msg, assistant_msg]
+            if _internal_control:
+                from api.streaming import _canonicalize_internal_control_context
+
+                _control_attr, _control_key = _internal_control
+                s.context_messages = _canonicalize_internal_control_context(
+                    s.context_messages,
+                    str(msg_text or ""),
+                    _control_key,
+                    getattr(s, _control_attr, None),
+                    previous_messages=previous_context,
+                )
             try:
                 from api.streaming import _is_context_compression_marker
 
@@ -985,6 +1025,7 @@ def _run_gateway_chat_streaming(
             s.pending_attachments = None
             s.pending_started_at = None
             s.pending_user_source = None
+            s.pending_server_instance_id = None
             s.workspace = str(workspace)
             s.model = model
             s.model_provider = model_provider
@@ -1040,7 +1081,7 @@ def _run_gateway_chat_streaming(
                         "state": "continuing" if decision.get("should_continue") else "idle",
                         "message": goal_message,
                         "message_key": decision.get("message_key") or (
-                            "goal_continuing" if goal_message else ""
+                            "goal_continuing" if decision.get("should_continue") else ""
                         ),
                         "message_args": decision.get("message_args") or [],
                         "decision": decision,
@@ -1048,7 +1089,15 @@ def _run_gateway_chat_streaming(
                 if decision.get("should_continue"):
                     continuation_prompt = str(decision.get("continuation_prompt") or "").strip()
                     if continuation_prompt:
-                        PENDING_GOAL_CONTINUATION.add(session_id)
+                        from api.goal_continuation import claim_goal_continuation
+
+                        claim_goal_continuation(
+                            session_id=session_id,
+                            parent_run_id=stream_id,
+                            prompt=continuation_prompt,
+                            goal_revision=decision.get("goal_revision"),
+                            profile_home=profile_home,
+                        )
                         put_gateway_event("goal_continue", {
                             "session_id": session_id,
                             "continuation_prompt": continuation_prompt,
@@ -1103,3 +1152,17 @@ def _run_gateway_chat_streaming(
             STREAMS.pop(stream_id, None)
         _STREAM_RUN_IDS.pop(stream_id, None)
         unregister_active_run(stream_id)
+        try:
+            from api.goal_continuation import (
+                recover_pending_goal_continuations,
+                settle_goal_continuation,
+            )
+
+            settle_goal_continuation(session_id, stream_id)
+            recover_pending_goal_continuations(session_id=session_id)
+        except Exception:
+            logger.exception(
+                "gateway goal continuation settle hook failed for session %s stream %s",
+                session_id,
+                stream_id,
+            )

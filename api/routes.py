@@ -41,6 +41,7 @@ from api.agent_sessions import (
     is_cli_session_row,
     is_cli_session_row_visible,
     resolve_shared_session_id,
+    read_session_lineage_metadata,
     read_session_lineage_report,
 )
 from api.compression_anchor import visible_messages_for_anchor
@@ -1930,6 +1931,17 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _composer_draft_has_payload(draft):
+    if not isinstance(draft, dict):
+        return False
+    text = draft.get("text")
+    files = draft.get("files")
+    return bool(
+        (isinstance(text, str) and text.strip())
+        or (isinstance(files, list) and any(files))
+    )
+
+
 def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
     """#4985 second-pass orphan prune for native-WebUI rows whose ``state.db.messages`` is empty.
 
@@ -1947,6 +1959,9 @@ def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
     - Rows with ``active_stream_id`` / ``has_pending_user_message`` /
       ``worktree_path`` set are NEVER pruned — the inflight / worktree-bound
       / pending safety contract from ``IC_kwDOR1LuPM8AAAABHrkF1Q``.
+    - Rows with a non-empty session-owned ``composer_draft`` are retained and
+      self-heal any prior orphan tombstone. Recovery successors can own durable
+      unsent work before their first transcript message exists.
     - Rows whose ``state.db.messages`` is empty AND that survived the
       upstream ``all_sessions()`` ``#1171`` keep-filter (i.e. titled OR has
       positive ``message_count``) ARE pruned — the post-#1171-survivor
@@ -2050,6 +2065,9 @@ def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
                 continue
             is_empty = sid in zero_message_sids
             is_tombstoned = sid in _tombstoned
+            sidecar_has_draft = _composer_draft_has_payload(
+                row.get("composer_draft")
+            )
             if is_empty:
                 # ``state.db.messages`` is empty. Probe the sidecar JSON
                 # for real messages — the cached ``message_count`` alone
@@ -2068,10 +2086,16 @@ def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
                     sidecar_has_messages = bool(
                         _loaded is not None and len(_loaded.messages or []) > 0
                     )
+                    sidecar_has_draft = sidecar_has_draft or bool(
+                        _loaded is not None
+                        and _composer_draft_has_payload(
+                            getattr(_loaded, "composer_draft", None)
+                        )
+                    )
                 except Exception:
                     logger.debug(
                         "Failed to load sidecar for webui orphan decision %s; "
-                        "treating as empty for prune purposes",
+                        "falling back to projected messages/draft metadata",
                         sid,
                         exc_info=True,
                     )
@@ -2079,9 +2103,10 @@ def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
             else:
                 # ``state.db.messages`` is non-empty — the conversation is real.
                 sidecar_has_messages = True
-            if sidecar_has_messages:
-                # Real transcript (state.db OR loaded sidecar). Retain; if
-                # tombstoned, self-heal so it stops thrashing on recovery.
+            if sidecar_has_messages or sidecar_has_draft:
+                # A real transcript OR session-owned unsent composer payload is
+                # durable user state. Retain it; if tombstoned, self-heal so a
+                # recovery successor cannot disappear on the next projection.
                 if is_tombstoned:
                     self_healed_ids.add(sid)
                 continue
@@ -2145,6 +2170,205 @@ def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
     ]
 
 
+_INTERNAL_SIDEBAR_CONTROL_SOURCES = frozenset({
+    "goal_continuation",
+    "tool",
+    "tool_limit_continuation",
+})
+
+
+def _sidebar_row_source_markers(row: dict) -> set[str]:
+    if not isinstance(row, dict):
+        return set()
+    return {
+        _normalized_source_marker(row.get(key))
+        for key in (
+            "source",
+            "source_tag",
+            "raw_source",
+            "session_source",
+            "source_label",
+        )
+        if _normalized_source_marker(row.get(key))
+    }
+
+
+def _partition_parent_only_sidebar_rows(
+    rows: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Split sidebar rows into visible parents and hidden child references.
+
+    ``/api/sessions`` is consumed by more than the browser frontend. Keep its
+    primary list parent-only so clients that do not run the browser's lineage
+    reducer cannot render child/control sessions as independent conversations.
+    Child rows remain available as reference-only metadata so the browser can
+    still bubble streaming, unread, and attention state to a visible parent.
+    Internal continuation/tool rows are control-plane artifacts and are never
+    returned as sidebar references.
+    """
+    visible: list[dict] = []
+    child_references: list[dict] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        source_markers = _sidebar_row_source_markers(row)
+        if source_markers & _INTERNAL_SIDEBAR_CONTROL_SOURCES:
+            continue
+        relationship_type = str(row.get("relationship_type") or "").strip().lower()
+        is_child = relationship_type == "child_session"
+        is_subagent = "subagent" in source_markers
+        if is_child or is_subagent:
+            if row.get("parent_session_id"):
+                child_references.append(row)
+            continue
+        visible.append(row)
+    return visible, child_references
+
+
+def _collapse_parent_only_sidebar_lineages(
+    rows: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Keep one visible tip per compression lineage.
+
+    Older clients consume the main API list directly and do not run the
+    browser's lineage reducer. Move older physical segments to reference-only
+    metadata while bubbling the logical pin onto the visible tip.
+    """
+    candidates = [row for row in rows or [] if isinstance(row, dict)]
+    groups: dict[str, list[dict]] = {}
+    for row in candidates:
+        sid = str(row.get("session_id") or "").strip()
+        if not sid:
+            continue
+        root_id = str(row.get("_lineage_root_id") or sid).strip() or sid
+        groups.setdefault(root_id, []).append(row)
+
+    def _activity(row: dict) -> float:
+        for key in ("last_message_at", "updated_at", "created_at"):
+            try:
+                value = float(row.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value:
+                return value
+        return 0.0
+
+    winners: dict[int, dict] = {}
+    for group in groups.values():
+        if len(group) == 1:
+            winners[id(group[0])] = group[0]
+            continue
+        tip_ids = {
+            str(row.get("_lineage_tip_id") or "").strip()
+            for row in group
+            if str(row.get("_lineage_tip_id") or "").strip()
+        }
+        tip_candidates = [
+            row for row in group
+            if str(row.get("session_id") or "").strip() in tip_ids
+        ]
+        winner = max(tip_candidates or group, key=_activity)
+        projected = dict(winner)
+        if any(bool(row.get("pinned")) for row in group):
+            projected["pinned"] = True
+        winners[id(winner)] = projected
+
+    visible: list[dict] = []
+    references: list[dict] = []
+    for row in candidates:
+        winner = winners.get(id(row))
+        if winner is not None:
+            visible.append(winner)
+            continue
+        reference = dict(row)
+        reference["pinned"] = False
+        references.append(reference)
+    return visible, references
+
+
+def _enrich_parent_only_sidebar_relationships(rows: list[dict]) -> None:
+    """Classify ambiguous parent links without scanning message history."""
+    candidates = [
+        row
+        for row in rows or []
+        if isinstance(row, dict)
+        and row.get("session_id")
+        and row.get("parent_session_id")
+        and not row.get("relationship_type")
+        and not row.get("_lineage_root_id")
+    ]
+    if not candidates:
+        return
+    try:
+        metadata = read_session_lineage_metadata(
+            _active_state_db_path(),
+            {str(row.get("session_id")) for row in candidates},
+            include_message_stats=False,
+        )
+    except Exception:
+        return
+    for row in candidates:
+        entry = dict(metadata.get(str(row.get("session_id"))) or {})
+        for key in (
+            "_state_db_title",
+            "_state_db_source",
+            "_state_db_source_tag",
+            "_state_db_raw_source",
+            "_state_db_session_source",
+            "_state_db_source_label",
+        ):
+            entry.pop(key, None)
+        row.update(entry)
+
+
+def _connected_sidebar_child_references(
+    visible_rows: list[dict],
+    child_rows: list[dict],
+) -> list[dict]:
+    """Return only hidden child rows connected to a returned parent lineage."""
+    connected_ids = {
+        str(value)
+        for row in visible_rows or []
+        if isinstance(row, dict)
+        for value in (
+            row.get("session_id"),
+            row.get("_lineage_root_id"),
+            row.get("_lineage_tip_id"),
+        )
+        if value
+    }
+    pending = [row for row in child_rows or [] if isinstance(row, dict)]
+    references: list[dict] = []
+    added: set[str] = set()
+    changed = True
+    while changed and pending:
+        changed = False
+        remaining: list[dict] = []
+        for row in pending:
+            sid = str(row.get("session_id") or "").strip()
+            parent_ids = {
+                str(value).strip()
+                for value in (
+                    row.get("parent_session_id"),
+                    row.get("_lineage_root_id"),
+                    row.get("_parent_lineage_root_id"),
+                    row.get("_parent_lineage_tip_id"),
+                )
+                if str(value or "").strip()
+            }
+            if sid and sid not in added and (
+                sid in connected_ids or parent_ids & connected_ids
+            ):
+                references.append(row)
+                added.add(sid)
+                connected_ids.add(sid)
+                changed = True
+            else:
+                remaining.append(row)
+        pending = remaining
+    return references
+
+
 def _build_session_list_seed_payload(
     *,
     active_profile: str | None,
@@ -2155,7 +2379,7 @@ def _build_session_list_seed_payload(
     archived_limit: int | None,
     archived_offset: int,
 ) -> dict:
-    """Build a bounded cold response from the immutable WebUI index only."""
+    """Build a bounded cold response from the index plus canonical org state."""
     from api import models as _models
 
     rows = [
@@ -2163,6 +2387,10 @@ def _build_session_list_seed_payload(
         for row in _models.read_session_index_projection()
         if isinstance(row, dict)
     ]
+    _models._apply_session_index_state_db_overrides(
+        rows,
+        all_profiles=all_profiles,
+    )
     if all_profiles:
         scoped = rows
         other_profile_count = 0
@@ -2176,13 +2404,27 @@ def _build_session_list_seed_payload(
 
     if exclude_hidden:
         scoped = [row for row in scoped if not row.get("default_hidden")]
+    _enrich_parent_only_sidebar_relationships(scoped)
+    scoped, child_reference_candidates = _partition_parent_only_sidebar_rows(scoped)
+    scoped, lineage_reference_candidates = _collapse_parent_only_sidebar_lineages(scoped)
+    child_reference_candidates.extend(lineage_reference_candidates)
     archived_count = sum(1 for row in scoped if row.get("archived"))
     visible = [row for row in scoped if not row.get("archived")]
     selected = list(scoped if include_archived else visible)
     if sidebar_source == "webui":
         selected = [row for row in selected if not _is_cli_session_for_settings(row)]
+        child_reference_candidates = [
+            row
+            for row in child_reference_candidates
+            if not _is_cli_session_for_settings(row)
+        ]
     elif sidebar_source == "cli":
         selected = [row for row in selected if _is_cli_session_for_settings(row)]
+        child_reference_candidates = [
+            row
+            for row in child_reference_candidates
+            if _is_cli_session_for_settings(row)
+        ]
 
     if include_archived and archived_limit is not None:
         limit = max(0, int(archived_limit))
@@ -2191,9 +2433,20 @@ def _build_session_list_seed_payload(
         archived_rows = [row for row in selected if row.get("archived")]
         selected = visible_rows + archived_rows[offset: offset + limit]
 
+    _enrich_sidebar_lineage_metadata(selected)
+    selected, late_child_reference_candidates = _partition_parent_only_sidebar_rows(selected)
+    child_reference_candidates.extend(late_child_reference_candidates)
+    selected, late_lineage_reference_candidates = _collapse_parent_only_sidebar_lineages(selected)
+    child_reference_candidates.extend(late_lineage_reference_candidates)
+
+    sidebar_reference_sessions = _connected_sidebar_child_references(
+        selected,
+        child_reference_candidates,
+    )
+
     return {
         "sessions": [dict(row) for row in selected],
-        "sidebar_reference_sessions": [],
+        "sidebar_reference_sessions": [dict(row) for row in sidebar_reference_sessions],
         "legacy_webui_archive": [],
         "cli_count": sum(1 for row in scoped if _is_cli_session_for_settings(row)),
         "archived_count": archived_count,
@@ -2260,6 +2513,7 @@ def _build_session_list_cache_payload(
             or session.get("active_stream_id")
             or session.get("pending_user_message")
             or session.get("has_pending_user_message")
+            or _composer_draft_has_payload(session.get("composer_draft"))
         )
 
     def _all_sessions_for_sidebar():
@@ -2520,6 +2774,25 @@ def _build_session_list_cache_payload(
     if exclude_hidden:
         archived_scoped = [s for s in archived_scoped if not s.get("default_hidden")]
         visible_scoped = [s for s in visible_scoped if not s.get("default_hidden")]
+    # Classify legacy parent links before partitioning. This path intentionally
+    # skips message aggregation; the ordinary returned-row enrichment below
+    # still computes full lineage/tip metadata for the rows the client sees.
+    diag_stage("parent_only_relationship_metadata")
+    _enrich_parent_only_sidebar_relationships(visible_scoped + archived_scoped)
+    visible_scoped, visible_child_reference_candidates = (
+        _partition_parent_only_sidebar_rows(visible_scoped)
+    )
+    archived_scoped, archived_child_reference_candidates = (
+        _partition_parent_only_sidebar_rows(archived_scoped)
+    )
+    visible_scoped, visible_lineage_reference_candidates = (
+        _collapse_parent_only_sidebar_lineages(visible_scoped)
+    )
+    archived_scoped, archived_lineage_reference_candidates = (
+        _collapse_parent_only_sidebar_lineages(archived_scoped)
+    )
+    visible_child_reference_candidates.extend(visible_lineage_reference_candidates)
+    archived_child_reference_candidates.extend(archived_lineage_reference_candidates)
     archived_webui_count = sum(
         1 for s in archived_scoped
         if s.get("archived") and not _is_cli_session_for_settings(s)
@@ -2548,6 +2821,11 @@ def _build_session_list_cache_payload(
     visible_scoped_filtered = _filter_sidebar_source(visible_scoped)
     archived_scoped_filtered = _filter_sidebar_source(archived_scoped)
     scoped = _filter_sidebar_source(full_scoped_all_sources)
+    child_reference_candidates = _filter_sidebar_source(
+        archived_child_reference_candidates
+        if include_archived
+        else visible_child_reference_candidates
+    )
     if include_archived and archived_limit is not None:
         try:
             normalized_archived_limit = max(0, int(archived_limit))
@@ -2563,16 +2841,29 @@ def _build_session_list_cache_payload(
             scoped = visible_rows_for_page + archived_rows_for_page[
                 normalized_archived_offset: normalized_archived_offset + normalized_archived_limit
             ]
+    diag_stage("visible_lineage_metadata")
+    _enrich_sidebar_lineage_metadata(scoped)
+    scoped, late_child_reference_candidates = _partition_parent_only_sidebar_rows(scoped)
+    child_reference_candidates.extend(late_child_reference_candidates)
+    scoped, late_lineage_reference_candidates = _collapse_parent_only_sidebar_lineages(scoped)
+    child_reference_candidates.extend(late_lineage_reference_candidates)
     sidebar_reference_sessions: list[dict] = []
     if not include_archived:
         sidebar_reference_sessions = _hidden_archived_sidebar_reference_sessions(
             visible_scoped_filtered,
             archived_scoped_filtered,
         )
+    sidebar_reference_sessions.extend(
+        _connected_sidebar_child_references(scoped, child_reference_candidates)
+    )
+    if sidebar_reference_sessions:
+        sidebar_reference_sessions = list({
+            str(row.get("session_id")): row
+            for row in sidebar_reference_sessions
+            if isinstance(row, dict) and row.get("session_id")
+        }.values())
     if not include_archived:
         diag_stage("filter_archived_sessions")
-    diag_stage("visible_lineage_metadata")
-    _enrich_sidebar_lineage_metadata(scoped)
     # Delegated subagent children (#5307) are view-only, owned by the delegate
     # runner. Coerce their sidebar rows to read_only=True + is_cli_session=False
     # so the UI never offers delete / edit / truncate / pin affordances on them
@@ -2965,6 +3256,7 @@ from api.config import (
     get_webui_session_save_mode,
     STREAM_GOAL_RELATED,
     PENDING_GOAL_CONTINUATION,
+    PENDING_GOAL_CONTINUATION_GUARDS,
     _get_config_path,
     _load_yaml_config_file,
     _save_yaml_config_file,
@@ -3162,6 +3454,8 @@ def _clear_stale_stream_state(session) -> bool:
             session.pending_started_at = None
         if hasattr(session, "pending_user_source"):
             session.pending_user_source = None
+        if hasattr(session, "pending_server_instance_id"):
+            session.pending_server_instance_id = None
         try:
             # Runtime cleanup is not user activity; do not bubble old sessions
             # to the top of the sidebar just because a stale stream flag was
@@ -7782,11 +8076,19 @@ def _lookup_cli_session_metadata(session_id: str, *, all_profiles: bool = False)
     if not session_id:
         return {}
     try:
+        targeted = get_cli_session_metadata(session_id, all_profiles=all_profiles)
+        if targeted:
+            return targeted
+    except Exception:
+        pass
+    # Compatibility fallback for older Agent schemas and test/integration
+    # adapters that only expose the historical full-list API.
+    try:
         for row in get_cli_sessions(all_profiles=all_profiles):
             if row.get("session_id") == session_id:
                 return row
     except Exception:
-        return {}
+        pass
     return {}
 
 
@@ -9353,6 +9655,7 @@ from api.models import (
     save_projects,
     import_cli_session,
     get_cli_sessions,
+    get_cli_session_metadata,
     get_cli_session_messages,
     get_state_db_session_messages,
     get_state_db_session_message_keys_before_timestamp,
@@ -9765,6 +10068,10 @@ _SIDEBAR_SESSION_RESPONSE_FIELDS = {
     "is_messaging_session",
     "is_streaming",
     "active_stream_id",
+    "is_working",
+    "activity_phase",
+    "activity_started_at",
+    "activity_heartbeat_at",
     "has_pending_user_message",
     "pending_started_at",
     "default_hidden",
@@ -12350,6 +12657,16 @@ def handle_get(handler, parsed) -> bool:
         with profile_env_for_active_request_readonly("/api/providers", logger_override=logger):
             return j(handler, get_providers())
 
+    if parsed.path == "/api/model-aliases":
+        config_data = _load_yaml_config_file(_active_profile_config_path())
+        raw_aliases = config_data.get("model_aliases", {}) if isinstance(config_data, dict) else {}
+        aliases = {
+            str(alias): str(entry.get("model") or "")
+            for alias, entry in raw_aliases.items()
+            if isinstance(entry, dict) and entry.get("model")
+        } if isinstance(raw_aliases, dict) else {}
+        return j(handler, {"aliases": aliases})
+
     # ── Plugins/hooks visibility (read-only, no callback/source internals) ──
     if parsed.path == "/api/plugins":
         return _handle_plugins(handler, parsed)
@@ -13094,12 +13411,24 @@ def handle_get(handler, parsed) -> bool:
             active_profile = profiles_api.get_active_profile_name()
             all_profiles = _all_profiles_enabled(parsed)
             include_archived = _query_flag(parsed, "include_archived")
-            exclude_hidden = _query_flag(parsed, "exclude_hidden")
+            # A bare /api/sessions request is the cross-client default sidebar
+            # contract, so it must be clean even for clients that do not know
+            # WebUI's project-hidden convention. The browser opts into hidden
+            # project/background rows only while a named project filter is
+            # active; the legacy exclude_hidden=1 flag remains supported.
+            include_hidden = _query_flag(parsed, "include_hidden")
+            exclude_hidden = (
+                _query_flag(parsed, "exclude_hidden")
+                or not include_hidden
+            )
             archived_limit = _query_positive_int(parsed, "archived_limit", default=None, maximum=2000)
             archived_offset = _query_positive_int(parsed, "archived_offset", default=0, maximum=200000)
             sidebar_source = parse_qs(parsed.query).get("sidebar_source", [""])[0].strip().lower() or None
             if sidebar_source not in ("webui", "cli"):
                 sidebar_source = None
+            projection_v2_enabled = str(
+                os.getenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "1")
+            ).strip().lower() not in {"0", "false", "no", "off"}
             # /api/sessions is the default sidebar contract, so keep the route-owned
             # visible-row filter in the shared cache builder for both cache hits and misses.
             key = _session_list_cache_key(
@@ -13141,15 +13470,17 @@ def handle_get(handler, parsed) -> bool:
                     archived_offset=archived_offset,
                     diag=diag,
                 ),
-                seed_builder=lambda: _build_session_list_seed_payload(
-                    active_profile=active_profile,
-                    all_profiles=all_profiles,
-                    include_archived=include_archived,
-                    exclude_hidden=exclude_hidden,
-                    sidebar_source=sidebar_source,
-                    archived_limit=archived_limit,
-                    archived_offset=archived_offset,
-                ),
+                seed_builder=(
+                    lambda: _build_session_list_seed_payload(
+                        active_profile=active_profile,
+                        all_profiles=all_profiles,
+                        include_archived=include_archived,
+                        exclude_hidden=exclude_hidden,
+                        sidebar_source=sidebar_source,
+                        archived_limit=archived_limit,
+                        archived_offset=archived_offset,
+                    )
+                ) if projection_v2_enabled else None,
                 diag=diag,
             )
             diag.stage("response_write")
@@ -14435,6 +14766,18 @@ def handle_post(handler, parsed) -> bool:
         from api.config import invalidate_provider_models_cache
         invalidate_provider_models_cache(provider_id)
         return j(handler, {"ok": True, "provider": provider_id})
+
+    if parsed.path == "/api/model-aliases":
+        try:
+            return j(
+                handler,
+                api_config.set_model_aliases(
+                    body.get("aliases"),
+                    config_path=_active_profile_config_path(),
+                ),
+            )
+        except ValueError as exc:
+            return bad(handler, str(exc), 400)
 
     if parsed.path == "/api/reasoning":
         # CLI-parity /reasoning handler — writes to the same config.yaml keys
@@ -19781,6 +20124,39 @@ def _handle_session_sse_stream(handler, parsed):
         # events, not pending state.
         _sse(handler, 'initial', {"session_id": sid})
 
+        # SessionChannel delivery is memory-only. If the process dies after a
+        # tool-limit child is durably claimed, startup recovery can finish the
+        # lineage before this tab reconnects; without a durable replay the tab
+        # remains stranded on the parent even though the final child exists.
+        # Replay only the newest receipt involving this displayed segment. The
+        # frontend coordinator dedupes by execution/child/stream, and a live
+        # child gets the matching recovered start frame so rendering can attach
+        # mid-stream. A completed child needs only the continuation frame to
+        # migrate and paint its persisted answer.
+        try:
+            from api.tool_limit_continuation import replay_frames_for_session
+
+            subscribed_session = Session.load_metadata_only(sid)
+            subscribed_session_updated_at = (
+                getattr(subscribed_session, "updated_at", None)
+                if subscribed_session is not None
+                else None
+            )
+            for event_name, event_payload in replay_frames_for_session(
+                sid,
+                active_stream_for_session=active_stream_id_for_session,
+                session_updated_at=subscribed_session_updated_at,
+            ):
+                _sse(handler, event_name, event_payload)
+        except _CLIENT_DISCONNECT_ERRORS:
+            raise
+        except Exception:
+            logger.debug(
+                "tool-limit continuation reconnect replay failed for %s",
+                sid,
+                exc_info=True,
+            )
+
         # ── Open-tab live-view self-heal (root cause: lost server_turn_started) ──
         # The `server_turn_started` fan-out (routes.start_session_turn) is a
         # fire-and-forget SessionChannel.emit with NO replay buffer: it reaches
@@ -20891,7 +21267,11 @@ def _handle_btw(handler, body):
     thr = threading.Thread(
         target=_run_agent_streaming,
         args=(ephemeral.session_id, question, s.model, s.workspace, stream_id, None),
-        kwargs={"ephemeral": True, "model_provider": model_provider},
+        kwargs={
+            "ephemeral": True,
+            "model_provider": model_provider,
+            "profile": getattr(s, "profile", None),
+        },
         daemon=True,
     )
     thr.start()
@@ -20954,6 +21334,7 @@ def _handle_background(handler, body):
                 stream_id,
                 None,
                 model_provider=model_provider,
+                profile=getattr(s, "profile", None),
             )
             # Reload the bg session from disk and extract the final assistant reply.
             try:
@@ -21037,6 +21418,9 @@ def _provisional_title_from_prompt(prompt: str, fallback: str = "Untitled") -> s
     return title_from([{"role": "user", "content": text}], fallback) or fallback
 
 
+_CHAT_START_SERVER_INSTANCE_ID = uuid.uuid4().hex
+
+
 def _prepare_chat_start_session_for_stream(
     s,
     *,
@@ -21063,16 +21447,28 @@ def _prepare_chat_start_session_for_stream(
     s.model_provider = model_provider
     s.active_stream_id = stream_id
     s.post_compression_context_tokens_estimate = None
-    s.pending_user_message = msg
+    _hidden_internal_control = source in ("tool_limit_continuation", "goal_continuation")
+    # Continuation prompts are control-plane input. The structured copy is
+    # already durable in context_messages; never expose it as composer/pending
+    # state, eagerly checkpoint it into the visible transcript, or derive a
+    # title from it.
+    s.pending_user_message = None if _hidden_internal_control else msg
     s.pending_attachments = attachments
     s.pending_started_at = started_at if started_at is not None else time.time()
     s.pending_user_source = source
+    # Close the hidden-turn persist-before-register race without mistaking a
+    # prior process's sidecar for a live worker after restart. This process
+    # token is proof only for the short registration gap; STREAMS/ACTIVE_RUNS
+    # remain the authoritative live-worker registries once registration lands.
+    s.pending_server_instance_id = (
+        _CHAT_START_SERVER_INSTANCE_ID if _hidden_internal_control else None
+    )
     current_title = getattr(s, "title", None)
-    if _is_default_or_empty_session_title(current_title):
+    if not _hidden_internal_control and _is_default_or_empty_session_title(current_title):
         provisional_title = _provisional_title_from_prompt(msg, current_title or "Untitled")
         if provisional_title and not _is_default_or_empty_session_title(provisional_title):
             s.title = provisional_title
-    if get_webui_session_save_mode() == "eager":
+    if not _hidden_internal_control and get_webui_session_save_mode() == "eager":
         _checkpoint_user_message_for_eager_session_save(
             s,
             msg,
@@ -21093,6 +21489,21 @@ def _is_hidden_empty_session(s) -> bool:
     )
 
 
+def _stream_is_confirmed_live(stream_id: str | None) -> bool:
+    """Return whether this process owns a registered channel or worker."""
+    if not stream_id:
+        return False
+    with STREAMS_LOCK:
+        if stream_id in STREAMS:
+            return True
+    try:
+        from api import config as _live_config
+        with _live_config.ACTIVE_RUNS_LOCK:
+            return stream_id in (_live_config.ACTIVE_RUNS or {})
+    except Exception:
+        return False
+
+
 def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
     """Return whether an active_stream_id still owns this session's next turn.
 
@@ -21103,16 +21514,19 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
     """
     if not stream_id:
         return False
-    with STREAMS_LOCK:
-        if stream_id in STREAMS:
-            return True
-    try:
-        from api import config as _live_config
-        with _live_config.ACTIVE_RUNS_LOCK:
-            if stream_id in (_live_config.ACTIVE_RUNS or {}):
-                return True
-    except Exception:
-        pass
+    if _stream_is_confirmed_live(stream_id):
+        return True
+    # Internal continuation turns intentionally have no visible pending prompt,
+    # but their freshly-persisted active owner must still close the same
+    # registration race as an ordinary pending user message.
+    if getattr(session, "pending_user_source", None) in (
+        "tool_limit_continuation",
+        "goal_continuation",
+    ):
+        return (
+            str(getattr(session, "pending_server_instance_id", None) or "")
+            == _CHAT_START_SERVER_INSTANCE_ID
+        )
     if getattr(session, "pending_user_message", None):
         try:
             from api.models import _REPAIR_STALE_PENDING_GRACE_SECONDS
@@ -21241,12 +21655,28 @@ def _start_chat_stream_for_session(
         diag.stage("stale_stream_cleanup") if diag else None
         _clear_stale_stream_state(s)
 
-    # #1932: check if this session has a pending goal continuation flag.
-    # The streaming hook sets PENDING_GOAL_CONTINUATION when goal_continue fires,
-    # so the next chat/start for this session is automatically treated as goal-related.
-    if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
-        goal_related = True
+    # Claim and validate a synthetic continuation only while holding the same
+    # per-session lock that commits the new stream. This prevents a competing
+    # chat start from consuming the guard and then losing it on a 409.
+    def _claim_goal_continuation_guard():
+        nonlocal goal_related
+        if s.session_id not in PENDING_GOAL_CONTINUATION:
+            return None
         PENDING_GOAL_CONTINUATION.discard(s.session_id)
+        _goal_guard = PENDING_GOAL_CONTINUATION_GUARDS.pop(s.session_id, None) or {}
+        try:
+            from api.goals import goal_revision_is_active
+            valid = goal_revision_is_active(
+                s.session_id,
+                _goal_guard.get("revision"),
+                profile_home=_goal_guard.get("profile_home"),
+            )
+        except Exception:
+            valid = False
+        if not valid:
+            return {"error": "stale goal continuation discarded", "_status": 409}
+        goal_related = True
+        return None
 
     # process_complete wakeup (ours-original, Option B): if this session has a
     # pending process_complete marker (set by api/background_process.py drain),
@@ -21274,6 +21704,9 @@ def _start_chat_stream_for_session(
                     "active_stream_id": blocking_run_stream_id,
                     "_status": 409,
                 }
+            _goal_guard_error = _claim_goal_continuation_guard()
+            if _goal_guard_error:
+                return _goal_guard_error
             stream_id = uuid.uuid4().hex
             was_hidden_empty_session = _is_hidden_empty_session(s)
             _prepare_chat_start_session_for_stream(
@@ -21308,6 +21741,9 @@ def _start_chat_stream_for_session(
                         "_status": 409,
                     }
                 needs_stale_cleanup = False
+                _goal_guard_error = _claim_goal_continuation_guard()
+                if _goal_guard_error:
+                    return _goal_guard_error
                 stream_id = uuid.uuid4().hex
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
@@ -21395,7 +21831,11 @@ def _start_chat_stream_for_session(
         diag.stage("worker_thread_start") if diag else None
         backend_is_gateway = webui_gateway_chat_enabled(get_config())
         worker_target = _run_gateway_chat_streaming if backend_is_gateway else _run_agent_streaming
-        worker_kwargs = {"model_provider": model_provider, "goal_related": goal_related}
+        worker_kwargs = {
+            "model_provider": model_provider,
+            "goal_related": goal_related,
+            "profile": getattr(s, "profile", None),
+        }
         if moa_config and not backend_is_gateway:
             worker_kwargs["moa_config"] = moa_config
         thr = threading.Thread(
@@ -21516,6 +21956,7 @@ def _chat_start_response_from_run_start(result):
         "effective_model_provider",
         "error",
         "active_stream_id",
+        "active_stream_confirmed_live",
         "_status",
     ):
         if key in payload:
@@ -21597,6 +22038,7 @@ def _start_run(
                 model_provider=request.provider or model_provider,
                 normalized_model=normalized_model,
                 diag=diag,
+                goal_related=(request.source or source) == "goal_continuation",
                 source=request.source or source,
                 moa_config=moa_config,
                 session_lock_held=session_lock_held,
@@ -21640,6 +22082,7 @@ def _start_run(
         model_provider=model_provider,
         normalized_model=normalized_model,
         diag=diag,
+        goal_related=source == "goal_continuation",
         source=source,
         moa_config=moa_config,
         session_lock_held=session_lock_held,
@@ -21891,6 +22334,19 @@ def start_session_turn(
         route="start_session_turn",
     )
 
+    # A durable continuation reconciles a replayed 409 only when the exact
+    # stream is registered in this process. Sidecar ownership fields can be
+    # left behind by a crash before worker registration and are not proof.
+    try:
+        _status = int((resp or {}).get("_status", 200) or 200)
+    except (TypeError, ValueError):
+        _status = 500
+    if _status == 409:
+        _active_stream_id = (resp or {}).get("active_stream_id")
+        if _stream_is_confirmed_live(_active_stream_id):
+            resp = dict(resp or {})
+            resp["active_stream_confirmed_live"] = True
+
     # ── Defect B: live-view of server-initiated turns ──────────────────────
     # Option Z starts this turn server-side, so NO browser EventSource is
     # attached to the new STREAMS[stream_id] (the browser only opens
@@ -21928,6 +22384,50 @@ def start_session_turn(
             "server_turn_started fan-out failed for session %s", session_id, exc_info=True
         )
     return resp
+
+
+def _recover_tool_limit_continuations_on_startup() -> None:
+    """Best-effort startup recovery for claimed children whose launch did not land."""
+    try:
+        from api.tool_limit_continuation import recover_pending_continuations
+
+        recover_pending_continuations(
+            start=lambda sid, prompt: start_session_turn(
+                sid, prompt, source="tool_limit_continuation"
+            )
+        )
+    except Exception:
+        logger.exception("tool-limit continuation startup recovery failed")
+
+
+# routes is imported by server.py before serving requests. Recovery is detached
+# so a provider/model initialization can never delay server startup.
+threading.Thread(
+    target=_recover_tool_limit_continuations_on_startup,
+    name="tool-limit-continuation-recovery",
+    daemon=True,
+).start()
+
+
+def _recover_goal_continuations_on_startup() -> None:
+    """Best-effort restart recovery for judged goal turns not yet launched."""
+    try:
+        from api.goal_continuation import recover_pending_goal_continuations
+
+        recover_pending_goal_continuations(
+            start=lambda sid, prompt: start_session_turn(
+                sid, prompt, source="goal_continuation"
+            )
+        )
+    except Exception:
+        logger.exception("goal continuation startup recovery failed")
+
+
+threading.Thread(
+    target=_recover_goal_continuations_on_startup,
+    name="goal-continuation-recovery",
+    daemon=True,
+).start()
 
 
 def _handle_bg_task_complete_ack(handler, body):
@@ -22232,6 +22732,25 @@ def _handle_chat_start(handler, body, diag=None):
             require(body, "session_id")
         except ValueError as e:
             return bad(handler, str(e))
+        diag.stage("validate_composer_owner") if diag else None
+        requested_session_id = str(body.get("session_id") or "").strip()
+        composer_session_id = str(body.get("composer_session_id") or "").strip()
+        if composer_session_id and composer_session_id != requested_session_id:
+            logger.warning(
+                "rejected cross-session composer send: session_id=%s composer_session_id=%s",
+                requested_session_id,
+                composer_session_id,
+            )
+            return j(
+                handler,
+                {
+                    "error": "Composer belongs to another session",
+                    "type": "composer_session_mismatch",
+                    "session_id": requested_session_id,
+                    "composer_session_id": composer_session_id,
+                },
+                status=409,
+            )
         diag.stage("get_session") if diag else None
         try:
             s = _get_or_materialize_session(body["session_id"], refresh_cli_messages=True)

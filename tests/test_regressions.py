@@ -564,12 +564,12 @@ def test_queue_card_cross_session_clear_called_before_draft_save(cleanup_test_se
         r"if \(currentSid && currentSid !== sid\) \{\s*"
         r"if\(typeof window\._clearPendingSelections==='function'\) window\._clearPendingSelections\(\);\s*"
         r"if\(typeof _clearQueueCardDisplay==='function'\) _clearQueueCardDisplay\(currentSid\);\s*"
-        r"await _saveComposerDraftNow\(currentSid",
+        r"await _saveComposerDraftNow\(_switchDraftSid",
         re.S,
     )
     assert block_pattern.search(src), (
         "cross-session loadSession path must clear queue card display via"
-        " _clearQueueCardDisplay(currentSid) before awaiting _saveComposerDraftNow"
+        " _clearQueueCardDisplay(currentSid) before saving the confirmed-owner draft"
     )
 
 
@@ -618,7 +618,8 @@ def test_chat_start_persists_pending_turn_metadata_for_reload_recovery(cleanup_t
     """
     routes_src = (REPO_ROOT / "api/routes.py").read_text()
     assert 's.active_stream_id = stream_id' in routes_src
-    assert 's.pending_user_message = msg' in routes_src
+    assert '_prepare_chat_start_session_for_stream(' in routes_src
+    assert 's.pending_user_message = None if _hidden_internal_control else msg' in routes_src
     assert 's.pending_attachments = attachments' in routes_src
     assert '"active_stream_id": getattr(s, "active_stream_id", None)' in routes_src
     assert '"pending_user_message": getattr(s, "pending_user_message", None)' in routes_src

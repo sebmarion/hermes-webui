@@ -111,6 +111,70 @@ def test_does_not_full_scan_sessions_table(tmp_path, monkeypatch):
     )
 
 
+def test_metadata_only_lookup_skips_messages_table(tmp_path, monkeypatch):
+    """Parent/child classification must not scan the multi-GB messages table."""
+    from api import agent_sessions
+
+    db = tmp_path / "state.db"
+    conn = _make_db(db)
+    _insert(conn, "parent", end_reason="user_stop")
+    _insert(conn, "child", parent="parent")
+    conn.execute(
+        "CREATE TABLE messages (session_id TEXT, timestamp REAL, content TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO messages VALUES ('child', 1, 'payload')"
+    )
+    conn.commit()
+    conn.close()
+
+    queries = []
+    real_connect = sqlite3.connect
+
+    class _TrackingConn:
+        def __init__(self, *args, **kwargs):
+            self._real = real_connect(*args, **kwargs)
+
+        def cursor(self):
+            return _TrackingCursor(self._real.cursor())
+
+        def close(self):
+            return self._real.close()
+
+        @property
+        def row_factory(self):
+            return self._real.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value):
+            self._real.row_factory = value
+
+    class _TrackingCursor:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, *args):
+            queries.append(sql)
+            return self._real.execute(sql, *args)
+
+        def fetchall(self):
+            return self._real.fetchall()
+
+        def fetchone(self):
+            return self._real.fetchone()
+
+    monkeypatch.setattr(sqlite3, "connect", _TrackingConn)
+
+    result = agent_sessions.read_session_lineage_metadata(
+        db,
+        ["child"],
+        include_message_stats=False,
+    )
+
+    assert result["child"]["relationship_type"] == "child_session"
+    assert not any("from messages" in sql.lower() for sql in queries)
+
+
 def test_orphan_parent_reference_not_exposed_in_metadata(tmp_path):
     """If a session row references a parent that doesn't exist in state.db
     (orphan), the API output must NOT include `parent_session_id` — because
@@ -318,6 +382,68 @@ def test_non_compression_parent_does_not_extend_lineage(tmp_path):
     # _lineage_root_id should NOT be set — chain doesn't span the boundary
     assert "_lineage_root_id" not in entry
     assert "_compression_segment_count" not in entry
+
+
+def test_compression_tip_inherits_outer_child_relationship(tmp_path):
+    """A tip must expose the root segment's non-continuation parent."""
+    from api.agent_sessions import read_session_lineage_metadata
+
+    db = tmp_path / "state.db"
+    conn = _make_db(db)
+    _insert(conn, "outer-parent", end_reason="user_stop", started_at=10)
+    _insert(
+        conn,
+        "lineage-root",
+        parent="outer-parent",
+        end_reason="compression",
+        started_at=20,
+    )
+    _insert(conn, "lineage-tip", parent="lineage-root", started_at=30)
+    conn.close()
+
+    result = read_session_lineage_metadata(
+        db,
+        ["lineage-tip"],
+        include_message_stats=False,
+    )
+
+    entry = result["lineage-tip"]
+    assert entry["_lineage_root_id"] == "lineage-root"
+    assert entry["parent_session_id"] == "outer-parent"
+    assert entry["relationship_type"] == "child_session"
+
+
+def test_long_compression_tip_inherits_outer_child_relationship(tmp_path):
+    """Lineages longer than the historical 20-hop cap stay connected."""
+    from api.agent_sessions import read_session_lineage_metadata
+
+    db = tmp_path / "state.db"
+    conn = _make_db(db)
+    _insert(conn, "outer-parent", end_reason="user_stop", started_at=10)
+    parent = "outer-parent"
+    for index in range(30):
+        sid = f"segment-{index:02d}"
+        _insert(
+            conn,
+            sid,
+            parent=parent,
+            end_reason="compression",
+            started_at=20 + index,
+        )
+        parent = sid
+    _insert(conn, "lineage-tip", parent=parent, started_at=100)
+    conn.close()
+
+    result = read_session_lineage_metadata(
+        db,
+        ["lineage-tip"],
+        include_message_stats=False,
+    )
+
+    entry = result["lineage-tip"]
+    assert entry["_lineage_root_id"] == "segment-00"
+    assert entry["parent_session_id"] == "outer-parent"
+    assert entry["relationship_type"] == "child_session"
 
 
 

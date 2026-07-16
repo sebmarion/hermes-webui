@@ -93,6 +93,61 @@ that breaks the page for everyone). A full chat golden-path E2E (send → stream
 render → switch → reload) lives in the maintainer's private QA harness, which has
 the agent + a mock LLM provider available.
 
+### Standing-goal continuation recovery gate
+
+Run the focused automated contract with:
+
+```bash
+./scripts/test.sh \
+  tests/test_goal_continuation_durable.py \
+  tests/test_goal_command_webui.py \
+  tests/test_issue_1932_goal_hook_unrelated_turns.py \
+  tests/test_stage326_pending_goal_continuation_race.py \
+  tests/test_webui_gateway_chat_backend.py
+```
+
+For a live provider canary, use isolated WebUI state and set a goal that requires
+two exact markers in separate turns. Expect one visible user row and two visible
+assistant rows, with no visible continuation prompt, partial duplicate, or error
+row. The first journal must end `done`/`stream_end`, its durable receipt must be
+`started`, and the successor journal must also end `done`/`stream_end`. Server
+access logs must show the initial `/api/goal` request but no browser
+`POST /api/chat/start` for the successor. For restart recovery, stop WebUI with a
+valid receipt in `claimed`, restart it without opening or interacting with a tab,
+and verify that the receipt becomes `started` and the successor reaches the same
+clean terminal state.
+
+### Tool-limit continuation recovery gate
+
+Run the focused backend, frontend, terminal-state, and gateway contracts with:
+
+```bash
+./scripts/test.sh \
+  tests/test_tool_limit_continuation.py \
+  tests/test_tool_limit_continuation_frontend.py \
+  tests/test_tool_limit_terminal_state.py \
+  tests/test_goal_continuation_durable.py \
+  tests/test_webui_gateway_chat_backend.py
+```
+
+Also run `tests/test_optionz_liveview_perf.py` and
+`tests/test_session_channel_option_x.py` when changing per-session SSE replay.
+For the live gate, use isolated WebUI state and a low agent iteration limit that
+forces at least two continuation boundaries. Verify exactly one child per
+boundary, one execution/root lineage, inherited profile/workspace/model/provider,
+and one structured control in each child model context with no visible synthetic
+prompt or error row. Stop the server after a child receipt reaches `claimed` but
+before its stream starts; restart without resubmitting from the browser and prove
+that the exact child id is reused. Finally, open the original parent URL in a
+clean browser tab: durable SSE replay must migrate to the final child, render one
+final answer, emit no browser errors, and create no duplicate prompt, stream, or
+child sidecar. The focused suite must also prove that an unreadable/version-
+incompatible receipt store creates no child, a stale pre-registration child
+sidecar is restarted instead of accepted as live, a newer active pane turn vetoes
+navigation both before and during the asynchronous child load, exact-text
+collisions preserve legitimate user turns, and a claim failure persists a visible
+terminal blocker.
+
 ### Unified Hermes conversation-list gate
 
 Run the focused contract with:
@@ -100,6 +155,7 @@ Run the focused contract with:
 ```bash
 ./scripts/test.sh \
   tests/test_shared_state_db_session_projection.py \
+  tests/test_shared_session_activity.py \
   tests/test_shared_session_metadata_routes.py \
   tests/test_issue4766_sidebar_source_pushdown.py \
   tests/test_session_list_long_history_perf.py
@@ -112,7 +168,10 @@ source badges and no WebUI/CLI tabs; disabling “Show optional external session
 must not remove them. “Show archived” must reveal the archived row and combined
 pagination must load further archived rows without source switching. Rename,
 workspace, archive, and pin edits must read back from `state.db` and must not
-change token usage counters.
+change token usage counters. Add a fork/delegate child beneath a visible parent
+and verify only the parent renders while the child's running/unread/approval state
+still bubbles to it. Pin a compressed conversation and verify exactly the lineage
+root carries `pinned=1`; hidden physical segments and child rows remain unpinned.
 
 
 `tests/test_static_js_runtime_lint.py` runs this automatically when eslint is present

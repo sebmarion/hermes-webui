@@ -2,6 +2,7 @@ import json
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 
 import api.models as models
 import api.routes as routes
@@ -44,6 +45,63 @@ def test_index_projection_read_never_loads_sidecars_or_state_db(monkeypatch, tmp
     rows = models.read_session_index_projection()
 
     assert [row["session_id"] for row in rows] == ["visible"]
+
+
+def test_all_sessions_does_not_hold_global_lock_while_compacting_live_sessions(
+    monkeypatch, tmp_path
+):
+    """A slow live-session projection must not block detail/session loads."""
+    index_file = tmp_path / "_index.json"
+    index_file.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", index_file)
+    monkeypatch.setattr(models, "_persisted_session_ids_snapshot", lambda: frozenset())
+    monkeypatch.setattr(models, "_session_dir_has_persisted_session_files", lambda: False)
+    monkeypatch.setattr(models, "_enrich_sidebar_lineage_metadata", lambda _rows: None)
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    session = models.Session(
+        session_id="projection-lock-free",
+        workspace=str(tmp_path),
+        messages=[{"role": "user", "content": "hello"}],
+    )
+    models.SESSIONS[session.session_id] = session
+    compact_started = threading.Event()
+    release_compact = threading.Event()
+
+    original_compact = models.Session.compact
+
+    def blocking_compact(self, *args, **kwargs):
+        if self.session_id == session.session_id:
+            compact_started.set()
+            release_compact.wait(2.0)
+        return original_compact(self, *args, **kwargs)
+
+    monkeypatch.setattr(models.Session, "compact", blocking_compact)
+
+    projection = threading.Thread(target=models.all_sessions, kwargs={"include_lineage_metadata": False})
+    projection.start()
+    assert compact_started.wait(1.0)
+
+    detail_loaded = threading.Event()
+
+    def load_detail():
+        models.get_session(session.session_id, metadata_only=True)
+        detail_loaded.set()
+
+    detail = threading.Thread(target=load_detail)
+    detail.start()
+    try:
+        assert detail_loaded.wait(0.2), (
+            "session detail loads must not wait for the sidebar projection's "
+            "expensive Session.compact() call"
+        )
+    finally:
+        release_compact.set()
+        projection.join(2.0)
+        detail.join(2.0)
+
+    assert not projection.is_alive()
+    assert not detail.is_alive()
 
 
 def test_seed_payload_applies_profile_archive_and_source_filters(monkeypatch):
@@ -91,6 +149,66 @@ def test_seed_payload_applies_profile_archive_and_source_filters(monkeypatch):
     assert [row["session_id"] for row in payload["sessions"]] == ["visible"]
     assert payload["archived_count"] == 1
     assert payload["other_profile_count"] == 1
+
+
+def test_seed_payload_uses_state_db_archive_and_pin_truth(monkeypatch, tmp_path):
+    db = tmp_path / "state.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, source TEXT, title TEXT, message_count INTEGER, "
+            "archived INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+        conn.executemany(
+            "INSERT INTO sessions "
+            "(id, source, title, message_count, archived, pinned) "
+            "VALUES (?, 'webui', ?, 1, ?, ?)",
+            [
+                ("state-archived", "State archived", 1, 0),
+                ("state-active", "State active", 0, 1),
+            ],
+        )
+
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    monkeypatch.setattr(
+        models,
+        "read_session_index_projection",
+        lambda: [
+            {
+                "session_id": "state-archived",
+                "title": "Stale active pin",
+                "message_count": 1,
+                "updated_at": 20.0,
+                "profile": "default",
+                "archived": False,
+                "pinned": True,
+            },
+            {
+                "session_id": "state-active",
+                "title": "Stale archived unpin",
+                "message_count": 1,
+                "updated_at": 10.0,
+                "profile": "default",
+                "archived": True,
+                "pinned": False,
+            },
+        ],
+    )
+
+    payload = routes._build_session_list_seed_payload(
+        active_profile="default",
+        all_profiles=False,
+        include_archived=False,
+        exclude_hidden=False,
+        sidebar_source=None,
+        archived_limit=None,
+        archived_offset=0,
+    )
+
+    assert [row["session_id"] for row in payload["sessions"]] == ["state-active"]
+    assert payload["sessions"][0]["pinned"] is True
+    assert payload["archived_count"] == 1
 
 
 def test_projection_token_refreshes_off_the_caller_thread(monkeypatch, tmp_path):

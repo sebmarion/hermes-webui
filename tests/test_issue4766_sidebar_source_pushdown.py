@@ -164,7 +164,7 @@ def test_sidebar_source_webui_excludes_cli_rows(monkeypatch):
     assert set(enriched[0]) == expected
 
 
-def test_sidebar_source_webui_includes_hidden_archived_parent_reference(monkeypatch):
+def test_sidebar_source_webui_hides_child_when_archived_parent_is_filtered(monkeypatch):
     rows = [
         {
             "session_id": "webui-parent",
@@ -201,10 +201,8 @@ def test_sidebar_source_webui_includes_hidden_archived_parent_reference(monkeypa
 
     body = handler.json_body()
     assert handler.status == 200
-    assert [row["session_id"] for row in body["sessions"]] == ["webui-child"]
-    assert [row["session_id"] for row in body["sidebar_reference_sessions"]] == ["webui-parent"]
-    assert body["sidebar_reference_sessions"][0]["archived"] is True
-    assert body["sidebar_reference_sessions"][0]["_sidebar_reference_only"] is True
+    assert body["sessions"] == []
+    assert body["sidebar_reference_sessions"] == []
 
 
 def test_sidebar_source_cli_excludes_webui_rows(monkeypatch):
@@ -486,7 +484,7 @@ console.log(JSON.stringify({{ first, second, searchFiltered, projectFiltered, ca
     assert body["first"] == "?exclude_hidden=1&all_profiles=1"
     assert body["second"] == "?exclude_hidden=1&all_profiles=1&include_archived=1&archived_limit=100"
     assert body["searchFiltered"] == "?exclude_hidden=1&all_profiles=1&include_archived=1"
-    assert body["projectFiltered"] == "?all_profiles=1&include_archived=1"
+    assert body["projectFiltered"] == "?include_hidden=1&all_profiles=1&include_archived=1"
     assert body["capped"] == "?exclude_hidden=1&all_profiles=1&include_archived=1&archived_limit=2000"
     assert body["third"] == "?exclude_hidden=1"
 

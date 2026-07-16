@@ -301,10 +301,10 @@ function _stripWorkspaceDisplayPrefix(text){
   // saved before the v1 migration; fall through to the legacy regex when the
   // v1 strip didn't match. Mirrors the Python `include_legacy=True` branch in
   // api/streaming.py:_strip_workspace_prefix(). Per Opus advisor on stage-322.
-  const value = String(text||'');
-  const stripped = value.replace(/^\s*\[Workspace::v1:\s*(?:\\.|[^\]\\])+\]\s*/,'');
-  if(stripped !== value) return stripped.trim();
-  return value.replace(/^\s*\[Workspace:[^\]]+\]\s*/,'').trim();
+  let value = String(text||'');
+  const prefix=/^\s*(?:\[Workspace::v1:\s*(?:\\.|[^\]\\])+\]|\[Workspace:[^\]]+\])\s*/;
+  while(prefix.test(value)) value=value.replace(prefix,'');
+  return value.trim();
 }
 function _renderUserFencedBlocks(text){
   const stash=[];
@@ -13827,6 +13827,7 @@ function _latestCompressionReferenceMessage(messages, summaryText=''){
   return {message:null, rawIdx:-1};
 }
 function _shouldShowSettledCompressionReference(referenceText){
+  if(_compressionModeForSession()!=='manual') return false;
   return !!String(referenceText||'').trim() && !_isContextCompactionText(referenceText);
 }
 function _compressionReferenceCardHtml(text, open=false){
@@ -13886,6 +13887,7 @@ function _hasActiveTodoItems(items){
   });
 }
 function _latestPreservedCompressionTaskListMessages(messages){
+  if(_compressionModeForSession()!=='manual') return [];
   const latest=[...(messages||[])].reverse().find(m=>_isPreservedCompressionTaskListMessage(m));
   if(!latest) return [];
   const latestTodos=_latestTodoToolItems(messages);

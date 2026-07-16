@@ -480,7 +480,10 @@ def test_sessions_route_preserves_visible_child_lineage_when_archived_parent_fil
         )
         assert [row["session_id"] for row in archived_payload["sessions"]] == [
             "lineage_api_visible_tip",
-            "lineage_api_archived_parent",
         ]
+        assert {
+            row["session_id"]
+            for row in archived_payload["sidebar_reference_sessions"]
+        } == {"lineage_api_archived_parent"}
     finally:
         conn.close()

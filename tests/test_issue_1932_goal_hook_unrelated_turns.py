@@ -21,14 +21,13 @@ def test_config_exports_stream_goal_related():
 
 
 # ---------------------------------------------------------------------------
-# Test 2: config exports PENDING_GOAL_CONTINUATION
+# Test 2: durable continuation source is explicit
 # ---------------------------------------------------------------------------
 
-def test_config_exports_pending_goal_continuation():
-    """api.config must export PENDING_GOAL_CONTINUATION for auto-marking
-    continuation streams as goal-related."""
-    from api.config import PENDING_GOAL_CONTINUATION
-    assert isinstance(PENDING_GOAL_CONTINUATION, (dict, set))
+def test_goal_continuation_source_is_explicit():
+    from api.goal_continuation import SOURCE
+
+    assert SOURCE == "goal_continuation"
 
 
 # ---------------------------------------------------------------------------
@@ -56,41 +55,29 @@ def test_streaming_source_code_gates_on_stream_goal_related():
 
 
 # ---------------------------------------------------------------------------
-# Test 4: streaming.py sets PENDING_GOAL_CONTINUATION on goal_continue
+# Test 4: streaming.py durably claims before goal_continue
 # ---------------------------------------------------------------------------
 
-def test_streaming_sets_pending_goal_continuation_on_goal_continue():
-    """When goal_continue is emitted, streaming.py must set
-    PENDING_GOAL_CONTINUATION so the next /chat/start marks the stream."""
+def test_streaming_claims_durable_goal_continuation_before_live_status():
     from pathlib import Path
     streaming_py = (Path(__file__).resolve().parents[1] / "api" / "streaming.py").read_text()
 
-    assert "PENDING_GOAL_CONTINUATION" in streaming_py, (
-        "streaming.py must reference PENDING_GOAL_CONTINUATION"
-    )
-
-    # The PENDING_GOAL_CONTINUATION set must happen near goal_continue
-    goal_continue_idx = streaming_py.find("goal_continue")
-    pending_idx = streaming_py.find("PENDING_GOAL_CONTINUATION")
-    assert goal_continue_idx != -1 and pending_idx != -1
+    claim_idx = streaming_py.find("claim_goal_continuation(")
+    goal_continue_idx = streaming_py.find("put('goal_continue'", claim_idx)
+    assert claim_idx != -1 and goal_continue_idx != -1
+    assert claim_idx < goal_continue_idx
 
 
 # ---------------------------------------------------------------------------
-# Test 5: routes.py reads PENDING_GOAL_CONTINUATION and marks stream
+# Test 5: routes.py marks server-owned continuation streams
 # ---------------------------------------------------------------------------
 
-def test_routes_reads_pending_goal_continuation():
-    """The chat/start handler must check PENDING_GOAL_CONTINUATION and mark
-    the new stream as goal-related."""
+def test_routes_marks_server_owned_goal_continuation():
     from pathlib import Path
     routes_py = (Path(__file__).resolve().parents[1] / "api" / "routes.py").read_text()
 
-    assert "PENDING_GOAL_CONTINUATION" in routes_py, (
-        "routes.py must reference PENDING_GOAL_CONTINUATION"
-    )
-    assert "STREAM_GOAL_RELATED" in routes_py, (
-        "routes.py must reference STREAM_GOAL_RELATED to mark goal-related streams"
-    )
+    assert 'goal_related=source == "goal_continuation"' in routes_py
+    assert 'source="goal_continuation"' in routes_py
 
 
 # ---------------------------------------------------------------------------

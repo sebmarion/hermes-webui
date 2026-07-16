@@ -377,7 +377,7 @@ def test_post_turn_lifecycle_marks_completion_without_commit():
     lifecycle_marker = src.index("mark_turn_completed(s.session_id, agent=agent)", save_pos)
     cancel_check = src.index("cancel_event.is_set()", save_pos)
     completed_journal = src.index('"completed"', save_pos)
-    sync_to_state_db = src.index("# Sync to state.db", save_pos)
+    sync_to_state_db = src.index("# Persist the shared conversation projection", save_pos)
 
     assert lifecycle_marker > cancel_check, (
         "mark_turn_completed must appear after the cancellation check"
@@ -390,7 +390,7 @@ def test_post_turn_lifecycle_marks_completion_without_commit():
     # The post-turn block must contain mark_turn_completed but NOT
     # commit_session_memory — extraction is a boundary concern.
     block_start = src.rindex("if not ephemeral:", save_pos, lifecycle_marker)
-    block_end_pos = src.index("# Sync to state.db", save_pos)
+    block_end_pos = src.index("# Persist the shared conversation projection", save_pos)
     post_turn_block = src[block_start:block_end_pos]
     assert "mark_turn_completed" in post_turn_block
     assert "commit_session_memory" not in post_turn_block

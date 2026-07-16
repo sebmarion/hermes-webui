@@ -10667,6 +10667,7 @@ async function loadProvidersPanel(){
   if(!list) return;
   try{
     const data=await api('/api/providers');
+    await _loadModelAliases();
     const quota=await _fetchProviderQuotaStatus(false).catch(e=>({ok:false,status:'unavailable',quota:null,message:e.message||t('provider_quota_unavailable'),client_fetched_at:new Date().toISOString()}));
     const providers=(data.providers||[]).filter(p=>p.configurable||p.is_oauth||p.is_custom||p.is_plugin_provider||p.is_self_hosted);
     list.innerHTML='';
@@ -10689,6 +10690,35 @@ async function loadProvidersPanel(){
   }catch(e){
     list.innerHTML='<div style="color:var(--error);padding:12px;font-size:13px">Failed to load providers: '+esc(e.message||String(e))+'</div>';
   }
+}
+
+async function _loadModelAliases(){
+  const input=$('modelAliasesInput');
+  const save=$('modelAliasesSaveBtn');
+  if(!input||!save) return;
+  const data=await api('/api/model-aliases',{cache:'no-store'});
+  input.value=Object.entries(data.aliases||{}).map(([alias,model])=>`${alias}=${model}`).join('\n');
+  if(save.dataset.bound) return;
+  save.dataset.bound='1';
+  save.addEventListener('click',async()=>{
+    const aliases={};
+    try{
+      for(const raw of input.value.split(/\r?\n/)){
+        const line=raw.trim();
+        if(!line||line.startsWith('#')) continue;
+        const split=line.indexOf('=');
+        if(split<1||!line.slice(split+1).trim()) throw new Error(`Invalid alias line: ${line}`);
+        const alias=line.slice(0,split).trim();
+        if(Object.keys(aliases).some(key=>key.toLowerCase()===alias.toLowerCase())) throw new Error(`Duplicate alias: ${alias}`);
+        aliases[alias]=line.slice(split+1).trim();
+      }
+      save.disabled=true;
+      const result=await api('/api/model-aliases',{method:'POST',body:JSON.stringify({aliases})});
+      input.value=Object.entries(result.aliases||{}).map(([alias,model])=>`${alias}=${model}`).join('\n');
+      showToast('Model aliases saved for WebUI and Hermes One');
+    }catch(e){showToast(e.message||String(e));}
+    finally{save.disabled=false;}
+  });
 }
 
 async function _refreshProviderQuota(card,button){

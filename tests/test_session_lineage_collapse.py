@@ -337,7 +337,7 @@ console.log(JSON.stringify({{parent:_resolveSessionIdFromSidebarLineage('parent'
     assert result == {"parent": "child", "child": "child", "other": "other"}
 
 
-def test_sidebar_attaches_child_sessions_to_collapsed_hidden_parent_lineage():
+def test_sidebar_hides_child_sessions_under_collapsed_parent_lineage():
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = f"""
 const src = {js!r};
@@ -372,8 +372,8 @@ console.log(JSON.stringify(attached));
 """
     rows = json.loads(_run_node(source))
     assert [row["session_id"] for row in rows] == ["tip"]
-    assert rows[0]["_child_session_count"] == 1
-    assert rows[0]["_child_sessions"][0]["session_id"] == "child"
+    assert "_child_session_count" not in rows[0]
+    assert "_child_sessions" not in rows[0]
 
 
 def test_mixed_source_live_refresh_keeps_authoritative_tip_and_child_set():
@@ -429,22 +429,22 @@ console.log(JSON.stringify([summarize(refreshA), summarize(refreshB)]));
     assert json.loads(_run_node(source)) == [
         {
             "visibleSid": "tip",
-            "badgeKind": "children",
-            "childSids": ["fork-child"],
+            "badgeKind": "prior-turns",
+            "childSids": [],
             "segmentSids": ["root", "tip"],
         },
         {
             "visibleSid": "tip",
-            "badgeKind": "children",
-            "childSids": ["fork-child"],
+            "badgeKind": "prior-turns",
+            "childSids": [],
             "segmentSids": ["tip", "root"],
         },
     ]
 
 
 
-def test_cross_surface_subagent_child_stacks_under_visible_webui_parent():
-    """Delegate subagent rows are cross-source but still belong under their WebUI parent."""
+def test_cross_surface_subagent_child_is_hidden_under_visible_webui_parent():
+    """Delegate subagent rows stay internal when their WebUI parent is visible."""
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = f"""
 const src = {js!r};
@@ -494,14 +494,13 @@ console.log(JSON.stringify(rows));
 """
     rows = json.loads(_run_node(source))
     assert [row["session_id"] for row in rows] == ["webui_parent"]
-    assert rows[0]["_child_session_count"] == 1
-    assert rows[0]["_child_sessions"][0]["session_id"] == "subagent_child"
-    assert "_orphan_child_session" not in rows[0]["_child_sessions"][0]
+    assert "_child_session_count" not in rows[0]
+    assert "_child_sessions" not in rows[0]
 
 
 
-def test_cross_surface_subagent_child_stacks_under_visible_fork_parent():
-    """Forked WebUI conversations can still own subagent child rows."""
+def test_cross_surface_subagent_child_is_hidden_under_visible_fork_parent():
+    """Forked WebUI conversations hide their internal subagent rows."""
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = f"""
 const src = {js!r};
@@ -550,8 +549,8 @@ console.log(JSON.stringify(rows));
 """
     rows = json.loads(_run_node(source))
     assert [row["session_id"] for row in rows] == ["fork_parent"]
-    assert rows[0]["_child_session_count"] == 1
-    assert rows[0]["_child_sessions"][0]["session_id"] == "subagent_child"
+    assert "_child_session_count" not in rows[0]
+    assert "_child_sessions" not in rows[0]
 
 
 def test_parent_source_label_display_text_does_not_force_external_orphaning():
@@ -587,7 +586,7 @@ console.log(JSON.stringify(rows));
 """
     rows = json.loads(_run_node(source))
     assert [row["session_id"] for row in rows] == ["parent"]
-    assert rows[0]["_child_session_count"] == 1
+    assert "_child_session_count" not in rows[0]
 
 
 def test_cross_surface_webui_child_session_remains_top_level_when_parent_is_messaging():
@@ -986,7 +985,7 @@ console.log(JSON.stringify(rows));
     assert "_child_session_attention" not in rows[0]
 
 
-def test_fork_child_with_visible_parent_is_nested_once():
+def test_fork_child_with_visible_parent_is_hidden():
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = f"""
 const src = {js!r};
@@ -1015,8 +1014,8 @@ console.log(JSON.stringify(rows));
 """
     rows = json.loads(_run_node(source))
     assert [row["session_id"] for row in rows] == ["parent"]
-    assert rows[0]["_child_session_count"] == 1
-    assert [child["session_id"] for child in rows[0]["_child_sessions"]] == ["fork1"]
+    assert "_child_session_count" not in rows[0]
+    assert "_child_sessions" not in rows[0]
 
 
 def test_fork_child_without_visible_parent_stays_top_level():
@@ -1050,7 +1049,7 @@ console.log(JSON.stringify(rows));
     assert "_child_sessions" not in rows[0]
 
 
-def test_pinned_fork_with_visible_parent_stays_top_level():
+def test_pinned_fork_with_visible_parent_stays_hidden():
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = f"""
 const src = {js!r};
@@ -1078,8 +1077,41 @@ const rows = _attachChildSessionsToSidebarRows([parent, fork], [parent, fork]);
 console.log(JSON.stringify(rows));
 """
     rows = json.loads(_run_node(source))
-    assert [row["session_id"] for row in rows] == ["parent", "fork1"]
+    assert [row["session_id"] for row in rows] == ["parent"]
     assert "_child_sessions" not in rows[0]
+
+
+def test_pinned_nested_fork_stays_hidden_when_parent_is_also_hidden():
+    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
+    source = f"""
+const src = {js!r};
+function extractFunc(name) {{
+  const re = new RegExp('function\\\\s+' + name + '\\\\s*\\\\(');
+  const start = src.search(re);
+  if (start < 0) throw new Error(name + ' not found');
+  let i = src.indexOf('{{', start);
+  let depth = 1; i++;
+  while (depth > 0 && i < src.length) {{
+    if (src[i] === '{{') depth++;
+    else if (src[i] === '}}') depth--;
+    i++;
+  }}
+  return src.slice(start, i);
+}}
+eval(extractFunc('_sessionTimestampMs'));
+eval(extractFunc('_isChildSession'));
+eval(extractFunc('_isForkWithResolvableParent'));
+eval(extractFunc('_sidebarLineageKeyForRow'));
+eval(extractFunc('_sessionDisplayTitle'));
+eval(extractFunc('_attachChildSessionsToSidebarRows'));
+const root = {{session_id:'root', title:'Root', updated_at:10, last_message_at:10}};
+const fork1 = {{session_id:'fork1', title:'Fork 1', session_source:'fork', parent_session_id:'root', updated_at:20, last_message_at:20}};
+const fork2 = {{session_id:'fork2', title:'Fork 2', session_source:'fork', parent_session_id:'fork1', pinned:true, updated_at:30, last_message_at:30}};
+const rows = _attachChildSessionsToSidebarRows([fork2, fork1, root], [fork2, fork1, root]);
+console.log(JSON.stringify(rows.map(row => ({{sid:row.session_id, orphan:!!row._orphan_child_session}}))));
+"""
+    rows = json.loads(_run_node(source))
+    assert rows == [{"sid": "root", "orphan": False}]
 
 
 def test_nested_fork_tracks_latest_child_without_changing_parent_bucket_timestamp():
@@ -1466,7 +1498,7 @@ console.log(JSON.stringify(rows));
     assert rows[0]["_child_session_attention"]["kind"] == "approval"
 
 
-def test_fork_chain_stays_attached_under_visible_root():
+def test_fork_chain_stays_hidden_under_visible_root():
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = f"""
 const src = {js!r};
@@ -1497,8 +1529,8 @@ console.log(JSON.stringify(rows));
 """
     rows = json.loads(_run_node(source))
     assert [row["session_id"] for row in rows] == ["root"]
-    assert [child["session_id"] for child in rows[0]["_child_sessions"]] == ["fork1", "fork2"]
-    assert rows[0]["_child_sessions"][1]["_parent_segment_id"] == "fork1"
+    assert "_child_sessions" not in rows[0]
+    assert rows[0]["_child_session_latest_at"] == 30
 
 
 def test_sidebar_lineage_key_uses_session_id_for_fork_rows():
@@ -2011,8 +2043,8 @@ def test_sidebar_search_and_rows_use_read_only_display_title():
     assert "const childTitle=_sessionDisplayTitle(child)||'Untitled child session';" in js
 
 
-def test_child_session_parent_segment_note_uses_display_title():
-    """A child attached through a hidden parent segment should show the reconciled segment title."""
+def test_child_session_through_hidden_parent_segment_stays_hidden():
+    """A child linked through a hidden segment must not reappear in the sidebar."""
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
     source = f"""
 const src = {js!r};
@@ -2050,11 +2082,11 @@ const child={{
   parent_session_id:'old-parent',
 }};
 const rows = _attachChildSessionsToSidebarRows([parentRow], [parentRow, child]);
-console.log(JSON.stringify(rows[0]._child_sessions[0]));
+console.log(JSON.stringify(rows));
 """
-    child = json.loads(_run_node(source))
-    assert child["_parent_segment_id"] == "old-parent"
-    assert child["_parent_segment_title"] == "Hermes WebUI #176"
+    rows = json.loads(_run_node(source))
+    assert [row["session_id"] for row in rows] == ["tip"]
+    assert "_child_sessions" not in rows[0]
 
 
 def test_default_webui_numbered_titles_are_not_treated_as_hash_tags():
@@ -2099,22 +2131,11 @@ def test_streaming_state_recorded_from_own_state_not_bubbled_child():
     assert "_rememberRenderedStreamingState(s, isStreaming);" not in js
 
 
-def test_nested_fork_rows_included_in_visible_sidebar_ids():
-    """Expanded writable fork children must appear in _sessionVisibleSidebarIds
-    so they participate in batch-select (select-all / shift-select)."""
+def test_parent_only_projection_excludes_nested_forks_from_batch_selection_input():
+    """Batch selection receives only the visible parent-only projection."""
     js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
-    assert "child.session_source==='fork'" in js
-    # The _sessionVisibleSidebarIds builder must push fork children.
-    assert "_sessionVisibleSidebarIds.push(child.session_id)" in js
-
-
-def test_nested_fork_rows_render_select_checkbox():
-    """The session-child-session-fork render path must include a batch-select
-    checkbox when _sessionSelectMode is active and the child is writable."""
-    js = SESSIONS_JS_PATH.read_text(encoding="utf-8")
-    render_marker = "row.className='session-child-session session-child-session-fork'"
-    fork_render_start = js.find(render_marker)
-    assert fork_render_start > 0
-    fork_render_block = js[fork_render_start:fork_render_start + 2000]
-    assert "session-select-cb" in fork_render_block
-    assert "_sessionSelectMode" in fork_render_block
+    assert (
+        ".filter(s=>!_isChildSession(s)"
+        "&&!_isForkWithResolvableParent(s, sessionIdsInList))"
+    ) in js
+    assert "parentRow._child_sessions=" not in js

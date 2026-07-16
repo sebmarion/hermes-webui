@@ -195,6 +195,165 @@ def _append_journal(state, event):
     return append_turn_journal_event("session-1", event, session_dir=state["session_dir"])
 
 
+def test_atomic_recovery_rebuilds_missing_compression_tip_sidecar_from_state_db(
+    recovery_state,
+):
+    root_id = "compression-root"
+    tip_path = recovery_state["session_dir"] / "session-1.json"
+    root_path = recovery_state["session_dir"] / f"{root_id}.json"
+    root_payload = json.loads(tip_path.read_text(encoding="utf-8"))
+    root_payload.update(
+        {
+            "session_id": root_id,
+            "pre_compression_snapshot": True,
+            "parent_session_id": None,
+        }
+    )
+    root_path.write_text(json.dumps(root_payload), encoding="utf-8")
+    tip_path.unlink()
+
+    with sqlite3.connect(recovery_state["state_db"]) as con:
+        con.execute("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")
+        con.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+            (root_id, "session-1"),
+        )
+        con.execute(
+            """
+            INSERT INTO sessions
+                (id, title, source, model, started_at, ended_at, end_reason,
+                 cwd, git_repo_root, parent_session_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                root_id,
+                "Atomic",
+                "webui",
+                "test-model",
+                time.time() - 4_000,
+                time.time() - 3_000,
+                "compression",
+                str(recovery_state["workspace"]),
+                None,
+                None,
+            ),
+        )
+    recovery_state["config"].SESSIONS.clear()
+
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(
+        recovery_state["body"]
+    )
+
+    assert result.get("stream_id")
+    rebuilt = json.loads(tip_path.read_text(encoding="utf-8"))
+    assert rebuilt["session_id"] == "session-1"
+    assert rebuilt["parent_session_id"] == root_id
+    assert rebuilt["pre_compression_snapshot"] is False
+    assert rebuilt["workspace"] == str(recovery_state["workspace"])
+    assert rebuilt["messages"][0]["content"] == recovery_state["messages"][0]["content"]
+
+
+def test_atomic_recovery_does_not_rebuild_missing_branch_child_from_compression_parent(
+    recovery_state,
+):
+    parent_id = "compression-parent"
+    tip_path = recovery_state["session_dir"] / "session-1.json"
+    parent_path = recovery_state["session_dir"] / f"{parent_id}.json"
+    parent_payload = json.loads(tip_path.read_text(encoding="utf-8"))
+    parent_payload.update(
+        {
+            "session_id": parent_id,
+            "pre_compression_snapshot": True,
+            "parent_session_id": None,
+        }
+    )
+    parent_path.write_text(json.dumps(parent_payload), encoding="utf-8")
+    tip_path.unlink()
+
+    with sqlite3.connect(recovery_state["state_db"]) as con:
+        con.execute("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")
+        con.execute("ALTER TABLE sessions ADD COLUMN model_config TEXT")
+        con.execute(
+            "UPDATE sessions SET parent_session_id = ?, model_config = ? WHERE id = ?",
+            (
+                parent_id,
+                json.dumps({"_branched_from": parent_id}),
+                "session-1",
+            ),
+        )
+        con.execute(
+            """
+            INSERT INTO sessions
+                (id, title, source, model, started_at, ended_at, end_reason,
+                 cwd, git_repo_root, parent_session_id, model_config)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                parent_id,
+                "Atomic",
+                "webui",
+                "test-model",
+                time.time() - 4_000,
+                time.time() - 3_000,
+                "compression",
+                str(recovery_state["workspace"]),
+                None,
+                None,
+                None,
+            ),
+        )
+    recovery_state["config"].SESSIONS.clear()
+
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(
+        recovery_state["body"]
+    )
+
+    assert result.get("_status") == 409, result
+    assert "sidecar" in result["error"].lower()
+    assert not tip_path.exists()
+
+
+def test_atomic_recovery_rejects_ended_compression_segment_when_tip_exists(
+    recovery_state,
+):
+    with sqlite3.connect(recovery_state["state_db"]) as con:
+        con.execute("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT")
+        con.execute("ALTER TABLE sessions ADD COLUMN model_config TEXT")
+        con.execute(
+            "UPDATE sessions SET ended_at = ?, end_reason = 'compression' WHERE id = ?",
+            (time.time() - 1_000, "session-1"),
+        )
+        con.execute(
+            """
+            INSERT INTO sessions
+                (id, title, source, model, started_at, ended_at, end_reason,
+                 cwd, git_repo_root, parent_session_id, model_config)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "session-tip",
+                "Atomic",
+                "webui",
+                "test-model",
+                time.time() - 900,
+                None,
+                None,
+                str(recovery_state["workspace"]),
+                None,
+                "session-1",
+                None,
+            ),
+        )
+
+    result = recovery_state["atomic_recovery"].start_atomic_webui_recovery(
+        recovery_state["body"]
+    )
+
+    assert result.get("_status") == 409, result
+    assert "canonical compression tip" in result["error"].lower()
+    assert recovery_state["config"].STREAMS == {}
+
+
 def test_internal_recovery_auth_requires_loopback_and_valid_durable_hmac(monkeypatch):
     from api import atomic_recovery
 

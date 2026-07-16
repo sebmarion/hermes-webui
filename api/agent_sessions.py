@@ -3,11 +3,91 @@ import logging
 import os
 import json
 import sqlite3
+import time
 from collections.abc import Iterable
 from contextlib import closing
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def read_shared_session_activity(
+    db_path: Path,
+    session_ids: list[str] | set[str] | None = None,
+    *,
+    now: float | None = None,
+    ttl_seconds: float = 20.0,
+) -> dict[str, dict]:
+    """Read fresh cross-surface worker activity without mutating state.db."""
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return {}
+    wanted = {str(sid) for sid in (session_ids or []) if str(sid)}
+    cutoff = float(now if now is not None else time.time()) - max(0.0, float(ttl_seconds))
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_activity'"
+            ).fetchone()
+            if table is None:
+                return {}
+            rows = []
+            if wanted:
+                wanted_list = list(wanted)
+                for start in range(0, len(wanted_list), 500):
+                    chunk = wanted_list[start : start + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows.extend(
+                        conn.execute(
+                            f"""
+                            SELECT session_id, phase, started_at, heartbeat_at
+                            FROM session_activity
+                            WHERE heartbeat_at >= ?
+                              AND session_id IN ({placeholders})
+                            """,
+                            (cutoff, *chunk),
+                        ).fetchall()
+                    )
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT session_id, phase, started_at, heartbeat_at
+                    FROM session_activity
+                    WHERE heartbeat_at >= ?
+                    """,
+                    (cutoff,),
+                ).fetchall()
+    except Exception:
+        logger.debug("Failed to read shared session activity from %s", db_path, exc_info=True)
+        return {}
+
+    activity: dict[str, dict] = {}
+    for raw in rows:
+        sid = str(raw["session_id"] or "").strip()
+        if not sid:
+            continue
+        try:
+            started = float(raw["started_at"] or 0)
+            heartbeat = float(raw["heartbeat_at"] or 0)
+        except (TypeError, ValueError):
+            continue
+        previous = activity.get(sid)
+        if previous is None:
+            activity[sid] = {
+                "is_working": True,
+                "activity_phase": str(raw["phase"] or "running"),
+                "activity_started_at": started,
+                "activity_heartbeat_at": heartbeat,
+            }
+            continue
+        previous["activity_started_at"] = min(
+            float(previous["activity_started_at"]), started
+        )
+        if heartbeat >= float(previous["activity_heartbeat_at"]):
+            previous["activity_heartbeat_at"] = heartbeat
+            previous["activity_phase"] = str(raw["phase"] or "running")
+    return activity
 
 
 def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> sqlite3.Connection:
@@ -390,6 +470,17 @@ def _continuation_root_id(
     return root_id
 
 
+def _is_generated_continuation_title(
+    tip_title: str | None,
+    root_title: str | None,
+) -> bool:
+    """Return whether ``tip_title`` is the automatic ``root #N`` variant."""
+    tip = str(tip_title or '').strip()
+    root = str(root_title or '').strip()
+    prefix = f'{root} #'
+    return bool(root and tip.startswith(prefix) and tip[len(prefix):].isdigit())
+
+
 def _project_agent_session_rows(
     rows: list[dict],
     *,
@@ -549,12 +640,17 @@ def _project_agent_session_rows(
         ):
             if key in tip:
                 merged[key] = tip[key]
-        # Titles follow the visible continuation tip just like message count
-        # and activity. Keeping the compressed root title here makes WebUI
-        # disagree with Hermes One whenever a continuation generated a new
-        # title for the same logical conversation.
-        if compression_only and tip.get('title'):
-            merged['title'] = tip['title']
+        # A generated ``Root title #N`` names a physical continuation, not a
+        # new logical conversation. Keep the root title for that exact shape,
+        # while preserving a genuinely renamed continuation title.
+        root_title = str(row.get('title') or '').strip()
+        tip_title = str(tip.get('title') or '').strip()
+        if compression_only and tip_title:
+            merged['title'] = (
+                root_title
+                if _is_generated_continuation_title(tip_title, root_title)
+                else tip_title
+            )
         if any(
             bool(rows_by_id.get(member_id, {}).get('pinned'))
             for member_id in lineage_member_ids
@@ -565,8 +661,8 @@ def _project_agent_session_rows(
             # ...), not opaque compression snapshots. Keep navigation pointed at
             # the latest tip and show that tip's title so the newest conversation
             # can be found by its visible TUI name.
-            if tip.get('title'):
-                merged['title'] = tip.get('title')
+            if tip_title and not compression_only:
+                merged['title'] = tip_title
             if tip.get('source'):
                 merged['source'] = tip.get('source')
         else:
@@ -1198,7 +1294,12 @@ def read_session_lineage_report(db_path: Path, session_id: str | None, max_hops:
     }
 
 
-def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[str]) -> dict[str, dict]:
+def read_session_lineage_metadata(
+    db_path: Path,
+    session_ids: list[str] | set[str],
+    *,
+    include_message_stats: bool = True,
+) -> dict[str, dict]:
     """Return compression-lineage metadata for known WebUI sidebar sessions.
 
     WebUI sessions are persisted as JSON files, but Hermes Agent also mirrors
@@ -1208,6 +1309,9 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
     group logical continuations without mutating or deleting any session files.
 
     Missing DBs, old schemas, or incomplete rows degrade to an empty mapping.
+    Callers that only need parent/child classification can disable message
+    statistics to avoid aggregating the potentially multi-gigabyte messages
+    table on a cold sidebar request.
     """
     wanted = {str(sid) for sid in (session_ids or []) if sid}
     db_path = Path(db_path)
@@ -1249,12 +1353,13 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
             # except below, and silently disable lineage collapse forever.
             # (Opus pre-release review of v0.50.251, SHOULD-FIX 2.)
             IN_CHUNK = 500
+            MAX_LINEAGE_HOPS = 256
             rows: dict[str, dict] = {}
             to_fetch = set(wanted)
-            # Cap walk depth to bound worst-case query count. Real lineage
-            # chains seen in production are <10 segments; anything longer is
-            # almost certainly pathological data and not worth chasing.
-            for _hop in range(20):
+            # Keep the walk bounded, but allow long-lived conversations with
+            # repeated compression. Production lineages above 50 segments are
+            # valid; the old 20-hop cap split them into fake top-level chats.
+            for _hop in range(MAX_LINEAGE_HOPS):
                 if not to_fetch:
                     break
                 fetch_list = list(to_fetch)
@@ -1283,7 +1388,7 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
             # collapse metadata enough information to choose the active branch.
             to_expand = set(rows)
             expanded: set[str] = set()
-            for _hop in range(20):
+            for _hop in range(MAX_LINEAGE_HOPS):
                 frontier = [sid for sid in to_expand if sid not in expanded]
                 if not frontier:
                     break
@@ -1309,8 +1414,10 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
                 expanded.update(frontier)
 
             message_stats: dict[str, dict] = {}
-            cur.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'messages'")
-            has_messages_table = cur.fetchone() is not None
+            has_messages_table = False
+            if include_message_stats:
+                cur.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'messages'")
+                has_messages_table = cur.fetchone() is not None
             # Older/minimal state.db schemas can have a `messages` table WITHOUT a
             # `timestamp` column (or with a non-numeric one). Detect the columns
             # rather than gating on table existence alone: require `session_id`,
@@ -1458,5 +1565,35 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
             tip_id, tip_depth = lineage_tip_cache[root_id]
             entry['_lineage_tip_id'] = tip_id
             entry['_compression_segment_count'] = max(segment_count, tip_depth)
+
+            # The physical tip's immediate parent is another compression
+            # segment, but the logical lineage root can itself be a child of a
+            # prior conversation. Propagate that outer relationship to the tip
+            # so bounded/cold sidebar projections do not promote each
+            # continuation lineage into a separate top-level conversation.
+            lineage_root = rows.get(root_id)
+            outer_parent_id = (
+                lineage_root.get('parent_session_id') if lineage_root else None
+            )
+            outer_parent = rows.get(outer_parent_id) if outer_parent_id else None
+            if (
+                outer_parent_id
+                and outer_parent
+                and not _is_continuation_session(outer_parent, lineage_root)
+            ):
+                entry['parent_session_id'] = outer_parent_id
+                entry['relationship_type'] = 'child_session'
+                entry['parent_title'] = outer_parent.get('title')
+                entry['parent_source'] = outer_parent.get('source')
+                outer_source = str(outer_parent.get('source') or '').strip().lower()
+                root_source = str(lineage_root.get('source') or '').strip().lower()
+                if outer_source and root_source and outer_source != root_source:
+                    entry['_cross_surface_child_session'] = True
+                parent_root = _continuation_root_id(rows, outer_parent_id)
+                if parent_root:
+                    entry['_parent_lineage_root_id'] = parent_root
+                    if parent_root not in lineage_tip_cache:
+                        lineage_tip_cache[parent_root] = freshest_continuation_tip(parent_root)
+                    entry['_parent_lineage_tip_id'] = lineage_tip_cache[parent_root][0]
 
     return metadata

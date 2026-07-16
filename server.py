@@ -746,6 +746,4 @@ def main() -> None:
             stop_session_channel_reaper()
         except Exception:
             logger.debug("Failed to stop SessionChannel reaper during shutdown", exc_info=True)
-
-if __name__ == '__main__':
-    main()
+if __name__ == '__main__': main()

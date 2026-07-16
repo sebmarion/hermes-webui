@@ -326,7 +326,7 @@ def test_external_state_projection_not_deduped_by_webui_source_guard():
 
 
 def test_sessions_endpoint_suppresses_duplicate_webui_state_projection(monkeypatch):
-    """The /api/sessions merge should not add WebUI state.db lineage duplicates."""
+    """The /api/sessions merge should expose one row per shared lineage."""
     import api.profiles as profiles
     import api.routes as routes
 
@@ -386,7 +386,14 @@ def test_sessions_endpoint_suppresses_duplicate_webui_state_projection(monkeypat
     session_ids = [row["session_id"] for row in handler.json_body()["sessions"]]
     assert "visible_tip" in session_ids
     assert "state_projection_tip" not in session_ids
-    assert "telegram_tip" in session_ids
+    # Cross-surface rows sharing the same canonical lineage are reference
+    # metadata, not a second top-level conversation.
+    assert "telegram_tip" not in session_ids
+    reference_ids = {
+        row["session_id"]
+        for row in handler.json_body().get("sidebar_reference_sessions", [])
+    }
+    assert "telegram_tip" in reference_ids
 
 
 def test_messaging_session_loader_prefers_longer_sidecar_transcript():

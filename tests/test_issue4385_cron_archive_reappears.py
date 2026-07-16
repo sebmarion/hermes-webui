@@ -234,6 +234,48 @@ def test_webhook_state_projection_preserves_archived_sidecar(monkeypatch, tmp_pa
     assert row["archived"] is True
 
 
+def test_claude_code_projection_preserves_archived_sidecar(monkeypatch, tmp_path):
+    """Archived imported Claude Code rows must not reappear from the raw scan."""
+    import api.models as models
+
+    sid = "claude_code_archived_run_packet"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    (session_dir / f"{sid}.json").write_text(
+        '{"session_id": "%s", "title": "Orchestrero Run Packet",'
+        ' "created_at": 1.0, "updated_at": 2.0, "archived": true,'
+        ' "messages": []}' % sid,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(
+        models,
+        "get_claude_code_sessions",
+        lambda: [
+            {
+                "session_id": sid,
+                "title": "Orchestrero Run Packet",
+                "source_tag": "claude_code",
+                "raw_source": "claude_code",
+                "session_source": "external_agent",
+                "archived": False,
+            }
+        ],
+    )
+    models.clear_sidecar_metadata_cache()
+
+    rows = models._load_cli_sessions_uncached(
+        tmp_path,
+        tmp_path / "missing.db",
+        "default",
+        source_filter="claude_code",
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == sid
+    assert rows[0]["archived"] is True
+
+
 def test_archived_webhook_projection_reaches_sidebar_payload(monkeypatch):
     """Archived webhook projections are counted by default and fetched on demand."""
     import api.routes as routes
