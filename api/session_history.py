@@ -34,6 +34,24 @@ _OPTIONAL_COLUMNS = (
 )
 
 
+class ResolvedSessionHistoryUnavailable(RuntimeError):
+    """The bounded reader cannot distinguish history from an empty result."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
+
+
+def _unavailable_history(
+    reason: str,
+    *,
+    require_available: bool,
+) -> list[dict[str, Any]]:
+    if require_available:
+        raise ResolvedSessionHistoryUnavailable(reason)
+    return []
+
+
 def _normalize_member_ids(member_ids: Iterable[str]) -> tuple[str, ...]:
     if isinstance(member_ids, (str, bytes)):
         raise ValueError("member_ids must be an iterable of session IDs")
@@ -101,6 +119,7 @@ def read_resolved_session_history(
     db_path: Path,
     member_ids: Iterable[str],
     include_inactive: bool = False,
+    require_available: bool = False,
 ) -> list[dict[str, Any]]:
     """Read chronological messages for explicit, previously resolved members.
 
@@ -114,7 +133,10 @@ def read_resolved_session_history(
 
     path = Path(db_path)
     if not path.exists():
-        return []
+        return _unavailable_history(
+            "missing_database",
+            require_available=require_available,
+        )
 
     member_order = {member_id: index for index, member_id in enumerate(members)}
     collected: list[tuple[dict[str, Any], Any, int, int]] = []
@@ -131,7 +153,10 @@ def read_resolved_session_history(
             if not {"id", "session_id", "role", "content", "timestamp"}.issubset(
                 available
             ):
-                return []
+                return _unavailable_history(
+                    "unsupported_schema",
+                    require_available=require_available,
+                )
 
             selected = ["id", "session_id", "role", "content"]
             selected.append("timestamp")
@@ -190,7 +215,11 @@ def read_resolved_session_history(
                             )
                         )
                         sequence += 1
-    except Exception:
+    except ResolvedSessionHistoryUnavailable:
+        raise
+    except Exception as exc:
+        if require_available:
+            raise ResolvedSessionHistoryUnavailable("read_failed") from exc
         return []
 
     collected.sort(

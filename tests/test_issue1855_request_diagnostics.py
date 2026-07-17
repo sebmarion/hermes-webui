@@ -1,9 +1,12 @@
 import json
 import logging
+from types import MappingProxyType, SimpleNamespace
 from pathlib import Path
+from urllib.parse import urlparse
 
 import api.models as models
 from api.models import Session
+from api.agent_sessions import SharedSessionResolution, shared_state_db_identity
 from api.request_diagnostics import RequestDiagnostics
 
 
@@ -108,3 +111,94 @@ def test_issue1855_target_routes_are_wired_to_diagnostics():
         "response_write",
     ):
         assert stage in src
+
+
+def test_session_canonical_resolution_stage_precedes_resolver_and_survives_early_return(
+    tmp_path,
+    monkeypatch,
+):
+    import api.routes as routes
+
+    events = []
+
+    class RouteDiag:
+        def stage(self, name):
+            events.append(f"stage:{name}")
+
+        def finish(self):
+            events.append("finish")
+
+    db_path = tmp_path / "state.db"
+    row = MappingProxyType(
+        {
+            "id": "tip",
+            "source": "webui",
+            "title": "private title",
+            "started_at": 1,
+            "message_count": 1,
+            "archived": False,
+            "pinned": False,
+        }
+    )
+    resolution = SharedSessionResolution(
+        requested_id="root",
+        canonical_id="tip",
+        root_id="root",
+        tip_id="tip",
+        member_ids=("root", "tip"),
+        canonical_row=row,
+        lineage_fingerprint="sha256:test",
+        global_projection_generation_hint=1,
+        mode="navigation",
+        status="found",
+        database_identity=shared_state_db_identity(db_path),
+    )
+    monkeypatch.setattr(
+        routes.RequestDiagnostics,
+        "maybe_start",
+        staticmethod(lambda *_args, **_kwargs: RouteDiag()),
+    )
+    monkeypatch.setattr(routes, "_active_state_db_path", lambda: db_path)
+
+    def resolve(_db_path, _sid):
+        events.append("resolve_shared_session")
+        return resolution
+
+    def get_session(_sid, metadata_only=False):
+        events.append("get_session")
+        return SimpleNamespace(profile="other")
+
+    monkeypatch.setattr(routes, "resolve_shared_session", resolve)
+    monkeypatch.setattr(
+        routes,
+        "resolve_shared_session_id",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy resolver must not run")
+        ),
+    )
+    monkeypatch.setattr(routes, "get_session", get_session)
+    monkeypatch.setattr(
+        routes,
+        "_session_visible_to_active_profile",
+        lambda _profile, _handler: False,
+    )
+    captured = {}
+
+    def respond(_handler, payload, status=200, extra_headers=None):
+        captured.update(payload=payload, status=status)
+        return payload
+
+    monkeypatch.setattr(routes, "j", respond)
+    handler = SimpleNamespace(_safe_webui_print=lambda _message: None)
+
+    routes.handle_get(
+        handler,
+        urlparse("/api/session?session_id=root&messages=0&resolve_model=0"),
+    )
+
+    assert captured["status"] == 409
+    assert events.index("stage:canonical_resolution") < events.index(
+        "resolve_shared_session"
+    )
+    assert events.index("resolve_shared_session") < events.index("get_session")
+    assert events.index("get_session") < events.index("finish")

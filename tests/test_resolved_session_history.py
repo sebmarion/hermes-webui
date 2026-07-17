@@ -232,7 +232,10 @@ def test_duplicate_and_missing_member_ids_are_safe(tmp_path):
 
 
 def test_missing_timestamp_or_other_required_schema_fails_closed(tmp_path):
-    from api.session_history import read_resolved_session_history
+    from api.session_history import (
+        ResolvedSessionHistoryUnavailable,
+        read_resolved_session_history,
+    )
 
     without_ts = tmp_path / "without-timestamp.db"
     _make_messages_db(without_ts, include_timestamp=False)
@@ -256,6 +259,12 @@ def test_missing_timestamp_or_other_required_schema_fails_closed(tmp_path):
     without_id = tmp_path / "without-id.db"
     _make_messages_db(without_id, include_id=False)
     assert read_resolved_session_history(db_path=without_id, member_ids=("root",)) == []
+    with pytest.raises(ResolvedSessionHistoryUnavailable, match="unsupported_schema"):
+        read_resolved_session_history(
+            db_path=without_id,
+            member_ids=("root",),
+            require_available=True,
+        )
 
 
 def test_output_matches_current_state_db_reader(tmp_path, monkeypatch):

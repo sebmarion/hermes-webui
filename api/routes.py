@@ -41,13 +41,17 @@ from api.agent_sessions import (
     _looks_like_default_cli_title,
     is_cli_session_row,
     is_cli_session_row_visible,
+    normalize_agent_session_source,
     resolve_shared_session,
     resolve_shared_session_id,
     shared_state_db_identity,
     read_session_lineage_metadata,
     read_session_lineage_report,
 )
-from api.session_history import read_resolved_session_history
+from api.session_history import (
+    ResolvedSessionHistoryUnavailable,
+    read_resolved_session_history,
+)
 from api.compression_anchor import visible_messages_for_anchor
 from api.compression_recovery import (
     COMPRESSION_RECOVERY_ACTION_START_FOCUSED,
@@ -8319,7 +8323,13 @@ def _is_claimable_cli_source(cli_meta: dict, state_db_source: str = "") -> tuple
     return True, ""
 
 
-def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
+def _claim_or_synthesize_cli_session(
+    sid: str,
+    cli_meta: dict = None,
+    *,
+    resolved_messages=None,
+    resolved_state_row=None,
+):
     """Resolve a session_id that has no WebUI sidecar.
 
     Returns ``(session_or_None, reason)``. Reasons:
@@ -8365,6 +8375,12 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
     building a sidebar dict) can pass it in to avoid the redundant
     lookup; callers without it (POST path, tests) pass nothing and the
     helper does the lookup itself.
+
+    ``resolved_messages`` and ``resolved_state_row`` are optional receipt
+    inputs for callers that already resolved a bounded shared-session
+    snapshot.  Supplying them prevents this helper from independently
+    re-reading history or state metadata.  Existing callers omit them and
+    retain the legacy targeted reads.
 
     Closing the GET-vs-POST asymmetry for foreign-origin sessions: GET
     ``/api/session`` and POST ``/api/chat/start`` both call this helper
@@ -8450,7 +8466,11 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
         return None, "was_webui"
     if cli_meta is None:
         cli_meta = _lookup_cli_session_metadata(sid) or {}
-    msgs = get_cli_session_messages(sid)
+    msgs = (
+        list(resolved_messages)
+        if resolved_messages is not None
+        else get_cli_session_messages(sid)
+    )
     if not msgs:
         return None, "no_foreign_state"
     # TUI/Desktop sessions often have empty cli_meta (they don't appear in
@@ -8459,23 +8479,29 @@ def _claim_or_synthesize_cli_session(sid: str, cli_meta: dict = None):
     # populate the Session's source-tag metadata so the sidebar still
     # renders the correct badge for these sessions.
     state_db_source = ""
-    state_db_row = None
-    try:
-        from api.models import _active_state_db_path
-        db_path = _active_state_db_path()
-        if db_path and Path(db_path).exists():
-            import sqlite3 as _sqlite
-            with closing(_sqlite.connect(str(db_path))) as _conn:
-                _conn.row_factory = _sqlite.Row
-                _row = _conn.execute(
-                    "SELECT source, title, model, cwd, started_at, ended_at "
-                    "FROM sessions WHERE id = ?", (sid,)
-                ).fetchone()
-                if _row is not None:
-                    state_db_row = dict(_row)
-                    state_db_source = str(_row["source"] or "").strip().lower()
-    except Exception:
-        state_db_source = ""
+    state_db_row = (
+        dict(resolved_state_row)
+        if resolved_state_row is not None
+        else None
+    )
+    if resolved_state_row is None:
+        try:
+            from api.models import _active_state_db_path
+            db_path = _active_state_db_path()
+            if db_path and Path(db_path).exists():
+                import sqlite3 as _sqlite
+                with closing(_sqlite.connect(str(db_path))) as _conn:
+                    _conn.row_factory = _sqlite.Row
+                    _row = _conn.execute(
+                        "SELECT source, title, model, cwd, started_at, ended_at "
+                        "FROM sessions WHERE id = ?", (sid,)
+                    ).fetchone()
+                    if _row is not None:
+                        state_db_row = dict(_row)
+        except Exception:
+            state_db_row = None
+    if state_db_row:
+        state_db_source = str(state_db_row.get("source") or "").strip().lower()
     # Populate source metadata from state.db when cli_meta is empty so the
     # synthesized Session carries the right source_tag/source_label.  Only
     # fill fields that are actually missing from cli_meta; the foreign store
@@ -9309,6 +9335,100 @@ def _session_requires_cli_metadata_lookup(session) -> bool:
         _field("source_label"),
         _field("platform"),
     ))
+
+
+def _cli_metadata_from_resolution(
+    resolution: SharedSessionResolution,
+    targeted: dict | None = None,
+) -> dict:
+    """Overlay one bounded state-db row onto targeted external metadata."""
+    metadata = dict(targeted or {})
+    row = dict(resolution.canonical_row or {})
+    if not row:
+        return metadata
+
+    raw_source = str(row.get("source") or "").strip().lower()
+    source_meta = normalize_agent_session_source(raw_source)
+    metadata.update(
+        {
+            "session_id": resolution.canonical_id,
+            "source": raw_source or row.get("source"),
+            "source_tag": source_meta.get("raw_source"),
+            "raw_source": source_meta.get("raw_source"),
+            "session_source": (
+                row.get("session_source") or source_meta.get("session_source")
+            ),
+            "source_label": source_meta.get("source_label"),
+            "parent_session_id": row.get("parent_session_id"),
+            "end_reason": row.get("end_reason"),
+            "actual_message_count": row.get("actual_message_count"),
+            "message_count": row.get("message_count"),
+            "archived": bool(row.get("archived")),
+            "pinned": bool(row.get("pinned")),
+            "_lineage_root_id": resolution.root_id,
+            "_lineage_tip_id": resolution.tip_id,
+            "_compression_segment_count": len(resolution.member_ids) or 1,
+        }
+    )
+    if str(row.get("title") or "").strip():
+        metadata["title"] = row["title"]
+    if row.get("model"):
+        metadata["model"] = row["model"]
+    if row.get("cwd"):
+        metadata["workspace"] = row["cwd"]
+        metadata["cwd"] = row["cwd"]
+    if row.get("started_at") is not None:
+        metadata["created_at"] = row["started_at"]
+    last_activity = row.get("last_activity") or row.get("ended_at")
+    if last_activity is not None:
+        metadata["updated_at"] = last_activity
+        metadata["last_message_at"] = last_activity
+    return metadata
+
+
+def _targeted_cli_metadata_for_resolution(
+    resolution: SharedSessionResolution,
+) -> dict:
+    """Read one external metadata row without the legacy collection fallback."""
+    try:
+        targeted = get_cli_session_metadata(resolution.canonical_id) or {}
+    except Exception:
+        targeted = {}
+    return _cli_metadata_from_resolution(resolution, targeted)
+
+
+def _apply_resolution_metadata_to_payload(
+    payload: dict,
+    resolution: SharedSessionResolution,
+) -> dict:
+    """Make request-snapshot state metadata authoritative for serialization."""
+    row = dict(resolution.canonical_row or {})
+    if not row:
+        return payload
+    if str(row.get("title") or "").strip():
+        payload["title"] = row["title"]
+    if row.get("cwd"):
+        payload["workspace"] = row["cwd"]
+        payload["cwd"] = row["cwd"]
+    if "archived" in row:
+        payload["archived"] = bool(row.get("archived"))
+    if "pinned" in row:
+        payload["pinned"] = bool(row.get("pinned"))
+
+    raw_source = str(row.get("source") or "").strip().lower()
+    if raw_source:
+        source_meta = normalize_agent_session_source(raw_source)
+        payload["source"] = raw_source
+        payload["source_tag"] = source_meta.get("raw_source")
+        payload["raw_source"] = source_meta.get("raw_source")
+        payload["session_source"] = (
+            row.get("session_source") or source_meta.get("session_source")
+        )
+        payload["source_label"] = source_meta.get("source_label")
+    payload["lineage_root_id"] = resolution.root_id
+    payload["lineage_tip_id"] = resolution.tip_id
+    payload["compression_segment_count"] = len(resolution.member_ids) or 1
+    return payload
 
 
 def _is_messaging_session_id(sid: str) -> bool:
@@ -12843,7 +12963,10 @@ def handle_get(handler, parsed) -> bool:
             if _diag: _diag.finish()
             return j(handler, {"error": "session_id is required"}, status=400)
         requested_sid = sid
-        sid = resolve_shared_session_id(_active_state_db_path(), sid)
+        state_db_path = _active_state_db_path()
+        if _diag: _diag.stage("canonical_resolution")
+        resolution = resolve_shared_session(state_db_path, requested_sid)
+        sid = resolution.canonical_id
         # ?messages=0 skips the message payload for fast session switching.
         # The frontend uses this when switching conversations in the sidebar
         # (only needs metadata). The full message array is loaded lazily
@@ -12898,7 +13021,10 @@ def handle_get(handler, parsed) -> bool:
                 return bad(handler, "Session not found", 404)
             original_stream_id = getattr(s, "active_stream_id", None)
             _clear_stale_stream_state(s)
-            cli_meta = _lookup_cli_session_metadata(sid) if _session_requires_cli_metadata_lookup(s) else {}
+            if _session_requires_cli_metadata_lookup(s):
+                cli_meta = _targeted_cli_metadata_for_resolution(resolution)
+            else:
+                cli_meta = {}
             is_messaging_session = _is_messaging_session_record(s) or _is_messaging_session_record(cli_meta)
             cli_messages = []
             state_db_messages = []
@@ -12908,7 +13034,7 @@ def handle_get(handler, parsed) -> bool:
             if is_messaging_session:
                 cli_messages = get_cli_session_messages(sid)
             elif load_messages:
-                if msg_limit is not None:
+                if msg_limit is not None and len(resolution.member_ids) == 1:
                     (
                         state_db_since_timestamp,
                         limited_sidecar_messages,
@@ -12917,13 +13043,28 @@ def handle_get(handler, parsed) -> bool:
                         msg_limit,
                         msg_before=msg_before,
                     )
-                _state_db_reader_kwargs = {"profile": _session_profile}
-                if state_db_since_timestamp is not None:
-                    _state_db_reader_kwargs["since_timestamp"] = state_db_since_timestamp
-                state_db_messages = get_state_db_session_messages(
-                    sid,
-                    **_state_db_reader_kwargs,
-                )
+                if msg_limit is not None and len(resolution.member_ids) == 1:
+                    _state_db_reader_kwargs = {"profile": _session_profile}
+                    if state_db_since_timestamp is not None:
+                        _state_db_reader_kwargs["since_timestamp"] = (
+                            state_db_since_timestamp
+                        )
+                    state_db_messages = get_state_db_session_messages(
+                        sid,
+                        **_state_db_reader_kwargs,
+                    )
+                else:
+                    try:
+                        state_db_messages = read_resolved_session_history(
+                            db_path=state_db_path,
+                            member_ids=resolution.member_ids,
+                            require_available=True,
+                        )
+                    except ResolvedSessionHistoryUnavailable:
+                        state_db_messages = get_state_db_session_messages(
+                            sid,
+                            profile=_session_profile,
+                        )
             elif not is_messaging_session:
                 # Metadata-only callers still need the same append-only
                 # reconciliation contract as full loads so stale/replayed
@@ -13183,6 +13324,7 @@ def handle_get(handler, parsed) -> bool:
                 # keep the raw count available as ``actual_message_count`` but
                 # do not let it make the frontend expect phantom messages.
                 raw["message_count"] = _merged_message_count
+            raw = _apply_resolution_metadata_to_payload(raw, resolution)
             # Signal to the frontend that older messages were omitted. The
             # message window cursor already reflects visible-row pagination and
             # avoids false positives when raw hidden tool rows exceed msg_limit.
@@ -13249,7 +13391,14 @@ def handle_get(handler, parsed) -> bool:
             # _session_index_marks_was_webui) and the #4911 source ownership
             # gate (via _is_claimable_cli_source) so the two endpoints can't
             # drift on foreign-session semantics.
-            cli_meta = _lookup_cli_session_metadata(sid)
+            cli_meta = _targeted_cli_metadata_for_resolution(resolution)
+            if resolution.canonical_row is not None and not cli_meta.get("profile"):
+                # The resolution row came from the already-selected active
+                # profile's state.db. A failed targeted metadata lookup must
+                # not turn that known-local row into profile=None (and a false
+                # 404 under non-default profiles).
+                cli_meta = dict(cli_meta)
+                cli_meta["profile"] = _get_active_profile_name()
             _session_profile = (cli_meta or {}).get("profile") or None
             if not _session_visible_to_active_profile(_session_profile, handler):
                 if _session_profile:
@@ -13267,7 +13416,30 @@ def handle_get(handler, parsed) -> bool:
                 # otherwise emit a useless 409 with profile=null and skip the
                 # frontend self-heal + spin the SSE reconnect against a dead sid.
                 return bad(handler, "Session not found", 404)
-            synth, reason = _claim_or_synthesize_cli_session(sid, cli_meta=cli_meta or {})
+            if resolution.canonical_row is not None:
+                try:
+                    resolved_messages = read_resolved_session_history(
+                        db_path=state_db_path,
+                        member_ids=resolution.member_ids,
+                        require_available=True,
+                    )
+                except ResolvedSessionHistoryUnavailable:
+                    synth, reason = _claim_or_synthesize_cli_session(
+                        sid,
+                        cli_meta=cli_meta or {},
+                    )
+                else:
+                    synth, reason = _claim_or_synthesize_cli_session(
+                        sid,
+                        cli_meta=cli_meta or {},
+                        resolved_messages=resolved_messages,
+                        resolved_state_row=dict(resolution.canonical_row),
+                    )
+            else:
+                synth, reason = _claim_or_synthesize_cli_session(
+                    sid,
+                    cli_meta=cli_meta or {},
+                )
             if reason == "was_webui":
                 # Deleted WebUI session: 404 so the client self-heals
                 # (clears stale /session/<id> URL and localStorage, #2782).
@@ -13323,6 +13495,10 @@ def handle_get(handler, parsed) -> bool:
             }
             attach_todo_state(sess, msgs)
             sess = _merge_cli_sidebar_metadata(sess, cli_meta)
+            sess = _apply_resolution_metadata_to_payload(sess, resolution)
+            sess["canonical_session_id"] = sid
+            if requested_sid != sid:
+                sess["requested_session_id"] = requested_sid
             return j(handler, {"session": redact_session_data(sess)})
 
     if parsed.path == "/api/session/lineage/report":
@@ -17257,10 +17433,18 @@ def _shared_session_detail_payload(
         )
     messages = []
     if include_messages:
-        state_messages = read_resolved_session_history(
-            db_path=db_path,
-            member_ids=resolution.member_ids,
-        )
+        try:
+            state_messages = read_resolved_session_history(
+                db_path=db_path,
+                member_ids=resolution.member_ids,
+                require_available=True,
+            )
+        except ResolvedSessionHistoryUnavailable:
+            state_messages = get_state_db_session_messages(
+                canonical_sid,
+                stitch_continuations=True,
+                compression_only=True,
+            )
         sidecar_messages = list(getattr(sidecar, "messages", []) or []) if sidecar else []
         messages = merge_session_messages_append_only(sidecar_messages, state_messages)
 
