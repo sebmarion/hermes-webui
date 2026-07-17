@@ -53,6 +53,17 @@ from api.session_history import (
     ResolvedSessionHistoryUnavailable,
     read_resolved_session_history,
 )
+from api.session_message_paging import (
+    MessageCursorError,
+    MessageCursorExpected,
+    MessageCursorRequestMismatch,
+    MessageCursorStateMismatch,
+    MessagePageValidationError,
+    decode_message_cursor,
+    evaluate_message_page_shadow,
+    message_cursor_database_identity_digest,
+    parse_message_paging_negotiation,
+)
 from api.compression_anchor import visible_messages_for_anchor
 from api.compression_recovery import (
     COMPRESSION_RECOVERY_ACTION_START_FOCUSED,
@@ -12968,6 +12979,25 @@ def handle_get(handler, parsed) -> bool:
         # pending watchdog entry; without it the entry stays for the full
         # 5s slow-request timeout and emits a spurious "Slow WebUI request
         # still running" log. Idempotent — finish() no-ops if already called.
+        try:
+            message_paging = parse_message_paging_negotiation(parsed.query)
+        except MessagePageValidationError as exc:
+            _finish_session_diagnostics()
+            return j(
+                handler,
+                {"error": str(exc), "code": "invalid_message_paging"},
+                status=400,
+            )
+        _message_cursor_gate = str(
+            os.environ.get("HERMES_WEBUI_MESSAGE_CURSOR_V1", "off")
+        ).strip().lower()
+        if _message_cursor_gate not in {"shadow", "on"}:
+            _message_cursor_gate = "off"
+        _message_cursor_legacy_reason = (
+            "gate_off"
+            if _message_cursor_gate == "off"
+            else "receipt_unavailable"
+        )
         query = parse_qs(parsed.query)
         sid = query.get("session_id", [""])[0]
         if not sid:
@@ -12989,19 +13019,63 @@ def handle_get(handler, parsed) -> bool:
         # transcript rows. Hidden tool-result rows do not consume the budget;
         # they are included only when they sit inside the selected window and
         # are bounded before serialization. Older rows load on-demand.
-        _msg_limit = query.get("msg_limit", [None])[0]
-        try:
-            msg_limit = max(1, int(_msg_limit)) if _msg_limit else None
-        except (ValueError, TypeError):
-            msg_limit = None
+        if message_paging.requested:
+            msg_limit = message_paging.visible_limit
+        else:
+            _msg_limit = query.get("msg_limit", [None])[0]
+            try:
+                msg_limit = max(1, int(_msg_limit)) if _msg_limit else None
+            except (ValueError, TypeError):
+                msg_limit = None
         # ?msg_before=N — 0-based index into the full message array.
         # Returns messages before this index (for scroll-to-top lazy loading).
         # Combined with msg_limit for paging.
-        _msg_before = query.get("msg_before", [None])[0]
-        try:
-            msg_before = int(_msg_before) if _msg_before else None
-        except (ValueError, TypeError):
+        if message_paging.requested:
             msg_before = None
+        else:
+            _msg_before = query.get("msg_before", [None])[0]
+            try:
+                msg_before = int(_msg_before) if _msg_before else None
+            except (ValueError, TypeError):
+                msg_before = None
+
+        def _message_cursor_rejection(profile):
+            token = message_paging.cursor_token
+            if not token:
+                return None
+            expected = MessageCursorExpected(
+                profile=str(profile or "default"),
+                canonical_id=resolution.canonical_id,
+                lineage_fingerprint=resolution.lineage_fingerprint,
+                source_mode="state_db",
+                database_identity_digest=message_cursor_database_identity_digest(
+                    resolution.database_identity
+                ),
+                global_generation_hint=(
+                    resolution.global_projection_generation_hint
+                ),
+                receipt_generation=None,
+                member_ids=resolution.member_ids,
+            )
+            try:
+                decode_message_cursor(token, expected=expected)
+            except MessageCursorStateMismatch:
+                return 409, {
+                    "error": "Message cursor restart required",
+                    "code": "cursor_restart_required",
+                }
+            except (MessageCursorRequestMismatch, MessageCursorError):
+                return 400, {
+                    "error": "Invalid message cursor",
+                    "code": "invalid_message_cursor",
+                }
+            # Stage 2A never serves public cursor success without a validated
+            # exact-count/reconciliation receipt. A previously valid token must
+            # restart rather than silently mix cursor and legacy coordinates.
+            return 409, {
+                "error": "Message cursor restart required",
+                "code": "cursor_restart_required",
+            }
         # ?expand_renderable=1 is retained for compatibility with older
         # frontends. msg_limit now counts visible transcript rows by default, so
         # the flag no longer changes the server-side pagination semantics.
@@ -13010,7 +13084,12 @@ def handle_get(handler, parsed) -> bool:
         try:
             _t1 = _time.monotonic()
             if _diag: _diag.stage("t1_after_get_session_check")
-            s = get_session(sid, metadata_only=(not load_messages))
+            s = get_session(
+                sid,
+                metadata_only=(
+                    not load_messages or message_paging.cursor_token is not None
+                ),
+            )
             _session_profile = getattr(s, 'profile', None) or None
             if not _session_visible_to_active_profile(_session_profile, handler):
                 if _session_profile:
@@ -13030,6 +13109,15 @@ def handle_get(handler, parsed) -> bool:
                 # otherwise emit a useless 409 with profile=null.
                 _finish_session_diagnostics()
                 return bad(handler, "Session not found", 404)
+            _cursor_rejection = _message_cursor_rejection(_session_profile)
+            if _cursor_rejection is not None:
+                _cursor_status, _cursor_payload = _cursor_rejection
+                _finish_session_diagnostics()
+                return j(
+                    handler,
+                    _cursor_payload,
+                    status=_cursor_status,
+                )
             original_stream_id = getattr(s, "active_stream_id", None)
             _clear_stale_stream_state(s)
             if _session_requires_cli_metadata_lookup(s):
@@ -13159,6 +13247,62 @@ def handle_get(handler, parsed) -> bool:
                 )
                 if msg_limit is not None:
                     _truncated_msgs = _messages_for_limited_payload(_truncated_msgs)
+                if (
+                    message_paging.requested
+                    and _message_cursor_gate == "shadow"
+                    and message_paging.cursor_token is None
+                    and not is_messaging_session
+                    and resolution.status == "found"
+                ):
+                    try:
+                        _shadow_observation = evaluate_message_page_shadow(
+                            db_path=state_db_path,
+                            resolution=resolution,
+                            visible_limit=msg_limit,
+                            legacy_messages=_messages_for_limited_payload(_all_msgs),
+                        )
+                        _shadow_diagnostic = _shadow_observation.as_diagnostic()
+                    except Exception:
+                        # Shadow mode is observational. A probe failure can
+                        # never change the exact legacy response or expose its
+                        # transcript through an exception string.
+                        _shadow_diagnostic = {
+                            "stage": "state_message_page",
+                            "mode": "legacy_required",
+                            "matched": None,
+                            "fallback_reason": "shadow_error",
+                            "visible_count": 0,
+                            "raw_rows_examined": 0,
+                            "serialized_bytes": 0,
+                            "sql_count": 0,
+                            "query_plan_indexed": False,
+                        }
+                    if _diag:
+                        _diag.set_metric("message_page_shadow_attempted", 1)
+                        _diag.set_metric(
+                            "message_page_shadow_match",
+                            (
+                                -1
+                                if _shadow_diagnostic["matched"] is None
+                                else int(_shadow_diagnostic["matched"])
+                            ),
+                        )
+                        _diag.set_metric(
+                            "message_page_shadow_sql",
+                            _shadow_diagnostic["sql_count"],
+                        )
+                        _diag.set_metric(
+                            "message_page_shadow_rows",
+                            _shadow_diagnostic["raw_rows_examined"],
+                        )
+                        _diag.set_metric(
+                            "message_page_shadow_bytes",
+                            _shadow_diagnostic["serialized_bytes"],
+                        )
+                    logger.info(
+                        "message_page_shadow %s",
+                        json.dumps(_shadow_diagnostic, sort_keys=True),
+                    )
                 _truncated_msgs = _hydrate_anchor_activity_scenes(
                     _truncated_msgs,
                     getattr(s, "anchor_activity_scenes", None),
@@ -13357,6 +13501,11 @@ def handle_get(handler, parsed) -> bool:
             ):
                 raw["is_cli_session"] = False
                 raw["read_only"] = True
+            if message_paging.requested:
+                raw["message_page"] = {
+                    "mode": "legacy",
+                    "fallback_reason": _message_cursor_legacy_reason,
+                }
             redact = redact_session_data(raw)
             _t5 = _time.monotonic()
             if _diag: _diag.stage("t5_after_redact")
@@ -13422,6 +13571,15 @@ def handle_get(handler, parsed) -> bool:
                 # frontend self-heal + spin the SSE reconnect against a dead sid.
                 _finish_session_diagnostics()
                 return bad(handler, "Session not found", 404)
+            _cursor_rejection = _message_cursor_rejection(_session_profile)
+            if _cursor_rejection is not None:
+                _cursor_status, _cursor_payload = _cursor_rejection
+                _finish_session_diagnostics()
+                return j(
+                    handler,
+                    _cursor_payload,
+                    status=_cursor_status,
+                )
             if resolution.canonical_row is not None:
                 try:
                     resolved_messages = read_resolved_session_history(
@@ -13510,6 +13668,11 @@ def handle_get(handler, parsed) -> bool:
             sess["canonical_session_id"] = sid
             if requested_sid != sid:
                 sess["requested_session_id"] = requested_sid
+            if message_paging.requested:
+                sess["message_page"] = {
+                    "mode": "legacy",
+                    "fallback_reason": _message_cursor_legacy_reason,
+                }
             if _diag: _diag.stage("t4_after_compact_and_merge")
             redacted = redact_session_data(sess)
             if _diag: _diag.stage("t5_after_redact")

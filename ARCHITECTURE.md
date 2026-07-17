@@ -332,6 +332,19 @@ shared metadata. This is the detail-path implementation of
 performance contract is in
 `docs/superpowers/specs/2026-07-16-bounded-conversation-load-design.md`.
 
+Negotiated message paging is isolated in `api/session_message_paging.py`.
+`message_paging=cursor_v1` uses a strict 1..100 visible-row limit, an indexed
+per-lineage k-way merge, hard raw-row and byte budgets, and HMAC-protected
+opaque boundaries. Invalid negotiation is rejected before opening `state.db`.
+Requests without negotiation keep the exact numeric `msg_before` response and
+keys. The server gate `HERMES_WEBUI_MESSAGE_CURSOR_V1=off|shadow|on` defaults to
+`off`; `shadow` compares the bounded candidate with the exact legacy window and
+logs only counters/reason codes. Neither `shadow` nor `on` may expose a cursor
+until a target-scoped content proof, exact-count reconciliation receipt, and
+current readiness evidence all validate. Today's unproven Agent schema therefore
+fails closed to explicit legacy mode rather than guessing from counts,
+timestamps, or global generations.
+
 The compatibility session API is state.db-first. `GET /api/sessions/{id}` and
 `GET /api/sessions/{id}/messages` resolve old compression IDs to the visible
 tip, return stable shared metadata (`title`, `cwd`/`workspace`, `archived`,

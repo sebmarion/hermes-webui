@@ -31,7 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from api import agent_sessions  # noqa: E402
+from api import agent_sessions, session_message_paging  # noqa: E402
 
 
 RECEIPT_SCHEMA_VERSION = 1
@@ -44,6 +44,7 @@ DIAGNOSTIC_STAGES = (
 )
 _TRACE_LOCAL = threading.local()
 _ORIGINAL_OPEN_STATE_DB_READONLY = agent_sessions.open_state_db_readonly
+_ORIGINAL_OPEN_MESSAGE_DB_READONLY = session_message_paging.open_state_db_readonly
 _DIAGNOSTIC_MARKER = "Slow WebUI request completed:"
 _BENCHMARK_PASSWORD = "hermes-isolated-benchmark"
 _CREDENTIAL_ENV_PREFIXES = (
@@ -180,8 +181,17 @@ def _traced_open_state_db_readonly(db_path: Path, log=None):
     return conn
 
 
+def _traced_open_message_db_readonly(db_path: Path, log=None):
+    conn = _ORIGINAL_OPEN_MESSAGE_DB_READONLY(db_path, log=log)
+    statements = getattr(_TRACE_LOCAL, "capability_statements", None)
+    if statements is not None:
+        conn.set_trace_callback(statements.append)
+    return conn
+
+
 def _install_trace_adapter() -> None:
     agent_sessions.open_state_db_readonly = _traced_open_state_db_readonly
+    session_message_paging.open_state_db_readonly = _traced_open_message_db_readonly
 
 
 def _normalize_sql(statement: str) -> str:
@@ -292,20 +302,139 @@ def _measure_resolution(
     }
 
 
-def _worker_sample(fixture: Path) -> dict:
+def _measure_message_page(
+    *,
+    db_path: Path,
+    requested_id: str,
+    expected_canonical_id: str,
+    visible_limit: int,
+    kind: str,
+) -> dict:
+    resolution_statements: list[str] = []
+    capability_statements: list[str] = []
+    agent_sessions.begin_shared_resolution_call_tracking()
+    total_started = time.perf_counter_ns()
+    try:
+        _TRACE_LOCAL.statements = resolution_statements
+        resolution_started = time.perf_counter_ns()
+        try:
+            resolution = agent_sessions.resolve_shared_session(db_path, requested_id)
+        finally:
+            resolution_elapsed_ms = (
+                time.perf_counter_ns() - resolution_started
+            ) / 1_000_000
+            _TRACE_LOCAL.statements = None
+
+        _TRACE_LOCAL.capability_statements = capability_statements
+        page_started = time.perf_counter_ns()
+        try:
+            page = session_message_paging.read_state_db_message_page(
+                db_path=db_path,
+                resolution=resolution,
+                visible_limit=visible_limit,
+                cursor=None,
+            )
+        finally:
+            page_elapsed_ms = (time.perf_counter_ns() - page_started) / 1_000_000
+            _TRACE_LOCAL.capability_statements = None
+    finally:
+        resolver_call_count = agent_sessions.end_shared_resolution_call_tracking()
+        elapsed_ms = (time.perf_counter_ns() - total_started) / 1_000_000
+
+    normalized_resolution = [
+        _normalize_sql(statement)
+        for statement in resolution_statements
+        if str(statement).strip()
+    ]
+    normalized_capability = [
+        _normalize_sql(statement)
+        for statement in capability_statements
+        if str(statement).strip()
+    ]
+    capability_detail_probe_count = sum(
+        not statement.startswith("pragma schema_version")
+        for statement in normalized_capability
+    )
+    resolution_plan_indexed = _captured_resolution_plan_is_indexed(
+        db_path,
+        resolution_statements,
+    )
+    query_plan_indexed = bool(resolution_plan_indexed and page.query_plan_indexed)
+    return {
+        "kind": kind,
+        "elapsed_ms": elapsed_ms,
+        "stages": {
+            "canonical_resolution": resolution_elapsed_ms,
+            "state_message_page": page_elapsed_ms,
+            "runtime_overlay": 0.0,
+            "derived_view_state": 0.0,
+            "redaction_and_serialize": 0.0,
+        },
+        "sql_count": page.sql_count,
+        "capability_sql_count": len(normalized_capability),
+        "capability_detail_probe_count": capability_detail_probe_count,
+        "resolution_sql_count": len(normalized_resolution),
+        "total_sql_count": (
+            len(normalized_resolution) + len(normalized_capability) + page.sql_count
+        ),
+        "lineage_depth": len(resolution.member_ids),
+        "requested_rows": visible_limit,
+        "returned_rows": len(page.messages),
+        "visible_count": page.visible_count,
+        "raw_rows_examined": page.raw_rows_examined,
+        "closure_rows_examined": page.closure_rows_examined,
+        "ordinary_serialized_bytes": page.ordinary_serialized_bytes,
+        "closure_serialized_bytes": page.closure_serialized_bytes,
+        "serialized_bytes": page.serialized_bytes,
+        "source_mode": page.mode,
+        "receipt_generation": None,
+        "cache_result": "miss" if capability_detail_probe_count else "hit",
+        "fallback_reason": page.fallback_reason,
+        "resolver_call_count": resolver_call_count,
+        "duplicate_resolver_count": max(0, resolver_call_count - 1),
+        "query_plan_unscoped_scan": (
+            _has_unscoped_scan(normalized_resolution) or not query_plan_indexed
+        ),
+        "query_plan_indexed": query_plan_indexed,
+        "resolution_status": resolution.status,
+        "canonical_matches_manifest": (
+            resolution.canonical_id == expected_canonical_id
+        ),
+        "has_more": page.has_more,
+        "tool_pair_status": page.tool_pair_status,
+    }
+
+
+def _worker_sample(
+    fixture: Path,
+    *,
+    stage: str = "resolution",
+    visible_limit: int = 30,
+) -> dict:
     manifest, db_path = _load_fixture(fixture)
     _install_trace_adapter()
-    sample = _measure_resolution(
+    measure = _measure_resolution
+    kwargs = {}
+    if stage == "message-page":
+        measure = _measure_message_page
+        kwargs["visible_limit"] = visible_limit
+    sample = measure(
         db_path=db_path,
         requested_id=manifest["target"]["requested_id"],
         expected_canonical_id=manifest["target"]["canonical_id"],
         kind="process_cold",
+        **kwargs,
     )
     sample["worker_pid"] = os.getpid()
     return sample
 
 
-def _process_cold_sample(fixture: Path) -> dict:
+def _process_cold_sample(
+    fixture: Path,
+    *,
+    stage: str = "resolution",
+    visible_limit: int = 30,
+) -> dict:
     started = time.perf_counter_ns()
     completed = subprocess.run(
         [
@@ -313,6 +442,10 @@ def _process_cold_sample(fixture: Path) -> dict:
             str(Path(__file__).resolve()),
             "--_worker-fixture",
             str(fixture),
+            "--_worker-stage",
+            stage,
+            "--_worker-visible-limit",
+            str(visible_limit),
         ],
         cwd=REPO_ROOT,
         text=True,
@@ -1053,6 +1186,180 @@ def _run_mechanical_fixture(
     )
 
 
+def _run_message_page_fixture(
+    fixture: Path,
+    *,
+    visible_limit: int,
+    warm_count: int,
+    process_cold_count: int,
+    concurrency: int,
+    stress_rounds: int,
+) -> tuple[dict, Path, list[dict], dict, bool]:
+    manifest, db_path = _load_fixture(fixture)
+    before_signature = _sqlite_artifact_signature(db_path)
+    _install_trace_adapter()
+    session_message_paging.clear_message_paging_capability_cache()
+    requested_id = manifest["target"]["requested_id"]
+    canonical_id = manifest["target"]["canonical_id"]
+
+    _measure_message_page(
+        db_path=db_path,
+        requested_id=requested_id,
+        expected_canonical_id=canonical_id,
+        visible_limit=visible_limit,
+        kind="primer",
+    )
+    samples = [
+        _measure_message_page(
+            db_path=db_path,
+            requested_id=requested_id,
+            expected_canonical_id=canonical_id,
+            visible_limit=visible_limit,
+            kind="warm",
+        )
+        for _ in range(warm_count)
+    ]
+    samples.extend(
+        _process_cold_sample(
+            fixture,
+            stage="message-page",
+            visible_limit=visible_limit,
+        )
+        for _ in range(process_cold_count)
+    )
+
+    def stress_sample(index: int) -> dict:
+        sample = _measure_message_page(
+            db_path=db_path,
+            requested_id=requested_id,
+            expected_canonical_id=canonical_id,
+            visible_limit=visible_limit,
+            kind="stress",
+        )
+        sample["stress_slot"] = index
+        return sample
+
+    for round_index in range(stress_rounds):
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            round_samples = list(pool.map(stress_sample, range(concurrency)))
+        for sample in round_samples:
+            sample["stress_round"] = round_index
+        samples.extend(round_samples)
+
+    after_signature = _sqlite_artifact_signature(db_path)
+    return (
+        manifest,
+        db_path,
+        samples,
+        _summary(samples),
+        before_signature == after_signature,
+    )
+
+
+def _evaluate_message_page_samples(samples: list[dict], summary: dict) -> list[str]:
+    failures = []
+    for sample in samples:
+        kind = sample["kind"]
+        depth = max(1, int(sample["lineage_depth"]))
+        requested_rows = int(sample["requested_rows"])
+        raw_ceiling = max(256, min(2048, 8 * requested_rows)) + 64
+        if int(sample["capability_sql_count"]) > 6:
+            failures.append(f"{kind} capability SQL exceeded 6")
+        if sample["cache_result"] == "hit" and int(
+            sample["capability_detail_probe_count"]
+        ):
+            failures.append(f"{kind} repeated capability detail probes")
+        if sample["cache_result"] == "miss" and not int(
+            sample["capability_detail_probe_count"]
+        ):
+            failures.append(f"{kind} capability miss did not inspect schema")
+        if int(sample["sql_count"]) > 3 + depth:
+            failures.append(f"{kind} paging SQL exceeded {3 + depth}")
+        if int(sample["raw_rows_examined"]) > raw_ceiling:
+            failures.append(f"{kind} raw rows exceeded {raw_ceiling}")
+        if int(sample["closure_rows_examined"]) > 64:
+            failures.append(f"{kind} closure rows exceeded 64")
+        if int(sample["ordinary_serialized_bytes"]) > 2 * 1024 * 1024:
+            failures.append(f"{kind} ordinary bytes exceeded 2 MiB")
+        if int(sample["closure_serialized_bytes"]) > 512 * 1024:
+            failures.append(f"{kind} closure bytes exceeded 512 KiB")
+        if int(sample["serialized_bytes"]) > 2_621_440:
+            failures.append(f"{kind} combined bytes exceeded 2.5 MiB")
+        if sample["resolver_call_count"] != 1:
+            failures.append(f"{kind} resolver count was not exactly one")
+        if sample["duplicate_resolver_count"] != 0:
+            failures.append(f"{kind} duplicated canonical resolution")
+        if not sample["query_plan_indexed"]:
+            failures.append(f"{kind} query plan was not indexed")
+        if sample["query_plan_unscoped_scan"]:
+            failures.append(f"{kind} used an unscoped query")
+        if not sample["canonical_matches_manifest"]:
+            failures.append(f"{kind} canonical target drifted")
+        if sample["source_mode"] != "cursor_v1":
+            failures.append(f"{kind} source mode was not cursor_v1")
+        if sample["fallback_reason"] is not None:
+            failures.append(f"{kind} unexpectedly fell back")
+        if kind in {"warm", "stress"} and sample["cache_result"] != "hit":
+            failures.append(f"{kind} repeated capability probes")
+        if kind == "process_cold" and sample["cache_result"] != "miss":
+            failures.append("process-cold sample did not start with an empty cache")
+    if summary["warm_p95_ms"] >= 1_000:
+        failures.append("warm p95 is not below 1s")
+    if summary["process_cold_p95_ms"] >= 2_000:
+        failures.append("process-cold p95 is not below 2s")
+    if summary["max_ms"] >= 5_000:
+        failures.append("a message-page request reached the 5s ceiling")
+    return failures
+
+
+def _message_page_work_signature(samples: list[dict]) -> dict[str, dict[str, list]]:
+    fields = (
+        "sql_count",
+        "capability_sql_count",
+        "resolution_sql_count",
+        "raw_rows_examined",
+        "source_mode",
+    )
+    signature = {}
+    for field in fields:
+        by_kind: dict[str, set] = {}
+        for sample in samples:
+            key = f"{sample['kind']}:{sample['cache_result']}"
+            by_kind.setdefault(key, set()).add(sample[field])
+        signature[field] = {
+            key: sorted(values)
+            for key, values in sorted(by_kind.items())
+        }
+    return signature
+
+
+def _message_page_fixture_receipt(
+    manifest: dict,
+    db_path: Path,
+    samples: list[dict],
+    summary: dict,
+    database_unchanged: bool,
+) -> dict:
+    environment = _environment(db_path)
+    environment["authenticated_http"] = False
+    environment["measurement_scope"] = "direct_read_only_message_page"
+    return {
+        "fixture": {
+            "schema_version": manifest["fixture_schema_version"],
+            "scale": manifest["scale"],
+            "agent_contract": manifest["agent_contract"],
+            "seed": manifest["seed"],
+            "state_db_sha256": manifest["file_hashes"]["state.db"],
+            "database_unchanged": bool(database_unchanged),
+        },
+        "environment": environment,
+        "samples": samples,
+        "summary": summary,
+        "primer_count": 1,
+        "work_signature": _message_page_work_signature(samples),
+    }
+
+
 def _comparison_failures(base: dict, comparison: dict) -> list[str]:
     failures = []
     if base["sql_signature"] != comparison["sql_signature"]:
@@ -1236,6 +1543,84 @@ def run_resolution_benchmark(args) -> tuple[dict, bool]:
     return receipt, not failures
 
 
+def run_message_page_benchmark(args) -> tuple[dict, bool]:
+    (
+        manifest,
+        db_path,
+        samples,
+        summary,
+        database_unchanged,
+    ) = _run_message_page_fixture(
+        args.fixture,
+        visible_limit=args.visible_limit,
+        warm_count=args.warm,
+        process_cold_count=args.process_cold,
+        concurrency=args.concurrency,
+        stress_rounds=args.stress_rounds,
+    )
+    base = _message_page_fixture_receipt(
+        manifest,
+        db_path,
+        samples,
+        summary,
+        database_unchanged,
+    )
+    failures = _evaluate_message_page_samples(samples, summary)
+    if not database_unchanged:
+        failures.append("message-page benchmark mutated fixture state.db")
+
+    comparison_receipt = None
+    if args.compare_fixture is not None:
+        (
+            compare_manifest,
+            compare_db,
+            compare_samples,
+            compare_summary,
+            compare_database_unchanged,
+        ) = _run_message_page_fixture(
+            args.compare_fixture,
+            visible_limit=args.visible_limit,
+            warm_count=args.warm,
+            process_cold_count=args.process_cold,
+            concurrency=args.concurrency,
+            stress_rounds=args.stress_rounds,
+        )
+        comparison_receipt = _message_page_fixture_receipt(
+            compare_manifest,
+            compare_db,
+            compare_samples,
+            compare_summary,
+            compare_database_unchanged,
+        )
+        failures.extend(_evaluate_message_page_samples(compare_samples, compare_summary))
+        if base["work_signature"] != comparison_receipt["work_signature"]:
+            failures.append("scaling fixture changed message-page work counts")
+        for field in ("warm_p95_ms", "process_cold_p95_ms"):
+            baseline = float(base["summary"][field])
+            observed = float(comparison_receipt["summary"][field])
+            if observed - baseline > max(100.0, baseline * 0.2):
+                failures.append(f"scaling {field} regressed beyond allowance")
+        if not compare_database_unchanged:
+            failures.append("comparison message-page benchmark mutated fixture state.db")
+
+    receipt = {
+        "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
+        "stage": "message-page",
+        "environment": base["environment"],
+        "fixture": base["fixture"],
+        "samples": base["samples"],
+        "summary": base["summary"],
+        "primer_count": base["primer_count"],
+        "gates": {
+            "passed": not failures,
+            "failures": failures,
+            "work_signature": base["work_signature"],
+        },
+        "comparison": comparison_receipt,
+    }
+    return receipt, not failures
+
+
 def _write_receipt(path: Path, receipt: dict) -> None:
     path = path.expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1256,8 +1641,9 @@ def _positive(name: str, value: int, *, allow_zero: bool = False) -> int:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=("resolution",))
+    parser.add_argument("--stage", choices=("resolution", "message-page"))
     parser.add_argument("--fixture", type=Path)
+    parser.add_argument("--visible-limit", type=int, default=30)
     parser.add_argument("--warm", type=int, default=40)
     parser.add_argument("--process-cold", type=int, default=20)
     parser.add_argument("--concurrency", type=int, default=4)
@@ -1270,6 +1656,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--_worker-fixture", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--_worker-stage",
+        choices=("resolution", "message-page"),
+        default="resolution",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--_worker-visible-limit",
+        type=int,
+        default=30,
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -1277,19 +1675,35 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args._worker_fixture is not None:
         try:
-            print(json.dumps(_worker_sample(args._worker_fixture), sort_keys=True))
+            if not 1 <= args._worker_visible_limit <= 100:
+                raise ValueError("worker visible limit must be from 1 to 100")
+            print(
+                json.dumps(
+                    _worker_sample(
+                        args._worker_fixture,
+                        stage=args._worker_stage,
+                        visible_limit=args._worker_visible_limit,
+                    ),
+                    sort_keys=True,
+                )
+            )
             return 0
         except Exception as exc:
             print(f"worker failed: {exc}", file=sys.stderr)
             return 2
     try:
-        if args.stage != "resolution" or args.fixture is None or args.output is None:
+        if args.stage is None or args.fixture is None or args.output is None:
             raise ValueError("--stage, --fixture, and --output are required")
         _positive("warm", args.warm)
         _positive("process-cold", args.process_cold)
         _positive("concurrency", args.concurrency)
         _positive("stress-rounds", args.stress_rounds, allow_zero=True)
-        receipt, passed = run_resolution_benchmark(args)
+        if not 1 <= args.visible_limit <= 100:
+            raise ValueError("visible-limit must be from 1 to 100")
+        if args.stage == "message-page":
+            receipt, passed = run_message_page_benchmark(args)
+        else:
+            receipt, passed = run_resolution_benchmark(args)
         _write_receipt(args.output, receipt)
     except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
         print(f"benchmark failed: {exc}", file=sys.stderr)

@@ -577,6 +577,168 @@ def test_resolution_scaling_comparison_preserves_query_shape_and_passes(tmp_path
     assert "target-000006-seed-4242" not in serialized
 
 
+def test_message_page_runner_emits_bounded_content_free_receipt(tmp_path):
+    fixture = tmp_path / "fixture"
+    _generate(fixture)
+    output = tmp_path / "message-page.json"
+
+    _run_script(
+        RUNNER,
+        "--stage",
+        "message-page",
+        "--fixture",
+        str(fixture),
+        "--visible-limit",
+        "30",
+        "--warm",
+        "2",
+        "--process-cold",
+        "1",
+        "--concurrency",
+        "2",
+        "--stress-rounds",
+        "1",
+        "--output",
+        str(output),
+    )
+
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["receipt_schema_version"] == 1
+    assert receipt["stage"] == "message-page"
+    assert receipt["primer_count"] == 1
+    assert receipt["gates"]["passed"] is True
+    assert receipt["fixture"]["database_unchanged"] is True
+    assert receipt["environment"]["authenticated_http"] is False
+    assert receipt["environment"]["measurement_scope"] == (
+        "direct_read_only_message_page"
+    )
+
+    by_kind = {
+        kind: [sample for sample in receipt["samples"] if sample["kind"] == kind]
+        for kind in ("warm", "process_cold", "stress")
+    }
+    assert len(by_kind["warm"]) == 2
+    assert len(by_kind["process_cold"]) == 1
+    assert len(by_kind["stress"]) == 2
+    assert len({sample["worker_pid"] for sample in by_kind["process_cold"]}) == 1
+
+    for sample in receipt["samples"]:
+        depth = sample["lineage_depth"]
+        raw_ceiling = max(256, min(2048, 8 * sample["requested_rows"])) + 64
+        assert set(sample["stages"]) == DIAGNOSTIC_STAGES
+        assert sample["resolver_call_count"] == 1
+        assert sample["duplicate_resolver_count"] == 0
+        assert sample["canonical_matches_manifest"] is True
+        assert sample["source_mode"] == "cursor_v1"
+        assert sample["fallback_reason"] is None
+        assert sample["receipt_generation"] is None
+        assert sample["query_plan_indexed"] is True
+        assert sample["query_plan_unscoped_scan"] is False
+        assert sample["sql_count"] <= 3 + depth
+        assert sample["capability_sql_count"] <= 6
+        assert sample["raw_rows_examined"] <= raw_ceiling
+        assert sample["closure_rows_examined"] <= 64
+        assert sample["ordinary_serialized_bytes"] <= 2 * 1024 * 1024
+        assert sample["closure_serialized_bytes"] <= 512 * 1024
+        assert sample["serialized_bytes"] <= 2_621_440
+        assert sample["returned_rows"] >= sample["visible_count"]
+        if sample["kind"] in {"warm", "stress"}:
+            assert sample["cache_result"] == "hit"
+            assert sample["capability_detail_probe_count"] == 0
+        else:
+            assert sample["cache_result"] == "miss"
+            assert sample["capability_detail_probe_count"] > 0
+
+    serialized = output.read_text(encoding="utf-8")
+    assert str(tmp_path) not in serialized
+    assert str(fixture) not in serialized
+    assert "target-000006-seed-4242" not in serialized
+
+
+def test_message_page_scaling_preserves_exact_sql_and_raw_work(tmp_path):
+    base_fixture = tmp_path / "base"
+    scaling_fixture = tmp_path / "scaling"
+    _generate(base_fixture, scale="mini")
+    _generate(scaling_fixture, scale="mini-scaling")
+    output = tmp_path / "comparison.json"
+
+    _run_script(
+        RUNNER,
+        "--stage",
+        "message-page",
+        "--fixture",
+        str(base_fixture),
+        "--visible-limit",
+        "30",
+        "--warm",
+        "1",
+        "--process-cold",
+        "1",
+        "--concurrency",
+        "1",
+        "--stress-rounds",
+        "1",
+        "--compare-fixture",
+        str(scaling_fixture),
+        "--output",
+        str(output),
+    )
+
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    comparison = receipt["comparison"]
+    assert receipt["gates"]["passed"] is True
+    assert comparison is not None
+    assert comparison["fixture"]["scale"] == "mini-scaling"
+    assert receipt["gates"]["work_signature"] == comparison["work_signature"]
+    for field in ("warm_p95_ms", "process_cold_p95_ms"):
+        baseline = receipt["summary"][field]
+        observed = comparison["summary"][field]
+        assert observed - baseline <= max(100.0, baseline * 0.2)
+
+
+def test_message_page_gate_rejects_budget_plan_resolver_and_mode_drift():
+    runner = _load_script(RUNNER, "conversation_benchmark_message_page_gate")
+    sample = {
+        "kind": "warm",
+        "lineage_depth": 2,
+        "requested_rows": 30,
+        "sql_count": 6,
+        "capability_sql_count": 7,
+        "capability_detail_probe_count": 1,
+        "raw_rows_examined": 321,
+        "closure_rows_examined": 65,
+        "ordinary_serialized_bytes": 2 * 1024 * 1024 + 1,
+        "closure_serialized_bytes": 512 * 1024 + 1,
+        "serialized_bytes": 2_621_441,
+        "resolver_call_count": 2,
+        "duplicate_resolver_count": 1,
+        "query_plan_indexed": False,
+        "query_plan_unscoped_scan": True,
+        "canonical_matches_manifest": False,
+        "source_mode": "legacy_required",
+        "fallback_reason": "unsupported_schema",
+        "cache_result": "miss",
+    }
+    summary = {
+        "warm_p95_ms": 1_000.0,
+        "process_cold_p95_ms": 2_000.0,
+        "stress_p95_ms": 1.0,
+        "max_ms": 5_000.0,
+    }
+
+    failures = runner._evaluate_message_page_samples([sample], summary)
+
+    assert any("capability" in failure for failure in failures)
+    assert any("paging SQL" in failure for failure in failures)
+    assert any("raw rows" in failure for failure in failures)
+    assert any("ordinary bytes" in failure for failure in failures)
+    assert any("closure bytes" in failure for failure in failures)
+    assert any("resolver" in failure for failure in failures)
+    assert any("indexed" in failure for failure in failures)
+    assert any("source mode" in failure for failure in failures)
+    assert any("5s" in failure for failure in failures)
+
+
 def test_resolution_state_only_metadata_open_does_not_serialize_history(tmp_path):
     fixture = tmp_path / "fixture"
     _generate(fixture)

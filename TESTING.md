@@ -173,6 +173,32 @@ and verify only the parent renders while the child's running/unread/approval sta
 still bubbles to it. Pin a compressed conversation and verify exactly the lineage
 root carries `pinned=1`; hidden physical segments and child rows remain unpinned.
 
+### Bounded conversation-load gate
+
+Run the read-only resolver, cursor reader, wire-compatibility, and shadow oracle
+contracts with:
+
+```bash
+./scripts/test.sh \
+  tests/test_state_db_message_cursor_capability.py \
+  tests/test_state_db_message_cursor_reader.py \
+  tests/test_session_message_cursor.py \
+  tests/test_session_cursor_paging_route.py \
+  tests/test_session_cursor_paging_shadow.py \
+  tests/test_session_tail_payload.py \
+  tests/test_session_lineage_full_transcript.py -q
+```
+
+The reader fixture includes 10,000 unrelated sessions and 1,000,000 unrelated
+messages; target SQL/raw work must remain identical to the base fixture. Run the
+checked-in mechanical gate with `scripts/benchmark_conversation_load.py --stage
+message-page`; it must prove indexed plans, bounded row/byte work, one canonical
+resolution, complete content-free diagnostics, base/scaling work equality, and
+the configured warm/cold/stress SLOs. `HERMES_WEBUI_MESSAGE_CURSOR_V1=shadow`
+may be used with isolated state to gather semantic comparisons. A current schema
+without the declared target content proof must report explicit legacy mode and
+must never emit an opaque cursor.
+
 
 `tests/test_static_js_runtime_lint.py` runs this automatically when eslint is present
 and **skips gracefully** (clear message) when it isn't — so environments without the
