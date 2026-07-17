@@ -305,6 +305,33 @@ and never joins or repairs the `messages` table. Older Agent schemas retain the
 legacy aggregation query as a background-only compatibility fallback. WebUI
 never migrates Agent state.
 
+Entity detail loads have a separate boundary from collection projection. A
+single indexed resolver starts at the requested `sessions` primary key, follows
+only validated compression edges through primary-key and `idx_sessions_parent`
+lookups, and returns a frozen `SharedSessionResolution` receipt from one SQLite
+read snapshot. The receipt carries the requested and canonical IDs, root/tip,
+ordered lineage members, canonical row, and lineage fingerprint. Detail routes
+resolve once and reuse that immutable receipt for metadata and message history;
+they do not reconstruct lineage from a session-list cache or collection scan.
+Collection projections such as `read_shared_session_rows()` remain list/export
+machinery only, and `state.db` remains the canonical shared conversation
+authority.
+
+The Stage 1 resolver and resolved-history reader are strictly read-only: they do
+not mutate state, migrate an Agent schema, reconcile sidecars, or import legacy
+history. Sidecar-only history stays lazy and is never bulk-imported. A missing
+row, an old or unsupported schema, a missing required index, or an unsafe,
+ambiguous, or capped lineage fails closed to the requested ID and the existing
+legacy/not-found behavior; the entity path never guesses by falling back to a
+global projection. The canonical receipt's title, workspace, archive, pin,
+source, and lineage metadata are applied after runtime/sidecar presentation
+overlays, within the same active-profile authorization and response-redaction
+envelope, so a stale sidecar or mismatched profile cannot override or disclose
+shared metadata. This is the detail-path implementation of
+`docs/rfcs/canonical-session-resolution.md`; the bounded-load capability and
+performance contract is in
+`docs/superpowers/specs/2026-07-16-bounded-conversation-load-design.md`.
+
 The compatibility session API is state.db-first. `GET /api/sessions/{id}` and
 `GET /api/sessions/{id}/messages` resolve old compression IDs to the visible
 tip, return stable shared metadata (`title`, `cwd`/`workspace`, `archived`,
