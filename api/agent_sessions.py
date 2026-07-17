@@ -788,6 +788,19 @@ class SharedSessionResolution:
     global_projection_generation_hint: int | None
     mode: Literal['navigation', 'history']
     status: Literal['found', 'missing', 'degraded', 'ambiguous']
+    database_identity: tuple[str, int | None, int | None]
+
+
+def shared_state_db_identity(
+    db_path: Path,
+) -> tuple[str, int | None, int | None]:
+    """Return a stable request-local identity for a profile's state database."""
+    path = Path(db_path).expanduser().resolve()
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return (str(path), None, None)
+    return (str(path), int(stat_result.st_dev), int(stat_result.st_ino))
 
 
 def _shared_resolution_fingerprint(rows: list[dict]) -> str:
@@ -814,6 +827,7 @@ def _shared_resolution_terminal(
     *,
     mode: Literal['navigation', 'history'],
     status: Literal['missing', 'degraded', 'ambiguous'],
+    database_identity: tuple[str, int | None, int | None],
     row: dict | None = None,
     generation_hint: int | None = None,
 ) -> SharedSessionResolution:
@@ -830,6 +844,7 @@ def _shared_resolution_terminal(
         global_projection_generation_hint=generation_hint,
         mode=mode,
         status=status,
+        database_identity=database_identity,
     )
 
 
@@ -989,8 +1004,25 @@ def resolve_shared_session(
         raise ValueError("mode must be 'navigation' or 'history'")
     sid = str(session_id or '').strip()
     path = Path(db_path)
+    database_identity = shared_state_db_identity(path)
+
+    def terminal(
+        *,
+        status: Literal['missing', 'degraded', 'ambiguous'],
+        row: dict | None = None,
+        generation_hint: int | None = None,
+    ) -> SharedSessionResolution:
+        return _shared_resolution_terminal(
+            sid,
+            mode=mode,
+            status=status,
+            database_identity=database_identity,
+            row=row,
+            generation_hint=generation_hint,
+        )
+
     if not sid or not path.exists():
-        return _shared_resolution_terminal(sid, mode=mode, status='missing')
+        return terminal(status='missing')
 
     try:
         with closing(open_state_db_readonly(path)) as conn:
@@ -1001,10 +1033,10 @@ def resolve_shared_session(
                 for row in conn.execute('PRAGMA table_info(sessions)').fetchall()
             }
             if not _SHARED_RESOLUTION_REQUIRED_COLUMNS.issubset(session_cols):
-                return _shared_resolution_terminal(sid, mode=mode, status='degraded')
+                return terminal(status='degraded')
             select_sql = _shared_resolution_select_sql(session_cols)
             if not _shared_resolution_has_parent_index(conn, select_sql):
-                return _shared_resolution_terminal(sid, mode=mode, status='degraded')
+                return terminal(status='degraded')
 
             generation_hint = _shared_resolution_generation_hint(conn)
 
@@ -1021,9 +1053,7 @@ def resolve_shared_session(
 
             requested = fetch_one(sid)
             if requested is None:
-                return _shared_resolution_terminal(
-                    sid,
-                    mode=mode,
+                return terminal(
                     status='missing',
                     generation_hint=generation_hint,
                 )
@@ -1035,27 +1065,21 @@ def resolve_shared_session(
             while current.get('parent_session_id'):
                 parent_id = str(current.get('parent_session_id') or '')
                 if not parent_id or parent_id in seen:
-                    return _shared_resolution_terminal(
-                        sid,
-                        mode=mode,
+                    return terminal(
                         status='degraded',
                         row=requested,
                         generation_hint=generation_hint,
                     )
                 parent = fetch_one(parent_id)
                 if parent is None:
-                    return _shared_resolution_terminal(
-                        sid,
-                        mode=mode,
+                    return terminal(
                         status='degraded',
                         row=requested,
                         generation_hint=generation_hint,
                     )
                 discovered[parent_id] = parent
                 if len(discovered) > _SHARED_RESOLUTION_MAX_ROWS:
-                    return _shared_resolution_terminal(
-                        sid,
-                        mode=mode,
+                    return terminal(
                         status='degraded',
                         row=requested,
                         generation_hint=generation_hint,
@@ -1063,9 +1087,7 @@ def resolve_shared_session(
                 # Detect a raw parent cycle even when one edge would otherwise
                 # be rejected by continuation semantics.
                 if str(parent.get('parent_session_id') or '') in seen:
-                    return _shared_resolution_terminal(
-                        sid,
-                        mode=mode,
+                    return terminal(
                         status='degraded',
                         row=requested,
                         generation_hint=generation_hint,
@@ -1087,9 +1109,7 @@ def resolve_shared_session(
                     children = []
                     remaining = _SHARED_RESOLUTION_MAX_ROWS - len(discovered)
                     if remaining <= 0:
-                        return _shared_resolution_terminal(
-                            sid,
-                            mode=mode,
+                        return terminal(
                             status='degraded',
                             row=requested,
                             generation_hint=generation_hint,
@@ -1106,9 +1126,7 @@ def resolve_shared_session(
                         discovered[child_id] = child
                         children.append(child)
                     if len(discovered) > _SHARED_RESOLUTION_MAX_ROWS:
-                        return _shared_resolution_terminal(
-                            sid,
-                            mode=mode,
+                        return terminal(
                             status='degraded',
                             row=requested,
                             generation_hint=generation_hint,
@@ -1130,9 +1148,7 @@ def resolve_shared_session(
                         and _continuation_child_semantic_key(ranked[0])
                         == _continuation_child_semantic_key(ranked[1])
                     ):
-                        return _shared_resolution_terminal(
-                            sid,
-                            mode=mode,
+                        return terminal(
                             status='ambiguous',
                             row=requested,
                             generation_hint=generation_hint,
@@ -1140,9 +1156,7 @@ def resolve_shared_session(
                     selected = ranked[0]
                     selected_id = str(selected['id'])
                     if selected_id in seen:
-                        return _shared_resolution_terminal(
-                            sid,
-                            mode=mode,
+                        return terminal(
                             status='degraded',
                             row=requested,
                             generation_hint=generation_hint,
@@ -1156,9 +1170,7 @@ def resolve_shared_session(
                     path_rows[-1],
                 )
                 if importable is None:
-                    return _shared_resolution_terminal(
-                        sid,
-                        mode=mode,
+                    return terminal(
                         status='degraded',
                         row=requested,
                         generation_hint=generation_hint,
@@ -1179,10 +1191,11 @@ def resolve_shared_session(
                 global_projection_generation_hint=generation_hint,
                 mode=mode,
                 status='found',
+                database_identity=database_identity,
             )
     except Exception:
         logger.debug('bounded shared session resolution failed for %s', sid, exc_info=True)
-        return _shared_resolution_terminal(sid, mode=mode, status='degraded')
+        return terminal(status='degraded')
 
 
 def resolve_shared_session_id(

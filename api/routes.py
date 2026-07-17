@@ -37,13 +37,17 @@ from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Requ
 from api.agent_sessions import (
     MESSAGING_SOURCES,
     SHARED_INTERACTIVE_SESSION_SOURCES,
+    SharedSessionResolution,
     _looks_like_default_cli_title,
     is_cli_session_row,
     is_cli_session_row_visible,
+    resolve_shared_session,
     resolve_shared_session_id,
+    shared_state_db_identity,
     read_session_lineage_metadata,
     read_session_lineage_report,
 )
+from api.session_history import read_resolved_session_history
 from api.compression_anchor import visible_messages_for_anchor
 from api.compression_recovery import (
     COMPRESSION_RECOVERY_ACTION_START_FOCUSED,
@@ -9660,10 +9664,10 @@ from api.models import (
     get_state_db_session_messages,
     get_state_db_session_message_keys_before_timestamp,
     get_state_db_session_summary,
-    read_shared_session_rows,
     shared_interactive_sidebar_projection,
     shared_interactive_sidebar_projection_all_profiles,
     merge_session_messages_append_only,
+    _read_metadata_json_prefix,
     _enrich_sidebar_lineage_metadata,
     _active_stream_ids,
     _evict_sessions_over_cap,
@@ -17114,9 +17118,25 @@ def _shared_session_path(path: str | None) -> tuple[str, str] | None:
     return unquote(sid), "messages"
 
 
-def _shared_session_sidecar(sid: str):
+def _shared_session_sidecar(sid: str, *, metadata_only: bool = False):
     try:
-        return Session.load(sid)
+        if not metadata_only:
+            return Session.load(sid)
+        if not is_safe_session_id(sid):
+            return None
+        path = SESSION_DIR / f"{sid}.json"
+        if not path.exists():
+            return None
+        prefix = _read_metadata_json_prefix(path)
+        if not prefix:
+            return None
+        parsed = json.loads(prefix)
+        required = {"session_id", "title", "created_at", "updated_at"}
+        if not required.issubset(parsed):
+            return None
+        parsed["messages"] = []
+        parsed["tool_calls"] = []
+        return Session(**parsed)
     except Exception:
         logger.debug("Failed to load shared-session sidecar %s", sid, exc_info=True)
         return None
@@ -17186,28 +17206,61 @@ def _shared_session_detail_payload(
     requested_sid: str,
     *,
     include_messages: bool = False,
+    resolution: SharedSessionResolution | None = None,
 ) -> dict | None:
     db_path = _active_state_db_path()
-    canonical_sid = resolve_shared_session_id(db_path, requested_sid)
-    rows = read_shared_session_rows(db_path, include_archived=True)
-    row = next((item for item in rows if str(item.get("id")) == canonical_sid), None)
-    if row is None and canonical_sid != requested_sid:
-        row = next((item for item in rows if str(item.get("id")) == requested_sid), None)
-    if row is None and _lazy_import_legacy_webui_session(requested_sid):
-        canonical_sid = resolve_shared_session_id(db_path, requested_sid)
-        rows = read_shared_session_rows(db_path, include_archived=True)
-        row = next((item for item in rows if str(item.get("id")) == canonical_sid), None)
+    database_identity = shared_state_db_identity(db_path)
+    if (
+        resolution is None
+        or resolution.requested_id != requested_sid
+        or resolution.database_identity != database_identity
+    ):
+        resolution = resolve_shared_session(db_path, requested_sid)
+    row = (
+        dict(resolution.canonical_row)
+        if resolution.canonical_row is not None
+        else None
+    )
+    if (
+        row is None
+        and resolution.status == "missing"
+        and _lazy_import_legacy_webui_session(requested_sid)
+    ):
+        resolution = resolve_shared_session(db_path, requested_sid)
+        row = (
+            dict(resolution.canonical_row)
+            if resolution.canonical_row is not None
+            else None
+        )
     if row is None:
         return None
 
-    sidecar = _shared_session_sidecar(canonical_sid) or _shared_session_sidecar(requested_sid)
-    state_messages = get_state_db_session_messages(
+    try:
+        visible_message_count = max(
+            int(row.get("message_count") or 0),
+            int(row.get("actual_message_count") or 0),
+        )
+    except (TypeError, ValueError):
+        return None
+    if visible_message_count <= 0:
+        return None
+
+    canonical_sid = resolution.canonical_id
+    sidecar = _shared_session_sidecar(
         canonical_sid,
-        stitch_continuations=True,
-        compression_only=True,
+        metadata_only=not include_messages,
     )
+    if sidecar is None and canonical_sid != requested_sid:
+        sidecar = _shared_session_sidecar(
+            requested_sid,
+            metadata_only=not include_messages,
+        )
     messages = []
     if include_messages:
+        state_messages = read_resolved_session_history(
+            db_path=db_path,
+            member_ids=resolution.member_ids,
+        )
         sidecar_messages = list(getattr(sidecar, "messages", []) or []) if sidecar else []
         messages = merge_session_messages_append_only(sidecar_messages, state_messages)
 
@@ -17238,13 +17291,21 @@ def _shared_session_detail_payload(
         "parent_session_id": row.get("parent_session_id"),
         "end_reason": row.get("end_reason"),
         "lineage": {
-            "root_id": row.get("_lineage_root_id") or canonical_sid,
-            "tip_id": row.get("_lineage_tip_id") or canonical_sid,
-            "segment_count": row.get("_compression_segment_count") or 1,
+            "root_id": row.get("_lineage_root_id") or resolution.root_id,
+            "tip_id": row.get("_lineage_tip_id") or resolution.tip_id,
+            "segment_count": (
+                row.get("_compression_segment_count")
+                or len(resolution.member_ids)
+                or 1
+            ),
         },
-        "lineage_root_id": row.get("_lineage_root_id") or canonical_sid,
-        "lineage_tip_id": row.get("_lineage_tip_id") or canonical_sid,
-        "compression_segment_count": row.get("_compression_segment_count") or 1,
+        "lineage_root_id": row.get("_lineage_root_id") or resolution.root_id,
+        "lineage_tip_id": row.get("_lineage_tip_id") or resolution.tip_id,
+        "compression_segment_count": (
+            row.get("_compression_segment_count")
+            or len(resolution.member_ids)
+            or 1
+        ),
     }
     if include_messages:
         payload["messages"] = messages
