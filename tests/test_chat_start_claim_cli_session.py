@@ -153,7 +153,8 @@ def test_get_session_route_uses_shared_synthesiser():
     src = ROUTES_PY.read_text(encoding="utf-8")
     # Find the /api/session GET block (not /api/sessions).
     block = re.search(
-        r'if parsed\.path == "/api/session":.*?return j\(handler, \{"session": redact_session_data\(sess\)\}\)',
+        r'if parsed\.path == "/api/session":.*?'
+        r'(?=\n    if parsed\.path == "/api/session/lineage/report":)',
         src,
         re.DOTALL,
     )
@@ -185,7 +186,8 @@ def test_get_session_preserves_cli_read_only_flag():
     sets to True for BOTH the explicit AND the source-refused
     refusal paths."""
     block = re.search(
-        r'if parsed\.path == "/api/session":.*?return j\(handler, \{"session": redact_session_data\(sess\)\}\)\)?',
+        r'if parsed\.path == "/api/session":.*?'
+        r'(?=\n    if parsed\.path == "/api/session/lineage/report":)',
         ROUTES_PY.read_text(encoding="utf-8"),
         re.DOTALL,
     )

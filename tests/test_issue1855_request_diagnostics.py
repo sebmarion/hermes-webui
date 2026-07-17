@@ -42,6 +42,39 @@ def test_request_diagnostics_timeout_record_includes_stage_and_thread_stacks(cap
     assert record["thread_stacks"]
 
 
+def test_request_diagnostics_record_includes_content_free_metrics(caplog):
+    logger = logging.getLogger("test.issue1855.metrics")
+    diag = RequestDiagnostics(
+        "GET",
+        "/api/session",
+        logger=logger,
+        timeout_seconds=5,
+        auto_start=False,
+    )
+    diag.set_metric("canonical_resolution_calls", 2)
+
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        diag._on_timeout()
+
+    record = json.loads(caplog.records[0].args[0])
+    assert record["metrics"] == {"canonical_resolution_calls": 2}
+
+
+def test_shared_resolution_call_tracking_counts_actual_invocations(tmp_path):
+    from api.agent_sessions import (
+        begin_shared_resolution_call_tracking,
+        end_shared_resolution_call_tracking,
+        resolve_shared_session,
+    )
+
+    missing = tmp_path / "missing.db"
+    begin_shared_resolution_call_tracking()
+    resolve_shared_session(missing, "one")
+    resolve_shared_session(missing, "two")
+
+    assert end_shared_resolution_call_tracking() == 2
+
+
 def test_request_diagnostics_maybe_start_is_limited_to_issue1855_paths():
     assert RequestDiagnostics.maybe_start("GET", "/api/sessions") is not None
     assert RequestDiagnostics.maybe_start("POST", "/api/chat/start") is not None
@@ -125,6 +158,9 @@ def test_session_canonical_resolution_stage_precedes_resolver_and_survives_early
         def stage(self, name):
             events.append(f"stage:{name}")
 
+        def set_metric(self, name, value):
+            events.append(f"metric:{name}:{value}")
+
         def finish(self):
             events.append("finish")
 
@@ -175,6 +211,7 @@ def test_session_canonical_resolution_stage_precedes_resolver_and_survives_early
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("legacy resolver must not run")
         ),
+        raising=False,
     )
     monkeypatch.setattr(routes, "get_session", get_session)
     monkeypatch.setattr(
@@ -200,5 +237,7 @@ def test_session_canonical_resolution_stage_precedes_resolver_and_survives_early
     assert events.index("stage:canonical_resolution") < events.index(
         "resolve_shared_session"
     )
+    assert events.count("resolve_shared_session") == 1
     assert events.index("resolve_shared_session") < events.index("get_session")
+    assert "metric:canonical_resolution_calls:0" in events
     assert events.index("get_session") < events.index("finish")

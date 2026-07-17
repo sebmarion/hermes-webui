@@ -5,6 +5,8 @@ import os
 import json
 import sqlite3
 import time
+import threading
+from collections import OrderedDict
 from collections.abc import Iterable
 from contextlib import closing
 from dataclasses import dataclass
@@ -772,6 +774,45 @@ _SHARED_RESOLUTION_FINGERPRINT_FIELDS = (
     'message_count',
     'last_activity',
 )
+_SHARED_RESOLUTION_CAPABILITY_CACHE_MAX = 64
+
+
+@dataclass(frozen=True)
+class _SharedResolutionCapabilities:
+    select_sql: str | None
+    # ``None`` means inspection itself was inconclusive (for example a
+    # transient SQLite lock while preparing EXPLAIN).  It must never enter the
+    # process cache as a durable schema-degradation result.
+    parent_index_usable: bool | None
+
+
+_SHARED_RESOLUTION_CAPABILITY_CACHE: OrderedDict[
+    tuple[tuple[str, int | None, int | None], int],
+    _SharedResolutionCapabilities,
+] = OrderedDict()
+_SHARED_RESOLUTION_CAPABILITY_CACHE_LOCK = threading.RLock()
+_SHARED_RESOLUTION_CALL_TRACKING = threading.local()
+
+
+def begin_shared_resolution_call_tracking() -> None:
+    """Begin a request-thread count of actual resolver invocations."""
+    _SHARED_RESOLUTION_CALL_TRACKING.active = True
+    _SHARED_RESOLUTION_CALL_TRACKING.count = 0
+
+
+def end_shared_resolution_call_tracking() -> int:
+    """End and return the current request-thread resolver invocation count."""
+    count = int(getattr(_SHARED_RESOLUTION_CALL_TRACKING, 'count', 0) or 0)
+    _SHARED_RESOLUTION_CALL_TRACKING.active = False
+    _SHARED_RESOLUTION_CALL_TRACKING.count = 0
+    return count
+
+
+def _record_shared_resolution_call() -> None:
+    if getattr(_SHARED_RESOLUTION_CALL_TRACKING, 'active', False):
+        _SHARED_RESOLUTION_CALL_TRACKING.count = (
+            int(getattr(_SHARED_RESOLUTION_CALL_TRACKING, 'count', 0) or 0) + 1
+        )
 
 
 @dataclass(frozen=True)
@@ -874,7 +915,7 @@ def _shared_resolution_select_sql(session_cols: set[str]) -> str:
 def _shared_resolution_has_parent_index(
     conn: sqlite3.Connection,
     select_sql: str,
-) -> bool:
+) -> bool | None:
     expected_name = 'idx_sessions_parent'
     index_row = None
     for raw_index in conn.execute('PRAGMA index_list(sessions)').fetchall():
@@ -911,7 +952,7 @@ def _shared_resolution_has_parent_index(
             ('__hermes_resolution_index_probe__', 1),
         ).fetchall()
     except sqlite3.Error:
-        return False
+        return None
     plan = ' '.join(
         str(row['detail'] if isinstance(row, sqlite3.Row) else row[3])
         for row in plan_rows
@@ -921,6 +962,71 @@ def _shared_resolution_has_parent_index(
         and expected_name.upper() in plan
         and 'SCAN ' not in plan
     )
+
+
+def _shared_resolution_capabilities(
+    conn: sqlite3.Connection,
+    database_identity: tuple[str, int | None, int | None],
+) -> _SharedResolutionCapabilities:
+    """Inspect immutable schema capabilities once per DB identity/version."""
+    try:
+        raw_version = conn.execute('PRAGMA schema_version').fetchone()
+        schema_version = int(raw_version[0]) if raw_version is not None else None
+    except (sqlite3.Error, TypeError, ValueError, IndexError):
+        schema_version = None
+
+    def inspect() -> _SharedResolutionCapabilities:
+        session_cols = {
+            str(row['name'])
+            for row in conn.execute('PRAGMA table_info(sessions)').fetchall()
+        }
+        if _SHARED_RESOLUTION_REQUIRED_COLUMNS.issubset(session_cols):
+            select_sql = _shared_resolution_select_sql(session_cols)
+            parent_index_usable = _shared_resolution_has_parent_index(
+                conn,
+                select_sql,
+            )
+        else:
+            select_sql = None
+            parent_index_usable = False
+        return _SharedResolutionCapabilities(
+            select_sql=select_sql,
+            parent_index_usable=parent_index_usable,
+        )
+
+    if schema_version is None:
+        return inspect()
+
+    cache_key = (database_identity, schema_version)
+    with _SHARED_RESOLUTION_CAPABILITY_CACHE_LOCK:
+        cached = _SHARED_RESOLUTION_CAPABILITY_CACHE.get(cache_key)
+        if cached is not None:
+            _SHARED_RESOLUTION_CAPABILITY_CACHE.move_to_end(cache_key)
+            return cached
+
+    # SQLite schema inspection belongs to this database connection, not the
+    # process-global LRU critical section.  Inspecting outside the lock keeps a
+    # cold or locked profile from serializing unrelated profile loads.
+    capabilities = inspect()
+    if capabilities.parent_index_usable is None:
+        return capabilities
+
+    with _SHARED_RESOLUTION_CAPABILITY_CACHE_LOCK:
+        # Another request may have populated this exact key while we inspected.
+        cached = _SHARED_RESOLUTION_CAPABILITY_CACHE.get(cache_key)
+        if cached is not None:
+            _SHARED_RESOLUTION_CAPABILITY_CACHE.move_to_end(cache_key)
+            return cached
+        for stale_key in tuple(_SHARED_RESOLUTION_CAPABILITY_CACHE):
+            if stale_key[0] == database_identity and stale_key != cache_key:
+                del _SHARED_RESOLUTION_CAPABILITY_CACHE[stale_key]
+        _SHARED_RESOLUTION_CAPABILITY_CACHE[cache_key] = capabilities
+        while (
+            len(_SHARED_RESOLUTION_CAPABILITY_CACHE)
+            > _SHARED_RESOLUTION_CAPABILITY_CACHE_MAX
+        ):
+            _SHARED_RESOLUTION_CAPABILITY_CACHE.popitem(last=False)
+        return capabilities
 
 
 def _shared_resolution_generation_hint(conn: sqlite3.Connection) -> int | None:
@@ -1000,6 +1106,7 @@ def resolve_shared_session(
     This is deliberately an entity lookup, not a collection projection.  It
     never reads messages, rebuilds session lists, or repairs Agent schema.
     """
+    _record_shared_resolution_call()
     if mode not in {'navigation', 'history'}:
         raise ValueError("mode must be 'navigation' or 'history'")
     sid = str(session_id or '').strip()
@@ -1028,14 +1135,12 @@ def resolve_shared_session(
         with closing(open_state_db_readonly(path)) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute('BEGIN')
-            session_cols = {
-                str(row['name'])
-                for row in conn.execute('PRAGMA table_info(sessions)').fetchall()
-            }
-            if not _SHARED_RESOLUTION_REQUIRED_COLUMNS.issubset(session_cols):
-                return terminal(status='degraded')
-            select_sql = _shared_resolution_select_sql(session_cols)
-            if not _shared_resolution_has_parent_index(conn, select_sql):
+            capabilities = _shared_resolution_capabilities(
+                conn,
+                database_identity,
+            )
+            select_sql = capabilities.select_sql
+            if select_sql is None or not capabilities.parent_index_usable:
                 return terminal(status='degraded')
 
             generation_hint = _shared_resolution_generation_hint(conn)

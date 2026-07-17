@@ -127,6 +127,7 @@ class RequestDiagnostics:
         self.started_wall = time.time()
         self._lock = threading.Lock()
         self._stages: list[dict[str, Any]] = []
+        self._metrics: dict[str, int] = {}
         self._current_stage = "start"
         self._current_stage_started = self.started_monotonic
         self._finished = False
@@ -183,6 +184,19 @@ class RequestDiagnostics:
             self._current_stage = clean
             self._current_stage_started = now
 
+    def set_metric(self, name: str, value: int) -> None:
+        """Attach a bounded numeric diagnostic without accepting content."""
+        clean = str(name or "").strip()
+        if not clean or len(clean) > 64 or isinstance(value, bool):
+            return
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            if not self._finished:
+                self._metrics[clean] = normalized
+
     def _emit_slow(self, prefix: str, record: dict) -> None:
         payload = json.dumps(record, sort_keys=True)
         log_msg = f"{prefix} %s"
@@ -234,6 +248,7 @@ class RequestDiagnostics:
             "elapsed_ms": round((now - self.started_monotonic) * 1000, 1),
             "current_stage": self._current_stage,
             "stages": stages,
+            "metrics": dict(self._metrics),
         }
         if include_stacks:
             record["thread_stacks"] = _thread_stack_snapshot()

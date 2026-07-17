@@ -39,11 +39,12 @@ from api.agent_sessions import (
     SHARED_INTERACTIVE_SESSION_SOURCES,
     SharedSessionResolution,
     _looks_like_default_cli_title,
+    begin_shared_resolution_call_tracking,
+    end_shared_resolution_call_tracking,
     is_cli_session_row,
     is_cli_session_row_visible,
     normalize_agent_session_source,
     resolve_shared_session,
-    resolve_shared_session_id,
     shared_state_db_identity,
     read_session_lineage_metadata,
     read_session_lineage_report,
@@ -12950,6 +12951,16 @@ def handle_get(handler, parsed) -> bool:
         # the allowlist, in which case the existing _tN-driven [SLOW] log
         # is the only signal — same as before.
         _diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
+        if _diag:
+            begin_shared_resolution_call_tracking()
+
+        def _finish_session_diagnostics():
+            if _diag:
+                _diag.set_metric(
+                    "canonical_resolution_calls",
+                    end_shared_resolution_call_tracking(),
+                )
+                _diag.finish()
         # perf(webui/session-load-latency) tier2c-followup: every early-return
         # in this handler calls `_diag.finish()` before returning so the
         # watchdog's _watchdog_pending dict stays bounded to in-flight requests.
@@ -12960,7 +12971,7 @@ def handle_get(handler, parsed) -> bool:
         query = parse_qs(parsed.query)
         sid = query.get("session_id", [""])[0]
         if not sid:
-            if _diag: _diag.finish()
+            _finish_session_diagnostics()
             return j(handler, {"error": "session_id is required"}, status=400)
         requested_sid = sid
         state_db_path = _active_state_db_path()
@@ -13005,7 +13016,7 @@ def handle_get(handler, parsed) -> bool:
                 if _session_profile:
                     # Valid session owned by a KNOWN other profile: 409 so the
                     # client can offer to switch to it (#5419).
-                    if _diag: _diag.finish()
+                    _finish_session_diagnostics()
                     return j(handler, {
                         "error": "Session belongs to a different profile",
                         "code": "session_profile_mismatch",
@@ -13017,7 +13028,7 @@ def handle_get(handler, parsed) -> bool:
                 # fires. _profiles_match coerces None->'default', so a truly
                 # missing/legacy session under a non-default active profile would
                 # otherwise emit a useless 409 with profile=null.
-                if _diag: _diag.finish()
+                _finish_session_diagnostics()
                 return bad(handler, "Session not found", 404)
             original_stream_id = getattr(s, "active_stream_id", None)
             _clear_stale_stream_state(s)
@@ -13374,16 +13385,9 @@ def handle_get(handler, parsed) -> bool:
                         (_t5-_t4)*1000, (_t6-_t5)*1000, _total_ms,
                     )
                 )
-            if _diag: _diag.finish()
+            _finish_session_diagnostics()
             return resp
         except KeyError:
-            # perf(webui/session-load-latency) tier2c-followup: fire
-            # _diag.finish() in the exception branch too. Greptile flagged
-            # this in PR review — finish() unregisters the pending watchdog
-            # entry; without it the entry stays for the full 5s slow-request
-            # timeout and emits a spurious "Slow WebUI request still
-            # running" log. Idempotent — finish() no-ops if already called.
-            if _diag: _diag.finish()
             # No WebUI sidecar. Delegate to the shared foreign-session
             # synthesizer so GET and POST have symmetric writeable/read-only
             # behaviour for CLI/TUI/Desktop sessions. The helper enforces the
@@ -13404,6 +13408,7 @@ def handle_get(handler, parsed) -> bool:
                 if _session_profile:
                     # Valid CLI/foreign session owned by a KNOWN other profile:
                     # 409 so the client can offer to switch to it (#5419).
+                    _finish_session_diagnostics()
                     return j(handler, {
                         "error": "Session belongs to a different profile",
                         "code": "session_profile_mismatch",
@@ -13415,6 +13420,7 @@ def handle_get(handler, parsed) -> bool:
                 # truly-missing session under a non-default active profile would
                 # otherwise emit a useless 409 with profile=null and skip the
                 # frontend self-heal + spin the SSE reconnect against a dead sid.
+                _finish_session_diagnostics()
                 return bad(handler, "Session not found", 404)
             if resolution.canonical_row is not None:
                 try:
@@ -13443,26 +13449,31 @@ def handle_get(handler, parsed) -> bool:
             if reason == "was_webui":
                 # Deleted WebUI session: 404 so the client self-heals
                 # (clears stale /session/<id> URL and localStorage, #2782).
+                _finish_session_diagnostics()
                 return bad(handler, "Session not found", 404)
             if synth is None:
                 # 'no_foreign_state' / 'invalid_sid' — nothing to render.
+                _finish_session_diagnostics()
                 return bad(handler, "Session not found", 404)
+            if _diag: _diag.stage("t2_after_state_db_load")
+            if _diag: _diag.stage("t3_after_model_resolve")
             # Build the legacy dict response from the synthesized Session so
             # the wire shape stays byte-equivalent to the previous inline
             # synthesis (the frontend has been reading these exact keys).
-            msgs = list(synth.messages or [])
+            all_msgs = list(synth.messages or [])
+            msgs = all_msgs if load_messages else []
             sess = {
                 "session_id": synth.session_id,
                 "title": synth.title,
                 "workspace": synth.workspace,
                 "model": synth.model,
-                "message_count": len(msgs),
+                "message_count": len(all_msgs),
                 "created_at": synth.created_at,
                 "updated_at": synth.updated_at,
                 "last_message_at": (
                     (cli_meta or {}).get("last_message_at")
                     or (cli_meta or {}).get("updated_at", 0)
-                    or ((msgs or [{}])[-1].get("timestamp", 0))
+                    or ((all_msgs or [{}])[-1].get("timestamp", 0))
                 ),
                 "pinned": bool(getattr(synth, "pinned", False)),
                 "archived": bool(getattr(synth, "archived", False)),
@@ -13493,13 +13504,19 @@ def handle_get(handler, parsed) -> bool:
                 "messages": msgs,
                 "tool_calls": [],
             }
-            attach_todo_state(sess, msgs)
+            attach_todo_state(sess, all_msgs)
             sess = _merge_cli_sidebar_metadata(sess, cli_meta)
             sess = _apply_resolution_metadata_to_payload(sess, resolution)
             sess["canonical_session_id"] = sid
             if requested_sid != sid:
                 sess["requested_session_id"] = requested_sid
-            return j(handler, {"session": redact_session_data(sess)})
+            if _diag: _diag.stage("t4_after_compact_and_merge")
+            redacted = redact_session_data(sess)
+            if _diag: _diag.stage("t5_after_redact")
+            response = j(handler, {"session": redacted})
+            if _diag: _diag.stage("t6_after_json_write")
+            _finish_session_diagnostics()
+            return response
 
     if parsed.path == "/api/session/lineage/report":
         sid = parse_qs(parsed.query).get("session_id", [""])[0]

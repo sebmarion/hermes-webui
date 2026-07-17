@@ -1,4 +1,6 @@
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -600,6 +602,133 @@ def test_query_shape_is_scoped_invariant_and_connection_closes(tmp_path, monkeyp
         if "parent_session_id =" in statement
     ]
     assert child_queries and all(" limit " in statement for statement in child_queries)
+
+
+def test_resolution_capability_probes_are_cached_and_schema_version_invalidates(
+    tmp_path,
+    monkeypatch,
+):
+    import api.agent_sessions as agent_sessions
+
+    db = tmp_path / "state.db"
+    _make_db(db)
+    _insert(db, "only")
+    runs = []
+
+    def tracked_open(_path):
+        statements = []
+        runs.append(statements)
+        return _TrackingConnection(sqlite3.connect(db), statements)
+
+    monkeypatch.setattr(agent_sessions, "open_state_db_readonly", tracked_open)
+
+    cold = agent_sessions.resolve_shared_session(db, "only")
+    warm = agent_sessions.resolve_shared_session(db, "only")
+
+    def sql(statements):
+        return [
+            " ".join(statement.lower().split())
+            for statement in statements
+            if statement.strip()
+        ]
+
+    cold_sql, warm_sql = map(sql, runs[:2])
+    assert cold.status == warm.status == "found"
+    assert len(cold_sql) <= 12  # 10 + 2D, D=1
+    assert len(warm_sql) <= 6  # 4 + 2D, D=1
+    assert any("pragma table_info(sessions)" in query for query in cold_sql)
+    assert any("pragma index_list(sessions)" in query for query in cold_sql)
+    assert not any("pragma table_info(sessions)" in query for query in warm_sql)
+    assert not any("pragma index_list(sessions)" in query for query in warm_sql)
+
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP INDEX idx_sessions_parent")
+
+    invalidated = agent_sessions.resolve_shared_session(db, "only")
+    invalidated_sql = sql(runs[2])
+    assert invalidated.status == "degraded"
+    assert any("pragma table_info(sessions)" in query for query in invalidated_sql)
+    assert any("pragma index_list(sessions)" in query for query in invalidated_sql)
+
+
+def test_transient_query_plan_error_is_not_cached_as_schema_degradation(
+    tmp_path,
+    monkeypatch,
+):
+    import api.agent_sessions as agent_sessions
+
+    db = tmp_path / "state.db"
+    _make_db(db)
+    _insert(db, "only")
+    fail_next_explain = [True]
+    runs = []
+
+    class TransientExplainConnection(_TrackingConnection):
+        def execute(self, sql, parameters=()):
+            if (
+                fail_next_explain[0]
+                and str(sql).lstrip().upper().startswith("EXPLAIN QUERY PLAN")
+            ):
+                fail_next_explain[0] = False
+                raise sqlite3.OperationalError("transient plan inspection failure")
+            return self._conn.execute(sql, parameters)
+
+    def tracked_open(_path):
+        statements = []
+        runs.append(statements)
+        return TransientExplainConnection(sqlite3.connect(db), statements)
+
+    monkeypatch.setattr(agent_sessions, "open_state_db_readonly", tracked_open)
+
+    first = agent_sessions.resolve_shared_session(db, "only")
+    second = agent_sessions.resolve_shared_session(db, "only")
+    third = agent_sessions.resolve_shared_session(db, "only")
+
+    normalized = [
+        [" ".join(statement.lower().split()) for statement in run]
+        for run in runs
+    ]
+    assert first.status == "degraded"
+    assert second.status == third.status == "found"
+    assert any("pragma table_info(sessions)" in query for query in normalized[1])
+    assert any("pragma index_list(sessions)" in query for query in normalized[1])
+    assert not any("pragma table_info(sessions)" in query for query in normalized[2])
+    assert not any("pragma index_list(sessions)" in query for query in normalized[2])
+
+
+def test_cold_capability_inspection_does_not_serialize_unrelated_databases(
+    tmp_path,
+    monkeypatch,
+):
+    import api.agent_sessions as agent_sessions
+
+    databases = [tmp_path / "first.db", tmp_path / "second.db"]
+    for db in databases:
+        _make_db(db)
+        _insert(db, "only")
+
+    original = agent_sessions._shared_resolution_has_parent_index
+    entered = threading.Barrier(2)
+
+    def concurrent_inspection(conn, select_sql):
+        entered.wait(timeout=2)
+        return original(conn, select_sql)
+
+    monkeypatch.setattr(
+        agent_sessions,
+        "_shared_resolution_has_parent_index",
+        concurrent_inspection,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda db: agent_sessions.resolve_shared_session(db, "only"),
+                databases,
+            )
+        )
+
+    assert [result.status for result in results] == ["found", "found"]
 
 
 def test_collection_helpers_are_not_used(tmp_path, monkeypatch):

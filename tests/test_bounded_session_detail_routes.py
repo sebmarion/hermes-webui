@@ -485,6 +485,7 @@ def _run_browser_session_route(
         routes,
         "resolve_shared_session_id",
         _forbidden("legacy canonical resolver"),
+        raising=False,
     )
     monkeypatch.setattr(
         routes,
@@ -742,6 +743,50 @@ def test_browser_session_sidecar_miss_passes_receipt_into_synthesized_fallback(
     assert payload["archived"] is False
     assert payload["pinned"] is True
     assert payload["messages"] == state_messages
+
+
+def test_browser_session_sidecar_miss_metadata_only_preserves_exact_count(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "state.db"
+    resolution = _resolution(db_path=db_path)
+    claim_calls = []
+    state_messages = [
+        {"role": "user", "content": "one", "timestamp": 1},
+        {"role": "assistant", "content": "two", "timestamp": 2},
+        {"role": "user", "content": "three", "timestamp": 3},
+    ]
+
+    def claim(sid, cli_meta=None, **kwargs):
+        claim_calls.append((sid, cli_meta, kwargs))
+        return _BrowserSession(messages=list(kwargs["resolved_messages"])), "materialized"
+
+    captured, resolve_calls, get_calls = _run_browser_session_route(
+        monkeypatch,
+        db_path=db_path,
+        resolution=resolution,
+        session_or_error=KeyError("tip"),
+        query="session_id=root&messages=0&resolve_model=0",
+        history_reader=lambda **_kwargs: state_messages,
+        claim_handler=claim,
+    )
+
+    assert resolve_calls == [(db_path, "root")]
+    assert get_calls == [("tip", True)]
+    assert len(claim_calls) == 1
+    sid, _cli_meta, kwargs = claim_calls[0]
+    assert sid == "tip"
+    assert kwargs == {
+        "resolved_messages": state_messages,
+        "resolved_state_row": dict(resolution.canonical_row),
+    }
+    assert captured["status"] == 200
+    payload = captured["payload"]["session"]
+    assert payload["canonical_session_id"] == "tip"
+    assert payload["requested_session_id"] == "root"
+    assert payload["message_count"] == 3
+    assert payload["messages"] == []
 
 
 def test_browser_session_sidecar_miss_uses_legacy_reader_when_bounded_schema_unavailable(
