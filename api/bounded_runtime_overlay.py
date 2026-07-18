@@ -22,6 +22,8 @@ from api.run_journal import (
 
 DEFAULT_MAX_JOURNAL_BYTES = 256 * 1024
 DEFAULT_MAX_JOURNAL_ROWS = 256
+_MAX_JSON_DEPTH = 64
+_MAX_JSON_NODES = 16_384
 VERIFIED_RUNTIME_OVERLAY_CAPABILITY = object()
 _RUN_JOURNAL_FIELDS = frozenset(
     {
@@ -126,16 +128,30 @@ def _finite_number(value: object) -> bool:
 
 
 def _finite_json(value: object) -> bool:
-    """Accept only finite JSON values after strict JSON decoding."""
-    if value is None or isinstance(value, (str, bool, int)):
-        return True
-    if isinstance(value, float):
-        return math.isfinite(value)
-    if isinstance(value, list):
-        return all(_finite_json(item) for item in value)
-    if isinstance(value, dict):
-        return all(isinstance(key, str) and _finite_json(item) for key, item in value.items())
-    return False
+    """Accept only bounded, finite JSON without recursive Python traversal."""
+    pending: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while pending:
+        item, depth = pending.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+            return False
+        if item is None or isinstance(item, (str, bool, int)):
+            continue
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                return False
+            continue
+        if isinstance(item, list):
+            pending.extend((child, depth + 1) for child in item)
+            continue
+        if isinstance(item, dict):
+            if not all(isinstance(key, str) for key in item):
+                return False
+            pending.extend((child, depth + 1) for child in item.values())
+            continue
+        return False
+    return True
 
 
 def _reject_json_constant(_value: str):
@@ -310,7 +326,13 @@ def _read_owned_journal(
                 event = json.loads(
                     raw.decode("utf-8"), parse_constant=_reject_json_constant
                 )
-            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+                RecursionError,
+            ):
                 return "runtime_journal_malformed", [], len(events), bytes_read
             valid, owner_matches = _valid_owned_event(
                 event, session_id=session_id, run_id=run_id

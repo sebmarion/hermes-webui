@@ -547,6 +547,41 @@ def test_owner_binding_rejects_type_coercion(tmp_path):
     assert result.status == "runtime_owner_invalid"
 
 
+def test_deeply_nested_journal_payload_fails_closed_without_recursion_error(tmp_path):
+    path = tmp_path / "_run_journal" / "session_1" / "run_1.jsonl"
+    path.parent.mkdir(parents=True)
+    record = {
+        "version": 1,
+        "event_id": "run_1:1",
+        "seq": 1,
+        "run_id": "run_1",
+        "session_id": "session_1",
+        "event": "token",
+        "type": "token",
+        "created_at": 1.0,
+        "terminal": False,
+        "terminal_state": None,
+        "payload": None,
+    }
+    encoded = json.dumps(record, separators=(",", ":"))
+    deeply_nested = ("[" * 1_200) + "0" + ("]" * 1_200)
+    path.write_text(
+        encoded.replace('"payload":null', f'"payload":{deeply_nested}') + "\n",
+        encoding="utf-8",
+    )
+
+    result = assemble_runtime_overlay(
+        [],
+        profile="default",
+        session_id="session_1",
+        owner=_owner(),
+        owner_verifier=_verified(_owner()),
+        session_dir=tmp_path,
+    )
+
+    assert result.status == "runtime_journal_malformed"
+
+
 def test_duplicate_in_memory_record_must_still_have_a_run_bound_identity(tmp_path):
     owner = _owner()
     result = assemble_runtime_overlay(
