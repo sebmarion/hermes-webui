@@ -132,8 +132,9 @@ def test_module_level_write_session_wrapper(session_dir):
     payload, _path = _write_json_session(session_dir, sid="wrapper_session")
     written = session_db.write_session(payload)
 
-    assert written == payload
-    assert session_db.read_session(payload["session_id"]) == payload
+    assert "sidecar_generation" not in payload
+    assert written == {**payload, "sidecar_generation": 1}
+    assert session_db.read_session(payload["session_id"]) == written
 
 
 def test_unified_session_db_flag_default_remains_false(monkeypatch, tmp_path):

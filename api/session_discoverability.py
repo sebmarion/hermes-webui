@@ -447,17 +447,20 @@ def _plan_discoverability_repairs(report: dict) -> list[dict]:
 
 
 def _clear_sidecar_cli_flag(session_dir: Path, sid: str, backup_dir: Path, backed_up: dict[Path, str]) -> dict:
+    import api.models as models
+
     path = session_dir / f"{sid}.json"
-    payload = _read_json(path)
-    if not isinstance(payload, dict):
-        return {"session_id": sid, "action": "clear_sidecar_cli_flag", "applied": False, "error": "sidecar_unreadable"}
-    if not _webui_origin(payload):
-        return {"session_id": sid, "action": "clear_sidecar_cli_flag", "applied": False, "skipped": "not_webui_origin"}
-    if payload.get("is_cli_session") is not True:
-        return {"session_id": sid, "action": "clear_sidecar_cli_flag", "applied": False, "skipped": "already_clear"}
-    backup = _backup_file(path, backup_dir, backed_up)
-    payload["is_cli_session"] = False
-    _atomic_write_json(path, payload)
+    with models._session_sidecar_write_lock(sid):
+        payload = _read_json(path)
+        if not isinstance(payload, dict):
+            return {"session_id": sid, "action": "clear_sidecar_cli_flag", "applied": False, "error": "sidecar_unreadable"}
+        if not _webui_origin(payload):
+            return {"session_id": sid, "action": "clear_sidecar_cli_flag", "applied": False, "skipped": "not_webui_origin"}
+        if payload.get("is_cli_session") is not True:
+            return {"session_id": sid, "action": "clear_sidecar_cli_flag", "applied": False, "skipped": "already_clear"}
+        backup = _backup_file(path, backup_dir, backed_up)
+        payload["is_cli_session"] = False
+        models._write_session_sidecar_payload(path, payload)
     return {"session_id": sid, "action": "clear_sidecar_cli_flag", "applied": True, "backup": backup}
 
 
@@ -485,6 +488,8 @@ def _clear_index_cli_flag(session_dir: Path, sid: str, backup_dir: Path, backed_
 
 
 def _materialize_sidecar_from_state_db(session_dir: Path, state_db_path: Path | None, sid: str, backup_dir: Path, backed_up: dict[Path, str]) -> dict:
+    from api.models import _write_session_sidecar_payload
+
     if state_db_path is None:
         return {"session_id": sid, "action": "materialize_sidecar_from_state_db", "applied": False, "error": "state_db_required"}
     target = session_dir / f"{sid}.json"
@@ -501,17 +506,13 @@ def _materialize_sidecar_from_state_db(session_dir: Path, state_db_path: Path | 
     payload = _state_db_row_to_sidecar(row)
     _backup_file(state_db_path, backup_dir, backed_up)
     session_dir.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    try:
-        os.link(str(tmp), str(target))
-    except FileExistsError:
+    published_generation = _write_session_sidecar_payload(
+        target,
+        payload,
+        create_only=True,
+    )
+    if published_generation is None:
         return {"session_id": sid, "action": "materialize_sidecar_from_state_db", "applied": False, "skipped": "sidecar_appeared_during_repair"}
-    finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
     index_updated = False
     index_path = session_dir / "_index.json"
     index_payload = _read_json(index_path)

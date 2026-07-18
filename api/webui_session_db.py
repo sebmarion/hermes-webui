@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import copy
 import json
-import os
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -136,10 +134,11 @@ class WebUIJsonSessionDB:
             raise ValueError(f"Unsafe session metadata fields: {', '.join(unsafe)}")
 
         path = self._existing_path_for_sid(sid)
-        data = self._read_writable_session(path)
-        data.update(copy.deepcopy(fields))
-        data["message_count"] = len(data["messages"])
-        self._atomic_write(path, data)
+        with models._session_sidecar_write_lock(sid):
+            data = self._read_writable_session(path)
+            data.update(copy.deepcopy(fields))
+            data["message_count"] = len(data["messages"])
+            self._atomic_write(path, data)
         return self._metadata_row(str(data.get("session_id") or sid), data)
 
     def archive(self, sid: str, archived: bool = True) -> dict[str, Any]:
@@ -220,19 +219,7 @@ class WebUIJsonSessionDB:
 
     @staticmethod
     def _atomic_write(path: Path, data: dict[str, Any]) -> None:
-        payload = json.dumps(data, ensure_ascii=False, indent=2)
-        tmp = path.with_suffix(f".tmp.{os.getpid()}.{threading.current_thread().ident}")
-        try:
-            with open(tmp, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, path)
-        finally:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+        models._write_session_sidecar_payload(path, data)
 
 
 def list_sessions() -> list[dict[str, Any]]:

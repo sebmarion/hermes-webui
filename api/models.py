@@ -161,6 +161,7 @@ def _safe_replace(src: Path, dst: Path) -> None:
 # Serializes index writers so concurrent Session.save() calls cannot race on
 # stale baselines while still allowing LOCK to be released before disk I/O.
 _INDEX_WRITE_LOCK = threading.RLock()
+_SESSION_SIDECAR_WRITE_LOCKS = tuple(threading.RLock() for _ in range(64))
 _SESSION_INDEX_REBUILD_LOCK = threading.Lock()
 _SESSION_INDEX_REBUILD_THREAD = None
 _SESSION_INDEX_REBUILD_THREAD_TARGET: tuple[Path, Path] | None = None
@@ -1086,6 +1087,217 @@ def _parse_nonnegative_int(value):
     return parsed if parsed >= 0 else None
 
 
+def _sidecar_generation_value(value) -> int:
+    return value if type(value) is int and value >= 0 else 0
+
+
+def _session_sidecar_write_lock(session_id: str) -> threading.RLock:
+    """Return the bounded process-local writer lock for one safe session id."""
+    if not is_safe_session_id(session_id):
+        raise ValueError(f"Unsafe session_id {session_id!r}")
+    digest = hashlib.sha256(session_id.encode("utf-8")).digest()
+    index = int.from_bytes(digest[:2], "big") % len(_SESSION_SIDECAR_WRITE_LOCKS)
+    return _SESSION_SIDECAR_WRITE_LOCKS[index]
+
+
+def _persisted_sidecar_generation(path: Path) -> int:
+    """Read only the metadata prefix and return its durable generation."""
+    if not path.exists():
+        return 0
+    try:
+        prefix = _read_metadata_json_prefix(path)
+        parsed = json.loads(prefix) if prefix else None
+        generation = (
+            _sidecar_generation_value(parsed.get("sidecar_generation"))
+            if isinstance(parsed, dict)
+            else 0
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        generation = 0
+    return generation
+
+
+def _payload_with_sidecar_generation(payload: dict, generation: int) -> dict:
+    """Place generation before either metadata-prefix stop key.
+
+    Legacy sidecars may serialize ``anchor_activity_scenes`` before
+    ``messages``.  The bounded metadata reader deliberately stops at whichever
+    key appears first, so generation must precede both layouts.
+    """
+    ordered = {}
+    inserted = False
+    for key, value in payload.items():
+        if key == "sidecar_generation":
+            continue
+        if key in {"messages", "anchor_activity_scenes"} and not inserted:
+            ordered["sidecar_generation"] = generation
+            inserted = True
+        ordered[key] = value
+    if not inserted:
+        ordered["sidecar_generation"] = generation
+    return ordered
+
+
+def _fsync_sidecar_parent(path: Path) -> None:
+    """Best-effort directory fsync after publishing a sidecar entry."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path.parent, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _write_session_sidecar_payload(
+    path: Path,
+    payload: dict,
+    *,
+    create_only: bool = False,
+) -> int | None:
+    """Publish one generation-aware sidecar under the shared writer lock.
+
+    Returns the published generation, or ``None`` when a create-only writer
+    loses to an already-published sidecar. The input mapping is updated only
+    after publication succeeds.
+    """
+    path = Path(path)
+    if not isinstance(payload, dict):
+        raise TypeError("session sidecar payload must be a dict")
+    session_id = str(payload.get("session_id") or path.stem)
+    if not is_safe_session_id(session_id) or path.stem != session_id:
+        raise ValueError(f"Unsafe or mismatched session_id {session_id!r}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _session_sidecar_write_lock(session_id):
+        if create_only and path.exists():
+            return None
+        persisted_generation = _persisted_sidecar_generation(path)
+        candidate_generation = _sidecar_generation_value(
+            payload.get("sidecar_generation")
+        )
+        next_generation = max(persisted_generation, candidate_generation) + 1
+        published_payload = _payload_with_sidecar_generation(
+            payload,
+            next_generation,
+        )
+        encoded = json.dumps(
+            published_payload,
+            ensure_ascii=False,
+            indent=2,
+        )
+        tmp = path.with_suffix(
+            f".tmp.{os.getpid()}.{threading.current_thread().ident}"
+        )
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(encoded)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if create_only:
+                try:
+                    os.link(str(tmp), str(path))
+                except FileExistsError:
+                    return None
+            else:
+                _safe_replace(tmp, path)
+            _fsync_sidecar_parent(path)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        payload["sidecar_generation"] = next_generation
+        return next_generation
+
+
+def _delete_session_sidecar_files(path: Path) -> bool:
+    """Delete one live sidecar and its backup as a single writer operation."""
+    path = Path(path)
+    session_id = path.stem
+    if not is_safe_session_id(session_id) or path.name != f"{session_id}.json":
+        raise ValueError(f"Unsafe or mismatched session sidecar {path!s}")
+    with _session_sidecar_write_lock(session_id):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Failed to unlink session file %s", path, exc_info=True)
+        live_deleted = not path.exists()
+        backup_path = path.with_suffix(".json.bak")
+        try:
+            backup_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug(
+                "Failed to unlink session backup file %s",
+                backup_path,
+                exc_info=True,
+            )
+        _fsync_sidecar_parent(path)
+        return live_deleted
+
+
+def _delete_session_sidecar_backup(path: Path) -> None:
+    """Delete one shrink backup under the shared sidecar writer lock."""
+    path = Path(path)
+    session_id = path.stem
+    if not is_safe_session_id(session_id) or path.name != f"{session_id}.json":
+        raise ValueError(f"Unsafe or mismatched session sidecar {path!s}")
+    with _session_sidecar_write_lock(session_id):
+        path.with_suffix(".json.bak").unlink(missing_ok=True)
+        _fsync_sidecar_parent(path)
+
+
+def _prepare_session_shrink_backup(session) -> bool:
+    """Preserve the #1558 shrink backup contract under the sidecar lock."""
+    try:
+        if not session.path.exists():
+            return True
+        existing_text = session.path.read_text(encoding="utf-8")
+        try:
+            existing = json.loads(existing_text)
+            existing_msg_count = len(existing.get("messages") or [])
+        except (json.JSONDecodeError, ValueError):
+            existing_msg_count = -1
+        incoming_msg_count = len(session.messages or [])
+        if (
+            existing_msg_count > 0
+            and incoming_msg_count == 0
+            and (session.active_stream_id or session.pending_user_message)
+        ):
+            logger.warning(
+                "refusing to overwrite session %s messages with empty "
+                "active/pending snapshot (existing=%s, incoming=%s, stream=%s)",
+                session.session_id,
+                existing_msg_count,
+                incoming_msg_count,
+                session.active_stream_id,
+            )
+            return False
+        if existing_msg_count <= incoming_msg_count:
+            return True
+        bak_path = session.path.with_suffix(".json.bak")
+        bak_tmp = bak_path.with_suffix(
+            f".bak.tmp.{os.getpid()}.{threading.current_thread().ident}"
+        )
+        try:
+            with open(bak_tmp, "w", encoding="utf-8") as handle:
+                handle.write(existing_text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            _safe_replace(bak_tmp, bak_path)
+        except OSError:
+            try:
+                bak_tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return True
+
+
 class Session:
     def __init__(self, session_id: str=None, title: str='Untitled',
                  workspace=str(DEFAULT_WORKSPACE), model=DEFAULT_MODEL,
@@ -1122,6 +1334,7 @@ class Session:
                  truncation_watermark=None,
                  truncation_boundary=None,
                  clear_generation=None,
+                 sidecar_generation=None,
                  gateway_routing=None, gateway_routing_history=None,
                  llm_title_generated: bool=False,
                  manual_title: bool=False,
@@ -1194,6 +1407,7 @@ class Session:
         self.truncation_watermark = truncation_watermark
         self.truncation_boundary = truncation_boundary
         self.clear_generation = clear_generation
+        self.sidecar_generation = _sidecar_generation_value(sidecar_generation)
         self.gateway_routing = gateway_routing if isinstance(gateway_routing, dict) else None
         self.gateway_routing_history = gateway_routing_history if isinstance(gateway_routing_history, list) else []
         self.llm_title_generated = bool(llm_title_generated)
@@ -1295,6 +1509,7 @@ class Session:
             'truncation_watermark',
             'truncation_boundary',
             'clear_generation',
+            'sidecar_generation',
             'gateway_routing', 'gateway_routing_history', 'llm_title_generated', 'manual_title',
             'parent_session_id',
             'worktree_path', 'worktree_branch', 'worktree_repo_root', 'worktree_created_at',
@@ -1327,84 +1542,20 @@ class Session:
         extra = {k: v for k, v in self.__dict__.items()
                  if k not in METADATA_FIELDS and k not in _placed
                  and not k.startswith('_')}
-        payload = json.dumps({**meta, **extra}, ensure_ascii=False, indent=2)
+        payload = {**meta, **extra}
 
-        # ── #1558 backup safeguard ──────────────────────────────────────
-        # Before overwriting the session file, copy the previous version to
-        # ``<sid>.json.bak`` IFF the previous file has more messages than the
-        # incoming payload. The asymmetric guard means:
-        #   * Normal grow-the-conversation saves never produce a backup
-        #     (incoming messages >= existing) — keeps disk overhead near zero.
-        #   * Any save that would shrink the messages array (the failure mode
-        #     of #1558, plus anything similar in the future) leaves a recoverable
-        #     snapshot of the pre-shrink state on disk.
-        # The recovery path is api/session_recovery.py — at server startup and
-        # via /api/session/recover, sessions whose JSON has fewer messages than
-        # their .bak get restored automatically.
-        try:
-            if self.path.exists():
-                existing_text = self.path.read_text(encoding='utf-8')
-                try:
-                    existing = json.loads(existing_text)
-                    existing_msg_count = len(existing.get('messages') or [])
-                except (json.JSONDecodeError, ValueError):
-                    existing_msg_count = -1  # corrupt → always back up
-                incoming_msg_count = len(self.messages or [])
-                if (
-                    existing_msg_count > 0
-                    and incoming_msg_count == 0
-                    and (self.active_stream_id or self.pending_user_message)
-                ):
-                    logger.warning(
-                        "refusing to overwrite session %s messages with empty active/pending snapshot "
-                        "(existing=%s, incoming=%s, stream=%s)",
-                        self.session_id,
-                        existing_msg_count,
-                        incoming_msg_count,
-                        self.active_stream_id,
-                    )
-                    return
-                if existing_msg_count > incoming_msg_count:
-                    bak_path = self.path.with_suffix('.json.bak')
-                    # SHOULD-FIX #2 (Opus): atomic write via tmp+replace,
-                    # mirroring the main save() pattern below. Prevents a
-                    # torn .bak from a crash mid-write or a concurrent
-                    # backup-producing save. Recovery defends against a
-                    # torn .bak (JSONDecodeError → no_action), so the
-                    # failure mode pre-fix was "backup is lost"; with
-                    # this fix the backup either lands cleanly or doesn't
-                    # land at all.
-                    try:
-                        bak_tmp = bak_path.with_suffix(
-                            f'.bak.tmp.{os.getpid()}.{threading.current_thread().ident}'
-                        )
-                        with open(bak_tmp, 'w', encoding='utf-8') as bf:
-                            bf.write(existing_text)
-                            bf.flush()
-                            os.fsync(bf.fileno())
-                        _safe_replace(bak_tmp, bak_path)
-                    except OSError:
-                        # Backup is best-effort; main save proceeds regardless.
-                        try:
-                            bak_tmp.unlink(missing_ok=True)
-                        except Exception:
-                            pass
-        except OSError:
-            pass
-
-        tmp = self.path.with_suffix(f'.tmp.{os.getpid()}.{threading.current_thread().ident}')
-        try:
-            with open(tmp, 'w', encoding='utf-8') as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-            _safe_replace(tmp, self.path)
-        except Exception:
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-            raise
+        # Backup inspection and generation allocation share the same striped
+        # RLock as recovery/materialization writers. This prevents stale
+        # Session objects and recovery races from reusing or moving backwards
+        # across a durable sidecar generation.
+        with _session_sidecar_write_lock(self.session_id):
+            if not _prepare_session_shrink_backup(self):
+                return
+            published_generation = _write_session_sidecar_payload(
+                self.path,
+                payload,
+            )
+        self.sidecar_generation = published_generation
         if not skip_index:
             _write_session_index(updates=[self])
 

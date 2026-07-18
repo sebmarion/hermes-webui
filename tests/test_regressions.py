@@ -344,7 +344,8 @@ def test_server_delete_prunes_session_index(cleanup_test_sessions):
             text.find('if parsed.path == "/api/session/delete":'),
         )
         if delete_idx >= 0:
-            delete_block = text[delete_idx:delete_idx+2400]
+            delete_end = text.find('if parsed.path == "/api/session/clear":', delete_idx)
+            delete_block = text[delete_idx:delete_end if delete_end >= 0 else delete_idx + 5000]
             assert "prune_session_from_index(sid)" in delete_block, \
                 f"{label} session/delete must prune SESSION_INDEX_FILE"
             return
@@ -359,9 +360,20 @@ def test_server_delete_removes_session_bak_snapshot(cleanup_test_sessions):
         routes_src.find('if parsed.path == "/api/session/delete":'),
     )
     assert delete_idx >= 0, "session/delete handler not found in api/routes.py"
-    delete_block = routes_src[delete_idx:delete_idx+2400]
-    assert "with_suffix('.json.bak').unlink" in delete_block or 'with_suffix(".json.bak").unlink' in delete_block, \
-        "session/delete must unlink <sid>.json.bak to avoid later orphan-backup recovery"
+    delete_end = routes_src.find('if parsed.path == "/api/session/clear":', delete_idx)
+    delete_block = routes_src[delete_idx:delete_end]
+    assert "with _session_sidecar_write_lock(sid):" in delete_block
+    assert "_delete_session_sidecar_files(p)" in delete_block, (
+        "session/delete must use the locked live+backup deletion helper to "
+        "avoid orphan-backup recovery"
+    )
+    assert "_record_webui_deleted_session_tombstone(sid)" in delete_block
+    models_src = (REPO_ROOT / "api" / "models.py").read_text()
+    helper_idx = models_src.find("def _delete_session_sidecar_files(")
+    assert helper_idx >= 0
+    helper_block = models_src[helper_idx:helper_idx + 1600]
+    assert 'with_suffix(".json.bak")' in helper_block
+    assert "backup_path.unlink(missing_ok=True)" in helper_block
 
 # ── R9: Token/tool SSE events write to wrong session after switch ─────────────
 

@@ -9800,6 +9800,9 @@ from api.models import (
     shared_interactive_sidebar_projection_all_profiles,
     merge_session_messages_append_only,
     _read_metadata_json_prefix,
+    _session_sidecar_write_lock,
+    _delete_session_sidecar_files,
+    _delete_session_sidecar_backup,
     _enrich_sidebar_lineage_metadata,
     _active_stream_ids,
     _evict_sessions_over_cap,
@@ -15524,25 +15527,24 @@ def handle_post(handler, parsed) -> bool:
             p.relative_to(SESSION_DIR.resolve())
         except Exception:
             return bad(handler, "Invalid session_id", 400)
-        sidecar_deleted = False
-        try:
-            p.unlink(missing_ok=True)
-        except Exception:
-            logger.debug("Failed to unlink session file %s", p)
-        sidecar_deleted = not p.exists()
-        try:
-            p.with_suffix('.json.bak').unlink(missing_ok=True)
-        except Exception:
-            logger.debug("Failed to unlink session backup file %s", p.with_suffix('.json.bak'))
+        # Sidecar deletion and its durable tombstone are one writer operation.
+        # A state.db reconciliation that scanned just before deletion must not
+        # be able to recreate the file in the gap before the tombstone lands.
+        with _session_sidecar_write_lock(sid):
+            try:
+                sidecar_deleted = _delete_session_sidecar_files(p)
+            except Exception:
+                logger.debug("Failed to delete session sidecar files for %s", p, exc_info=True)
+                sidecar_deleted = not p.exists()
+            if sidecar_deleted and not is_messaging_session:
+                try:
+                    _record_webui_deleted_session_tombstone(sid)
+                except Exception:
+                    logger.debug("Failed to tombstone deleted WebUI session %s", sid, exc_info=True)
         try:
             prune_session_from_index(sid)
         except Exception:
             logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
-        if sidecar_deleted and not is_messaging_session:
-            try:
-                _record_webui_deleted_session_tombstone(sid)
-            except Exception:
-                logger.debug("Failed to tombstone deleted WebUI session %s", sid, exc_info=True)
         try:
             from api.upload import _session_attachment_dir
 
@@ -15658,29 +15660,33 @@ def handle_post(handler, parsed) -> bool:
             # again (#3542 lifecycle gap).
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, "Untitled")
-            s.save()
-            persisted_clear = False
-            try:
-                persisted = json.loads(s.path.read_text(encoding="utf-8"))
-                persisted_clear = (
-                    persisted.get("messages") == []
-                    and persisted.get("context_messages") == []
-                    and persisted.get("truncation_watermark") == 0.0
-                    and persisted.get("truncation_boundary") == 0.0
-                    and persisted.get("active_stream_id") is None
-                    and persisted.get("pending_user_message") is None
-                    and persisted.get("pending_attachments") == []
-                    and persisted.get("pending_started_at") is None
-                    and persisted.get("pending_user_source") is None
-                    and persisted.get("clear_generation") == s.clear_generation
-                )
-            except (OSError, json.JSONDecodeError, ValueError):
-                logger.warning("session clear could not verify persisted empty state for %s", sid, exc_info=True)
-            if had_sidecar_messages and persisted_clear:
+            # Save and stale-backup cleanup are one sidecar writer operation.
+            # Otherwise a concurrent save can create a newer backup between
+            # publication and cleanup, and this clear would delete that backup.
+            with _session_sidecar_write_lock(sid):
+                s.save()
+                persisted_clear = False
                 try:
-                    s.path.with_suffix('.json.bak').unlink(missing_ok=True)
-                except OSError:
-                    logger.warning("session clear could not remove stale backup for %s", sid, exc_info=True)
+                    persisted = json.loads(s.path.read_text(encoding="utf-8"))
+                    persisted_clear = (
+                        persisted.get("messages") == []
+                        and persisted.get("context_messages") == []
+                        and persisted.get("truncation_watermark") == 0.0
+                        and persisted.get("truncation_boundary") == 0.0
+                        and persisted.get("active_stream_id") is None
+                        and persisted.get("pending_user_message") is None
+                        and persisted.get("pending_attachments") == []
+                        and persisted.get("pending_started_at") is None
+                        and persisted.get("pending_user_source") is None
+                        and persisted.get("clear_generation") == s.clear_generation
+                    )
+                except (OSError, json.JSONDecodeError, ValueError):
+                    logger.warning("session clear could not verify persisted empty state for %s", sid, exc_info=True)
+                if had_sidecar_messages and persisted_clear:
+                    try:
+                        _delete_session_sidecar_backup(s.path)
+                    except OSError:
+                        logger.warning("session clear could not remove stale backup for %s", sid, exc_info=True)
         # Evict cached agent outside the per-session lock.  Eviction may run a
         # boundary memory commit for batch-extraction providers, and provider
         # I/O must not hold the session mutation lock.
@@ -21554,7 +21560,8 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
             if should_delete:
                 with LOCK:
                     SESSIONS.pop(p.stem, None)
-                p.unlink(missing_ok=True)
+                if not _delete_session_sidecar_files(p):
+                    continue
                 cleaned += 1
                 phase1_removed_ids.add(p.stem)
         except Exception:
@@ -21782,7 +21789,7 @@ def _handle_background(handler, body):
             # clutter the sidebar or SESSION_DIR. The index is pruned on the
             # next rebuild via _index_entry_exists().
             try:
-                (SESSION_DIR / f"{bg_sid}.json").unlink(missing_ok=True)
+                _delete_session_sidecar_files(SESSION_DIR / f"{bg_sid}.json")
             except Exception:
                 pass
         except Exception:
@@ -25643,12 +25650,14 @@ def _handle_session_compress(handler, body):
             s.truncation_boundary = compress_watermark
             s.compression_anchor_mode = "manual"
             s.last_prompt_tokens = new_tokens
-            s.save()
-            # Drop stale backups that would undo an intentional manual compress.
-            try:
-                s.path.with_suffix(".json.bak").unlink(missing_ok=True)
-            except OSError:
-                pass
+            # Publish the compressed view and remove only the backup belonging
+            # to that publication while holding the same sidecar writer lock.
+            with _session_sidecar_write_lock(sid):
+                s.save()
+                try:
+                    _delete_session_sidecar_backup(s.path)
+                except OSError:
+                    pass
 
         session_payload = redact_session_data(
             s.compact() | {

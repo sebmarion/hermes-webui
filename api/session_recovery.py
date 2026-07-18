@@ -29,7 +29,6 @@ import argparse
 import json
 import logging
 import os
-import shutil
 import sqlite3
 import threading
 from pathlib import Path
@@ -346,23 +345,28 @@ def recover_session(session_path: Path) -> dict:
     Returns a status dict identical to ``inspect_session_recovery_status``
     plus a "restored" boolean.
     """
-    status = inspect_session_recovery_status(session_path)
-    if status["recommend"] != "restore":
-        return {**status, "restored": False}
-    bak_path = session_path.with_suffix('.json.bak')
-    # Stage the recovery via a tmp copy + atomic replace so a crash mid-restore
-    # cannot leave a half-written session.json.
-    tmp_path = session_path.with_suffix('.json.recover.tmp')
-    try:
-        shutil.copyfile(bak_path, tmp_path)
-        tmp_path.replace(session_path)
-    except OSError as exc:
-        logger.warning("recover_session: copy failed for %s: %s", session_path, exc)
+    from api.models import (
+        _session_sidecar_write_lock,
+        _write_session_sidecar_payload,
+    )
+
+    session_path = Path(session_path)
+    session_id = session_path.stem
+    with _session_sidecar_write_lock(session_id):
+        # Re-evaluate under the same writer lock as Session.save(). A live save
+        # that won the race can make the older backup unnecessary.
+        status = inspect_session_recovery_status(session_path)
+        if status["recommend"] != "restore":
+            return {**status, "restored": False}
+        bak_path = session_path.with_suffix('.json.bak')
         try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return {**status, "restored": False, "error": str(exc)}
+            payload = json.loads(bak_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("backup payload is not an object")
+            _write_session_sidecar_payload(session_path, payload)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning("recover_session: copy failed for %s: %s", session_path, exc)
+            return {**status, "restored": False, "error": str(exc)}
     logger.warning(
         "recover_session: restored %s from .bak (live=%d → bak=%d messages). "
         "See #1558 for the data-loss class this guards against.",
@@ -591,6 +595,11 @@ def _state_db_row_to_sidecar(row: dict) -> dict:
 
 def recover_missing_sidecars_from_state_db(session_dir: Path, state_db_path: Path | None) -> dict:
     """Materialize missing WebUI JSON sidecars from canonical state.db rows."""
+    from api.models import (
+        _session_sidecar_write_lock,
+        _write_session_sidecar_payload,
+    )
+
     rows = _read_state_db_missing_sidecar_rows(session_dir, state_db_path)
     materialized = 0
     details: list[dict] = []
@@ -603,44 +612,39 @@ def recover_missing_sidecars_from_state_db(session_dir: Path, state_db_path: Pat
         if target.exists():
             continue
         payload = _state_db_row_to_sidecar(row)
-        # Per-process/per-thread tmp suffix to avoid corruption under
-        # concurrent reconciliation calls (matches api/models.py:484
-        # Session.save() convention).
-        tmp_suffix = f".json.reconcile.tmp.{os.getpid()}.{threading.current_thread().ident}"
-        tmp = target.with_suffix(tmp_suffix)
-        detail_recorded = False
         try:
-            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
-        except OSError as exc:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+            with _session_sidecar_write_lock(sid):
+                # Re-check deletion intent under the same lock used by the
+                # delete route. The initial DB scan can become stale while a
+                # user deletion is publishing its durable tombstone.
+                if _durable_tombstone_marks_deleted_webui_session(
+                    session_dir,
+                    sid,
+                ):
+                    details.append({
+                        'session_id': sid,
+                        'materialized': False,
+                        'skipped': 'deleted_session_tombstone',
+                    })
+                    continue
+                published_generation = _write_session_sidecar_payload(
+                    target,
+                    payload,
+                    create_only=True,
+                )
+        except (OSError, TypeError, ValueError) as exc:
             details.append({'session_id': sid, 'materialized': False, 'error': str(exc)})
             continue
-        # Atomic create-or-fail: os.link() refuses to overwrite an existing
-        # target. Closes the TOCTOU window between the target.exists() check
-        # above and the rename — a concurrent Session.save() for the same SID
-        # will win and we silently skip rather than overwrite a live sidecar.
-        materialized_now = False
-        try:
-            os.link(str(tmp), str(target))
-            materialized_now = True
-        except FileExistsError:
-            # Live sidecar appeared between the check and the link — keep it.
-            pass
-        except OSError as exc:
-            details.append({'session_id': sid, 'materialized': False, 'error': str(exc)})
-            detail_recorded = True
-        finally:
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+        materialized_now = published_generation is not None
         if materialized_now:
             materialized += 1
-            details.append({'session_id': sid, 'materialized': True, 'messages': len(payload.get('messages') or [])})
-        elif not detail_recorded:
+            details.append({
+                'session_id': sid,
+                'materialized': True,
+                'messages': len(payload.get('messages') or []),
+                'sidecar_generation': published_generation,
+            })
+        else:
             details.append({'session_id': sid, 'materialized': False, 'skipped': 'sidecar_appeared_during_reconcile'})
     return {'scanned': len(rows), 'materialized': materialized, 'details': details}
 
