@@ -358,14 +358,19 @@ def test_cheap_fingerprint_returns_none_without_source_column(tmp_path):
 
 
 def _make_modern_projection_db(tmp_path: Path):
-    """Create the schema-v20 watcher fast-path contract."""
+    """Create the completed projection-v2 watcher fast-path contract."""
     db, conn = _make_db(tmp_path)
     conn.executescript(
         """
         ALTER TABLE sessions ADD COLUMN last_activity_at REAL;
         ALTER TABLE sessions ADD COLUMN model_config TEXT;
-        CREATE TABLE session_projection_meta (id INTEGER PRIMARY KEY, generation INTEGER);
-        INSERT INTO session_projection_meta (id, generation) VALUES (1, 1);
+        CREATE TABLE session_projection_meta (
+            id INTEGER PRIMARY KEY,
+            generation INTEGER,
+            backfill_complete INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO session_projection_meta (id, generation, backfill_complete)
+        VALUES (1, 1, 1);
         """
     )
     conn.commit()
@@ -437,6 +442,60 @@ def test_cheap_fingerprint_uses_legacy_message_aggregate_without_metadata(tmp_pa
     db, conn = _make_db(tmp_path)
     conn.execute("ALTER TABLE sessions ADD COLUMN last_activity_at REAL")
     _add_session(conn, "visible", "telegram", mc=2)
+    conn.commit()
+    fp_before = gw._cheap_change_fingerprint(db)
+    conn.execute("UPDATE messages SET timestamp = 999.0 WHERE session_id = 'visible'")
+    conn.commit()
+    assert gw._cheap_change_fingerprint(db) != fp_before
+
+
+def test_cheap_fingerprint_uses_legacy_aggregate_without_metadata_singleton(tmp_path):
+    """A created-but-uninitialized metadata table is not a ready projection."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_modern_projection_db(tmp_path)
+    conn.execute("DELETE FROM session_projection_meta WHERE id = 1")
+    _add_session(conn, "visible", "telegram", mc=2)
+    conn.execute("UPDATE sessions SET last_activity_at = NULL WHERE id = 'visible'")
+    conn.commit()
+    fp_before = gw._cheap_change_fingerprint(db)
+    conn.execute("UPDATE messages SET timestamp = 999.0 WHERE session_id = 'visible'")
+    conn.commit()
+    assert gw._cheap_change_fingerprint(db) != fp_before
+
+
+def test_cheap_fingerprint_uses_legacy_aggregate_until_backfill_complete(tmp_path):
+    """Stale activity during backfill cannot hide a same-count transcript rewrite."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_modern_projection_db(tmp_path)
+    conn.execute(
+        "UPDATE session_projection_meta SET backfill_complete = 0 WHERE id = 1"
+    )
+    _add_session(conn, "visible", "telegram", mc=2)
+    conn.execute("UPDATE sessions SET last_activity_at = 100.0 WHERE id = 'visible'")
+    conn.commit()
+    fp_before = gw._cheap_change_fingerprint(db)
+    conn.execute("UPDATE messages SET timestamp = 999.0 WHERE session_id = 'visible'")
+    conn.commit()
+    assert gw._cheap_change_fingerprint(db) != fp_before
+
+
+def test_cheap_fingerprint_uses_legacy_aggregate_without_backfill_flag(tmp_path):
+    """Metadata from an older schema cannot prove transactional activity is ready."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    conn.executescript(
+        """
+        ALTER TABLE sessions ADD COLUMN last_activity_at REAL;
+        ALTER TABLE sessions ADD COLUMN model_config TEXT;
+        CREATE TABLE session_projection_meta (
+            id INTEGER PRIMARY KEY,
+            generation INTEGER
+        );
+        INSERT INTO session_projection_meta (id, generation) VALUES (1, 1);
+        """
+    )
+    _add_session(conn, "visible", "telegram", mc=2)
+    conn.execute("UPDATE sessions SET last_activity_at = NULL WHERE id = 'visible'")
     conn.commit()
     fp_before = gw._cheap_change_fingerprint(db)
     conn.execute("UPDATE messages SET timestamp = 999.0 WHERE session_id = 'visible'")

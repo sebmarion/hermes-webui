@@ -308,11 +308,12 @@ never migrates Agent state.
 The optional external-session gateway watcher is not a server-startup owner.
 `/api/sessions/gateway/stream` creates it lazily through `get_watcher()` only
 when the browser enables that SSE bridge, after the initial session-list render.
-On projection-v2 schemas its five-second change check hashes only the filtered
-`sessions` rows, including Agent-maintained `last_activity_at`, and never scans
-`messages`; legacy, partial, or explicitly rolled-back schemas retain the
-conservative per-session message aggregate. Shutdown still stops every watcher
-in the profile registry.
+On completed projection-v2 schemas its five-second change check hashes only the
+filtered `sessions` rows, including Agent-maintained `last_activity_at`, and
+never scans `messages`; the work is therefore bounded by eligible session count,
+not transcript volume. Legacy, partial, incomplete-backfill, or explicitly
+rolled-back schemas retain the conservative per-session message aggregate.
+Shutdown still stops every watcher in the profile registry.
 
 Entity detail loads have a separate boundary from collection projection. A
 single indexed resolver starts at the requested `sessions` primary key, follows

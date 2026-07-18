@@ -44,9 +44,9 @@ _WATCHER_EXCLUDED_SOURCES = ("cron", "webui")
 
 
 def _cheap_change_fingerprint(db_path: Path) -> str | None:
-    """Compute a bounded change fingerprint for the gateway projection.
+    """Compute a message-volume-bounded fingerprint for the gateway projection.
 
-    Agent projection-v2 schemas maintain ``message_count`` and
+    Completed Agent projection-v2 schemas maintain ``message_count`` and
     ``last_activity_at`` transactionally in ``sessions``. On that contract the
     watcher hashes only the same top-level candidate rows as
     ``read_importable_agent_session_rows`` and never opens the ``messages``
@@ -55,13 +55,12 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
     transcript change (issues #3506 / #3536).
 
     The modern fingerprint is scoped to the same non-cron/webui, non-delegate
-    rows as the projection. To guarantee
-    it never skips a change the watcher payload would reflect, it hashes every
-    sessions-table column used by that payload or by top-level eligibility and
-    compression collapse. That matters because the projection hides/shows rows based on
-    ``parent_session_id`` / ``ended_at`` / ``end_reason`` / ``source``, so a change
-    to one of those alters *which rows* appear even when no displayed field on a
-    given row moved.
+    rows as the projection. To guarantee it never skips a change the watcher
+    payload would reflect, it hashes every sessions-table column used by that
+    payload or by top-level eligibility and compression collapse. That matters
+    because the projection hides/shows rows based on ``parent_session_id`` /
+    ``ended_at`` / ``end_reason`` / ``source``, so a change to one of those
+    alters *which rows* appear even when no displayed field on a given row moved.
 
     Returns the fingerprint string, or ``None`` on any error / a pre-source
     schema so the caller falls back to running the expensive projection rather
@@ -106,15 +105,20 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
             projection_enabled = os.getenv(
                 "HERMES_WEBUI_SESSION_PROJECTION_V2", "true"
             ).strip().lower() not in {"0", "false", "no", "off"}
-            projection_meta_present = False
+            projection_ready = False
             if projection_enabled and 'last_activity_at' in cols:
                 try:
-                    projection_meta_present = cur.execute(
-                        "SELECT 1 FROM sqlite_master "
-                        "WHERE type = 'table' AND name = 'session_projection_meta'"
-                    ).fetchone() is not None
-                except sqlite3.Error:
-                    projection_meta_present = False
+                    meta_row = cur.execute(
+                        "SELECT backfill_complete FROM session_projection_meta "
+                        "WHERE id = 1"
+                    ).fetchone()
+                    projection_ready = (
+                        meta_row is not None and int(meta_row[0] or 0) == 1
+                    )
+                except (sqlite3.Error, TypeError, ValueError):
+                    # A missing table/column/row or malformed value cannot prove
+                    # that last_activity_at is transactionally authoritative.
+                    projection_ready = False
 
             cur.execute(
                 f"SELECT {', '.join(selectable)} FROM sessions "
@@ -126,7 +130,7 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
             for row in cur.fetchall():
                 h.update(repr(row).encode('utf-8', 'replace'))
                 h.update(b'\x1e')
-            if projection_meta_present:
+            if projection_ready:
                 return h.hexdigest()
 
             # A same-count transcript rewrite (SessionDB.replace_messages used by
