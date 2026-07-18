@@ -133,6 +133,51 @@ def test_clear_empties_context_messages(monkeypatch, tmp_path):
     assert loaded.context_messages == []
 
 
+def test_clear_syncs_untitled_title_before_canonical_overlay(monkeypatch, tmp_path):
+    """A clear must not let a stale state.db title win on the next read.
+
+    The bounded session route applies its request-snapshot canonical metadata
+    after compacting the cleared sidecar.  Rename has already mirrored the old
+    title into state.db, so clear must synchronously mirror ``Untitled`` before
+    returning; otherwise that stale canonical row re-labels the cleared session
+    on the next ``GET /api/session``.
+    """
+    _seed_session_dir(monkeypatch, tmp_path)
+    from api.models import Session
+    import api.routes as routes
+
+    session = Session(
+        session_id="issue5532title",
+        title="clear-test",
+        messages=_four_turn_messages(),
+        context_messages=_four_turn_messages(),
+    )
+    session.save()
+    canonical_row = {"title": "clear-test", "source": "webui"}
+    sync_lock_states = []
+
+    def sync_canonical_title(cleared):
+        sync_lock_states.append(
+            routes._get_session_agent_lock(cleared.session_id).locked()
+        )
+        canonical_row["title"] = cleared.title
+
+    monkeypatch.setattr(routes, "_sync_session_title_to_insights", sync_canonical_title)
+    _call_clear(monkeypatch, session.session_id)
+
+    payload = routes._apply_resolution_metadata_to_payload(
+        {"title": "Untitled"},
+        SimpleNamespace(
+            canonical_row=canonical_row,
+            root_id=session.session_id,
+            tip_id=session.session_id,
+            member_ids=(session.session_id,),
+        ),
+    )
+    assert sync_lock_states == [True]
+    assert payload["title"] == "Untitled"
+
+
 def test_clear_then_read_does_not_resurrect_state_db_messages(monkeypatch, tmp_path):
     """After /clear, a subsequent /api/session read (the append-only state.db
     merge) must return EMPTY — the cleared turns must NOT resurrect from

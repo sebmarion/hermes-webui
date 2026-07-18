@@ -16256,6 +16256,13 @@ def handle_post(handler, parsed) -> bool:
                         _delete_session_sidecar_backup(s.path)
                     except OSError:
                         logger.warning("session clear could not remove stale backup for %s", sid, exc_info=True)
+            # ``/api/session`` overlays the resolved state.db row after
+            # compacting the sidecar. A prior rename has already mirrored its
+            # manual title there, so mirror the post-clear ``Untitled`` title
+            # as part of this same per-session mutation. Keep the SQLite write
+            # outside the nested sidecar writer lock while preventing a later
+            # session mutation from overtaking the verified clear.
+            _sync_session_title_to_insights(s)
         # Evict cached agent outside the per-session lock.  Eviction may run a
         # boundary memory commit for batch-extraction providers, and provider
         # I/O must not hold the session mutation lock.
