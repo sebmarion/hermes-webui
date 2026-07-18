@@ -133,14 +133,15 @@ def test_clear_empties_context_messages(monkeypatch, tmp_path):
     assert loaded.context_messages == []
 
 
-def test_clear_syncs_untitled_title_before_canonical_overlay(monkeypatch, tmp_path):
+def test_clear_nulls_canonical_title_before_canonical_overlay(monkeypatch, tmp_path):
     """A clear must not let a stale state.db title win on the next read.
 
     The bounded session route applies its request-snapshot canonical metadata
     after compacting the cleared sidecar.  Rename has already mirrored the old
-    title into state.db, so clear must synchronously mirror ``Untitled`` before
-    returning; otherwise that stale canonical row re-labels the cleared session
-    on the next ``GET /api/session``.
+    title into state.db. Agent titles are unique, so clear must synchronously
+    NULL the canonical title before returning rather than trying to persist a
+    duplicate ``Untitled`` placeholder. Otherwise the rejected write leaves the
+    stale canonical row to re-label the cleared session on the next GET.
     """
     _seed_session_dir(monkeypatch, tmp_path)
     from api.models import Session
@@ -156,13 +157,18 @@ def test_clear_syncs_untitled_title_before_canonical_overlay(monkeypatch, tmp_pa
     canonical_row = {"title": "clear-test", "source": "webui"}
     sync_lock_states = []
 
-    def sync_canonical_title(cleared):
+    def clear_canonical_title(session_id, *, profile=None):
         sync_lock_states.append(
-            routes._get_session_agent_lock(cleared.session_id).locked()
+            routes._get_session_agent_lock(session_id).locked()
         )
-        canonical_row["title"] = cleared.title
+        canonical_row["title"] = None
+        return True
 
-    monkeypatch.setattr(routes, "_sync_session_title_to_insights", sync_canonical_title)
+    monkeypatch.setattr(
+        "api.state_sync.clear_session_title",
+        clear_canonical_title,
+        raising=False,
+    )
     _call_clear(monkeypatch, session.session_id)
 
     payload = routes._apply_resolution_metadata_to_payload(

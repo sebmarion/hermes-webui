@@ -514,6 +514,39 @@ def test_shared_metadata_mutation_reports_unavailable_state_db(monkeypatch):
     assert state_sync.sync_session_metadata("sid", title="Renamed") is False
 
 
+def test_clear_shared_session_title_uses_null_when_untitled_is_taken(
+    tmp_path, monkeypatch
+):
+    """The placeholder title must not compete with Agent's unique title index."""
+    hermes_state = pytest.importorskip("hermes_state")
+    import api.state_sync as state_sync
+
+    db_path = tmp_path / "state.db"
+    db = hermes_state.SessionDB(db_path)
+    try:
+        db.ensure_session(session_id="existing", source="webui")
+        db.set_session_title("existing", "Untitled")
+        db.ensure_session(session_id="target", source="webui")
+        db.set_session_title("target", "clear-test")
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        state_sync,
+        "_get_state_db",
+        lambda profile=None: hermes_state.SessionDB(db_path),
+    )
+
+    assert state_sync.clear_session_title("target", profile="default") is True
+
+    verify = hermes_state.SessionDB(db_path)
+    try:
+        assert verify.get_session_title("target") is None
+        assert verify.get_session_title("existing") == "Untitled"
+    finally:
+        verify.close()
+
+
 def test_sidebar_projection_is_state_db_first_and_keeps_legacy_archive(tmp_path, monkeypatch):
     import api.models as models
 

@@ -16258,11 +16258,17 @@ def handle_post(handler, parsed) -> bool:
                         logger.warning("session clear could not remove stale backup for %s", sid, exc_info=True)
             # ``/api/session`` overlays the resolved state.db row after
             # compacting the sidecar. A prior rename has already mirrored its
-            # manual title there, so mirror the post-clear ``Untitled`` title
-            # as part of this same per-session mutation. Keep the SQLite write
-            # outside the nested sidecar writer lock while preventing a later
-            # session mutation from overtaking the verified clear.
-            _sync_session_title_to_insights(s)
+            # manual title there. Agent titles are globally unique, so do not
+            # persist the shared ``Untitled`` placeholder (a collision would
+            # silently leave the old title canonical); clear it to SQL NULL.
+            # Keep the SQLite write outside the nested sidecar writer lock while
+            # preventing a later session mutation from overtaking the clear.
+            from api.state_sync import clear_session_title
+
+            clear_session_title(
+                sid,
+                profile=getattr(s, "profile", None),
+            )
         # Evict cached agent outside the per-session lock.  Eviction may run a
         # boundary memory commit for batch-extraction providers, and provider
         # I/O must not hold the session mutation lock.

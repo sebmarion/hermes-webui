@@ -677,6 +677,41 @@ def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=
             logger.debug("Failed to close state.db")
 
 
+def clear_session_title(
+    session_id: str,
+    *,
+    profile: Optional[str] = None,
+) -> bool:
+    """Clear one canonical title without persisting the UI placeholder.
+
+    Agent titles are globally unique, so ``Untitled`` cannot safely represent
+    every cleared WebUI session in state.db.  Store SQL NULL through the public
+    SessionDB API, clear any valid compression-lineage copies, and read the
+    target back before reporting success.  A null canonical title intentionally
+    leaves the sidecar's ``Untitled`` label authoritative on the next read.
+    """
+    db = _get_state_db(profile=profile)
+    if not db:
+        return False
+    try:
+        db.ensure_session(session_id=session_id, source="webui")
+        if not db.set_session_title(session_id, ""):
+            return False
+        _sync_compression_lineage_field(db, session_id, "title", None)
+        get_title = getattr(db, "get_session_title", None)
+        if callable(get_title):
+            return not str(get_title(session_id) or "").strip()
+        return True
+    except Exception:
+        logger.debug("Failed to clear shared session title", exc_info=True)
+        return False
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Failed to close state.db")
+
+
 def sync_session_pinned(
     session_id: str,
     pinned: bool,
