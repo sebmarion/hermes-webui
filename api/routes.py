@@ -13058,6 +13058,7 @@ def handle_get(handler, parsed) -> bool:
                     resolution.global_projection_generation_hint
                 ),
                 receipt_generation=None,
+                receipt_proof_digest=None,
                 member_ids=resolution.member_ids,
             )
             try:

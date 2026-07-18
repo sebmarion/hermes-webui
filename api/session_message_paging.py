@@ -136,6 +136,7 @@ class MessageCursorClaims:
     database_identity_digest: str
     global_generation_hint: int | None
     receipt_generation: int | None
+    receipt_proof_digest: str | None
     boundaries: tuple[MessageCursorBoundary, ...]
 
 
@@ -148,6 +149,7 @@ class MessageCursorExpected:
     database_identity_digest: str
     global_generation_hint: int | None
     receipt_generation: int | None
+    receipt_proof_digest: str | None
     member_ids: tuple[str, ...] = ()
 
 
@@ -295,6 +297,15 @@ def _cursor_optional_generation(value: Any, field: str) -> int | None:
     return value
 
 
+def _cursor_optional_digest(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    digest = _cursor_text(value, field)
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise MessageCursorError(f"cursor {field} is invalid")
+    return digest
+
+
 def _validated_cursor_members(member_ids: Any) -> tuple[str, ...]:
     if not isinstance(member_ids, (list, tuple)):
         raise MessageCursorError("cursor member_ids are invalid")
@@ -374,6 +385,18 @@ def _validated_cursor_claims(claims: MessageCursorClaims) -> MessageCursorClaims
     ):
         if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
             raise MessageCursorError(f"cursor {field} is invalid")
+    receipt_generation = _cursor_optional_generation(
+        claims.receipt_generation,
+        "receipt_generation",
+    )
+    receipt_proof_digest = _cursor_optional_digest(
+        claims.receipt_proof_digest,
+        "receipt_proof_digest",
+    )
+    if (receipt_generation is None) != (receipt_proof_digest is None):
+        raise MessageCursorError(
+            "cursor receipt generation and proof digest must be present together"
+        )
     return MessageCursorClaims(
         version=claims.version,
         profile=_cursor_text(claims.profile, "profile", max_length=256),
@@ -385,10 +408,8 @@ def _validated_cursor_claims(claims: MessageCursorClaims) -> MessageCursorClaims
             claims.global_generation_hint,
             "global_generation_hint",
         ),
-        receipt_generation=_cursor_optional_generation(
-            claims.receipt_generation,
-            "receipt_generation",
-        ),
+        receipt_generation=receipt_generation,
+        receipt_proof_digest=receipt_proof_digest,
         boundaries=_validated_cursor_boundaries(claims.boundaries),
     )
 
@@ -484,6 +505,7 @@ def _cursor_payload(
         "lineage_fingerprint": claims.lineage_fingerprint,
         "profile": claims.profile,
         "receipt_generation": claims.receipt_generation,
+        "receipt_proof_digest": claims.receipt_proof_digest,
         "source_mode": claims.source_mode,
         "version": claims.version,
     }
@@ -539,6 +561,7 @@ def _claims_from_payload(payload: Any) -> MessageCursorClaims:
         "lineage_fingerprint",
         "profile",
         "receipt_generation",
+        "receipt_proof_digest",
         "source_mode",
         "version",
     }
@@ -554,6 +577,7 @@ def _claims_from_payload(payload: Any) -> MessageCursorClaims:
             database_identity_digest=payload["database_identity_digest"],
             global_generation_hint=payload["global_generation_hint"],
             receipt_generation=payload["receipt_generation"],
+            receipt_proof_digest=payload["receipt_proof_digest"],
             boundaries=(),
         )
     )
@@ -602,6 +626,7 @@ def decode_message_cursor(
         "source_mode",
         "database_identity_digest",
         "receipt_generation",
+        "receipt_proof_digest",
     ):
         if getattr(claims, field) != getattr(expected, field):
             raise MessageCursorStateMismatch(f"cursor {field} does not match")
@@ -614,6 +639,7 @@ def decode_message_cursor(
         database_identity_digest=claims.database_identity_digest,
         global_generation_hint=claims.global_generation_hint,
         receipt_generation=claims.receipt_generation,
+        receipt_proof_digest=claims.receipt_proof_digest,
         boundaries=_decode_cursor_boundaries(payload["boundaries"], members),
     )
 

@@ -15,6 +15,7 @@ def _claims(**overrides):
         "database_identity_digest": "sha256:" + ("b" * 64),
         "global_generation_hint": 7,
         "receipt_generation": None,
+        "receipt_proof_digest": None,
         "boundaries": (
             MessageCursorBoundary("root", 12.5, 9),
             MessageCursorBoundary("tip", None, 4),
@@ -36,6 +37,7 @@ def _expected(claims=None, **overrides):
         "database_identity_digest": claims.database_identity_digest,
         "global_generation_hint": claims.global_generation_hint,
         "receipt_generation": claims.receipt_generation,
+        "receipt_proof_digest": claims.receipt_proof_digest,
         "member_ids": tuple(
             boundary.member_id for boundary in claims.boundaries
         ),
@@ -213,6 +215,59 @@ def test_global_generation_hint_is_not_a_hard_cursor_binding():
         signing_key=b"k" * 32,
         expected=replace(_expected(claims), global_generation_hint=99),
     ) == claims
+
+
+def test_receipt_epoch_and_canonical_content_proof_are_one_hard_binding():
+    from api.session_message_paging import (
+        MessageCursorError,
+        decode_message_cursor,
+        encode_message_cursor,
+    )
+
+    claims = _claims(
+        receipt_generation=11,
+        receipt_proof_digest="sha256:" + ("c" * 64),
+    )
+    token = encode_message_cursor(claims, signing_key=b"k" * 32)
+
+    assert decode_message_cursor(
+        token,
+        signing_key=b"k" * 32,
+        expected=_expected(claims),
+    ) == claims
+    with pytest.raises(MessageCursorError, match="receipt_proof_digest"):
+        decode_message_cursor(
+            token,
+            signing_key=b"k" * 32,
+            expected=replace(
+                _expected(claims),
+                receipt_proof_digest="sha256:" + ("d" * 64),
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "receipt_generation,receipt_proof_digest",
+    [
+        (1, None),
+        (None, "sha256:" + ("c" * 64)),
+        (1, "not-a-digest"),
+    ],
+)
+def test_receipt_epoch_and_proof_digest_must_be_present_together(
+    receipt_generation,
+    receipt_proof_digest,
+):
+    from api.session_message_paging import MessageCursorError, encode_message_cursor
+
+    with pytest.raises(MessageCursorError, match="receipt"):
+        encode_message_cursor(
+            _claims(
+                receipt_generation=receipt_generation,
+                receipt_proof_digest=receipt_proof_digest,
+            ),
+            signing_key=b"k" * 32,
+        )
 
 
 def test_wrong_version_and_malformed_boundaries_are_rejected():

@@ -137,6 +137,7 @@ def _cursor_token(*, resolution, profile="default", lineage_fingerprint=None):
             ),
             global_generation_hint=resolution.global_projection_generation_hint,
             receipt_generation=None,
+            receipt_proof_digest=None,
             boundaries=(MessageCursorBoundary("tip", 10, 1),),
         ),
         member_ids=resolution.member_ids,
