@@ -224,24 +224,15 @@ def test_update_flows_keep_explicit_longer_timeouts():
 def test_session_message_loads_keep_explicit_longer_timeouts():
     """Large state.db installs can take longer than the generic 30s API timeout."""
     src = _source(SESSIONS_JS)
-    assert (
-        "api(\n"
-        "      `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`,\n"
-        "      {timeoutMs:120000}\n"
-        "    )"
-    ) in src
-    assert (
-        "api(\n"
-        "      `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${requestedLimit}`,\n"
-        "      {timeoutMs:120000}\n"
-        "    )"
-    ) in src
-    assert (
-        "api(\n"
-        "        `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`,\n"
-        "        {timeoutMs:120000}\n"
-        "      )"
-    ) in src
+    for request in (
+        r"/api/session\?session_id=\$\{encodeURIComponent\(sid\)\}&messages=1&resolve_model=0\$\{reloadLimitParam\}\$\{expandParam\}",
+        r"/api/session\?session_id=\$\{encodeURIComponent\(sid\)\}&messages=1&resolve_model=0&msg_limit=\$\{requestedLimit\}",
+        r"/api/session\?session_id=\$\{encodeURIComponent\(sid\)\}&messages=1&resolve_model=0&msg_before=\$\{_oldestIdx\}&msg_limit=\$\{_INITIAL_MSG_LIMIT\}",
+    ):
+        assert re.search(
+            rf"api\(\s*`{request}`,\s*\{{timeoutMs:120000\}}\s*\)",
+            src,
+        ), f"{request} must retain the explicit 120s timeout"
 
 
 def test_passive_background_polls_suppress_timeout_toasts():

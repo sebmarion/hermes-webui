@@ -1,4 +1,5 @@
 import queue
+import re
 import threading
 import time
 from pathlib import Path
@@ -69,9 +70,20 @@ def test_stale_stream_cleanup_does_not_refresh_sidebar_timestamp():
 
 
 def test_session_load_clears_stale_stream_before_response():
-    load_pos = ROUTES_SRC.index("s = get_session(sid, metadata_only=(not load_messages))")
-    cleanup_pos = ROUTES_SRC.index("_clear_stale_stream_state(s)", load_pos)
-    response_pos = ROUTES_SRC.index('"active_stream_id": getattr(s, "active_stream_id", None)', cleanup_pos)
+    route_start = ROUTES_SRC.index('if parsed.path == "/api/session":')
+    route_end = ROUTES_SRC.index(
+        'if parsed.path == "/api/session/status":', route_start
+    )
+    route_src = ROUTES_SRC[route_start:route_end]
+    load_match = re.search(
+        r"s = get_session\(\s*sid,\s*metadata_only=", route_src
+    )
+    assert load_match, "the session route must load its session before responding"
+    load_pos = load_match.start()
+    cleanup_pos = route_src.index("_clear_stale_stream_state(s)", load_pos)
+    response_pos = route_src.index(
+        '"active_stream_id": getattr(s, "active_stream_id", None)', cleanup_pos
+    )
     assert load_pos < cleanup_pos < response_pos
 
 

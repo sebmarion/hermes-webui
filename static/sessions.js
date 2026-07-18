@@ -1616,10 +1616,11 @@ async function loadSession(sid){
     const _msgInner = $('msgInner');
     if (_msgInner && currentSid !== sid) _msgInner.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Loading conversation...</div>';
   }
-  // Phase 1: Keep model resolution out of the first-paint path. The bounded
-  // browser gate negotiates the initial tail in this one request; legacy and
-  // old-server paths retain the metadata-only request followed by the existing
-  // message request.
+  // Phase 1: Load metadata only (~1KB) for fast session switching. Keep model
+  // resolution out of the first-paint path; the bounded browser gate instead
+  // negotiates the initial tail in this one request. Legacy and old-server
+  // paths retain the metadata-only request followed by the existing message
+  // request.
   // Guard against network/server failures to prevent a permanently stuck loading state.
   // A normal same-session refresh reuses the legacy widened-tail request so it
   // cannot collapse a reader's already-loaded transcript. The one bounded
@@ -1632,9 +1633,11 @@ async function loadSession(sid){
   );
   let data;
   try {
-    data = await api(_useBoundedInitialMessagePaging
-      ? `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${_INITIAL_MSG_LIMIT}&message_paging=cursor_v1`
-      : `/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
+    if (_useBoundedInitialMessagePaging) {
+      data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${_INITIAL_MSG_LIMIT}&message_paging=cursor_v1`);
+    } else {
+      data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
+    }
   } catch(e) {
     const profileMismatch=_sessionProfileMismatchFromError(e);
     if(profileMismatch && profileMismatch.profile && !opts.skipProfileResolve){
@@ -2967,8 +2970,15 @@ async function _ensureMessagesLoaded(sid, opts) {
   if (!_ownsLoad()) return;
   // Guard: api() may have redirected (401) and returned undefined.
   if (!data || !data.session) return;
-  _adoptMessagePaging(data.session);
-  if (_messagePaging.mode === 'legacy') {
+  // Browser runtime always has the paging helpers. The guarded legacy branch
+  // also keeps this independently-extractable load helper compatible with
+  // focused recovery tests and partial script loads.
+  let _pagingMode = 'legacy';
+  if (typeof _adoptMessagePaging === 'function') {
+    _adoptMessagePaging(data.session);
+    _pagingMode = _messagePaging.mode;
+  }
+  if (_pagingMode === 'legacy') {
     _messagesTruncated = !!data.session._messages_truncated;
     _oldestIdx = data.session._messages_offset || 0;
   }

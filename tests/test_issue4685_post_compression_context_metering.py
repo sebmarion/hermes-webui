@@ -1,9 +1,42 @@
 import json
 import subprocess
+import sys
+import types
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _install_agent_token_estimator_stubs(
+    monkeypatch,
+    *,
+    request_estimator=None,
+    message_estimator=None,
+    compressor_budget_estimator=None,
+):
+    """Install only the token-estimation boundary used by the fallback helper.
+
+    These checks must not import the operator's real ``agent`` package: it can
+    have optional runtime dependencies that are irrelevant to this display-only
+    WebUI estimate.
+    """
+    agent_package = types.ModuleType("agent")
+    agent_package.__path__ = []
+    model_metadata = types.ModuleType("agent.model_metadata")
+    if callable(request_estimator):
+        model_metadata.estimate_request_tokens_rough = request_estimator
+    if callable(message_estimator):
+        model_metadata.estimate_messages_tokens_rough = message_estimator
+    agent_package.model_metadata = model_metadata
+    monkeypatch.setitem(sys.modules, "agent", agent_package)
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", model_metadata)
+
+    if callable(compressor_budget_estimator):
+        context_compressor = types.ModuleType("agent.context_compressor")
+        context_compressor._estimate_msg_budget_tokens = compressor_budget_estimator
+        agent_package.context_compressor = context_compressor
+        monkeypatch.setitem(sys.modules, "agent.context_compressor", context_compressor)
 
 
 def _run_context_indicator(usage):
@@ -60,7 +93,7 @@ def test_post_compression_estimate_uses_pruned_request_and_preserves_last_prompt
         calls.append((messages, system_prompt, tools))
         return 4_096
 
-    monkeypatch.setattr("agent.model_metadata.estimate_request_tokens_rough", estimate, raising=False)
+    _install_agent_token_estimator_stubs(monkeypatch, request_estimator=estimate)
     pruned = [{"role": "assistant", "content": "summary"}]
     agent = type("Agent", (), {"tools": [{"name": "read_file"}]})()
 
@@ -77,8 +110,7 @@ def test_post_compression_estimate_falls_back_when_request_estimator_is_unavaila
         calls.append(messages)
         return len(messages) * 100
 
-    monkeypatch.delattr("agent.model_metadata.estimate_request_tokens_rough", raising=False)
-    monkeypatch.setattr("agent.model_metadata.estimate_messages_tokens_rough", estimate_messages, raising=False)
+    _install_agent_token_estimator_stubs(monkeypatch, message_estimator=estimate_messages)
     pruned = [{"role": "assistant", "content": "summary"}]
     agent = type("Agent", (), {"tools": [{"name": "read_file"}]})()
 
@@ -91,14 +123,18 @@ def test_post_compression_estimate_falls_back_when_request_estimator_is_unavaila
 
 
 def test_post_compression_estimate_uses_compressor_budget_counter_without_metadata_estimators(monkeypatch):
-    import pytest
-
     from api.streaming import _estimate_post_compression_context_tokens
 
-    context_compressor = pytest.importorskip("agent.context_compressor")
+    calls = []
 
-    monkeypatch.delattr("agent.model_metadata.estimate_request_tokens_rough", raising=False)
-    monkeypatch.delattr("agent.model_metadata.estimate_messages_tokens_rough", raising=False)
+    def estimate_message_budget(message):
+        calls.append(message)
+        return {"assistant": 100, "system": 200}[message["role"]]
+
+    _install_agent_token_estimator_stubs(
+        monkeypatch,
+        compressor_budget_estimator=estimate_message_budget,
+    )
     pruned = [{"role": "assistant", "content": "summary"}]
     agent = type("Agent", (), {"tools": [{"name": "read_file"}]})()
     expected_messages = [
@@ -107,10 +143,8 @@ def test_post_compression_estimate_uses_compressor_budget_counter_without_metada
         {"role": "system", "content": str(agent.tools)},
     ]
 
-    assert _estimate_post_compression_context_tokens(agent, pruned, "workspace") == sum(
-        context_compressor._estimate_msg_budget_tokens(message)
-        for message in expected_messages
-    )
+    assert _estimate_post_compression_context_tokens(agent, pruned, "workspace") == 500
+    assert calls == expected_messages
 
 
 def test_chat_start_clears_expired_post_compression_estimate(tmp_path, monkeypatch):
