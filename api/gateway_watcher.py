@@ -44,34 +44,24 @@ _WATCHER_EXCLUDED_SOURCES = ("cron", "webui")
 
 
 def _cheap_change_fingerprint(db_path: Path) -> str | None:
-    """Compute a cheap change-detection fingerprint without the messages JOIN.
+    """Compute a bounded change fingerprint for the gateway projection.
 
-    The expensive projection (``read_importable_agent_session_rows``) runs a CTE
-    plus a per-session ``MAX(messages.timestamp)`` aggregation over an oversampled
-    candidate set every poll. On a large ``state.db`` (hundreds of sessions, tens
-    of thousands of messages) that is ~10x the cost of a single ``sessions``-table
-    scan, and the watcher runs it forever on a 5s timer even when nothing changed
-    (issue #3506).
+    Agent projection-v2 schemas maintain ``message_count`` and
+    ``last_activity_at`` transactionally in ``sessions``. On that contract the
+    watcher hashes only the same top-level candidate rows as
+    ``read_importable_agent_session_rows`` and never opens the ``messages``
+    table. Older, partial, or explicitly rolled-back schemas retain the legacy
+    per-session message aggregate so an unknown writer cannot silently hide a
+    transcript change (issues #3506 / #3536).
 
-    This computes a fingerprint from a ``sessions``-table-only scan (no messages
-    JOIN), scoped to the same non-cron/webui rows as the projection. To guarantee
-    it never skips a change the projection would reflect, it hashes **every
-    sessions-table column the projection reads or uses for visibility/collapse**
-    -- not just the columns surfaced to the sidebar. That matters because the
-    projection collapses compression lineage and hides/shows rows based on
+    The modern fingerprint is scoped to the same non-cron/webui, non-delegate
+    rows as the projection. To guarantee
+    it never skips a change the watcher payload would reflect, it hashes every
+    sessions-table column used by that payload or by top-level eligibility and
+    compression collapse. That matters because the projection hides/shows rows based on
     ``parent_session_id`` / ``ended_at`` / ``end_reason`` / ``source``, so a change
     to one of those alters *which rows* appear even when no displayed field on a
     given row moved.
-
-    The one projection input that does not live in the ``sessions`` table is the
-    per-session message aggregate (``COUNT`` / ``MAX(messages.timestamp)`` ->
-    ``last_activity``). That is fully proxied by ``sessions.message_count``: the
-    agent's state layer bumps ``message_count`` on every appended message and
-    rewrites it to the absolute count on truncate/rewind/compaction, so a message
-    insert or delete (the only events that can move ``MAX(timestamp)``) always
-    changes ``message_count``. The fingerprint is therefore a strict superset of
-    the projection's change surface (it also fires on out-of-order inserts that
-    would not raise ``MAX(timestamp)``).
 
     Returns the fingerprint string, or ``None`` on any error / a pre-source
     schema so the caller falls back to running the expensive projection rather
@@ -81,9 +71,10 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
     # are always present (``source`` is required for the projection to run at
     # all); the rest are optional on older agent schemas and filtered below.
     _PROJECTION_SESSION_COLS = (
-        'id', 'source', 'session_source', 'title', 'model', 'message_count',
-        'started_at', 'ended_at', 'end_reason', 'parent_session_id', 'archived',
-        'user_id', 'chat_id', 'chat_type', 'thread_id', 'session_key',
+        'id', 'source', 'session_source', 'title', 'model', 'model_config',
+        'message_count', 'last_activity_at', 'started_at', 'ended_at',
+        'end_reason', 'parent_session_id', 'archived', 'user_id', 'chat_id',
+        'chat_type', 'thread_id', 'session_key',
         'origin_chat_id', 'origin_user_id', 'platform',
     )
     try:
@@ -95,9 +86,39 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
                 return None
             selectable = [c for c in _PROJECTION_SESSION_COLS if c in cols]
             placeholders = ", ".join("?" for _ in _WATCHER_EXCLUDED_SOURCES)
+
+            def candidate_where(alias: str = "") -> str:
+                prefix = f"{alias}." if alias else ""
+                clauses = [
+                    f"{prefix}source IS NOT NULL",
+                    f"{prefix}source NOT IN ({placeholders})",
+                    f"LOWER(TRIM(COALESCE({prefix}source, ''))) != 'subagent'",
+                ]
+                if 'model_config' in cols:
+                    clauses.append(
+                        f"({prefix}model_config IS NULL "
+                        f"OR NOT json_valid({prefix}model_config) "
+                        f"OR COALESCE(json_extract({prefix}model_config, "
+                        "'$._delegate_from'), '') = '')"
+                    )
+                return " AND ".join(clauses)
+
+            projection_enabled = os.getenv(
+                "HERMES_WEBUI_SESSION_PROJECTION_V2", "true"
+            ).strip().lower() not in {"0", "false", "no", "off"}
+            projection_meta_present = False
+            if projection_enabled and 'last_activity_at' in cols:
+                try:
+                    projection_meta_present = cur.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'session_projection_meta'"
+                    ).fetchone() is not None
+                except sqlite3.Error:
+                    projection_meta_present = False
+
             cur.execute(
                 f"SELECT {', '.join(selectable)} FROM sessions "
-                f"WHERE source IS NOT NULL AND source NOT IN ({placeholders}) "
+                f"WHERE {candidate_where()} "
                 f"ORDER BY id",
                 list(_WATCHER_EXCLUDED_SOURCES),
             )
@@ -105,6 +126,9 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
             for row in cur.fetchall():
                 h.update(repr(row).encode('utf-8', 'replace'))
                 h.update(b'\x1e')
+            if projection_meta_present:
+                return h.hexdigest()
+
             # A same-count transcript rewrite (SessionDB.replace_messages used by
             # /retry, /undo, /compress) deletes + reinserts messages with new
             # timestamps but can leave sessions.message_count unchanged — so the
@@ -127,7 +151,7 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
                         "COUNT(CASE WHEN LOWER(m.role) = 'user' THEN 1 END), "
                         "COALESCE(MAX(m.timestamp), 0) "
                         "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
-                        f"WHERE s.source IS NOT NULL AND s.source NOT IN ({placeholders}) "
+                        f"WHERE {candidate_where('s')} "
                         "GROUP BY s.id ORDER BY s.id",
                         list(_WATCHER_EXCLUDED_SOURCES),
                     ).fetchall()

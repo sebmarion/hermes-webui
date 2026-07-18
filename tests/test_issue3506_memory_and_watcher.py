@@ -357,6 +357,120 @@ def test_cheap_fingerprint_returns_none_without_source_column(tmp_path):
     assert gw._cheap_change_fingerprint(db) is None
 
 
+def _make_modern_projection_db(tmp_path: Path):
+    """Create the schema-v20 watcher fast-path contract."""
+    db, conn = _make_db(tmp_path)
+    conn.executescript(
+        """
+        ALTER TABLE sessions ADD COLUMN last_activity_at REAL;
+        ALTER TABLE sessions ADD COLUMN model_config TEXT;
+        CREATE TABLE session_projection_meta (id INTEGER PRIMARY KEY, generation INTEGER);
+        INSERT INTO session_projection_meta (id, generation) VALUES (1, 1);
+        """
+    )
+    conn.commit()
+    return db, conn
+
+
+def test_modern_projection_fingerprint_never_scans_messages(tmp_path, monkeypatch):
+    """Schema v20 owns activity, so the watcher must avoid messages JOIN/GROUP BY."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_modern_projection_db(tmp_path)
+    _add_session(conn, "visible", "telegram", mc=2)
+    conn.execute(
+        "UPDATE sessions SET last_activity_at = ?, model_config = ? WHERE id = 'visible'",
+        (200.0, '{"temperature": 0.2}'),
+    )
+    conn.commit()
+    executed_sql = []
+    real_open = gw.open_state_db_readonly
+
+    def tracing_open(path):
+        traced = real_open(path)
+        traced.set_trace_callback(executed_sql.append)
+        return traced
+
+    monkeypatch.setattr(gw, "open_state_db_readonly", tracing_open)
+    assert gw._cheap_change_fingerprint(db) is not None
+    normalized = "\n".join(executed_sql).lower()
+    assert "join messages" not in normalized
+    assert "group by" not in normalized
+
+
+def test_modern_projection_same_count_rewrite_uses_transactional_activity(tmp_path):
+    """A same-count rewrite is visible through transactionally-maintained activity."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_modern_projection_db(tmp_path)
+    _add_session(conn, "visible", "telegram", mc=3)
+    conn.execute("UPDATE sessions SET last_activity_at = 100.0 WHERE id = 'visible'")
+    conn.commit()
+    fp_before = gw._cheap_change_fingerprint(db)
+    with conn:
+        conn.execute("DELETE FROM messages WHERE session_id = 'visible'")
+        for timestamp in (300.0, 301.0, 302.0):
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', 'rewrite', ?)",
+                ("visible", timestamp),
+            )
+        conn.execute("UPDATE sessions SET last_activity_at = 302.0 WHERE id = 'visible'")
+    assert conn.execute("SELECT message_count FROM sessions WHERE id = 'visible'").fetchone()[0] == 3
+    assert gw._cheap_change_fingerprint(db) != fp_before
+
+
+def test_cheap_fingerprint_uses_legacy_message_aggregate_when_v2_disabled(tmp_path, monkeypatch):
+    """Rollback mode retains the legacy per-session messages aggregate."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_modern_projection_db(tmp_path)
+    _add_session(conn, "visible", "telegram", mc=2)
+    conn.execute("UPDATE sessions SET last_activity_at = 100.0 WHERE id = 'visible'")
+    conn.commit()
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
+    fp_before = gw._cheap_change_fingerprint(db)
+    conn.execute("UPDATE messages SET timestamp = 999.0 WHERE session_id = 'visible'")
+    conn.commit()
+    assert gw._cheap_change_fingerprint(db) != fp_before
+
+
+def test_cheap_fingerprint_uses_legacy_message_aggregate_without_metadata(tmp_path):
+    """A partial modern schema remains fail-safe until projection metadata exists."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    conn.execute("ALTER TABLE sessions ADD COLUMN last_activity_at REAL")
+    _add_session(conn, "visible", "telegram", mc=2)
+    conn.commit()
+    fp_before = gw._cheap_change_fingerprint(db)
+    conn.execute("UPDATE messages SET timestamp = 999.0 WHERE session_id = 'visible'")
+    conn.commit()
+    assert gw._cheap_change_fingerprint(db) != fp_before
+
+
+def test_modern_projection_fingerprint_matches_importable_candidate_scope(tmp_path):
+    """Excluded hidden rows stay stable, while a visibility transition changes the fp."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_modern_projection_db(tmp_path)
+    _add_session(conn, "visible", "telegram", mc=1)
+    _add_session(conn, "cron", "cron", mc=1)
+    _add_session(conn, "webui", "webui", mc=1)
+    _add_session(conn, "subagent", " SubAgent ", mc=1)
+    _add_session(conn, "delegated", "telegram", mc=1)
+    conn.execute("UPDATE sessions SET last_activity_at = 100.0")
+    conn.execute("UPDATE sessions SET model_config = '{\"_delegate_from\": \"parent\"}' WHERE id = 'delegated'")
+    conn.commit()
+    fp_before = gw._cheap_change_fingerprint(db)
+    conn.execute(
+        "UPDATE sessions SET last_activity_at = 200.0, model_config = '{\"x\": 1}' "
+        "WHERE id IN ('cron', 'webui', 'subagent')"
+    )
+    conn.execute(
+        "UPDATE sessions SET last_activity_at = 200.0 WHERE id = 'delegated'"
+    )
+    conn.commit()
+    assert gw._cheap_change_fingerprint(db) == fp_before
+    conn.execute("UPDATE sessions SET model_config = '{\"x\": 2}', last_activity_at = 300.0 WHERE id = 'delegated'")
+    conn.commit()
+    assert gw._cheap_change_fingerprint(db) != fp_before
+
+
 def test_poll_loop_skips_projection_when_unchanged(tmp_path, monkeypatch):
     """The poll body must call the expensive projection only when the cheap fp changes."""
     gw = importlib.import_module("api.gateway_watcher")
