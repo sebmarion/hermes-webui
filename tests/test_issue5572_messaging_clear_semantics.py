@@ -126,6 +126,7 @@ def test_session_clear_preserves_imported_messaging_transcript_and_blocks_state_
     source_label,
 ):
     import api.routes as routes
+    import api.state_sync as state_sync
     from api.models import Session, get_cli_session_messages, merge_session_messages_append_only
 
     _install_isolated_session_env(monkeypatch, tmp_path)
@@ -165,6 +166,11 @@ def test_session_clear_preserves_imported_messaging_transcript_and_blocks_state_
         _msg("assistant", f"{source_label} external reply", 11.0, f"{source_tag}-ext-a1"),
     ]
     _make_state_db(tmp_path / "state.db", sid, source_tag, external_messages)
+
+    def _forbid_external_title_mutation(*_args, **_kwargs):
+        raise AssertionError("messaging-owned canonical titles must not be cleared by WebUI")
+
+    monkeypatch.setattr(state_sync, "clear_session_title", _forbid_external_title_mutation)
 
     captured = _post_clear(monkeypatch, sid)
 
@@ -210,6 +216,11 @@ def test_session_clear_preserves_imported_messaging_transcript_and_blocks_state_
     assert [(m["role"], m["content"], m["timestamp"]) for m in state_db_messages] == [
         (m["role"], m["content"], m["timestamp"]) for m in external_messages
     ]
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        canonical_title = conn.execute(
+            "SELECT title FROM sessions WHERE id = ?", (sid,)
+        ).fetchone()[0]
+    assert canonical_title == f"Imported {source_tag}"
 
     handler = _GetHandler(f"/api/session?session_id={sid}&resolve_model=0")
     routes.handle_get(handler, urlparse(handler.path))

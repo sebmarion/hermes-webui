@@ -16258,31 +16258,34 @@ def handle_post(handler, parsed) -> bool:
                         _delete_session_sidecar_backup(s.path)
                     except OSError:
                         logger.warning("session clear could not remove stale backup for %s", sid, exc_info=True)
-            # ``/api/session`` overlays the resolved state.db row after
+            # ``/api/session`` overlays WebUI-owned metadata from state.db after
             # compacting the sidecar. A prior rename has already mirrored its
             # manual title there. Agent titles are globally unique, so do not
             # persist the shared ``Untitled`` placeholder (a collision would
             # silently leave the old title canonical); clear it to SQL NULL.
-            # Keep the SQLite write outside the nested sidecar writer lock while
-            # preventing a later session mutation from overtaking the clear.
-            from api.state_sync import clear_session_title
+            # Imported messaging conversations are different: their state.db
+            # row is owned by the external channel and its title/transcript must
+            # survive a WebUI sidecar clear. Keep that ownership boundary while
+            # retaining the checked receipt for every WebUI-owned conversation.
+            if not _is_messaging_session_record(s):
+                from api.state_sync import clear_session_title
 
-            canonical_title_cleared = clear_session_title(
-                sid,
-                profile=getattr(s, "profile", None),
-            )
-            if not canonical_title_cleared and _active_state_db_path().exists():
-                post_clear_resolution = resolve_shared_session(
-                    _active_state_db_path(),
+                canonical_title_cleared = clear_session_title(
                     sid,
+                    profile=getattr(s, "profile", None),
                 )
-                canonical_title = str(
-                    (post_clear_resolution.canonical_row or {}).get("title") or ""
-                ).strip()
-                canonical_title_clear_failed = (
-                    post_clear_resolution.status not in {"found", "missing"}
-                    or bool(canonical_title)
-                )
+                if not canonical_title_cleared and _active_state_db_path().exists():
+                    post_clear_resolution = resolve_shared_session(
+                        _active_state_db_path(),
+                        sid,
+                    )
+                    canonical_title = str(
+                        (post_clear_resolution.canonical_row or {}).get("title") or ""
+                    ).strip()
+                    canonical_title_clear_failed = (
+                        post_clear_resolution.status not in {"found", "missing"}
+                        or bool(canonical_title)
+                    )
         # Evict cached agent outside the per-session lock.  Eviction may run a
         # boundary memory commit for batch-extraction providers, and provider
         # I/O must not hold the session mutation lock.
