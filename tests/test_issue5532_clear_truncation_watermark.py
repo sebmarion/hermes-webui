@@ -27,8 +27,11 @@ cleared transcript) and pass with the fix.
 """
 from __future__ import annotations
 
+import ast
 import json
+import threading
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 
@@ -182,6 +185,102 @@ def test_clear_nulls_canonical_title_before_canonical_overlay(monkeypatch, tmp_p
     )
     assert sync_lock_states == [True]
     assert payload["title"] == "Untitled"
+
+
+def test_clear_reports_partial_failure_when_canonical_title_survives(
+    monkeypatch, tmp_path
+):
+    """A durable stale title must not hide behind a successful clear response."""
+    _seed_session_dir(monkeypatch, tmp_path)
+    from api.models import Session
+    import api.routes as routes
+
+    session = Session(
+        session_id="issue5532titlesyncfail",
+        title="clear-test",
+        messages=_four_turn_messages(),
+        context_messages=_four_turn_messages(),
+    )
+    session.save()
+    state_db_path = tmp_path / "state.db"
+    state_db_path.touch()
+    monkeypatch.setattr(routes, "_active_state_db_path", lambda: state_db_path)
+    monkeypatch.setattr(
+        "api.state_sync.clear_session_title",
+        lambda *_args, **_kwargs: False,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        routes,
+        "resolve_shared_session",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            status="found",
+            canonical_row={"title": "clear-test"},
+        ),
+    )
+
+    captured = _call_clear(monkeypatch, session.session_id)
+
+    assert captured["status"] == 503
+    assert captured["payload"]["code"] == "session_clear_metadata_sync_failed"
+    assert captured["payload"]["session"]["title"] == "Untitled"
+
+
+def test_route_title_publications_stay_inside_session_mutation_locks():
+    """Rename/update/archive/generated titles cannot publish after clear wins."""
+    source = Path(__file__).parent.parent.joinpath("api", "routes.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    parents = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[child] = parent
+
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_sync_session_title_to_insights"
+    ]
+
+    def is_inside_session_lock(node):
+        current = node
+        while current in parents:
+            current = parents[current]
+            if not isinstance(current, ast.With):
+                continue
+            for item in current.items:
+                context = item.context_expr
+                if (
+                    isinstance(context, ast.Call)
+                    and isinstance(context.func, ast.Name)
+                    and context.func.id == "_get_session_agent_lock"
+                ):
+                    return True
+        return False
+
+    assert len(calls) == 4
+    assert all(is_inside_session_lock(call) for call in calls)
+
+
+def test_lazy_archived_import_reloads_sidecar_under_session_lock(monkeypatch):
+    """A stale pre-clear sidecar snapshot cannot publish after clear wins."""
+    import api.routes as routes
+
+    lock = threading.Lock()
+    observed_lock_states = []
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda _sid: lock)
+
+    def load_sidecar(_sid):
+        observed_lock_states.append(lock.locked())
+        return None
+
+    monkeypatch.setattr(routes, "_shared_session_sidecar", load_sidecar)
+
+    assert routes._lazy_import_legacy_webui_session("legacy-archived") is False
+    assert observed_lock_states == [True]
 
 
 def test_clear_then_read_does_not_resurrect_state_db_messages(monkeypatch, tmp_path):

@@ -547,6 +547,72 @@ def test_clear_shared_session_title_uses_null_when_untitled_is_taken(
         verify.close()
 
 
+def test_clear_shared_session_title_nulls_compression_lineage(tmp_path, monkeypatch):
+    """A hidden compression title must not reappear after clearing its tip."""
+    hermes_state = pytest.importorskip("hermes_state")
+    import api.state_sync as state_sync
+
+    db_path = tmp_path / "state.db"
+    db = hermes_state.SessionDB(db_path)
+    try:
+        db.ensure_session(session_id="root", source="webui")
+        db.set_session_title("root", "root-title")
+        db.ensure_session(
+            session_id="tip",
+            source="webui",
+            parent_session_id="root",
+        )
+        db.set_session_title("tip", "clear-test")
+    finally:
+        db.close()
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE sessions SET end_reason = 'compression' WHERE id = 'root'"
+        )
+        conn.commit()
+
+    monkeypatch.setattr(
+        state_sync,
+        "_get_state_db",
+        lambda profile=None: hermes_state.SessionDB(db_path),
+    )
+
+    assert state_sync.clear_session_title("tip", profile="default") is True
+
+    with sqlite3.connect(db_path) as conn:
+        titles = dict(conn.execute("SELECT id, title FROM sessions").fetchall())
+    assert titles["root"] is None
+    assert titles["tip"] is None
+
+
+def test_clear_shared_session_title_reports_lineage_write_failure(monkeypatch):
+    import api.state_sync as state_sync
+
+    class FailingLineageDB:
+        def ensure_session(self, **_kwargs):
+            return None
+
+        def set_session_title(self, _session_id, _title):
+            return True
+
+        def _execute_write(self, _callback):
+            raise OSError("synthetic lineage write failure")
+
+        def get_session_title(self, _session_id):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        state_sync,
+        "_get_state_db",
+        lambda profile=None: FailingLineageDB(),
+    )
+
+    assert state_sync.clear_session_title("sid", profile="default") is False
+
+
 def test_sidebar_projection_is_state_db_first_and_keeps_legacy_archive(tmp_path, monkeypatch):
     import api.models as models
 

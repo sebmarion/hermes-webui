@@ -392,7 +392,7 @@ def sync_session_start(session_id: str, model=None, profile: Optional[str] = Non
             logger.debug("Failed to close state.db")
 
 
-def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> None:
+def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> bool:
     """Apply shared metadata consistently within one compression lineage.
 
     Hermes Agent stores each compression segment as a physical row. Title and
@@ -402,10 +402,10 @@ def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> N
     never follow branches, delegates, tool rows, or cross-source children.
     """
     if field not in {"title", "archived", "pinned"}:
-        return
+        return False
     execute_write = getattr(db, "_execute_write", None)
     if not callable(execute_write):
-        return
+        return False
 
     def _write(conn):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
@@ -416,7 +416,8 @@ def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> N
                     f"UPDATE sessions SET {field} = ? WHERE id = ?",
                     (value, session_id),
                 )
-            return
+                return True
+            return False
         if "model_config" in columns:
             branch_guard = "(x.model_config IS NULL OR NOT json_valid(x.model_config) OR (COALESCE(json_extract(x.model_config, '$._branched_from'), '') = '' AND COALESCE(json_extract(x.model_config, '$._delegate_from'), '') = ''))"
         else:
@@ -450,7 +451,7 @@ def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> N
             row[0] for row in conn.execute(lineage_query, (session_id,)).fetchall()
         ]
         if not lineage_ids:
-            return
+            return False
 
         placeholders = ", ".join("?" for _ in lineage_ids)
         if field == "pinned":
@@ -477,7 +478,7 @@ def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> N
                     "UPDATE sessions SET pinned = 1 WHERE id = ?",
                     (root_id,),
                 )
-            return
+            return True
 
         if field == "title":
             # Titles are unique in state.db, but several old physical
@@ -492,7 +493,7 @@ def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> N
                 (value, *lineage_ids),
             ).fetchone()
             if conflict is not None and not bool(conflict[1]):
-                return
+                return False
             if conflict is not None:
                 conn.execute(
                     "UPDATE sessions SET title = NULL WHERE id = ?",
@@ -515,18 +516,20 @@ def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> N
                     # Older state schemas may not have the projection marker;
                     # the title write itself remains valid and durable.
                     pass
-            return
+            return True
 
         conn.execute(
             f"UPDATE sessions SET {field} = ? "
             f"WHERE id IN ({placeholders})",
             (value, *lineage_ids),
         )
+        return True
 
     try:
-        execute_write(_write)
+        return bool(execute_write(_write))
     except Exception:
         logger.debug("Failed to sync %s across compression lineage", field, exc_info=True)
+        return False
 
 
 def sync_session_metadata(
@@ -697,7 +700,8 @@ def clear_session_title(
         db.ensure_session(session_id=session_id, source="webui")
         if not db.set_session_title(session_id, ""):
             return False
-        _sync_compression_lineage_field(db, session_id, "title", None)
+        if not _sync_compression_lineage_field(db, session_id, "title", None):
+            return False
         get_title = getattr(db, "get_session_title", None)
         if callable(get_title):
             return not str(get_title(session_id) or "").strip()

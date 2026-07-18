@@ -9064,8 +9064,9 @@ def _get_session_agent_lock(session_id: str) -> threading.Lock:
         leak.  The streaming thread already holds the Lock during this
         migration, so the reference stays alive even after the dict entry is
         removed.
-      - Lock contract: hold for the in-memory mutation + s.save() only; never
-        across network I/O (LLM calls, HTTP requests).
+      - Lock contract: hold for the in-memory mutation, s.save(), and its local
+        state.db metadata publication; never across network I/O (LLM calls,
+        HTTP requests).
     """
     with SESSION_AGENT_LOCKS_LOCK:
         if session_id not in SESSION_AGENT_LOCKS:

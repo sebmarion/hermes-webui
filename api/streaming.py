@@ -9785,31 +9785,33 @@ def _run_agent_streaming(
                             })
                     except Exception:
                         logger.debug("Persistent state change detection failed for session %s", s.session_id, exc_info=True)
-            # Persist the shared conversation projection. ``sync_to_insights``
-            # remains a compatibility setting and does not gate this write.
-            with _stream_writeback_stage(_writeback_timings, "state_sync"):
-                try:
-                    from api.state_sync import sync_session_usage
-                    sync_session_usage(
-                        session_id=s.session_id,
-                        input_tokens=s.input_tokens or 0,
-                        output_tokens=s.output_tokens or 0,
-                        estimated_cost=s.estimated_cost,
-                        model=model,
-                        title=s.title,
-                        message_count=len(s.messages),
-                        cache_read_tokens=s.cache_read_tokens or 0,
-                        cache_write_tokens=s.cache_write_tokens or 0,
-                        api_call_count=getattr(agent, 'session_api_calls', None),
-                        # #2762: pass the session's profile explicitly so the
-                        # background-thread state.db lookup cannot fall through
-                        # to the process-global active profile.
-                        profile=getattr(s, 'profile', None),
-                        cwd=getattr(s, 'workspace', None),
-                        archived=getattr(s, 'archived', None),
-                    )
-                except Exception:
-                    logger.debug("Failed to sync session to insights")
+                # Publish the same completed state while still holding the
+                # per-session mutation lock. Otherwise clear/rename can win the
+                # sidecar race and then be overwritten by this stale canonical
+                # title after the lock is released.
+                with _stream_writeback_stage(_writeback_timings, "state_sync"):
+                    try:
+                        from api.state_sync import sync_session_usage
+                        sync_session_usage(
+                            session_id=s.session_id,
+                            input_tokens=s.input_tokens or 0,
+                            output_tokens=s.output_tokens or 0,
+                            estimated_cost=s.estimated_cost,
+                            model=model,
+                            title=s.title,
+                            message_count=len(s.messages),
+                            cache_read_tokens=s.cache_read_tokens or 0,
+                            cache_write_tokens=s.cache_write_tokens or 0,
+                            api_call_count=getattr(agent, 'session_api_calls', None),
+                            # #2762: pass the session's profile explicitly so the
+                            # background-thread state.db lookup cannot fall through
+                            # to the process-global active profile.
+                            profile=getattr(s, 'profile', None),
+                            cwd=getattr(s, 'workspace', None),
+                            archived=getattr(s, 'archived', None),
+                        )
+                    except Exception:
+                        logger.debug("Failed to sync session to insights")
             # A late cancel can land during memory/state-sync writeback. Do not
             # clear a credential-exhausted process-wakeup pause unless this run
             # is still settling as a normal completion. The pause re-read, clear,

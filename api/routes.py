@@ -170,7 +170,7 @@ def _persist_generated_session_title(
             SESSIONS[sid] = session
             SESSIONS.move_to_end(sid)
             _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
-    _sync_session_title_to_insights(session)
+        _sync_session_title_to_insights(session)
     _publish_session_list_changed(
         event_reason,
         profile=getattr(session, "profile", None),
@@ -15785,7 +15785,7 @@ def handle_post(handler, parsed) -> bool:
             from api.session_ops import apply_session_title_rename
             apply_session_title_rename(s, body["title"])
             s.save()
-        _sync_session_title_to_insights(s)
+            _sync_session_title_to_insights(s)
         publish_session_list_changed(
             "session_rename",
             profile=getattr(s, "profile", None),
@@ -16030,7 +16030,7 @@ def handle_post(handler, parsed) -> bool:
 
                     _evict_session_agent(body["session_id"])
             s.save()
-        _sync_session_title_to_insights(s)
+            _sync_session_title_to_insights(s)
         if str(old_ws or "") != str(new_ws or ""):
             try:
                 from api.terminal import close_terminal
@@ -16179,6 +16179,8 @@ def handle_post(handler, parsed) -> bool:
         except KeyError:
             return bad(handler, "Session not found", 404)
         sid = body["session_id"]
+        canonical_title_cleared = True
+        canonical_title_clear_failed = False
         with _get_session_agent_lock(sid):
             had_sidecar_messages = bool(s.messages or [])
             # Clear is a full truncate-to-empty: route through the SAME helper the
@@ -16265,15 +16267,43 @@ def handle_post(handler, parsed) -> bool:
             # preventing a later session mutation from overtaking the clear.
             from api.state_sync import clear_session_title
 
-            clear_session_title(
+            canonical_title_cleared = clear_session_title(
                 sid,
                 profile=getattr(s, "profile", None),
             )
+            if not canonical_title_cleared and _active_state_db_path().exists():
+                post_clear_resolution = resolve_shared_session(
+                    _active_state_db_path(),
+                    sid,
+                )
+                canonical_title = str(
+                    (post_clear_resolution.canonical_row or {}).get("title") or ""
+                ).strip()
+                canonical_title_clear_failed = (
+                    post_clear_resolution.status not in {"found", "missing"}
+                    or bool(canonical_title)
+                )
         # Evict cached agent outside the per-session lock.  Eviction may run a
         # boundary memory commit for batch-extraction providers, and provider
         # I/O must not hold the session mutation lock.
         from api.config import _evict_session_agent
         _evict_session_agent(sid)
+        if canonical_title_clear_failed:
+            return j(
+                handler,
+                {
+                    "ok": False,
+                    "partial": True,
+                    "retryable": True,
+                    "error": (
+                        "Conversation was cleared locally, but its canonical "
+                        "title could not be synchronized"
+                    ),
+                    "code": "session_clear_metadata_sync_failed",
+                    "session": s.compact(),
+                },
+                status=503,
+            )
         return j(handler, {"ok": True, "session": s.compact()})
 
     if parsed.path == "/api/session/truncate":
@@ -17251,7 +17281,7 @@ def handle_post(handler, parsed) -> bool:
         with _get_session_agent_lock(sid):
             s.archived = bool(body.get("archived", True))
             s.save(touch_updated_at=False)
-        _sync_session_title_to_insights(s)
+            _sync_session_title_to_insights(s)
         publish_session_list_changed(
             "session_archive",
             profile=getattr(s, "profile", None),
@@ -18092,58 +18122,62 @@ def _lazy_import_legacy_webui_session(sid: str) -> bool:
     This is intentionally per-session and only runs when the requested id has
     no state.db row. It preserves legacy history without a bulk migration.
     """
-    session = _shared_session_sidecar(sid)
-    if not session or not getattr(session, "archived", False) or not session.messages:
-        return False
-    try:
-        from api.state_sync import _get_state_db, sync_session_usage
-
-        db = _get_state_db(profile=getattr(session, "profile", None))
-        if not db:
+    with _get_session_agent_lock(sid):
+        # Reload only after acquiring the mutation lock. A clear that won first
+        # must turn this into a no-op; an importer that won first must finish its
+        # canonical publication before clear can become the final writer.
+        session = _shared_session_sidecar(sid)
+        if not session or not getattr(session, "archived", False) or not session.messages:
             return False
         try:
-            db.ensure_session(
-                session_id=session.session_id,
-                source="webui",
-                model=getattr(session, "model", None),
-                parent_session_id=getattr(session, "parent_session_id", None),
-            )
-            for message in session.messages:
-                if not isinstance(message, dict):
-                    continue
-                kwargs = {
-                    key: message[key]
-                    for key in (
-                        "tool_name", "tool_calls", "tool_call_id", "reasoning",
-                        "reasoning_content", "reasoning_details",
-                    )
-                    if message.get(key) is not None
-                }
-                db.append_message(
-                    session.session_id,
-                    str(message.get("role") or "assistant"),
-                    message.get("content"),
-                    timestamp=message.get("timestamp"),
-                    **kwargs,
-                )
-        finally:
+            from api.state_sync import _get_state_db, sync_session_usage
+
+            db = _get_state_db(profile=getattr(session, "profile", None))
+            if not db:
+                return False
             try:
-                db.close()
-            except Exception:
-                pass
-        sync_session_usage(
-            session_id=session.session_id,
-            model=getattr(session, "model", None),
-            title=getattr(session, "title", None),
-            message_count=len(session.messages),
-            cwd=getattr(session, "workspace", None),
-            archived=True,
-            profile=getattr(session, "profile", None),
-        )
-        return True
-    except Exception:
-        logger.warning("Lazy import of legacy WebUI session %s failed", sid, exc_info=True)
-        return False
+                db.ensure_session(
+                    session_id=session.session_id,
+                    source="webui",
+                    model=getattr(session, "model", None),
+                    parent_session_id=getattr(session, "parent_session_id", None),
+                )
+                for message in session.messages:
+                    if not isinstance(message, dict):
+                        continue
+                    kwargs = {
+                        key: message[key]
+                        for key in (
+                            "tool_name", "tool_calls", "tool_call_id", "reasoning",
+                            "reasoning_content", "reasoning_details",
+                        )
+                        if message.get(key) is not None
+                    }
+                    db.append_message(
+                        session.session_id,
+                        str(message.get("role") or "assistant"),
+                        message.get("content"),
+                        timestamp=message.get("timestamp"),
+                        **kwargs,
+                    )
+            finally:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+            sync_session_usage(
+                session_id=session.session_id,
+                model=getattr(session, "model", None),
+                title=getattr(session, "title", None),
+                message_count=len(session.messages),
+                cwd=getattr(session, "workspace", None),
+                archived=True,
+                profile=getattr(session, "profile", None),
+            )
+            return True
+        except Exception:
+            logger.warning("Lazy import of legacy WebUI session %s failed", sid, exc_info=True)
+            return False
 
 
 def _shared_session_detail_payload(
@@ -24220,29 +24254,29 @@ def _handle_chat_sync(handler, body):
         if s.title == "Untitled":
             s.title = title_from(s.messages, s.title)
         s.save()
-    # Persist the shared conversation projection. ``sync_to_insights`` remains
-    # a compatibility setting, but must not gate state.db conversation state.
-    try:
-        from api.state_sync import sync_session_usage
+        # Publish the exact saved title/usage before another session mutation
+        # can overtake it and be overwritten by stale canonical metadata.
+        try:
+            from api.state_sync import sync_session_usage
 
-        sync_session_usage(
-            session_id=s.session_id,
-            input_tokens=s.input_tokens or 0,
-            output_tokens=s.output_tokens or 0,
-            estimated_cost=s.estimated_cost,
-            model=s.model,
-            title=s.title,
-            message_count=len(s.messages),
-            cache_read_tokens=s.cache_read_tokens or 0,
-            cache_write_tokens=s.cache_write_tokens or 0,
-            # #2762 / #2827 parity with api/streaming.py: pass the session's
-            # profile explicitly so detached work cannot write another DB.
-            profile=getattr(s, 'profile', None),
-            cwd=getattr(s, 'workspace', None),
-            archived=getattr(s, 'archived', None),
-        )
-    except Exception:
-        logger.debug("Failed to update session cost tracking")
+            sync_session_usage(
+                session_id=s.session_id,
+                input_tokens=s.input_tokens or 0,
+                output_tokens=s.output_tokens or 0,
+                estimated_cost=s.estimated_cost,
+                model=s.model,
+                title=s.title,
+                message_count=len(s.messages),
+                cache_read_tokens=s.cache_read_tokens or 0,
+                cache_write_tokens=s.cache_write_tokens or 0,
+                # #2762 / #2827 parity with api/streaming.py: pass the session's
+                # profile explicitly so detached work cannot write another DB.
+                profile=getattr(s, 'profile', None),
+                cwd=getattr(s, 'workspace', None),
+                archived=getattr(s, 'archived', None),
+            )
+        except Exception:
+            logger.debug("Failed to update session cost tracking")
     return j(
         handler,
         {

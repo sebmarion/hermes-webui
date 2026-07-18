@@ -7,6 +7,7 @@ Validates:
     (as it would be by on_tool() during real agent execution)
   - Messages stored via pending_user_message survive a simulated server restart
 """
+import ast
 import json
 import threading
 import time
@@ -16,6 +17,34 @@ import pytest
 
 import api.models as models
 from api.models import Session
+
+
+def test_final_shared_state_sync_stays_inside_session_writeback_lock():
+    """A completed stream cannot rewrite canonical metadata after clear wins."""
+    source = Path(__file__).parent.parent.joinpath("api", "streaming.py").read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+
+    def is_agent_lock_with(node):
+        return isinstance(node, ast.With) and any(
+            isinstance(item.context_expr, ast.Name)
+            and item.context_expr.id == "_agent_lock"
+            for item in node.items
+        )
+
+    def calls_sync_session_usage(node):
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id == "sync_session_usage"
+            for child in ast.walk(node)
+        )
+
+    assert any(
+        is_agent_lock_with(node) and calls_sync_session_usage(node)
+        for node in ast.walk(tree)
+    ), "final state.db publication must complete under the per-session lock"
 
 
 @pytest.fixture(autouse=True)
