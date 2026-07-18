@@ -151,6 +151,7 @@ def test_publication_requires_a_typed_shadow_match_bound_to_the_same_epoch(tmp_p
 def test_publication_derives_empty_tombstone_and_binds_exact_projection(tmp_path):
     receipts, projections = _stores(tmp_path)
     current = _current()
+    current["settled_display_message_count"] = 0
 
     published = publish_settled_conversation_state(
         receipt_store=receipts,
@@ -172,6 +173,89 @@ def test_publication_derives_empty_tombstone_and_binds_exact_projection(tmp_path
     )
     assert published.receipt.todo_projection_snapshot_digest == published.projection.snapshot_digest
     assert receipts.load("default", "root") == published.receipt
+
+
+def test_publication_rejects_canonical_messages_from_a_different_shadow_snapshot(
+    tmp_path,
+):
+    receipts, projections = _stores(tmp_path)
+    current = _current()
+    accepted = _todo_messages()
+    different = (
+        {"role": "user", "content": "different", "timestamp": 120.0},
+        {"role": "assistant", "content": "not the accepted transcript", "timestamp": 123.0},
+    )
+
+    with pytest.raises(
+        ConversationStatePublicationError,
+        match="canonical messages do not match exact shadow acceptance",
+    ):
+        publish_settled_conversation_state(
+            receipt_store=receipts,
+            view_state_store=projections,
+            canonical_messages=different,
+            current_supplier=lambda: current,
+            shadow_match=_shadow(current, accepted),
+        )
+
+    _assert_no_usable_receipt(receipts)
+    assert projections.read(
+        profile="default",
+        root_id="root",
+        target_content_proof_digest=canonical_proof_digest(
+            current["lineage_fingerprint"], current["state_content_proof"]
+        ),
+        watermark=MessageWatermark(timestamp=123.0, message_id=901),
+    ) is None
+
+
+def test_publication_uses_an_immutable_snapshot_after_exact_binding(tmp_path):
+    receipts, projections = _stores(tmp_path)
+    current = _current()
+    canonical = [dict(message) for message in _todo_messages()]
+    match = _shadow(current, canonical)
+
+    def mutate_original(stage):
+        if stage == "after_current_read":
+            canonical[1]["content"] = json.dumps(
+                {"todos": [], "summary": {"total": 0}}
+            )
+
+    published = publish_settled_conversation_state(
+        receipt_store=receipts,
+        view_state_store=projections,
+        canonical_messages=canonical,
+        current_supplier=lambda: current,
+        shadow_match=match,
+        fault_hook=mutate_original,
+    )
+
+    assert published.projection.snapshot["todos"] == [
+        {"id": "todo-1", "content": "ship it", "status": "pending"}
+    ]
+    assert published.receipt.visible_transcript_digest == match.candidate_visible_digest
+
+
+def test_publication_rejects_a_truncated_tool_payload_as_noncanonical(tmp_path):
+    receipts, projections = _stores(tmp_path)
+    current = _current()
+    truncated = [dict(message) for message in _todo_messages()]
+    truncated[1]["_content_truncated"] = True
+    match = _shadow(current, truncated)
+
+    with pytest.raises(
+        ConversationStatePublicationError,
+        match="canonical messages contain an incomplete payload",
+    ):
+        publish_settled_conversation_state(
+            receipt_store=receipts,
+            view_state_store=projections,
+            canonical_messages=truncated,
+            current_supplier=lambda: current,
+            shadow_match=match,
+        )
+
+    _assert_no_usable_receipt(receipts)
 
 
 @pytest.mark.parametrize("fault_stage", ("after_current_read", "after_todo_cas", "before_receipt_publish"))

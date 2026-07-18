@@ -335,6 +335,70 @@ def read_bounded_state_snapshot(
         raise IntegrationProofError("bounded state snapshot is unavailable") from exc
 
 
+def read_unpublished_current_proof_from_sources(
+    *,
+    target: ResolvedTarget,
+    profile: str,
+    db_path: str | Path,
+    expected_database_identity: tuple[str, int | None, int | None],
+    sidecar_dir: str | Path,
+    shadow_match: ExactShadowMatch,
+) -> dict[str, Any]:
+    """Re-read a publishable exact-match binding before a receipt exists.
+
+    Unlike :func:`read_current_proof_from_sources`, this reader intentionally
+    does not require an existing receipt or todo projection.  It is only for
+    bootstrapping those artifacts from a typed exact shadow match; every value
+    is re-derived from proof-v1 SQLite state and the sidecar lineage.
+    """
+    if not isinstance(target, ResolvedTarget) or not _identifier(profile):
+        raise IntegrationProofError("unpublished current proof inputs are invalid")
+    state = read_bounded_state_snapshot(
+        db_path=db_path,
+        member_ids=target.member_ids,
+        expected_database_identity=expected_database_identity,
+    )
+    if state.capability.capability_marker is not VERIFIED_AGENT_CONTENT_PROOF_CAPABILITY:
+        raise IntegrationProofError("unverifiable current state")
+    sidecars = prove_sidecar_lineage(sidecar_dir, target.member_ids, profile)
+    paths = {
+        member_id: str(Path(sidecar_dir) / f"{member_id}.json")
+        for member_id in target.member_ids
+    }
+    content_proof = _content_proof(target.member_ids, state.target_content_proof)
+    sidecar_proof, generation, sidecar_stat, truncation = _sidecar_binding(
+        target, sidecars, paths
+    )
+    tails, watermark = _state_tails(target.member_ids, state.state_tail_watermarks)
+    if not _shadow_match_binds(
+        shadow_match,
+        profile=profile,
+        target=target,
+        state_content_proof=content_proof,
+        lineage_sidecar_proof=sidecar_proof,
+        visible_transcript_digest=shadow_match.candidate_visible_digest,
+        settled_display_message_count=shadow_match.candidate_count,
+    ):
+        raise IntegrationProofError("exact shadow match is not current")
+    return {
+        "profile": profile,
+        "root_id": target.root_id,
+        "member_ids": target.member_ids,
+        "lineage_fingerprint": target.lineage_fingerprint,
+        "canonical_sidecar_id": target.canonical_id,
+        "lineage_sidecar_proof": sidecar_proof,
+        "sidecar_generation": generation,
+        "sidecar_stat": sidecar_stat,
+        "truncation_watermark": truncation,
+        "state_message_watermark": watermark,
+        "state_content_proof": content_proof,
+        "state_content_proof_capability": VERIFIED_AGENT_CONTENT_PROOF_CAPABILITY,
+        "settled_display_message_count": shadow_match.candidate_count,
+        "visible_transcript_digest": shadow_match.candidate_visible_digest,
+        "state_tail_watermarks": tails,
+    }
+
+
 def shadow_readiness_from_evidence(evidence: Any) -> ShadowReadiness:
     """Convert the durable store's readiness without manufacturing readiness."""
     ready = getattr(evidence, "ready", None)

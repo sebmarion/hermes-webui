@@ -9,6 +9,7 @@ streaming, or Agent session locks.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Any, Callable, Mapping, Sequence
 
 from api.conversation_receipts import (
@@ -27,7 +28,9 @@ from api.conversation_view_state import (
 )
 from api.bounded_conversation_integration import (
     ExactShadowMatch,
+    IntegrationProofError,
     exact_shadow_match_accepts_current,
+    exact_visible_digest,
 )
 from api.todo_state import derive_todo_state
 
@@ -42,6 +45,70 @@ class SettledConversationStatePublication:
 
     projection: ConversationViewState
     receipt: ConversationReceipt
+
+
+_MAX_CANONICAL_SNAPSHOT_BYTES = (2 * 1024 * 1024) + (512 * 1024)
+
+
+def _immutable_canonical_snapshot(
+    messages: Sequence[dict[str, Any]],
+    shadow_match: ExactShadowMatch,
+) -> tuple[dict[str, Any], ...]:
+    """Copy and bind the todo source to the exact transcript acceptance."""
+    if not isinstance(messages, (list, tuple)):
+        raise ConversationStatePublicationError(
+            "canonical messages must be a bounded sequence"
+        )
+    encoder = json.JSONEncoder(
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    chunks: list[str] = []
+    encoded_bytes = 0
+    try:
+        for chunk in encoder.iterencode(messages):
+            encoded_bytes += len(chunk.encode("utf-8"))
+            if encoded_bytes > _MAX_CANONICAL_SNAPSHOT_BYTES:
+                raise ConversationStatePublicationError(
+                    "canonical messages exceed the exact shadow bound"
+                )
+            chunks.append(chunk)
+        decoded = json.loads("".join(chunks))
+    except ConversationStatePublicationError:
+        raise
+    except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as exc:
+        raise ConversationStatePublicationError(
+            "canonical messages are not finite JSON"
+        ) from exc
+    if not isinstance(decoded, list) or any(type(message) is not dict for message in decoded):
+        raise ConversationStatePublicationError("canonical messages are malformed")
+    if any(
+        message.get("_content_truncated") is True
+        or "_content_original_chars" in message
+        or "_content_original_bytes" in message
+        for message in decoded
+    ):
+        raise ConversationStatePublicationError(
+            "canonical messages contain an incomplete payload"
+        )
+    snapshot = tuple(decoded)
+    try:
+        digest = exact_visible_digest(snapshot)
+    except IntegrationProofError as exc:
+        raise ConversationStatePublicationError(
+            "canonical messages are not an exact shadow snapshot"
+        ) from exc
+    if (
+        not isinstance(shadow_match, ExactShadowMatch)
+        or digest != shadow_match.candidate_visible_digest
+        or len(snapshot) != shadow_match.candidate_count
+    ):
+        raise ConversationStatePublicationError(
+            "canonical messages do not match exact shadow acceptance"
+        )
+    return snapshot
 
 
 def _empty_todo_tombstone() -> dict[str, Any]:
@@ -190,8 +257,9 @@ def publish_settled_conversation_state(
     and re-read sidecar/proof state on every call.  Any mismatch leaves only a
     rebuildable projection; without the final receipt it is never cursor-usable.
     """
-    if not isinstance(canonical_messages, (list, tuple)):
-        raise ConversationStatePublicationError("canonical messages must be a bounded sequence")
+    canonical_snapshot = _immutable_canonical_snapshot(
+        canonical_messages, shadow_match
+    )
 
     initial = _current_mapping(current_supplier)
     if not exact_shadow_match_accepts_current(shadow_match, initial):
@@ -207,7 +275,7 @@ def publish_settled_conversation_state(
         raise ConversationStatePublicationError("current proof is unverifiable") from exc
     _fault(fault_hook, "after_current_read")
 
-    todo_snapshot = derive_todo_state(canonical_messages) or _empty_todo_tombstone()
+    todo_snapshot = derive_todo_state(canonical_snapshot) or _empty_todo_tombstone()
     try:
         derived_snapshot_digest = snapshot_digest(todo_snapshot)
     except ValueError as exc:
