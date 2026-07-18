@@ -63,6 +63,7 @@ from api.session_message_paging import (
     evaluate_message_page_shadow,
     message_cursor_database_identity_digest,
     parse_message_paging_negotiation,
+    read_state_db_message_page,
 )
 from api.compression_anchor import visible_messages_for_anchor
 from api.compression_recovery import (
@@ -12371,6 +12372,266 @@ def _render_index_shell_base() -> str:
     return base
 
 
+def _bounded_runtime_owner_absent(profile: str, member_ids) -> bool:
+    """Prove no bounded active-run row owns any member of this lineage."""
+    try:
+        from api import config as _live_config
+
+        members = tuple(member_ids)
+        if not members or len(members) > 256 or any(
+            type(member_id) is not str or not member_id for member_id in members
+        ):
+            return False
+        with _live_config.ACTIVE_RUNS_LOCK:
+            active_runs = _live_config.ACTIVE_RUNS
+            if type(active_runs) is not dict or len(active_runs) > 256:
+                return False
+            rows = tuple(active_runs.values())
+            if any(type(row) is not dict or len(row) > 32 for row in rows):
+                return False
+            rows = tuple(dict(row) for row in rows)
+        for row in rows:
+            session_id = row.get("session_id")
+            if type(session_id) is not str or not session_id:
+                return False
+            try:
+                profile_matches = _profiles_match(row.get("profile"), profile)
+            except Exception:
+                return False
+            if profile_matches and session_id in members:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _bounded_conversation_browser_enabled() -> bool:
+    """Return the non-persisted browser capability only with current proof.
+
+    The operator switch requests adoption; it never grants it by itself.  This
+    intentionally has no target receipt to validate, so it only advertises the
+    server/readiness prerequisites.  Each negotiated session request performs
+    its own receipt and projection validation again before serving a page.
+    """
+    if os.environ.get("HERMES_WEBUI_BOUNDED_CONVERSATION_BROWSER") != "1":
+        return False
+    try:
+        from api.bounded_conversation_integration import (
+            BOUNDED_VIEW_IMPLEMENTATION_ID,
+            PROOF_SCHEMA_ID,
+            detect_readonly_proof_capability,
+            evaluate_public_cursor_gate,
+            shadow_readiness_from_evidence,
+        )
+        from api.conversation_shadow_evidence import (
+            ConversationShadowEvidenceStore,
+            ShadowProofInput,
+        )
+
+        profile = str(_get_active_profile_name() or "default")
+        capability = detect_readonly_proof_capability(_active_state_db_path())
+        evidence = ConversationShadowEvidenceStore(STATE_DIR).readiness(
+            ShadowProofInput(
+                implementation_id=BOUNDED_VIEW_IMPLEMENTATION_ID,
+                schema_id=PROOF_SCHEMA_ID,
+                profile=profile,
+                request_generation=0,
+                candidate_complete=True,
+                oracle_complete=True,
+                lineage_unchanged=True,
+                gates_passed=True,
+            )
+        )
+        return evaluate_public_cursor_gate(
+            os.environ,
+            capability,
+            receipt_is_durable=True,
+            shadow_readiness=shadow_readiness_from_evidence(evidence),
+        ).public_cursor
+    except Exception:
+        return False
+
+
+def _assemble_bounded_conversation_view(
+    *,
+    resolution,
+    profile: str,
+    db_path: Path,
+    visible_limit: int,
+    cursor: str | None,
+):
+    """Run the proof-first view reader, returning a typed fail-closed gate.
+
+    Initial degradation deliberately does *not* read the legacy oracle here.
+    The caller resumes its unchanged legacy path lazily, after reloading a full
+    sidecar when this request began metadata-only.
+    """
+    from api.bounded_conversation_integration import (
+        BOUNDED_VIEW_IMPLEMENTATION_ID,
+        PROOF_SCHEMA_ID,
+        PublicCursorGate,
+        detect_readonly_proof_capability,
+        evaluate_public_cursor_gate,
+        read_current_proof_from_sources,
+        shadow_readiness_from_evidence,
+    )
+    from api.bounded_session_view import (
+        BoundedSessionViewAssembler,
+        BoundedViewDependencies,
+        BoundedViewRequest,
+        PageView,
+        ResolvedTarget,
+    )
+    from api.bounded_target_confirmation import confirm_shared_session_target
+    from api.conversation_receipts import ConversationReceiptStore, canonical_proof_digest
+    from api.conversation_shadow_evidence import (
+        ConversationShadowEvidenceStore,
+        ShadowProofInput,
+    )
+    from api.conversation_view_state import (
+        ConversationViewStateStore,
+        MessageWatermark,
+    )
+
+    try:
+        target = ResolvedTarget(
+            requested_id=resolution.requested_id,
+            canonical_id=resolution.canonical_id,
+            root_id=resolution.root_id,
+            member_ids=tuple(resolution.member_ids),
+            lineage_fingerprint=resolution.lineage_fingerprint,
+            database_identity_digest=message_cursor_database_identity_digest(
+                resolution.database_identity
+            ),
+            global_generation_hint=resolution.global_projection_generation_hint,
+            source_mode="state_db",
+        )
+        capability = detect_readonly_proof_capability(db_path)
+        generation = resolution.global_projection_generation_hint
+        request_generation = (
+            generation if type(generation) is int and generation >= 0 else 0
+        )
+        evidence = ConversationShadowEvidenceStore(STATE_DIR).readiness(
+            ShadowProofInput(
+                implementation_id=BOUNDED_VIEW_IMPLEMENTATION_ID,
+                schema_id=PROOF_SCHEMA_ID,
+                profile=profile,
+                request_generation=request_generation,
+                candidate_complete=True,
+                oracle_complete=True,
+                lineage_unchanged=True,
+                gates_passed=True,
+            )
+        )
+        receipt_store = ConversationReceiptStore(STATE_DIR)
+        view_state_store = ConversationViewStateStore(STATE_DIR)
+        receipt = receipt_store.load(profile, target.root_id)
+        public_cursor_gate = evaluate_public_cursor_gate(
+            os.environ,
+            capability,
+            receipt_is_durable=receipt is not None,
+            shadow_readiness=shadow_readiness_from_evidence(evidence),
+        )
+        if not public_cursor_gate.public_cursor:
+            return public_cursor_gate, None, 0, None
+
+        page_stats = {"visible_count": 0}
+        todo_snapshot = {"value": None}
+
+        def read_current(current_target, _marker):
+            current_receipt = receipt_store.load(profile, current_target.root_id)
+            if current_receipt is None:
+                raise ValueError("receipt is unavailable")
+            proof = read_current_proof_from_sources(
+                target=current_target,
+                profile=profile,
+                db_path=db_path,
+                expected_database_identity=resolution.database_identity,
+                sidecar_dir=SESSION_DIR,
+                receipt=current_receipt,
+                view_state_store=view_state_store,
+            )
+            projection = view_state_store.read(
+                profile=profile,
+                root_id=current_target.root_id,
+                target_content_proof_digest=canonical_proof_digest(
+                    current_target.lineage_fingerprint,
+                    proof.state_content_proof,
+                ),
+                watermark=MessageWatermark(
+                    timestamp=proof.todo_projection.timestamp,
+                    message_id=proof.todo_projection.message_id,
+                ),
+            )
+            if projection is None:
+                raise ValueError("durable todo projection is unavailable")
+            if (
+                projection.generation != proof.todo_projection.generation
+                or projection.watermark.message_id
+                != proof.todo_projection.message_id
+                or projection.watermark.timestamp
+                != proof.todo_projection.timestamp
+                or projection.snapshot_digest
+                != proof.todo_projection.snapshot_digest
+            ):
+                raise ValueError("durable todo projection changed during read")
+            todo_snapshot["value"] = dict(projection.snapshot)
+            return proof.to_mapping()
+
+        def load_page(_target, claims, limit):
+            page = read_state_db_message_page(
+                db_path=db_path,
+                resolution=resolution,
+                visible_limit=limit,
+                cursor=claims,
+            )
+            if page.mode != "cursor_v1":
+                raise ValueError(page.fallback_reason or "cursor_page_unavailable")
+            page_stats["visible_count"] = page.visible_count
+            return PageView(
+                messages=list(page.messages),
+                has_more=page.has_more,
+                visible_count=page.visible_count,
+                raw_rows_examined=page.raw_rows_examined,
+                serialized_bytes=page.serialized_bytes,
+                before_boundaries=page.before_boundaries,
+            )
+
+        dependencies = BoundedViewDependencies(
+            resolve=lambda requested_profile, requested_id: (
+                target
+                if requested_profile == profile and requested_id == target.requested_id
+                else (_ for _ in ()).throw(ValueError("request target changed"))
+            ),
+            confirm_target=lambda _target: confirm_shared_session_target(db_path, resolution),
+            read_current=read_current,
+            load_receipt=lambda receipt_profile, root_id: receipt_store.load(
+                receipt_profile, root_id
+            ),
+            load_legacy=lambda _target, _limit: (_ for _ in ()).throw(
+                ValueError("legacy path resumes in the route")
+            ),
+            load_page=load_page,
+            capability=lambda: capability,
+        )
+        result = BoundedSessionViewAssembler(dependencies).assemble(
+            BoundedViewRequest(
+                profile=profile,
+                requested_id=target.requested_id,
+                limit=visible_limit,
+                cursor=cursor,
+            )
+        )
+        return (
+            public_cursor_gate,
+            result,
+            page_stats["visible_count"],
+            todo_snapshot["value"],
+        )
+    except Exception:
+        return PublicCursorGate(False, "bounded_read_unavailable"), None, 0, None
+
+
 def handle_get(handler, parsed) -> bool:
     """Handle all GET routes. Returns True if handled, False for 404."""
     proxy_result = _handle_extension_sidecar_proxy(handler, parsed, "GET")
@@ -12835,6 +13096,10 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path == "/api/settings":
         settings = load_settings()
+        # Capability only: this is never written back through POST /api/settings.
+        # The route repeats target-specific proof/receipt checks before it can
+        # actually return a cursor page.
+        settings["bounded_conversation_browser"] = _bounded_conversation_browser_enabled()
         settings["persisted_speech_keys"] = persisted_speech_settings_keys()
         # Never expose the stored password hash to clients
         settings.pop("password_hash", None)
@@ -13088,10 +13353,17 @@ def handle_get(handler, parsed) -> bool:
         try:
             _t1 = _time.monotonic()
             if _diag: _diag.stage("t1_after_get_session_check")
+            _bounded_metadata_only = (
+                _message_cursor_gate == "on"
+                and message_paging.requested
+                and load_messages
+            )
             s = get_session(
                 sid,
                 metadata_only=(
-                    not load_messages or message_paging.cursor_token is not None
+                    not load_messages
+                    or message_paging.cursor_token is not None
+                    or _bounded_metadata_only
                 ),
             )
             _session_profile = getattr(s, 'profile', None) or None
@@ -13113,15 +13385,20 @@ def handle_get(handler, parsed) -> bool:
                 # otherwise emit a useless 409 with profile=null.
                 _finish_session_diagnostics()
                 return bad(handler, "Session not found", 404)
-            _cursor_rejection = _message_cursor_rejection(_session_profile)
-            if _cursor_rejection is not None:
-                _cursor_status, _cursor_payload = _cursor_rejection
-                _finish_session_diagnostics()
-                return j(
-                    handler,
-                    _cursor_payload,
-                    status=_cursor_status,
-                )
+            # Existing gate-off/shadow semantics retain their original cursor
+            # validation.  An enabled public read is instead validated by the
+            # proof-first assembler below, after it can bind the receipt and
+            # current target state.  Its continuation failures remain empty.
+            if _message_cursor_gate != "on":
+                _cursor_rejection = _message_cursor_rejection(_session_profile)
+                if _cursor_rejection is not None:
+                    _cursor_status, _cursor_payload = _cursor_rejection
+                    _finish_session_diagnostics()
+                    return j(
+                        handler,
+                        _cursor_payload,
+                        status=_cursor_status,
+                    )
             original_stream_id = getattr(s, "active_stream_id", None)
             _clear_stale_stream_state(s)
             if _session_requires_cli_metadata_lookup(s):
@@ -13129,12 +13406,123 @@ def handle_get(handler, parsed) -> bool:
             else:
                 cli_meta = {}
             is_messaging_session = _is_messaging_session_record(s) or _is_messaging_session_record(cli_meta)
+            bounded_cursor_result = None
+            bounded_visible_count = 0
+            bounded_todo_snapshot = None
+            bounded_mode = (
+                _bounded_metadata_only
+                and not is_messaging_session
+                and resolution.status == "found"
+                and not original_stream_id
+                and not getattr(s, "pending_user_message", None)
+                and _bounded_runtime_owner_absent(
+                    str(_session_profile or "default"), resolution.member_ids
+                )
+            )
+            if bounded_mode:
+                (
+                    public_cursor_gate,
+                    bounded_result,
+                    bounded_visible_count,
+                    bounded_todo_snapshot,
+                ) = _assemble_bounded_conversation_view(
+                    resolution=resolution,
+                    profile=str(_session_profile or "default"),
+                    db_path=state_db_path,
+                    visible_limit=msg_limit,
+                    cursor=message_paging.cursor_token,
+                )
+                if (
+                    public_cursor_gate.public_cursor
+                    and bounded_result is not None
+                    and bounded_result.status == 200
+                    and bounded_result.mode == "cursor_v1"
+                    and _bounded_runtime_owner_absent(
+                        str(_session_profile or "default"), resolution.member_ids
+                    )
+                ):
+                    bounded_cursor_result = bounded_result
+                elif message_paging.cursor_token is not None:
+                    # A continuation is never permitted to mix a failed cursor
+                    # read with a legacy response, even when the public gate
+                    # changed while the request was in flight.
+                    _finish_session_diagnostics()
+                    if (
+                        bounded_result is not None
+                        and bounded_result.error == "invalid_message_cursor"
+                    ):
+                        return j(
+                            handler,
+                            {
+                                "error": "Invalid message cursor",
+                                "code": "invalid_message_cursor",
+                            },
+                            status=400,
+                        )
+                    return j(
+                        handler,
+                        {
+                            "error": "Message cursor restart required",
+                            "code": "cursor_restart_required",
+                        },
+                        status=409,
+                    )
+
+            if (
+                _bounded_metadata_only
+                and message_paging.cursor_token is not None
+                and bounded_cursor_result is None
+            ):
+                _finish_session_diagnostics()
+                return j(
+                    handler,
+                    {
+                        "error": "Message cursor restart required",
+                        "code": "cursor_restart_required",
+                    },
+                    status=409,
+                )
+
+            # The first bounded attempt intentionally used metadata only.  Any
+            # initial miss resumes the exact pre-existing oracle with a full
+            # sidecar load; the cursor-success path never reaches this branch.
+            if _bounded_metadata_only and bounded_cursor_result is None:
+                s = get_session(sid, metadata_only=False)
+                _session_profile = getattr(s, "profile", None) or None
+                if not _session_visible_to_active_profile(_session_profile, handler):
+                    _finish_session_diagnostics()
+                    if _session_profile:
+                        return j(
+                            handler,
+                            {
+                                "error": "Session belongs to a different profile",
+                                "code": "session_profile_mismatch",
+                                "session_id": sid,
+                                "profile": _session_profile,
+                            },
+                            status=409,
+                        )
+                    return bad(handler, "Session not found", 404)
+                original_stream_id = getattr(s, "active_stream_id", None)
+                _clear_stale_stream_state(s)
+                if _session_requires_cli_metadata_lookup(s):
+                    cli_meta = _targeted_cli_metadata_for_resolution(resolution)
+                else:
+                    cli_meta = {}
+                is_messaging_session = (
+                    _is_messaging_session_record(s)
+                    or _is_messaging_session_record(cli_meta)
+                )
             cli_messages = []
             state_db_messages = []
             metadata_summary = None
             limited_sidecar_messages = None
             state_db_since_timestamp = None
-            if is_messaging_session:
+            if bounded_cursor_result is not None:
+                # All conversation data is already the validated bounded page.
+                # Do not read state history or parse the full sidecar.
+                pass
+            elif is_messaging_session:
                 cli_messages = get_cli_session_messages(sid)
             elif load_messages:
                 if msg_limit is not None and len(resolution.member_ids) == 1:
@@ -13190,7 +13578,9 @@ def handle_get(handler, parsed) -> bool:
             _t3 = _time.monotonic()
             if _diag: _diag.stage("t3_after_model_resolve")
             if load_messages:
-                if is_messaging_session and cli_messages:
+                if bounded_cursor_result is not None:
+                    _all_msgs = []
+                elif is_messaging_session and cli_messages:
                     # Recovery/aggregate sidecars can intentionally contain a
                     # longer visible conversation than the single state.db
                     # segment for this messaging session id. Prefer the longer
@@ -13243,16 +13633,21 @@ def handle_get(handler, parsed) -> bool:
                 _summary_message_count = None
                 _summary_last_message_at = None
             if load_messages:
-                _truncated_msgs, _messages_offset = _message_window_for_display(
-                    _all_msgs,
-                    msg_limit=msg_limit,
-                    msg_before=msg_before,
-                    expand_renderable=expand_renderable,
-                )
-                if msg_limit is not None:
-                    _truncated_msgs = _messages_for_limited_payload(_truncated_msgs)
+                if bounded_cursor_result is not None:
+                    _truncated_msgs = list(bounded_cursor_result.messages)
+                    _messages_offset = 0
+                else:
+                    _truncated_msgs, _messages_offset = _message_window_for_display(
+                        _all_msgs,
+                        msg_limit=msg_limit,
+                        msg_before=msg_before,
+                        expand_renderable=expand_renderable,
+                    )
+                    if msg_limit is not None:
+                        _truncated_msgs = _messages_for_limited_payload(_truncated_msgs)
                 if (
-                    message_paging.requested
+                    bounded_cursor_result is None
+                    and message_paging.requested
                     and _message_cursor_gate == "shadow"
                     and message_paging.cursor_token is None
                     and not is_messaging_session
@@ -13307,12 +13702,13 @@ def handle_get(handler, parsed) -> bool:
                         "message_page_shadow %s",
                         json.dumps(_shadow_diagnostic, sort_keys=True),
                     )
-                _truncated_msgs = _hydrate_anchor_activity_scenes(
-                    _truncated_msgs,
-                    getattr(s, "anchor_activity_scenes", None),
-                    message_offset=_messages_offset,
-                    tool_calls=getattr(s, "tool_calls", None),
-                )
+                if bounded_cursor_result is None:
+                    _truncated_msgs = _hydrate_anchor_activity_scenes(
+                        _truncated_msgs,
+                        getattr(s, "anchor_activity_scenes", None),
+                        message_offset=_messages_offset,
+                        tool_calls=getattr(s, "tool_calls", None),
+                    )
             else:
                 _truncated_msgs = []
                 _messages_offset = 0
@@ -13320,6 +13716,7 @@ def handle_get(handler, parsed) -> bool:
             # Frontend uses this as cursor for scroll-to-top paging.
             _windowed_messages = (
                 load_messages
+                and bounded_cursor_result is None
                 and msg_limit is not None
                 and (msg_before is not None or len(_truncated_msgs) < len(_all_msgs))
             )
@@ -13391,7 +13788,15 @@ def handle_get(handler, parsed) -> bool:
                     _messages_offset,
                     len(_truncated_msgs),
                 )
-            _merged_message_count = _summary_message_count if _summary_message_count is not None else len(_all_msgs)
+            _merged_message_count = (
+                bounded_cursor_result.message_count
+                if bounded_cursor_result is not None
+                else (
+                    _summary_message_count
+                    if _summary_message_count is not None
+                    else len(_all_msgs)
+                )
+            )
             _merged_last_message_at = _summary_last_message_at if _summary_last_message_at is not None else 0
             if _summary_last_message_at is None and _all_msgs:
                 try:
@@ -13450,13 +13855,12 @@ def handle_get(handler, parsed) -> bool:
                         if snapshot:
                             raw["runtime_journal_snapshot"] = snapshot
                             raw["pending_attachments"] = getattr(s, "pending_attachments", []) or []
-            # Cold-load: derive the latest settled todo snapshot from the full
-            # merged transcript, not the truncated display window. This keeps
-            # the Todos panel correct after refresh even when the latest todo
-            # tool result is outside msg_limit, and treats an explicit empty
-            # todo list as the current state instead of falling through to an
-            # older non-empty write.
-            if load_messages and _all_msgs:
+            # Cursor success uses the exact durable projection bound to the
+            # validated receipt.  Legacy loads keep deriving from their full
+            # merge exactly as before.
+            if bounded_cursor_result is not None and bounded_todo_snapshot is not None:
+                raw["todo_state"] = bounded_todo_snapshot
+            elif load_messages and _all_msgs:
                 attach_todo_state(raw, _all_msgs)
             if _merged_last_message_at:
                 raw["last_message_at"] = max(
@@ -13506,10 +13910,26 @@ def handle_get(handler, parsed) -> bool:
                 raw["is_cli_session"] = False
                 raw["read_only"] = True
             if message_paging.requested:
-                raw["message_page"] = {
-                    "mode": "legacy",
-                    "fallback_reason": _message_cursor_legacy_reason,
-                }
+                if bounded_cursor_result is not None:
+                    # Cursor pages have no absolute message coordinate.
+                    # Per-message tool metadata remains intact; old
+                    # session-level absolute tool-call indexes do not.
+                    raw["tool_calls"] = []
+                    raw.pop("_messages_offset", None)
+                    raw.pop("_messages_truncated", None)
+                    raw["message_page"] = {
+                        "mode": "cursor_v1",
+                        "before_cursor": bounded_cursor_result.before_cursor,
+                        "has_more": bounded_cursor_result.has_more,
+                        "visible_count": bounded_visible_count,
+                        "raw_rows_examined": bounded_cursor_result.raw_rows_examined,
+                        "serialized_bytes": bounded_cursor_result.serialized_bytes,
+                    }
+                else:
+                    raw["message_page"] = {
+                        "mode": "legacy",
+                        "fallback_reason": _message_cursor_legacy_reason,
+                    }
             redact = redact_session_data(raw)
             _t5 = _time.monotonic()
             if _diag: _diag.stage("t5_after_redact")

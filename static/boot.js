@@ -3135,6 +3135,7 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
   try{
     const s=await api('/api/settings');
     _bootSettings=s;
+    window._boundedConversationBrowser=s.bounded_conversation_browser===true;
     if(typeof checkWebUIVersionSkew==='function'){try{checkWebUIVersionSkew(s);}catch(_){}}
     window._sendKey=s.send_key||'enter';
     // Persist default workspace so the blank new-chat page can show it
