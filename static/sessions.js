@@ -1583,6 +1583,7 @@ async function loadSession(sid){
     // instead of collapsing a long session back to the default tail window.
     if (sameSessionForceReload) _captureSameSessionForceReloadHint(sid);
     else _clearSameSessionForceReloadHint();
+    _resetMessagePaging({restartAttempted:!!opts.cursorRestartAttempted});
     // #5177: keep-stale-until-loaded path — defer the destructive
     // S.messages/toolCalls clear so the user does NOT see a transcript-wide
     // blank gap during the metadata + messages round-trip. Only the
@@ -1615,13 +1616,25 @@ async function loadSession(sid){
     const _msgInner = $('msgInner');
     if (_msgInner && currentSid !== sid) _msgInner.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Loading conversation...</div>';
   }
-  // Phase 1: Load metadata only (~1KB) for fast session switching. Keep model
-  // resolution out of the first-paint path; old provider-shaped model IDs are
-  // repaired by the deferred resolver after S.session is assigned.
+  // Phase 1: Keep model resolution out of the first-paint path. The bounded
+  // browser gate negotiates the initial tail in this one request; legacy and
+  // old-server paths retain the metadata-only request followed by the existing
+  // message request.
   // Guard against network/server failures to prevent a permanently stuck loading state.
+  // A normal same-session refresh reuses the legacy widened-tail request so it
+  // cannot collapse a reader's already-loaded transcript. The one bounded
+  // restart after a cursor failure is explicitly allowed to renegotiate.
+  const _useBoundedInitialMessagePaging = (
+    typeof window !== 'undefined' &&
+    window._boundedConversationBrowser === true &&
+    !opts.forceLegacyMessagePaging &&
+    (!sameSessionForceReload || !!opts.cursorRestartAttempted)
+  );
   let data;
   try {
-    data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
+    data = await api(_useBoundedInitialMessagePaging
+      ? `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${_INITIAL_MSG_LIMIT}&message_paging=cursor_v1`
+      : `/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
   } catch(e) {
     const profileMismatch=_sessionProfileMismatchFromError(e);
     if(profileMismatch && profileMismatch.profile && !opts.skipProfileResolve){
@@ -1916,7 +1929,11 @@ async function loadSession(sid){
     // this session's INFLIGHT snapshot, not leave prior-session rows in place.
     if(typeof clearLiveToolCards==='function') clearLiveToolCards();
     try {
-      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});
+      if (_useBoundedInitialMessagePaging) {
+        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, initialData:data});
+      } else {
+        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});
+      }
     } catch(e) {
       if (!_isCurrentLoad()) {
         _rearmActiveSessionStream();
@@ -2022,7 +2039,11 @@ async function loadSession(sid){
     // "messages already populated" early-return inside _ensureMessagesLoaded
     // does NOT skip the swap to the new transcript.
     try {
-      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});
+      if (_useBoundedInitialMessagePaging) {
+        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, initialData:data});
+      } else {
+        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});
+      }
     } catch (e) {
       if (!_isCurrentLoad()) {
         _rearmActiveSessionStream();
@@ -2752,6 +2773,68 @@ function _resolveSessionModelForDisplaySoon(sid){
 // When true, scrolling to the top triggers _loadOlderMessages().
 let _messagesTruncated = false;
 
+// Browser-local negotiated paging state. Cursor values are opaque server
+// coordinates and must never be converted into legacy message indexes.
+let _messagePaging = {
+  mode: 'legacy',
+  beforeCursor: null,
+  hasMore: false,
+  visibleCount: 0,
+  restartAttempted: false,
+};
+
+function _resetMessagePaging(opts) {
+  _messagePaging.mode = 'legacy';
+  _messagePaging.beforeCursor = null;
+  _messagePaging.hasMore = false;
+  _messagePaging.visibleCount = 0;
+  _messagePaging.restartAttempted = !!(opts && opts.restartAttempted);
+  _messagesTruncated = false;
+  _oldestIdx = 0;
+}
+
+function _parseMessagePage(page) {
+  if (!page || typeof page !== 'object' || Array.isArray(page)) return null;
+  const keys = ['mode', 'before_cursor', 'has_more', 'visible_count', 'raw_rows_examined', 'serialized_bytes'];
+  if (Object.keys(page).length !== 6 || !keys.every(key => Object.prototype.hasOwnProperty.call(page, key))) return null;
+  if (page.mode !== 'cursor_v1') return null;
+  if (page.before_cursor !== null && typeof page.before_cursor !== 'string') return null;
+  if (typeof page.has_more !== 'boolean') return null;
+  if (page.has_more && (page.before_cursor === null || page.before_cursor === '')) return null;
+  if (!page.has_more && page.before_cursor !== null) return null;
+  if (!Number.isSafeInteger(page.visible_count) || page.visible_count < 0) return null;
+  if (!Number.isSafeInteger(page.raw_rows_examined) || page.raw_rows_examined < 0) return null;
+  if (!Number.isSafeInteger(page.serialized_bytes) || page.serialized_bytes < 0) return null;
+  if (page.visible_count > 100) return null;
+  if (page.raw_rows_examined > 864) return null;
+  if (page.serialized_bytes > 2621440) return null;
+  return {
+    beforeCursor: page.before_cursor,
+    hasMore: page.has_more,
+    visibleCount: page.visible_count,
+  };
+}
+
+function _adoptMessagePaging(session) {
+  const page = _parseMessagePage(session && session.message_page);
+  if (!page) {
+    _messagePaging.mode = 'legacy';
+    _messagePaging.beforeCursor = null;
+    _messagePaging.hasMore = !!(session && session._messages_truncated);
+    _messagePaging.visibleCount = 0;
+    _messagesTruncated = !!(session && session._messages_truncated);
+    _oldestIdx = Number(session && session._messages_offset) || 0;
+    return null;
+  }
+  _messagePaging.mode = 'cursor_v1';
+  _messagePaging.beforeCursor = page.beforeCursor;
+  _messagePaging.hasMore = page.hasMore;
+  _messagePaging.visibleCount = page.visibleCount;
+  _messagesTruncated = page.hasMore;
+  _oldestIdx = 0;
+  return page;
+}
+
 // Load session messages if not already present.
 // Called after loadSession fetches metadata (messages=0).
 // Idempotent: if messages are already in S.messages, resolves immediately.
@@ -2870,20 +2953,25 @@ async function _ensureMessagesLoaded(sid, opts) {
   // The server now counts msg_limit by visible transcript rows by default; keep
   // the flag for compatibility with mixed-version deployments.
   const expandParam = reloadLimit ? '&expand_renderable=1' : '';
-  let data;
-  try {
-    data = await api(
-      `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`,
-      {timeoutMs:120000}
-    );
-  } finally {
-    if (_ownsLoad()) _clearSameSessionForceReloadHint(sid);
+  let data = opts.initialData || null;
+  if (!data) {
+    try {
+      data = await api(
+        `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`,
+        {timeoutMs:120000}
+      );
+    } finally {
+      if (_ownsLoad()) _clearSameSessionForceReloadHint(sid);
+    }
   }
   if (!_ownsLoad()) return;
   // Guard: api() may have redirected (401) and returned undefined.
   if (!data || !data.session) return;
-  _messagesTruncated = !!data.session._messages_truncated;
-  _oldestIdx = data.session._messages_offset || 0;
+  _adoptMessagePaging(data.session);
+  if (_messagePaging.mode === 'legacy') {
+    _messagesTruncated = !!data.session._messages_truncated;
+    _oldestIdx = data.session._messages_offset || 0;
+  }
   // #3162: `msgs` is reassigned below by the #3018 ephemeral-field carry-forward,
   // so it must be `let`, not `const`. The `const` form threw a TypeError inside
   // _ensureMessagesLoaded() that surfaced as a "Failed to load conversation messages"
@@ -3352,10 +3440,126 @@ function _bumpMessagesGeneration() {
   return _messagesGeneration;
 }
 
+async function _recoverCursorPaging(sid, startLoadGeneration, startGeneration) {
+  if (!S.session || S.session.session_id !== sid) return false;
+  if (_loadingSessionId !== null && _loadingSessionId !== sid) return false;
+  if (_loadSessionGeneration !== startLoadGeneration) return false;
+  if (_messagesGeneration !== startGeneration) return false;
+  _messagePaging.beforeCursor = null;
+  _messagePaging.hasMore = false;
+  _messagesTruncated = false;
+  if (!_messagePaging.restartAttempted) {
+    _messagePaging.restartAttempted = true;
+    await loadSession(sid, {force:true, cursorRestartAttempted:true});
+    return true;
+  }
+  await loadSession(sid, {force:true, forceLegacyMessagePaging:true});
+  return true;
+}
+
 async function _loadOlderMessages() {
   if (_loadingOlder || !_messagesTruncated) return;
   const sid = S.session ? S.session.session_id : null;
   if (!sid || !S.messages.length) return;
+  if (_messagePaging.mode === 'cursor_v1') {
+    if (!_messagePaging.hasMore || !_messagePaging.beforeCursor) {
+      _messagePaging.hasMore = false;
+      _messagesTruncated = false;
+      return;
+    }
+    _loadingOlder = true;
+    const startGeneration = _messagesGeneration;
+    const startLoadGeneration = _loadSessionGeneration;
+    const requestedCursor = _messagePaging.beforeCursor;
+    try {
+      const data = await api(
+        `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&message_paging=cursor_v1&msg_cursor=${encodeURIComponent(requestedCursor)}&msg_limit=${_INITIAL_MSG_LIMIT}`,
+        {timeoutMs:120000}
+      );
+      if (!data || !data.session) return;
+      if (data.session.session_id !== sid) return;
+      if (!S.session || S.session.session_id !== sid) return;
+      if (_loadingSessionId !== null && _loadingSessionId !== sid) return;
+      if (_loadSessionGeneration !== startLoadGeneration) return;
+      if (_messagesGeneration !== startGeneration) return;
+      const page = _parseMessagePage(data.session.message_page);
+      if (!page || (page.hasMore && page.beforeCursor === requestedCursor)) {
+        await _recoverCursorPaging(sid, startLoadGeneration, startGeneration);
+        return;
+      }
+      const currentMsgs = (S.messages || []).filter(m => m && m.role);
+      const stableIds = new Set(currentMsgs
+        .map(message => message && message._state_db_message_id)
+        .filter(id => id !== undefined && id !== null)
+        .map(String));
+      const olderMsgs = [];
+      for (const message of (data.session.messages || [])) {
+        if (!message || !message.role) continue;
+        const stableId = message._state_db_message_id;
+        if (stableId !== undefined && stableId !== null) {
+          const key = String(stableId);
+          if (stableIds.has(key)) continue;
+          stableIds.add(key);
+          olderMsgs.push(message);
+          continue;
+        }
+        if (currentMsgs.some(existing => _sameTranscriptMessage(existing, message))) continue;
+        if (olderMsgs.some(existing => _sameTranscriptMessage(existing, message))) continue;
+        olderMsgs.push(message);
+      }
+      _messagePaging.beforeCursor = page.beforeCursor;
+      _messagePaging.hasMore = page.hasMore;
+      _messagePaging.visibleCount = page.visibleCount;
+      _messagesTruncated = page.hasMore;
+      _oldestIdx = 0;
+      if (!olderMsgs.length) return;
+      const nextMessages = [...olderMsgs, ...currentMsgs];
+      const container = $('messages');
+      const prevScrollH = container ? container.scrollHeight : 0;
+      const oldTop = container ? container.scrollTop : 0;
+      const viewportAnchor = (container && typeof _captureMessageViewportAnchor === 'function')
+        ? _captureMessageViewportAnchor()
+        : null;
+      let messagesToAssign = nextMessages;
+      if (typeof window._carryForwardEphemeralTurnFields === 'function') {
+        messagesToAssign = window._carryForwardEphemeralTurnFields(S.messages || [], nextMessages);
+      }
+      S.messages = messagesToAssign;
+      _syncToolCallsForLoadedMessages(messagesToAssign, data.session.tool_calls);
+      const addedRenderable = olderMsgs.filter(message => {
+        if (typeof _messageIsRenderable === 'function') return _messageIsRenderable(message);
+        return !!(message && message.role && message.role !== 'tool');
+      }).length;
+      _messageRenderWindowSize = _currentMessageRenderWindowSize() + Math.max(addedRenderable, MESSAGE_RENDER_WINDOW_DEFAULT);
+      renderMessages({ preserveScroll: true });
+      if (container) {
+        const restoredViaAnchor = (viewportAnchor && typeof _restoreMessageViewportAnchor === 'function')
+          ? _restoreMessageViewportAnchor(viewportAnchor, olderMsgs.length)
+          : false;
+        if (!restoredViaAnchor) {
+          const virtualAddedHeight = (typeof _messageVirtualPrependedHeightDelta === 'function')
+            ? _messageVirtualPrependedHeightDelta(addedRenderable)
+            : null;
+          const addedHeight = Number.isFinite(virtualAddedHeight)
+            ? virtualAddedHeight
+            : Math.max(0, container.scrollHeight - prevScrollH);
+          _programmaticScroll = true;
+          container.scrollTop = oldTop + addedHeight;
+          requestAnimationFrame(() => { _programmaticScroll = false; });
+        }
+      }
+      _scrollPinned = false;
+    } catch (e) {
+      if (e && (e.status === 400 || e.status === 409)) {
+        if (await _recoverCursorPaging(sid, startLoadGeneration, startGeneration)) return;
+      }
+      console.warn('_loadOlderMessages cursor page failed:', e);
+    } finally {
+      _loadingOlder = false;
+    }
+    return;
+  }
+  // Legacy numeric paging
   if (_oldestIdx <= 0) { _messagesTruncated = false; return; }
   _loadingOlder = true;
   // Snapshot the generation BEFORE we await. If S.messages is wholesale
@@ -3558,6 +3762,7 @@ async function _ensureAllMessagesLoaded() {
     _messagesTruncated = false;
     _oldestIdx = 0;
     _syncToolCallsForLoadedMessages(msgs, data.session.tool_calls);
+    _resetMessagePaging();
     if (S.session && S.session.session_id === sid) {
       S.session.message_count = Number(data.session.message_count || msgs.length);
     }

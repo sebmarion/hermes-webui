@@ -19,7 +19,7 @@ def _function_body(src: str, signature: str) -> str:
 
 
 def test_loading_older_messages_expands_render_window_before_rendering():
-    body = _function_body(SESSIONS_JS, "async function _loadOlderMessages")
+    body = _function_body(SESSIONS_JS, "async function _loadOlderMessages").split("// Legacy numeric paging", 1)[1]
 
     replace_idx = body.index("S.messages = nextMessages")
     expand_idx = body.index("_messageRenderWindowSize=_currentMessageRenderWindowSize()")
@@ -34,7 +34,7 @@ def test_loading_older_messages_expands_render_window_before_rendering():
 
 
 def test_loading_older_messages_preserves_viewport_without_bottom_snap():
-    body = _function_body(SESSIONS_JS, "async function _loadOlderMessages")
+    body = _function_body(SESSIONS_JS, "async function _loadOlderMessages").split("// Legacy numeric paging", 1)[1]
 
     assert "renderMessages({ preserveScroll: true });" in body
     assert "const viewportAnchor = (container && typeof _captureMessageViewportAnchor === 'function')" in body
@@ -56,7 +56,7 @@ def test_loading_older_messages_preserves_viewport_without_bottom_snap():
 
 
 def test_loading_older_messages_marks_scroll_programmatic_while_anchoring():
-    body = _function_body(SESSIONS_JS, "async function _loadOlderMessages")
+    body = _function_body(SESSIONS_JS, "async function _loadOlderMessages").split("// Legacy numeric paging", 1)[1]
 
     set_idx = body.index("_programmaticScroll = true;")
     restore_idx = body.index("container.scrollTop = oldTop + addedHeight")
@@ -65,7 +65,7 @@ def test_loading_older_messages_marks_scroll_programmatic_while_anchoring():
 
 
 def test_loading_older_messages_captures_anchor_before_replacing_messages():
-    body = _function_body(SESSIONS_JS, "async function _loadOlderMessages")
+    body = _function_body(SESSIONS_JS, "async function _loadOlderMessages").split("// Legacy numeric paging", 1)[1]
 
     anchor_idx = body.index("const viewportAnchor = (container && typeof _captureMessageViewportAnchor === 'function')")
     replace_idx = body.index("S.messages = nextMessages")

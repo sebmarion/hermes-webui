@@ -206,8 +206,25 @@ function createEnvironment() {
   globalThis._pendingCarryForwardSnapshot = null;
   globalThis._messagesTruncated = false;
   globalThis._oldestIdx = 0;
+  globalThis._messagePaging = { mode: 'legacy' };
+  // The production helpers live outside the two extracted functions under
+  // test. Model their legacy fallback here so this ordering harness remains
+  // about stale ownership, not negotiated cursor parsing.
+  globalThis._resetMessagePaging = () => {
+    _messagesTruncated = false;
+    _oldestIdx = 0;
+  };
+  globalThis._adoptMessagePaging = (session) => {
+    _messagePaging.mode = 'legacy';
+    _messagesTruncated = !!(session && session._messages_truncated);
+    _oldestIdx = Number(session && session._messages_offset) || 0;
+    return null;
+  };
   globalThis._messageRenderWindowSize = 0;
   globalThis._messageReloadLimitForSession = () => 2;
+  // The negotiated first-page branch reads this module constant before it
+  // reaches the extracted _ensureMessagesLoaded helper.
+  globalThis._INITIAL_MSG_LIMIT = 30;
   globalThis._currentMessageRenderWindowSize = () => 1;
   globalThis._messageRenderableMessageCount = () => 2;
 
@@ -338,7 +355,11 @@ __ENSURE_MESSAGES_LOADED_SRC__
 
 async function waitForQueued(apiHost, url) {
   const target = String(url);
+  let turns = 0;
   while (!apiHost.pending.some((entry) => entry.url === target)) {
+    if (++turns > 1000) {
+      throw new Error(`Timed out waiting for ${target}; calls=${JSON.stringify(apiHost.apiCalls)}`);
+    }
     await Promise.resolve();
   }
 }
@@ -544,11 +565,55 @@ async function runStaleRejectedIdleCatch() {
   };
 }
 
+async function runBoundedSameSessionForceReloads() {
+  createEnvironment();
+  window._boundedConversationBrowser = true;
+  S.session = { session_id: 'sid-atlas', message_count: 47 };
+  S.messages = [
+    { role: 'user', content: 'already-loaded-one' },
+    { role: 'assistant', content: 'already-loaded-two' },
+  ];
+  globalThis._messageReloadLimitForSession = () => 47;
+  const apiHost = makeHarness();
+  globalThis.apiHost = apiHost;
+  globalThis.api = apiHost.api;
+
+  const ordinaryMeta = apiHost.enqueue('/api/session?session_id=sid-atlas&messages=0&resolve_model=0');
+  const ordinaryMsgs = apiHost.enqueue('/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=47&expand_renderable=1');
+  const ordinary = loadSession('sid-atlas', { force: true });
+  await waitForQueued(apiHost, ordinaryMeta.url);
+  ordinaryMeta._resolve(API_ATLAS_RELOAD_META);
+  await waitForQueued(apiHost, ordinaryMsgs.url);
+  ordinaryMsgs._resolve(API_ATLAS_RELOAD_MSGS);
+  await ordinary;
+  const ordinaryCalls = apiHost.apiCalls.slice();
+
+  createEnvironment();
+  window._boundedConversationBrowser = true;
+  S.session = { session_id: 'sid-atlas', message_count: 47 };
+  S.messages = [{ role: 'assistant', content: 'cursor-restart-seed' }];
+  const restartHost = makeHarness();
+  globalThis.apiHost = restartHost;
+  globalThis.api = restartHost.api;
+  const restartRequest = restartHost.enqueue('/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=30&message_paging=cursor_v1');
+  const restart = loadSession('sid-atlas', { force: true, cursorRestartAttempted: true });
+  await waitForQueued(restartHost, restartRequest.url);
+  restartRequest._resolve(API_ATLAS_RELOAD_MSGS);
+  await restart;
+
+  return {
+    scenario: 'bounded-same-session-force-reloads',
+    ordinaryCalls,
+    restartCalls: restartHost.apiCalls.slice(),
+  };
+}
+
 async function runAll() {
   return {
     crossSessionOrdering: await runCrossSessionOrdering(),
     observedIdleCrossSessionOrdering: await runObservedIdleCrossSessionOrdering(),
     staleIdleCatch: await runStaleRejectedIdleCatch(),
+    boundedSameSessionForceReloads: await runBoundedSameSessionForceReloads(),
   };
 }
 
@@ -589,6 +654,7 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior():
     cross = body["crossSessionOrdering"]
     stale = body["staleIdleCatch"]
     observed = body["observedIdleCrossSessionOrdering"]
+    bounded_force = body["boundedSameSessionForceReloads"]
 
     def _assert_atlas_wins(session_result, *, label):
         assert session_result["finalSid"] == "sid-atlas", f"{label}: stale overlap should end on Atlas session"
@@ -654,6 +720,14 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior():
     assert stale["apiCalls"].count(
         "/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1"
     ) == 2, "both old and active loads should have attempted message fetch"
+
+    assert bounded_force["ordinaryCalls"] == [
+        "/api/session?session_id=sid-atlas&messages=0&resolve_model=0",
+        "/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=47&expand_renderable=1",
+    ], "ordinary same-session force refresh must retain the widened legacy request width"
+    assert bounded_force["restartCalls"] == [
+        "/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=30&message_paging=cursor_v1",
+    ], "the explicit cursor restart is the only same-session force reload that may renegotiate cursor paging"
 
     assert cross["loadingSid"] is None, "load marker should be cleared after successful completion"
     assert stale["loadingSid"] is None, "load marker should be cleared after stale reject + re-owner completion"
