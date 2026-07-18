@@ -113,9 +113,11 @@ def _cheap_change_fingerprint(db_path: Path) -> str | None:
                         "WHERE id = 1"
                     ).fetchone()
                     projection_ready = (
-                        meta_row is not None and int(meta_row[0] or 0) == 1
+                        meta_row is not None
+                        and type(meta_row[0]) is int
+                        and meta_row[0] == 1
                     )
-                except (sqlite3.Error, TypeError, ValueError):
+                except sqlite3.Error:
                     # A missing table/column/row or malformed value cannot prove
                     # that last_activity_at is transactionally authoritative.
                     projection_ready = False

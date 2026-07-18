@@ -479,6 +479,22 @@ def test_cheap_fingerprint_uses_legacy_aggregate_until_backfill_complete(tmp_pat
     assert gw._cheap_change_fingerprint(db) != fp_before
 
 
+def test_cheap_fingerprint_rejects_malformed_backfill_completion(tmp_path):
+    """SQLite affinity must not let a corrupt REAL value prove readiness."""
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_modern_projection_db(tmp_path)
+    conn.execute(
+        "UPDATE session_projection_meta SET backfill_complete = 1.5 WHERE id = 1"
+    )
+    _add_session(conn, "visible", "telegram", mc=2)
+    conn.execute("UPDATE sessions SET last_activity_at = NULL WHERE id = 'visible'")
+    conn.commit()
+    fp_before = gw._cheap_change_fingerprint(db)
+    conn.execute("UPDATE messages SET timestamp = 999.0 WHERE session_id = 'visible'")
+    conn.commit()
+    assert gw._cheap_change_fingerprint(db) != fp_before
+
+
 def test_cheap_fingerprint_uses_legacy_aggregate_without_backfill_flag(tmp_path):
     """Metadata from an older schema cannot prove transactional activity is ready."""
     gw = importlib.import_module("api.gateway_watcher")
