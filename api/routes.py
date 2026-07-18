@@ -16791,11 +16791,6 @@ def handle_post(handler, parsed) -> bool:
             # the old profile's cached model list (#1200 — profile-switch model bug).
             from api.config import invalidate_models_cache
             invalidate_models_cache()
-            try:
-                from api.gateway_watcher import restart_watcher_for_profile
-                restart_watcher_for_profile(name)
-            except Exception as exc:
-                logger.warning("Failed to restart gateway watcher for profile %s: %s", name, exc)
             session_cookie_value = getattr(handler, '_trusted_auth_session_cookie_value', None)
             if session_cookie_value:
                 if bound_profile and name == bound_profile:
@@ -19441,18 +19436,22 @@ def _handle_gateway_sse_stream(handler, parsed):
     Only active when show_cli_sessions (show_agent_sessions) setting is enabled.
     """
     settings = load_settings()
+    probe = parse_qs(parsed.query).get('probe', [''])[0].lower() in {'1', 'true', 'yes'}
+
+    # The watcher is an optional SSE-owned resource. Disabled probes and direct
+    # requests must not create a background poller merely to return 404.
+    if not settings.get('show_cli_sessions'):
+        if probe:
+            payload, status = _gateway_sse_probe_payload(settings, watcher=None)
+            return j(handler, payload, status=status)
+        return j(handler, {'error': 'agent sessions not enabled'}, status=404)
 
     from api.gateway_watcher import get_watcher
     watcher = get_watcher()
 
-    probe = parse_qs(parsed.query).get('probe', [''])[0].lower() in {'1', 'true', 'yes'}
     if probe:
         payload, status = _gateway_sse_probe_payload(settings, watcher)
         return j(handler, payload, status=status)
-
-    # Check if the feature is enabled
-    if not settings.get('show_cli_sessions'):
-        return j(handler, {'error': 'agent sessions not enabled'}, status=404)
 
     # Same watcher_alive semantics as the probe path — centralised via
     # the helper so both branches stay in sync.

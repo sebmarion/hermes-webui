@@ -272,6 +272,43 @@ def test_start_watcher_pins_active_profile_home(tmp_path, monkeypatch):
     assert gw.get_watcher() is created[0]
 
 
+def test_start_watcher_reaps_idle_other_profile(tmp_path, monkeypatch):
+    from api import gateway_watcher as gw
+
+    old_home = (tmp_path / "old").resolve()
+    new_home = (tmp_path / "new").resolve()
+
+    class FakeWatcher:
+        def __init__(self, *, profile_name="", hermes_home=None, state_db_path=None):
+            self.profile_name = profile_name
+            self.hermes_home = hermes_home
+            self.started = False
+            self.stopped = False
+            self._subscribers = []
+            self._sub_lock = threading.Lock()
+
+        def start(self):
+            self.started = True
+
+        def is_alive(self):
+            return self.started
+
+        def stop(self):
+            self.stopped = True
+            self.started = False
+
+    old = FakeWatcher(profile_name="old", hermes_home=old_home)
+    old.started = True
+    monkeypatch.setattr(gw, "_watchers", {str(old_home): old})
+    monkeypatch.setattr(gw, "GatewayWatcher", FakeWatcher)
+
+    current = gw.start_watcher(profile_name="new", hermes_home=new_home)
+
+    assert old.stopped is True
+    assert str(old_home) not in gw._watchers
+    assert gw._watchers[str(new_home)] is current
+
+
 def test_get_watcher_scopes_lookup_to_active_profile(tmp_path, monkeypatch):
     from api import gateway_watcher as gw
     from api import profiles
@@ -308,7 +345,7 @@ def test_get_watcher_scopes_lookup_to_active_profile(tmp_path, monkeypatch):
     assert gw.get_watcher() is work_watcher
 
 
-def test_profile_switch_restarts_watcher_best_effort(monkeypatch):
+def test_profile_switch_leaves_watcher_creation_to_gateway_sse(monkeypatch):
     from api import config, gateway_watcher, profiles, routes
 
     calls = []
@@ -317,29 +354,10 @@ def test_profile_switch_restarts_watcher_best_effort(monkeypatch):
     monkeypatch.setattr(profiles, "_validate_profile_name", lambda name: None)
     monkeypatch.setattr(profiles, "switch_profile", lambda name, process_wide=False: {"ok": True, "name": name})
     monkeypatch.setattr(config, "invalidate_models_cache", lambda: calls.append("cache"))
-    monkeypatch.setattr(gateway_watcher, "restart_watcher_for_profile", lambda name: calls.append(("watcher", name)))
-
-    handler = _FakeHandler()
-    routes.handle_post(handler, urlparse("/api/profile/switch"))
-
-    assert handler.status == 200
-    assert handler.get_json() == {"ok": True, "name": "demo"}
-    assert calls == ["cache", ("watcher", "demo")]
-    assert any(k == "Set-Cookie" for k, _v in handler.sent_headers)
-
-
-def test_profile_switch_response_survives_watcher_restart_failure(monkeypatch):
-    from api import config, gateway_watcher, profiles, routes
-
-    monkeypatch.setattr(routes, "_check_csrf", lambda handler: True)
-    monkeypatch.setattr(routes, "read_body", lambda handler: {"name": "demo"})
-    monkeypatch.setattr(profiles, "_validate_profile_name", lambda name: None)
-    monkeypatch.setattr(profiles, "switch_profile", lambda name, process_wide=False: {"ok": True, "name": name})
-    monkeypatch.setattr(config, "invalidate_models_cache", lambda: None)
     monkeypatch.setattr(
         gateway_watcher,
         "restart_watcher_for_profile",
-        lambda name: (_ for _ in ()).throw(RuntimeError("restart failed")),
+        lambda name: calls.append(("watcher", name)),
     )
 
     handler = _FakeHandler()
@@ -347,6 +365,33 @@ def test_profile_switch_response_survives_watcher_restart_failure(monkeypatch):
 
     assert handler.status == 200
     assert handler.get_json() == {"ok": True, "name": "demo"}
+    assert calls == ["cache"]
+    assert any(k == "Set-Cookie" for k, _v in handler.sent_headers)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/sessions/gateway/stream?probe=1",
+        "/api/sessions/gateway/stream",
+    ],
+)
+def test_disabled_gateway_sse_does_not_create_watcher(path, monkeypatch):
+    from api import gateway_watcher, routes
+
+    monkeypatch.setattr(routes, "load_settings", lambda: {"show_cli_sessions": False})
+    monkeypatch.setattr(
+        gateway_watcher,
+        "get_watcher",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("disabled gateway SSE must not create a watcher")
+        ),
+    )
+
+    handler = _FakeHandler()
+    routes._handle_gateway_sse_stream(handler, urlparse(path))
+
+    assert handler.status == 404
 
 
 def test_subscribe_after_stop_gets_sentinel_immediately():

@@ -443,6 +443,7 @@ def start_watcher(*, profile_name: str | None = None, hermes_home: Path | None =
         hermes_home=hermes_home,
     )
     key = _watcher_registry_key(resolved_profile, resolved_home)
+    stale_watchers: list[GatewayWatcher] = []
     with _watcher_lock:
         watcher = _watchers.get(key)
         if watcher is None or not watcher.is_alive():
@@ -451,7 +452,10 @@ def start_watcher(*, profile_name: str | None = None, hermes_home: Path | None =
             watcher = GatewayWatcher(profile_name=resolved_profile, hermes_home=resolved_home)
             watcher.start()
             _watchers[key] = watcher
-        return watcher
+        stale_watchers = _pop_idle_watchers_locked(exclude_key=key)
+    for stale in stale_watchers:
+        stale.stop()
+    return watcher
 
 
 def stop_watcher(*, profile_name: str | None = None, hermes_home: Path | None = None):

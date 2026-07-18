@@ -471,6 +471,27 @@ def test_modern_projection_fingerprint_matches_importable_candidate_scope(tmp_pa
     assert gw._cheap_change_fingerprint(db) != fp_before
 
 
+def test_server_does_not_start_gateway_watcher_before_serving():
+    """Gateway SSE owns lazy watcher startup; server readiness never waits for it."""
+    root = Path(__file__).resolve().parents[1]
+    server_source = (root / "server.py").read_text(encoding="utf-8")
+    main_source = server_source[
+        server_source.index("def main() -> None:"):
+        server_source.index("if __name__ == '__main__':")
+    ]
+    assert "start_watcher" not in main_source
+    assert "stop_watcher" in main_source
+
+    routes_source = (root / "api" / "routes.py").read_text(encoding="utf-8")
+    handler_start = routes_source.index("def _handle_gateway_sse_stream")
+    handler_end = routes_source.index(
+        "def _handle_session_events_stream", handler_start
+    )
+    handler_source = routes_source[handler_start:handler_end]
+    assert "from api.gateway_watcher import get_watcher" in handler_source
+    assert "watcher = get_watcher()" in handler_source
+
+
 def test_poll_loop_skips_projection_when_unchanged(tmp_path, monkeypatch):
     """The poll body must call the expensive projection only when the cheap fp changes."""
     gw = importlib.import_module("api.gateway_watcher")

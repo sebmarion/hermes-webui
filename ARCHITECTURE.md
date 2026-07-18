@@ -305,6 +305,15 @@ and never joins or repairs the `messages` table. Older Agent schemas retain the
 legacy aggregation query as a background-only compatibility fallback. WebUI
 never migrates Agent state.
 
+The optional external-session gateway watcher is not a server-startup owner.
+`/api/sessions/gateway/stream` creates it lazily through `get_watcher()` only
+when the browser enables that SSE bridge, after the initial session-list render.
+On projection-v2 schemas its five-second change check hashes only the filtered
+`sessions` rows, including Agent-maintained `last_activity_at`, and never scans
+`messages`; legacy, partial, or explicitly rolled-back schemas retain the
+conservative per-session message aggregate. Shutdown still stops every watcher
+in the profile registry.
+
 Entity detail loads have a separate boundary from collection projection. A
 single indexed resolver starts at the requested `sessions` primary key, follows
 only validated compression edges through primary-key and `idx_sessions_parent`
