@@ -44,4 +44,7 @@ def test_routes_attach_todo_state_from_webui_and_cli_session_paths():
         arg_names.append((call.args[0].id, call.args[1].id))
 
     assert ("raw", "_all_msgs") in arg_names
-    assert ("sess", "msgs") in arg_names
+    # The synthesized foreign-session path may omit display messages for a
+    # metadata-only response, but todo derivation still uses the complete
+    # resolved conversation so the cold panel cannot regress to stale state.
+    assert ("sess", "all_msgs") in arg_names
