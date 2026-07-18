@@ -383,3 +383,64 @@ def test_runtime_owner_registered_during_continuation_assembly_returns_empty_res
         "error": "Message cursor restart required",
         "code": "cursor_restart_required",
     }
+
+
+def test_shadow_publication_holds_runtime_and_sidecar_ownership_locks(monkeypatch):
+    import api.config as config
+    import api.conversation_shadow_publication as publication
+    import api.models as models
+    import api.routes as routes
+    import threading
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    runtime_lock = threading.Lock()
+    sidecar_locks = []
+
+    class FakeEpoch:
+        profile = "default"
+        target = SimpleNamespace(
+            member_ids=("root", "tip"),
+            global_generation_hint=7,
+        )
+
+        def prove_current_match(self, **_kwargs):
+            assert runtime_lock.locked()
+            assert sidecar_locks == ["root", "tip"]
+            return object()
+
+        def current_proof_source(self):
+            return object()
+
+    @contextmanager
+    def sidecar_lock(member_id):
+        sidecar_locks.append(member_id)
+        try:
+            yield
+        finally:
+            assert sidecar_locks.pop() == member_id
+
+    def publish(**kwargs):
+        assert runtime_lock.locked()
+        assert runtime_lock.acquire(blocking=False) is False
+        assert sidecar_locks == ["root", "tip"]
+        assert kwargs["settled_supplier"]() is True
+        return SimpleNamespace(reason="published_and_recorded")
+
+    monkeypatch.setattr(config, "ACTIVE_RUNS_LOCK", runtime_lock)
+    monkeypatch.setattr(config, "ACTIVE_RUNS", {})
+    monkeypatch.setattr(models, "_session_sidecar_write_lock", sidecar_lock)
+    monkeypatch.setattr(publication, "ExactShadowComparisonEpoch", FakeEpoch)
+    monkeypatch.setattr(publication, "publish_exact_shadow_settlement", publish)
+
+    reason = routes._publish_exact_shadow_settlement_for_route(
+        comparison_epoch=FakeEpoch(),
+        candidate_messages=({"role": "user", "content": "one"},),
+        oracle_messages=({"role": "user", "content": "one"},),
+        candidate_count=1,
+        oracle_count=1,
+    )
+
+    assert reason == "published_and_recorded"
+    assert runtime_lock.locked() is False
+    assert sidecar_locks == []

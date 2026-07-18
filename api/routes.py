@@ -30,7 +30,7 @@ import http.client
 import socket as _socket
 from collections import defaultdict, deque
 from pathlib import Path
-from contextlib import closing
+from contextlib import ExitStack, closing
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, ProxyHandler, Request, build_opener
@@ -12372,24 +12372,22 @@ def _render_index_shell_base() -> str:
     return base
 
 
-def _bounded_runtime_owner_absent(profile: str, member_ids) -> bool:
-    """Prove no bounded active-run row owns any member of this lineage."""
+def _bounded_runtime_owner_absent_snapshot(
+    profile: str, member_ids, active_runs
+) -> bool:
+    """Validate one already-locked ACTIVE_RUNS snapshot for this lineage."""
     try:
-        from api import config as _live_config
-
         members = tuple(member_ids)
         if not members or len(members) > 256 or any(
             type(member_id) is not str or not member_id for member_id in members
         ):
             return False
-        with _live_config.ACTIVE_RUNS_LOCK:
-            active_runs = _live_config.ACTIVE_RUNS
-            if type(active_runs) is not dict or len(active_runs) > 256:
-                return False
-            rows = tuple(active_runs.values())
-            if any(type(row) is not dict or len(row) > 32 for row in rows):
-                return False
-            rows = tuple(dict(row) for row in rows)
+        if type(active_runs) is not dict or len(active_runs) > 256:
+            return False
+        rows = tuple(active_runs.values())
+        if any(type(row) is not dict or len(row) > 32 for row in rows):
+            return False
+        rows = tuple(dict(row) for row in rows)
         for row in rows:
             session_id = row.get("session_id")
             if type(session_id) is not str or not session_id:
@@ -12401,6 +12399,19 @@ def _bounded_runtime_owner_absent(profile: str, member_ids) -> bool:
             if profile_matches and session_id in members:
                 return False
         return True
+    except Exception:
+        return False
+
+
+def _bounded_runtime_owner_absent(profile: str, member_ids) -> bool:
+    """Prove no bounded active-run row owns any member of this lineage."""
+    try:
+        from api import config as _live_config
+
+        with _live_config.ACTIVE_RUNS_LOCK:
+            return _bounded_runtime_owner_absent_snapshot(
+                profile, member_ids, _live_config.ACTIVE_RUNS
+            )
     except Exception:
         return False
 
@@ -12450,6 +12461,99 @@ def _bounded_conversation_browser_enabled() -> bool:
         ).public_cursor
     except Exception:
         return False
+
+
+def _publish_exact_shadow_settlement_for_route(
+    *,
+    comparison_epoch,
+    candidate_messages,
+    oracle_messages,
+    candidate_count: int,
+    oracle_count: int,
+) -> str:
+    """Turn one exact shadow result into durable proof artifacts, fail closed."""
+    try:
+        from api.bounded_conversation_integration import (
+            BOUNDED_VIEW_IMPLEMENTATION_ID,
+            PROOF_SCHEMA_ID,
+        )
+        from api import config as _live_config
+        from api.conversation_receipts import ConversationReceiptStore
+        from api.conversation_shadow_evidence import ConversationShadowEvidenceStore
+        from api.conversation_shadow_publication import (
+            ExactShadowComparisonEpoch,
+            ShadowPublicationEvidenceRequest,
+            publish_exact_shadow_settlement,
+        )
+        from api.conversation_view_state import ConversationViewStateStore
+        from api.models import _session_sidecar_write_lock
+
+        if not isinstance(comparison_epoch, ExactShadowComparisonEpoch):
+            return "comparison_epoch_unavailable"
+        target = comparison_epoch.target
+        generation = target.global_generation_hint
+        # Hold active-run registration plus every target sidecar writer from
+        # the post-comparison epoch proof through receipt/evidence publication.
+        # A turn cannot enter the persisted-before-ACTIVE_RUNS gap while this
+        # critical section is open.
+        with _live_config.ACTIVE_RUNS_LOCK, ExitStack() as sidecar_locks:
+            for member_id in sorted(target.member_ids):
+                sidecar_locks.enter_context(_session_sidecar_write_lock(member_id))
+            settled = lambda: _bounded_runtime_owner_absent_snapshot(
+                comparison_epoch.profile,
+                target.member_ids,
+                _live_config.ACTIVE_RUNS,
+            )
+            if not settled():
+                return "runtime_owner_present"
+            match = comparison_epoch.prove_current_match(
+                candidate_messages=candidate_messages,
+                oracle_messages=oracle_messages,
+                candidate_count=candidate_count,
+                oracle_count=oracle_count,
+            )
+            result = publish_exact_shadow_settlement(
+                receipt_store=ConversationReceiptStore(STATE_DIR),
+                view_state_store=ConversationViewStateStore(STATE_DIR),
+                canonical_messages=oracle_messages,
+                proof_source=comparison_epoch.current_proof_source(),
+                exact_match=match,
+                evidence_store=ConversationShadowEvidenceStore(STATE_DIR),
+                evidence_request=ShadowPublicationEvidenceRequest(
+                    implementation_id=BOUNDED_VIEW_IMPLEMENTATION_ID,
+                    schema_id=PROOF_SCHEMA_ID,
+                    request_generation=(
+                        generation
+                        if type(generation) is int and generation >= 0
+                        else 0
+                    ),
+                ),
+                settled_supplier=settled,
+            )
+        return result.reason
+    except Exception:
+        return "publication_unavailable"
+
+
+def _capture_exact_shadow_comparison_epoch(
+    *, resolution, profile: str, db_path: Path
+):
+    """Capture proof-v1 state before any legacy oracle source is opened."""
+    try:
+        from api.bounded_conversation_integration import (
+            resolved_target_from_shared_resolution,
+        )
+        from api.conversation_shadow_publication import ExactShadowComparisonEpoch
+
+        return ExactShadowComparisonEpoch.capture(
+            target=resolved_target_from_shared_resolution(resolution),
+            profile=profile,
+            db_path=db_path,
+            expected_database_identity=resolution.database_identity,
+            sidecar_dir=SESSION_DIR,
+        )
+    except Exception:
+        return None
 
 
 def _assemble_bounded_conversation_view(
@@ -13350,6 +13454,23 @@ def handle_get(handler, parsed) -> bool:
         # the flag no longer changes the server-side pagination semantics.
         _expand_renderable = query.get("expand_renderable", [None])[0]
         expand_renderable = str(_expand_renderable).strip() in ("1", "true", "True")
+        _shadow_comparison_epoch = None
+        if (
+            _message_cursor_gate == "shadow"
+            and message_paging.requested
+            and message_paging.cursor_token is None
+            and load_messages
+            and resolution.status == "found"
+        ):
+            try:
+                _shadow_profile = str(_get_active_profile_name() or "default")
+            except Exception:
+                _shadow_profile = "default"
+            _shadow_comparison_epoch = _capture_exact_shadow_comparison_epoch(
+                resolution=resolution,
+                profile=_shadow_profile,
+                db_path=state_db_path,
+            )
         try:
             _t1 = _time.monotonic()
             if _diag: _diag.stage("t1_after_get_session_check")
@@ -13652,13 +13773,40 @@ def handle_get(handler, parsed) -> bool:
                     and message_paging.cursor_token is None
                     and not is_messaging_session
                     and resolution.status == "found"
+                    and not original_stream_id
+                    and not getattr(s, "pending_user_message", None)
+                    and _bounded_runtime_owner_absent(
+                        str(_session_profile or "default"), resolution.member_ids
+                    )
                 ):
                     try:
+                        _publish_exact_shadow = None
+                        if (
+                            _shadow_comparison_epoch is not None
+                            and _shadow_comparison_epoch.profile
+                            == str(_session_profile or "default")
+                        ):
+
+                            def _publish_exact_shadow(
+                                candidate_messages,
+                                oracle_messages,
+                                candidate_count,
+                                oracle_count,
+                            ):
+                                _publish_exact_shadow_settlement_for_route(
+                                    comparison_epoch=_shadow_comparison_epoch,
+                                    candidate_messages=candidate_messages,
+                                    oracle_messages=oracle_messages,
+                                    candidate_count=candidate_count,
+                                    oracle_count=oracle_count,
+                                )
+
                         _shadow_observation = evaluate_message_page_shadow(
                             db_path=state_db_path,
                             resolution=resolution,
                             visible_limit=msg_limit,
                             legacy_messages=_messages_for_limited_payload(_all_msgs),
+                            on_exact_match=_publish_exact_shadow,
                         )
                         _shadow_diagnostic = _shadow_observation.as_diagnostic()
                     except Exception:

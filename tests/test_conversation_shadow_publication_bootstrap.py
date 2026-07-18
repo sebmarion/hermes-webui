@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
 import pytest
 
@@ -120,6 +121,7 @@ def test_exact_shadow_bootstrap_publishes_then_records_only_content_free_evidenc
             schema_id="agent-proof-v1",
             request_generation=99,
         ),
+        settled_supplier=lambda: True,
     )
 
     assert published.published is True
@@ -166,6 +168,7 @@ def test_exact_shadow_bootstrap_never_publishes_or_records_without_verified_proo
             schema_id="agent-proof-v1",
             request_generation=99,
         ),
+        settled_supplier=lambda: True,
     )
 
     assert result.published is False
@@ -213,6 +216,7 @@ def test_exact_shadow_bootstrap_drops_evidence_when_current_proof_changes_after_
             schema_id="agent-proof-v1",
             request_generation=99,
         ),
+        settled_supplier=lambda: True,
     )
 
     assert result.publication is published_marker
@@ -256,6 +260,7 @@ def test_exact_shadow_bootstrap_fails_closed_when_the_publisher_raises_unexpecte
             schema_id="agent-proof-v1",
             request_generation=99,
         ),
+        settled_supplier=lambda: True,
     )
 
     assert result.published is False
@@ -298,6 +303,7 @@ def test_exact_shadow_bootstrap_never_records_evidence_for_a_different_canonical
             schema_id="agent-proof-v1",
             request_generation=99,
         ),
+        settled_supplier=lambda: True,
     )
 
     assert result.published is False
@@ -368,3 +374,105 @@ def test_exact_shadow_current_proof_source_rereads_proof_v1_and_sidecars(tmp_pat
     )
     with pytest.raises(Exception, match="exact shadow match is not current"):
         source.current_supplier(exact_match)()
+
+
+@pytest.mark.parametrize("mutation", ("state", "sidecar"))
+def test_comparison_epoch_rejects_source_change_after_shadow_equality(
+    tmp_path, mutation
+):
+    from api.agent_sessions import shared_state_db_identity
+    from api.conversation_shadow_publication import ExactShadowComparisonEpoch
+    from tests.test_bounded_conversation_integration import (
+        _route_target,
+        _write_proof_v1_database,
+        _write_route_sidecar,
+    )
+
+    db_path = _write_proof_v1_database(tmp_path)
+    sidecar_dir = tmp_path / "sidecars"
+    sidecar_dir.mkdir()
+    _write_route_sidecar(sidecar_dir, "root")
+    _write_route_sidecar(sidecar_dir, "tip")
+    target = _route_target()
+    epoch = ExactShadowComparisonEpoch.capture(
+        target=target,
+        profile="default",
+        db_path=db_path,
+        expected_database_identity=shared_state_db_identity(db_path),
+        sidecar_dir=sidecar_dir,
+    )
+
+    if mutation == "state":
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE messages SET content = ? WHERE id = (SELECT MIN(id) FROM messages)",
+                ("changed after equality",),
+            )
+            conn.commit()
+    else:
+        (sidecar_dir / "tip.json").write_text(
+            json.dumps(
+                {
+                    "session_id": "tip",
+                    "profile": "default",
+                    "sidecar_generation": 5,
+                    "truncation_watermark": 12.5,
+                    "messages": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ValueError, match="comparison epoch changed"):
+        epoch.prove_current_match(
+            candidate_messages=_messages(),
+            oracle_messages=_messages(),
+            candidate_count=2,
+            oracle_count=2,
+        )
+
+
+def test_runtime_owner_appearing_inside_publication_aborts_before_evidence(
+    tmp_path, monkeypatch
+):
+    import api.conversation_shadow_publication as bootstrap
+    from api.conversation_shadow_publication import (
+        ShadowPublicationEvidenceRequest,
+        publish_exact_shadow_settlement,
+    )
+
+    current = _current()
+    messages = _messages()
+    evidence = _EvidenceStore()
+    runtime = {"active": False}
+    monkeypatch.setattr(
+        bootstrap,
+        "read_unpublished_current_proof_from_sources",
+        lambda **_kwargs: current,
+    )
+
+    def publisher(**kwargs):
+        assert kwargs["current_supplier"]() == current
+        runtime["active"] = True
+        kwargs["current_supplier"]()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(bootstrap, "publish_settled_conversation_state", publisher)
+    result = publish_exact_shadow_settlement(
+        receipt_store=ConversationReceiptStore(tmp_path),
+        view_state_store=ConversationViewStateStore(tmp_path),
+        canonical_messages=messages,
+        proof_source=_test_proof_source(tmp_path),
+        exact_match=_match(current, messages),
+        evidence_store=evidence,
+        evidence_request=ShadowPublicationEvidenceRequest(
+            implementation_id="bounded-view-v1",
+            schema_id="agent-proof-v1",
+            request_generation=99,
+        ),
+        settled_supplier=lambda: not runtime["active"],
+    )
+
+    assert result.published is False
+    assert result.reason == "publication_failed"
+    assert evidence.recorded == []

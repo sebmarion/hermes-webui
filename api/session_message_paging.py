@@ -17,7 +17,7 @@ from collections import OrderedDict
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeAlias
 from urllib.parse import parse_qsl
 
 from api.agent_sessions import open_state_db_readonly, shared_state_db_identity
@@ -207,6 +207,11 @@ class MessagePageShadowObservation:
             "sql_count": self.sql_count,
             "query_plan_indexed": self.query_plan_indexed,
         }
+
+
+MessagePageShadowExactMatchConsumer: TypeAlias = Callable[
+    [tuple[Any, ...], tuple[Any, ...], int, int], None
+]
 
 
 @dataclass(frozen=True)
@@ -2019,12 +2024,15 @@ def evaluate_message_page_shadow(
     resolution: Any,
     visible_limit: int,
     legacy_messages: Any,
+    on_exact_match: MessagePageShadowExactMatchConsumer | None = None,
 ) -> MessagePageShadowObservation:
     """Compare a complete bounded page sequence with the exact legacy merge.
 
     The returned observation intentionally contains only booleans, counters,
     the typed mode/reason, and the plan verdict. Transcript content and local
-    paths never leave this function through diagnostics.
+    paths never leave this function through diagnostics. ``on_exact_match`` is
+    an in-process observational seam; it receives normalized candidate and
+    oracle tuples plus their append-only display counts only after equality.
     """
     legacy = tuple(
         _shadow_comparable_message(message)
@@ -2128,6 +2136,12 @@ def evaluate_message_page_shadow(
         for message in batch
     )
     matched = bounded == legacy
+    if matched and on_exact_match is not None:
+        try:
+            on_exact_match(bounded, legacy, len(bounded), len(legacy))
+        except Exception:
+            # Consumers are observational and must not affect the legacy path.
+            pass
     return MessagePageShadowObservation(
         mode="cursor_v1",
         matched=matched,

@@ -15,11 +15,15 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from api.bounded_conversation_integration import (
+    BoundedStateSnapshot,
     ExactShadowMatch,
     ResolvedTarget,
     exact_shadow_match_accepts_current,
+    prove_exact_shadow_match,
+    read_bounded_state_snapshot,
     read_unpublished_current_proof_from_sources,
 )
+from api.bounded_sidecar_proof import SidecarLineageProof, prove_sidecar_lineage
 from api.conversation_receipts import (
     VERIFIED_AGENT_CONTENT_PROOF_CAPABILITY,
     ConversationReceiptStore,
@@ -34,6 +38,7 @@ from api.conversation_view_state import ConversationViewStateStore
 
 _IDENTIFIER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 _CURRENT_PROOF_SOURCE_CAPABILITY = object()
+_COMPARISON_EPOCH_CAPABILITY = object()
 
 
 class ShadowEvidenceRecorder(Protocol):
@@ -116,6 +121,95 @@ class ExactShadowCurrentProofSource:
         return supplier
 
 
+@dataclass(frozen=True)
+class ExactShadowComparisonEpoch:
+    """Opaque proof captured before comparison and reverified afterward."""
+
+    target: ResolvedTarget
+    profile: str
+    db_path: Path
+    expected_database_identity: tuple[str, int | None, int | None]
+    sidecar_dir: Path
+    state: BoundedStateSnapshot
+    sidecars: SidecarLineageProof
+    _capability: object | None = None
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        target: ResolvedTarget,
+        profile: str,
+        db_path: str | Path,
+        expected_database_identity: tuple[str, int | None, int | None],
+        sidecar_dir: str | Path,
+    ) -> "ExactShadowComparisonEpoch":
+        path = Path(db_path)
+        directory = Path(sidecar_dir)
+        state = read_bounded_state_snapshot(
+            db_path=path,
+            member_ids=target.member_ids,
+            expected_database_identity=expected_database_identity,
+        )
+        sidecars = prove_sidecar_lineage(directory, target.member_ids, profile)
+        return cls(
+            target=target,
+            profile=profile,
+            db_path=path,
+            expected_database_identity=expected_database_identity,
+            sidecar_dir=directory,
+            state=state,
+            sidecars=sidecars,
+            _capability=_COMPARISON_EPOCH_CAPABILITY,
+        )
+
+    def prove_current_match(
+        self,
+        *,
+        candidate_messages: Sequence[Mapping[str, Any]],
+        oracle_messages: Sequence[Mapping[str, Any]],
+        candidate_count: int,
+        oracle_count: int,
+    ) -> ExactShadowMatch:
+        if self._capability is not _COMPARISON_EPOCH_CAPABILITY:
+            raise ValueError("comparison epoch is untrusted")
+        current_state = read_bounded_state_snapshot(
+            db_path=self.db_path,
+            member_ids=self.target.member_ids,
+            expected_database_identity=self.expected_database_identity,
+        )
+        current_sidecars = prove_sidecar_lineage(
+            self.sidecar_dir, self.target.member_ids, self.profile
+        )
+        if current_state != self.state or current_sidecars != self.sidecars:
+            raise ValueError("comparison epoch changed")
+        return prove_exact_shadow_match(
+            target=self.target,
+            profile=self.profile,
+            sidecars=self.sidecars,
+            sidecar_paths={
+                member_id: str(self.sidecar_dir / f"{member_id}.json")
+                for member_id in self.target.member_ids
+            },
+            target_content_proof=self.state.target_content_proof,
+            candidate_messages=candidate_messages,
+            oracle_messages=oracle_messages,
+            candidate_count=candidate_count,
+            oracle_count=oracle_count,
+        )
+
+    def current_proof_source(self) -> ExactShadowCurrentProofSource:
+        if self._capability is not _COMPARISON_EPOCH_CAPABILITY:
+            raise ValueError("comparison epoch is untrusted")
+        return ExactShadowCurrentProofSource.from_sources(
+            target=self.target,
+            profile=self.profile,
+            db_path=self.db_path,
+            expected_database_identity=self.expected_database_identity,
+            sidecar_dir=self.sidecar_dir,
+        )
+
+
 def _read_current(
     current_supplier: Callable[[], Mapping[str, Any]],
 ) -> Mapping[str, Any] | None:
@@ -160,6 +254,7 @@ def publish_exact_shadow_settlement(
     exact_match: ExactShadowMatch,
     evidence_store: ShadowEvidenceRecorder,
     evidence_request: ShadowPublicationEvidenceRequest,
+    settled_supplier: Callable[[], bool],
 ) -> ExactShadowPublicationResult:
     """Publish only a proof-v1-bound exact match, then record evidence last.
 
@@ -173,6 +268,8 @@ def publish_exact_shadow_settlement(
         return ExactShadowPublicationResult(False, "evidence_request_invalid")
     if not callable(getattr(evidence_store, "record", None)):
         return ExactShadowPublicationResult(False, "evidence_store_unavailable")
+    if not callable(settled_supplier):
+        return ExactShadowPublicationResult(False, "settled_supplier_unavailable")
     if not isinstance(proof_source, ExactShadowCurrentProofSource):
         return ExactShadowPublicationResult(False, "current_proof_source_unavailable")
     try:
@@ -180,7 +277,20 @@ def publish_exact_shadow_settlement(
     except Exception:
         return ExactShadowPublicationResult(False, "current_proof_source_unavailable")
 
-    before = _read_current(current_supplier)
+    def is_settled() -> bool:
+        try:
+            return settled_supplier() is True
+        except Exception:
+            return False
+
+    def settled_current_supplier() -> Mapping[str, Any]:
+        if not is_settled():
+            raise ValueError("conversation has an active runtime owner")
+        return current_supplier()
+
+    if not is_settled():
+        return ExactShadowPublicationResult(False, "runtime_not_settled")
+    before = _read_current(settled_current_supplier)
     if not _proof_is_publishable(exact_match, before):
         return ExactShadowPublicationResult(False, "current_proof_unavailable")
 
@@ -189,7 +299,7 @@ def publish_exact_shadow_settlement(
             receipt_store=receipt_store,
             view_state_store=view_state_store,
             canonical_messages=canonical_messages,
-            current_supplier=current_supplier,
+            current_supplier=settled_current_supplier,
             shadow_match=exact_match,
         )
     except Exception:
@@ -198,7 +308,13 @@ def publish_exact_shadow_settlement(
     # The publisher repeats its own receipt/projection proof checks.  This
     # independent re-read is specifically for evidence: a race after receipt
     # publication must never become a qualifying shadow sample.
-    after = _read_current(current_supplier)
+    if not is_settled():
+        return ExactShadowPublicationResult(
+            True,
+            "published_evidence_skipped_runtime_changed",
+            publication=publication,
+        )
+    after = _read_current(settled_current_supplier)
     if not _proof_is_publishable(exact_match, after):
         return ExactShadowPublicationResult(
             True,
