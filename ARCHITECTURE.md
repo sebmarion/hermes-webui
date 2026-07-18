@@ -345,6 +345,25 @@ current readiness evidence all validate. Today's unproven Agent schema therefore
 fails closed to explicit legacy mode rather than guessing from counts,
 timestamps, or global generations.
 
+An exact shadow match may bootstrap the rebuildable todo projection and durable
+reconciliation receipt only on the declared proof-v1 Agent contract. The
+candidate and legacy oracle remain in process, are normalized and compared
+exactly, and the canonical sequence is deep-copied, byte/count/digest bound, and
+rejected if any payload was truncated before the projection is written. The
+projection is written first, the receipt last, and content-free shadow evidence
+only after one final independent state/sidecar proof read. Current schemas fail
+before creating any of those artifacts.
+
+Browser adoption has a separate non-persisted operator switch,
+`HERMES_WEBUI_BOUNDED_CONVERSATION_BROWSER=1`. `/api/settings` advertises it only
+when the server, proof capability, durable receipt, and shadow cohort are ready;
+the session route repeats target-specific proof and active-runtime checks. An
+advertised browser uses one negotiated initial request, validates the exact
+six-field `message_page` shape, and keeps opaque cursor state separate from
+legacy numeric offsets. A malformed/stale page or HTTP 400/409 gets one
+negotiated restart, then a forced legacy reload. Ordinary same-session refreshes
+retain their existing widened legacy window.
+
 The compatibility session API is state.db-first. `GET /api/sessions/{id}` and
 `GET /api/sessions/{id}/messages` resolve old compression IDs to the visible
 tip, return stable shared metadata (`title`, `cwd`/`workspace`, `archived`,

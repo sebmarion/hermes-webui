@@ -199,6 +199,26 @@ may be used with isolated state to gather semantic comparisons. A current schema
 without the declared target content proof must report explicit legacy mode and
 must never emit an opaque cursor.
 
+Run the proof publication, route seam, and browser recovery contracts with:
+
+```bash
+./scripts/test.sh \
+  tests/test_conversation_state_publication.py \
+  tests/test_conversation_shadow_publication_bootstrap.py \
+  tests/test_bounded_conversation_route_seam.py \
+  tests/test_bounded_session_browser_adoption.py \
+  tests/test_bounded_session_cursor_paging.py \
+  tests/test_bounded_session_cursor_runtime.py \
+  tests/test_cross_session_message_load_isolation.py -q
+```
+
+Publication tests must prove that a different, mutable, or truncated canonical
+message snapshot cannot leave a usable receipt or qualifying evidence. Browser
+tests must cover repeated cursors, malformed page metadata, 400/409 restart,
+cross-session ownership, and the one-restart-then-legacy policy. Keep
+`HERMES_WEBUI_BOUNDED_CONVERSATION_BROWSER` unset in production until proof-v1
+capability and the durable zero-difference evidence threshold are both present.
+
 
 `tests/test_static_js_runtime_lint.py` runs this automatically when eslint is present
 and **skips gracefully** (clear message) when it isn't — so environments without the
