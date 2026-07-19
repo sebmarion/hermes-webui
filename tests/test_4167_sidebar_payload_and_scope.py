@@ -38,6 +38,24 @@ def test_sidebar_response_item_preserves_read_only_flag():
     assert "not_allowed_field" not in row
 
 
+def test_sidebar_response_item_preserves_durable_completion_receipt():
+    import api.routes as routes
+
+    row = routes._sidebar_session_response_item({
+        "session_id": "s1",
+        "completion_generation": 7,
+        "completed_at": 123.5,
+        "completion_run_id": "run-7",
+        "completion_source": "webui-native",
+        "completion_outcome": "completed",
+    })
+    assert row["completion_generation"] == 7
+    assert row["completed_at"] == 123.5
+    assert row["completion_run_id"] == "run-7"
+    assert row["completion_source"] == "webui-native"
+    assert row["completion_outcome"] == "completed"
+
+
 def test_failed_refresh_clears_cache_on_profile_scope_change():
     """The catch path must reject cached rows from a mismatched sidebar scope."""
     src = (_ROOT / "static" / "sessions.js").read_text(encoding="utf-8")

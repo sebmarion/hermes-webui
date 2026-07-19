@@ -7,6 +7,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SESSIONS_JS = (REPO / "static" / "sessions.js").read_text(encoding="utf-8")
 MESSAGES_JS = (REPO / "static" / "messages.js").read_text(encoding="utf-8")
+STYLE_CSS = (REPO / "static" / "style.css").read_text(encoding="utf-8")
 
 
 def _done_block() -> str:
@@ -455,7 +456,7 @@ def test_hidden_active_done_still_updates_current_pane_but_not_read_state():
 def test_hidden_or_unfocused_active_session_counts_as_background_completion():
     helper_idx = MESSAGES_JS.find("function _isSessionActivelyViewed(sid)")
     assert helper_idx != -1, "_isSessionActivelyViewed helper missing"
-    helper_block = MESSAGES_JS[helper_idx:MESSAGES_JS.find("function _markActiveSessionViewedOnReturn", helper_idx)]
+    helper_block = MESSAGES_JS[helper_idx:MESSAGES_JS.find("function _chatPayloadModel", helper_idx)]
 
     current_idx = MESSAGES_JS.find("function _isSessionCurrentPane(sid)")
     assert current_idx != -1, "_isSessionCurrentPane helper missing"
@@ -498,20 +499,40 @@ def test_restore_settled_background_stream_marks_completion_unread():
     )
 
 
-def test_focus_visibility_return_marks_active_session_viewed_and_clears_marker():
-    return_idx = MESSAGES_JS.find("function _markActiveSessionViewedOnReturn()")
-    assert return_idx != -1, "_markActiveSessionViewedOnReturn helper missing"
-    return_block = MESSAGES_JS[return_idx:MESSAGES_JS.find("async function send()", return_idx)]
+def test_focus_visibility_return_does_not_acknowledge_completion():
+    """Focus alone is not an explicit read acknowledgment.
 
-    assert "if(!_isDocumentVisibleAndFocused() || !S.session || !S.session.session_id) return;" in return_block
-    assert "_markSessionViewed(S.session.session_id" in return_block
-    assert "_clearSessionCompletionUnread(S.session.session_id)" in return_block, (
-        "returning to a visible/focused tab must clear the explicit unread marker "
-        "for the active session the user is now viewing"
+    A hidden active completion is marked unread. Clearing that marker in the
+    focus/visibility event that makes the sidebar visible again deletes the only
+    evidence before the user can see its dot.
+    """
+    assert "function _markActiveSessionViewedOnReturn()" not in MESSAGES_JS
+    assert "document.addEventListener('visibilitychange', _markActiveSessionViewedOnReturn);" not in MESSAGES_JS
+    assert "window.addEventListener('focus', _markActiveSessionViewedOnReturn);" not in MESSAGES_JS
+
+
+def test_active_rows_do_not_suppress_background_completion_unread_state():
+    render_idx = SESSIONS_JS.find("function _renderOneSession")
+    assert render_idx != -1, "_renderOneSession not found"
+    render_block = SESSIONS_JS[render_idx:SESSIONS_JS.find("// Append tag chips", render_idx)]
+
+    assert "const hasUnread=(_hasUnreadForSession(s)||!!s._child_session_has_unread);" in render_block, (
+        "an explicit background-completion marker must render even when its "
+        "lineage is the selected sidebar row"
     )
-    assert "renderSessionListFromCache()" in return_block
-    assert "document.addEventListener('visibilitychange', _markActiveSessionViewedOnReturn);" in MESSAGES_JS
-    assert "window.addEventListener('focus', _markActiveSessionViewedOnReturn);" in MESSAGES_JS
+    assert "const childHasUnread=_hasUnreadForSession(child);" in render_block, (
+        "an active nested fork must render its own background-completion marker"
+    )
+    assert "&&!isActive" not in render_block
+    assert "&&!childIsActive" not in render_block
+
+
+def test_completion_unread_dot_uses_dedicated_blue_semantic_token():
+    assert "--session-completion-unread:" in STYLE_CSS
+    unread_idx = STYLE_CSS.find(".session-state-indicator.is-unread::before")
+    assert unread_idx != -1, "unread-dot CSS rule missing"
+    unread_block = STYLE_CSS[unread_idx:STYLE_CSS.find("}", unread_idx) + 1]
+    assert "background:var(--session-completion-unread);" in unread_block
 
 
 def test_completion_unread_clears_only_when_session_is_opened():

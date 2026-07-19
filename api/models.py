@@ -32,6 +32,7 @@ from api.agent_sessions import (
     open_state_db_readonly,
     read_importable_agent_session_rows,
     read_shared_session_activity,
+    read_shared_session_completions,
     read_shared_session_rows,
     read_session_lineage_metadata,
 )
@@ -5387,6 +5388,34 @@ def _read_state_db_sidebar_overrides(
                                 entry['_state_db_last_message_at'] = float(row['last_message_at'] or 0)
                             except (TypeError, ValueError):
                                 pass
+            cur.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_completion_events'"
+            )
+            if cur.fetchone() is not None:
+                for i in range(0, len(ids), chunk_size):
+                    chunk = ids[i:i + chunk_size]
+                    placeholders = ','.join('?' * len(chunk))
+                    cur.execute(
+                        f"""
+                        SELECT generation, session_id, run_id, source, completed_at, outcome
+                        FROM session_completion_events
+                        WHERE session_id IN ({placeholders})
+                        ORDER BY generation DESC
+                        """,
+                        chunk,
+                    )
+                    seen_completion_ids: set[str] = set()
+                    for row in cur.fetchall():
+                        sid = str(row['session_id'] or '').strip()
+                        if not sid or sid in seen_completion_ids:
+                            continue
+                        seen_completion_ids.add(sid)
+                        entry = overrides.setdefault(sid, {})
+                        entry['_state_db_completion_generation'] = int(row['generation'] or 0)
+                        entry['_state_db_completed_at'] = float(row['completed_at'] or 0)
+                        entry['_state_db_completion_run_id'] = str(row['run_id'] or '')
+                        entry['_state_db_completion_source'] = str(row['source'] or '')
+                        entry['_state_db_completion_outcome'] = str(row['outcome'] or 'completed')
             return overrides
     except Exception:
         return {}
@@ -5500,6 +5529,17 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
         state_db_last_message_at = entry.pop('_state_db_last_message_at', None)
         state_db_archived = entry.pop('_state_db_archived', missing)
         state_db_pinned = entry.pop('_state_db_pinned', missing)
+        completion_generation = entry.pop('_state_db_completion_generation', missing)
+        completed_at = entry.pop('_state_db_completed_at', missing)
+        completion_run_id = entry.pop('_state_db_completion_run_id', missing)
+        completion_source = entry.pop('_state_db_completion_source', missing)
+        completion_outcome = entry.pop('_state_db_completion_outcome', missing)
+        if completion_generation is not missing:
+            session['completion_generation'] = completion_generation
+            session['completed_at'] = completed_at
+            session['completion_run_id'] = completion_run_id
+            session['completion_source'] = completion_source
+            session['completion_outcome'] = completion_outcome
         if state_db_archived is not missing:
             session['archived'] = bool(state_db_archived)
         if state_db_pinned is not missing:
@@ -6779,7 +6819,7 @@ def _sqlite_content_fingerprint(db_path: Path):
     value and never advances (verified). A cheap content fingerprint over the
     sessions/messages tables, read on a fresh connection, DOES advance on every
     commit (incl. external gateway writes) and is immune to mtime granularity.
-    Cost is a pair of indexed COUNT/MAX queries (sub-ms), far cheaper than the
+    Cost is a few indexed MAX queries (sub-ms), far cheaper than the
     full uncached session scan this key gates.
     """
     try:
@@ -6803,7 +6843,7 @@ def _sqlite_content_fingerprint(db_path: Path):
         try:
             conn.execute("PRAGMA busy_timeout=50")
             parts = []
-            for table in ("sessions", "messages"):
+            for table in ("sessions", "messages", "session_completion_events"):
                 try:
                     # MAX(rowid) is an O(1) index lookup (no table scan) and
                     # advances on every INSERT. Pair it with the table's largest
@@ -7178,7 +7218,13 @@ def shared_interactive_sidebar_projection(
     except Exception:
         activity_rows = {}
         logger.debug("Failed to read shared session activity", exc_info=True)
+    try:
+        completion_rows = read_shared_session_completions(state_db_path, activity_ids)
+    except Exception:
+        completion_rows = {}
+        logger.debug("Failed to read shared session completions", exc_info=True)
     activity_by_canonical: dict[int, dict] = {}
+    completion_by_canonical: dict[int, dict] = {}
     for canonical in canonical_rows:
         aliases = {
             str(canonical.get("id") or "").strip(),
@@ -7206,6 +7252,13 @@ def shared_interactive_sidebar_projection(
                     float(item.get("activity_heartbeat_at") or 0) for item in candidates
                 ),
             }
+        completion_candidates = [completion_rows[alias] for alias in aliases if alias in completion_rows]
+        if completion_candidates:
+            selected_completion = max(
+                completion_candidates,
+                key=lambda item: int(item.get("generation") or 0),
+            )
+            completion_by_canonical[id(canonical)] = selected_completion
 
     def _is_webui_sidecar(row: dict) -> bool:
         markers = {
@@ -7439,6 +7492,13 @@ def shared_interactive_sidebar_projection(
                 if activity_by_canonical.get(id(state_row))
                 else None
             ),
+            "completion_generation": int(
+                completion_by_canonical.get(id(state_row), {}).get("generation") or 0
+            ),
+            "completed_at": completion_by_canonical.get(id(state_row), {}).get("completed_at"),
+            "completion_run_id": completion_by_canonical.get(id(state_row), {}).get("run_id"),
+            "completion_source": completion_by_canonical.get(id(state_row), {}).get("source"),
+            "completion_outcome": completion_by_canonical.get(id(state_row), {}).get("outcome"),
         }
         if overlay:
             overlay_stream_id = str(overlay.get("active_stream_id") or "").strip()

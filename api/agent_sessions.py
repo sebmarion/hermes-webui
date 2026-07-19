@@ -96,6 +96,62 @@ def read_shared_session_activity(
     return activity
 
 
+def read_shared_session_completions(
+    db_path: Path,
+    session_ids: list[str] | set[str] | tuple[str, ...] | None = None,
+) -> dict[str, dict]:
+    """Read the newest durable completion event for each requested session."""
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return {}
+    wanted = {str(sid).strip() for sid in (session_ids or []) if str(sid).strip()}
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_completion_events'"
+            ).fetchone()
+            if table is None:
+                return {}
+            rows = []
+            if wanted:
+                values = list(wanted)
+                for start in range(0, len(values), 500):
+                    chunk = values[start : start + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows.extend(conn.execute(
+                        f"""
+                        SELECT generation, session_id, run_id, source, completed_at, outcome
+                        FROM session_completion_events
+                        WHERE session_id IN ({placeholders})
+                        ORDER BY generation DESC
+                        """, chunk,
+                    ).fetchall())
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT generation, session_id, run_id, source, completed_at, outcome
+                    FROM session_completion_events ORDER BY generation DESC
+                    """
+                ).fetchall()
+    except Exception:
+        logger.debug("Failed to read shared session completions from %s", db_path, exc_info=True)
+        return {}
+    completions: dict[str, dict] = {}
+    for row in rows:
+        sid = str(row["session_id"] or "").strip()
+        if sid and sid not in completions:
+            completions[sid] = {
+                "generation": int(row["generation"]),
+                "session_id": sid,
+                "run_id": str(row["run_id"] or ""),
+                "source": str(row["source"] or ""),
+                "completed_at": float(row["completed_at"]),
+                "outcome": str(row["outcome"] or "completed"),
+            }
+    return completions
+
+
 def open_state_db_readonly(db_path: Path, log: logging.Logger | None = None) -> sqlite3.Connection:
     """Open the live agent ``state.db`` read-only for a pure-read projection.
 

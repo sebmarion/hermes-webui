@@ -362,6 +362,7 @@ function _clearComposerDraft(sid, text, files) {
 
 const SESSION_VIEWED_COUNTS_KEY = 'hermes-session-viewed-counts';
 const SESSION_COMPLETION_UNREAD_KEY = 'hermes-session-completion-unread';
+const SESSION_COMPLETION_RECEIPTS_KEY = 'hermes-session-completion-receipts-v1';
 const SESSION_OBSERVED_STREAMING_KEY = 'hermes-session-observed-streaming';
 // Per-profile session-count cache (issue #4717 / #4662 Phase 1.5). Records how
 // many sessions each profile rendered last time, keyed by profile name, so a
@@ -374,6 +375,7 @@ const SESSION_PROFILE_COUNTS_KEY = 'hermes-session-profile-counts';
 let _sessionProfileCounts = null;
 let _sessionViewedCounts = null;
 let _sessionCompletionUnread = null;
+let _sessionCompletionReceipts = null;
 let _sessionObservedStreaming = null;
 const _sessionStreamingById = new Map();
 const _sessionListSnapshotById = new Map();
@@ -521,6 +523,70 @@ function _getSessionCompletionUnread() {
   return _sessionCompletionUnread;
 }
 
+function _getSessionCompletionReceipts() {
+  if (_sessionCompletionReceipts !== null) return _sessionCompletionReceipts;
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SESSION_COMPLETION_RECEIPTS_KEY) || '{}');
+    _sessionCompletionReceipts = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed : {seen:{}, watched:{}};
+  } catch (_) { _sessionCompletionReceipts = {seen:{}, watched:{}}; }
+  if (!_sessionCompletionReceipts.seen || typeof _sessionCompletionReceipts.seen !== 'object') _sessionCompletionReceipts.seen = {};
+  if (!_sessionCompletionReceipts.watched || typeof _sessionCompletionReceipts.watched !== 'object') _sessionCompletionReceipts.watched = {};
+  const cutoff = Date.now() - 600000;
+  for (const [key, candidate] of Object.entries(_sessionCompletionReceipts.watched)) {
+    if (!candidate || typeof candidate !== 'object' || !candidate.run_id ||
+        !candidate.session_id || !Number.isFinite(Number(candidate.recorded_at_ms)) ||
+        Number(candidate.recorded_at_ms) < cutoff) delete _sessionCompletionReceipts.watched[key];
+  }
+  const seenKeys = Object.keys(_sessionCompletionReceipts.seen);
+  if (seenKeys.length > 256) {
+    for (const key of seenKeys.slice(0, seenKeys.length - 256)) delete _sessionCompletionReceipts.seen[key];
+  }
+  const watchedKeys = Object.keys(_sessionCompletionReceipts.watched);
+  if (watchedKeys.length > 256) {
+    watchedKeys.sort((a, b) => Number(_sessionCompletionReceipts.watched[a].recorded_at_ms) - Number(_sessionCompletionReceipts.watched[b].recorded_at_ms));
+    for (const key of watchedKeys.slice(0, watchedKeys.length - 256)) delete _sessionCompletionReceipts.watched[key];
+  }
+  return _sessionCompletionReceipts;
+}
+function _saveSessionCompletionReceipts() {
+  try { localStorage.setItem(SESSION_COMPLETION_RECEIPTS_KEY, JSON.stringify(_getSessionCompletionReceipts())); } catch (_) {}
+}
+function _completionReceiptKey(sid, profile = null) {
+  const p = String(profile || (typeof S !== 'undefined' && S && S.activeProfile) || 'default').trim() || 'default';
+  return `${p}:${String(sid || '').trim()}`;
+}
+function _recordCompletionCandidate(sid, runId) {
+  if (!sid || !runId) return;
+  const receipts = _getSessionCompletionReceipts();
+  receipts.watched[_completionReceiptKey(sid)] = {run_id:String(runId), session_id:String(sid), recorded_at_ms:Date.now()};
+  _saveSessionCompletionReceipts();
+}
+function _reconcileDurableCompletionReceipts(sessions) {
+  if (!Array.isArray(sessions)) return;
+  const receipts = _getSessionCompletionReceipts();
+  const now = Date.now();
+  for (const s of sessions) {
+    if (!s || !s.session_id) continue;
+    const generation = Number(s.completion_generation || 0);
+    if (!generation) continue;
+    const sid = String(s.session_id);
+    const receiptKey = _completionReceiptKey(sid, s.profile);
+    const seen = Number(receipts.seen[receiptKey] || 0);
+    if (generation <= seen) continue;
+    const watched = receipts.watched[receiptKey];
+    const watchedMatches = watched && (now - Number(watched.recorded_at_ms || 0) <= 600000)
+      && String(watched.run_id || '') === String(s.completion_run_id || '');
+    if (watchedMatches || _isSessionActivelyViewedForList(sid)) {
+      receipts.seen[receiptKey] = generation;
+      delete receipts.watched[receiptKey];
+      continue;
+    }
+    _markSessionCompletionUnread(sid, s.message_count);
+  }
+  _saveSessionCompletionReceipts();
+}
+
 function _saveSessionCompletionUnread() {
   try {
     localStorage.setItem(SESSION_COMPLETION_UNREAD_KEY, JSON.stringify(_getSessionCompletionUnread()));
@@ -562,6 +628,16 @@ function _clearSessionCompletionUnread(sid) {
   if (!Object.prototype.hasOwnProperty.call(unread, sid)) return;
   delete unread[sid];
   _saveSessionCompletionUnread();
+  if (typeof _getSessionCompletionReceipts === 'function') {
+    const receipts = _getSessionCompletionReceipts();
+    const row = (typeof _allSessions !== 'undefined' && _allSessions || []).find(s => s && s.session_id === sid);
+    const receiptKey = _completionReceiptKey(sid, row && row.profile);
+    if (row && Number(row.completion_generation || 0) > Number(receipts.seen[receiptKey] || 0)) {
+      receipts.seen[receiptKey] = Number(row.completion_generation || 0);
+      delete receipts.watched[receiptKey];
+      _saveSessionCompletionReceipts();
+    }
+  }
 }
 
 function _clearSessionViewedCount(sid) {
@@ -5229,6 +5305,7 @@ function _applySessionListPayload(sessData, projData){
     : [];
   _reconcileActiveSessionIdleStateFromList(serverSessions);
   _allSessions = _mergeOptimisticFirstTurnSessions(serverSessions);
+  _reconcileDurableCompletionReceipts(_allSessions);
   // Tag the cache with the scope it was loaded under (active profile +
   // all-profiles flag). If a later /api/sessions fails right after a profile
   // switch, the catch path checks this so it won't re-render the PRIOR
@@ -7796,7 +7873,7 @@ function renderSessionListFromCache(){
     const isStreaming=ownStreaming||!!s._child_session_streaming;
     _rememberRenderedStreamingState(s, ownStreaming);
     _rememberRenderedSessionSnapshot(s);
-    const hasUnread=(_hasUnreadForSession(s)||!!s._child_session_has_unread)&&!isActive;
+    const hasUnread=(_hasUnreadForSession(s)||!!s._child_session_has_unread);
     const attention=_sessionAttentionState(s)||_sessionAttentionState({_child:true,attention:s._child_session_attention});
     const attentionClass=attention?(attention.kind==='approval'?' attention-approval':(attention.kind==='clarify'?' attention-clarify':' attention-attention')):'';
     const readOnly=_isReadOnlySession(s);
@@ -8218,7 +8295,7 @@ function renderSessionListFromCache(){
         if(child.session_source==='fork'){
           const childIsActive=!!(activeSidForSidebar&&child.session_id===activeSidForSidebar);
           const childStreaming=_isSessionEffectivelyStreaming(child);
-          const childHasUnread=_hasUnreadForSession(child)&&!childIsActive;
+          const childHasUnread=_hasUnreadForSession(child);
           const childAttention=_sessionAttentionState(child);
           const childAttentionClass=childAttention?(childAttention.kind==='approval'?' attention-approval':(childAttention.kind==='clarify'?' attention-clarify':' attention-attention')):'';
           const row=document.createElement('div');

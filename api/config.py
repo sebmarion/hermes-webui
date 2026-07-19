@@ -8941,7 +8941,7 @@ def update_active_run(stream_id: str, **metadata) -> None:
         _ACTIVE_ACTIVITY_HEARTBEAT_WAKE.set()
 
 
-def unregister_active_run(stream_id: str) -> None:
+def unregister_active_run(stream_id: str, *, defer_activity_finish: bool = False) -> dict | None:
     """Remove a worker from the active-run registry and record idle start."""
     if not stream_id:
         return
@@ -8950,10 +8950,12 @@ def unregister_active_run(stream_id: str) -> None:
         entry = ACTIVE_RUNS.pop(stream_id, None)
         LAST_RUN_FINISHED_AT = time.time()
     if entry is not None:
-        _sync_active_run_activity(dict(entry), clear=True)
+        if not defer_activity_finish:
+            _sync_active_run_activity(dict(entry), clear=True)
         _publish_active_run_activity_change(dict(entry))
         _sync_active_delegation_activity()
     unregister_stream_owner(stream_id)
+    return dict(entry) if entry is not None else None
 
 # Agent cache: reuse AIAgent across messages in the same WebUI session so that
 # _user_turn_count survives between turns.  This mirrors the gateway's

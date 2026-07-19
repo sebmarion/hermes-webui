@@ -12,6 +12,7 @@ from typing import Any
 
 from api.config import (
     CANCEL_FLAGS,
+    PENDING_GOAL_CONTINUATION,
     STREAM_GOAL_RELATED,
     STREAMS,
     STREAMS_LOCK,
@@ -623,6 +624,7 @@ def _run_gateway_chat_streaming(
         STREAM_LIVE_TOOL_CALLS[stream_id] = []
 
     success_writeback_committed = False
+    continuation_pending = False
 
     def put_gateway_event(event, data):
         if cancel_event.is_set() and not success_writeback_committed and event not in ("cancel", "error", "apperror"):
@@ -1091,6 +1093,7 @@ def _run_gateway_chat_streaming(
                     if continuation_prompt:
                         from api.goal_continuation import claim_goal_continuation
 
+                        continuation_pending = True
                         claim_goal_continuation(
                             session_id=session_id,
                             parent_run_id=stream_id,
@@ -1151,7 +1154,9 @@ def _run_gateway_chat_streaming(
             STREAM_LAST_EVENT_ID.pop(stream_id, None)
             STREAMS.pop(stream_id, None)
         _STREAM_RUN_IDS.pop(stream_id, None)
-        unregister_active_run(stream_id)
+        _finished_run_entry = unregister_active_run(
+            stream_id, defer_activity_finish=True
+        )
         try:
             from api.goal_continuation import (
                 recover_pending_goal_continuations,
@@ -1166,3 +1171,29 @@ def _run_gateway_chat_streaming(
                 session_id,
                 stream_id,
             )
+        try:
+            from api.state_sync import (
+                COMPLETION_SOURCE_WEBUI_GATEWAY,
+                finish_session_activity,
+            )
+
+            _entry = _finished_run_entry or {
+                "session_id": session_id,
+                "stream_id": stream_id,
+                "profile": profile,
+            }
+            finish_session_activity(
+                str(_entry.get("session_id") or session_id),
+                stream_id,
+                profile=_entry.get("profile") or profile,
+                lineage_session_ids={session_id},
+                emit_completion=bool(
+                    success_writeback_committed
+                    and not continuation_pending
+                    and session_id not in PENDING_GOAL_CONTINUATION
+                ),
+                completion_session_id=session_id,
+                source=COMPLETION_SOURCE_WEBUI_GATEWAY,
+            )
+        except Exception:
+            logger.debug("gateway completion event finalization failed for %s", session_id, exc_info=True)

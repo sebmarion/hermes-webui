@@ -7108,6 +7108,7 @@ def _run_agent_streaming(
     _metering_thread = threading.Thread(target=_metering_ticker, daemon=True)
 
     _success_writeback_committed = False
+    _continuation_pending = False
 
     def put(event, data):
         # If cancelled, drop all further events except the cancel event itself
@@ -9104,7 +9105,7 @@ def _run_agent_streaming(
                                     conversation_history=_sanitize_messages_for_api(
                                         _previous_context_messages,
                                         cfg=_cfg,
-                                        effective_model=resolved_model,
+                                        effective_model=_effective_runtime_model,
                                         effective_provider=resolved_provider,
                                         effective_base_url=resolved_base_url,
                                     ),
@@ -10108,6 +10109,7 @@ def _run_agent_streaming(
                     if continuation_prompt:
                         from api.goal_continuation import claim_goal_continuation
 
+                        _continuation_pending = True
                         claim_goal_continuation(
                             session_id=session_id,
                             parent_run_id=stream_id,
@@ -10568,7 +10570,12 @@ def _run_agent_streaming(
             STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)  # Clean up tool calls (#1361 §B)
             STREAM_GOAL_RELATED.pop(stream_id, None)  # Clean up goal-related flag (#1932)
             STREAM_LAST_EVENT_ID.pop(stream_id, None)  # Clean up event_id pointer (stage-364)
-            unregister_active_run(stream_id)
+            # unregister_active_run(stream_id) remains the lifecycle marker
+            # used by source-order regression tests; defer its durable clear
+            # until continuation settlement below.
+            _finished_run_entry = unregister_active_run(
+                stream_id, defer_activity_finish=True
+            )
 
         # This is the deterministic parent-settled boundary: the stream channel
         # and ACTIVE_RUNS row are both gone before any successor is started.
@@ -10612,6 +10619,40 @@ def _run_agent_streaming(
                         getattr(s, "session_id", session_id),
                         stream_id,
                     )
+
+        # Durable completion is emitted only after transcript writeback and
+        # continuation/deferred-work settlement have both had a chance to
+        # claim a successor. The activity row remains present until this
+        # point, so a fresh alias suppresses a false idle notification.
+        try:
+            from api.state_sync import (
+                COMPLETION_SOURCE_WEBUI_NATIVE,
+                finish_session_activity,
+            )
+
+            _entry = _finished_run_entry or {
+                "session_id": session_id,
+                "stream_id": stream_id,
+                "profile": _profile,
+            }
+            _completion_session_id = str(getattr(s, "session_id", session_id) or session_id)
+            _emit_completion = bool(
+                _success_writeback_committed
+                and not _tool_limit_reached
+                and not _continuation_pending
+                and session_id not in PENDING_GOAL_CONTINUATION
+            )
+            finish_session_activity(
+                str(_entry.get("session_id") or session_id),
+                stream_id,
+                profile=_entry.get("profile") or _profile,
+                lineage_session_ids={session_id, _completion_session_id},
+                emit_completion=_emit_completion,
+                completion_session_id=_completion_session_id,
+                source=COMPLETION_SOURCE_WEBUI_NATIVE,
+            )
+        except Exception:
+            logger.debug("session completion event finalization failed for %s", session_id, exc_info=True)
 
         # ── Defer-path fix: turn-teardown idle-hook ────────────────────────
         # The session has just transitioned active→idle: unregister_active_run

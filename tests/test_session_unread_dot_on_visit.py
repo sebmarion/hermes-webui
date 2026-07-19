@@ -2,7 +2,7 @@
 
 Salvage of #4946 (originally by @neaucode-bot), rebuilt fresh on master.
 
-The yellow unread dot in the sidebar historically cleared only reliably when the
+The unread dot in the sidebar historically cleared only reliably when the
 sidebar **row** was clicked. Opening/visiting a session through other paths — or
 re-selecting the already-open session — could leave a stale dot, and a deferred
 /api/sessions list poll landing across the async message-load gap could re-flag
@@ -160,7 +160,7 @@ def _run_node(script: str) -> dict:
 
 def test_acknowledge_visit_clears_completion_unread_marker():
     """Visiting a session that carries an explicit completion-unread marker must
-    clear it (so the yellow dot disappears) and repaint the sidebar."""
+    clear it (so the blue dot disappears) and repaint the sidebar."""
     ack = _extract("_acknowledgeSessionVisit")
     sync = _extract("_syncSessionListSnapshotOnVisit")
     set_viewed = _extract("_setSessionViewedCount")

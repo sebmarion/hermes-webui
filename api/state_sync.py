@@ -30,6 +30,12 @@ _ACTIVITY_SQLITE_TIMEOUT_SECONDS = 1.0
 _ACTIVITY_SCHEMA_READY: set[str] = set()
 _ACTIVITY_SCHEMA_LOCK = threading.Lock()
 
+COMPLETION_SOURCE_WEBUI_NATIVE = "webui-native"
+COMPLETION_SOURCE_WEBUI_GATEWAY = "webui-gateway"
+_COMPLETION_SOURCES = frozenset(
+    {COMPLETION_SOURCE_WEBUI_NATIVE, COMPLETION_SOURCE_WEBUI_GATEWAY}
+)
+
 
 def _ensure_shared_activity_schema(db, *, db_key: str | None = None) -> bool:
     """Create the additive runtime activity table on older state databases.
@@ -58,6 +64,25 @@ def _ensure_shared_activity_schema(db, *, db_key: str | None = None) -> bool:
             """
             CREATE INDEX IF NOT EXISTS idx_session_activity_heartbeat
             ON session_activity (heartbeat_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_completion_events (
+                generation INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                completed_at REAL NOT NULL,
+                outcome TEXT NOT NULL DEFAULT 'completed',
+                UNIQUE (source, run_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_session_completion_events_session_generation
+            ON session_completion_events (session_id, generation DESC)
             """
         )
 
@@ -277,6 +302,102 @@ def clear_session_activity(
             db.close()
         except Exception:
             logger.debug("Failed to close state.db after activity clear", exc_info=True)
+
+
+def finish_session_activity(
+    session_id: str,
+    run_id: str,
+    *,
+    profile: Optional[str] = None,
+    lineage_session_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+    emit_completion: bool = False,
+    completion_session_id: str | None = None,
+    source: str = COMPLETION_SOURCE_WEBUI_NATIVE,
+    completed_at: float | None = None,
+) -> dict | None:
+    """Finalize one live run and optionally append its durable completion event.
+
+    The activity row is always removed.  Completion emission is opt-in so
+    cancellation, retries, and legacy callers retain clear-only semantics.
+    A fresh successor heartbeat anywhere in the supplied lineage suppresses
+    the event, preventing a continuation from appearing as a finished turn.
+    """
+    sid = str(session_id or "").strip()
+    rid = str(run_id or "").strip()
+    if not sid or not rid:
+        return None
+    source = str(source or "").strip()
+    if emit_completion and source not in _COMPLETION_SOURCES:
+        emit_completion = False
+    target_sid = str(completion_session_id or sid).strip() or sid
+    aliases = {str(value).strip() for value in (lineage_session_ids or ()) if str(value).strip()}
+    aliases.add(sid)
+    now = float(completed_at if completed_at is not None else time.time())
+    db, db_path = _open_activity_db(profile)
+    if not db:
+        return None
+    result = {
+        "activity_deleted": False,
+        "inserted": False,
+        "generation": None,
+        "completed_at": None,
+        "completion_run_id": None,
+        "session_id": target_sid,
+    }
+    try:
+        if not _ensure_shared_activity_schema(db, db_key=str(db_path)):
+            return None
+        db.execute("BEGIN IMMEDIATE")
+        deleted = db.execute(
+            "DELETE FROM session_activity WHERE session_id = ? AND run_id = ?",
+            (sid, rid),
+        )
+        result["activity_deleted"] = deleted.rowcount > 0
+        if emit_completion:
+            cutoff = now - SESSION_ACTIVITY_TTL_SECONDS
+            placeholders = ",".join("?" for _ in aliases)
+            successor = db.execute(
+                f"SELECT 1 FROM session_activity WHERE heartbeat_at >= ? "
+                f"AND run_id != ? AND session_id IN ({placeholders}) LIMIT 1",
+                (cutoff, rid, *sorted(aliases)),
+            ).fetchone()
+            if successor is None:
+                cursor = db.execute(
+                    """
+                    INSERT OR IGNORE INTO session_completion_events
+                        (session_id, run_id, source, completed_at, outcome)
+                    VALUES (?, ?, ?, ?, 'completed')
+                    """,
+                    (target_sid, rid, source, now),
+                )
+                result["inserted"] = cursor.rowcount == 1
+                existing = db.execute(
+                    """
+                    SELECT generation, completed_at, run_id, session_id
+                    FROM session_completion_events
+                    WHERE source = ? AND run_id = ?
+                    """,
+                    (source, rid),
+                ).fetchone()
+                if existing:
+                    result["generation"] = int(existing[0])
+                    result["completed_at"] = float(existing[1])
+                    result["completion_run_id"] = str(existing[2])
+                    result["session_id"] = str(existing[3])
+        db.commit()
+        return result
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.debug("Failed to finish session activity for %s", sid, exc_info=True)
+        return None
+    finally:
+        try:
+            db.close()
+        except Exception:
+            logger.debug("Failed to close state.db after activity finish", exc_info=True)
 
 
 def _ensure_shared_pinned_column(db) -> None:

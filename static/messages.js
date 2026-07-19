@@ -88,13 +88,6 @@ function _isSessionActivelyViewed(sid) {
   return true;
 }
 
-function _markActiveSessionViewedOnReturn() {
-  if(!_isDocumentVisibleAndFocused() || !S.session || !S.session.session_id) return;
-  _markSessionViewed(S.session.session_id, S.session.message_count || (S.messages&&S.messages.length) || 0);
-  if(typeof _clearSessionCompletionUnread==='function') _clearSessionCompletionUnread(S.session.session_id);
-  if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
-}
-
 function _chatPayloadModel(){
   return S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'';
 }
@@ -126,9 +119,6 @@ function _deferStreamErrorIfOffline(){
   }
   return false;
 }
-
-document.addEventListener('visibilitychange', _markActiveSessionViewedOnReturn);
-window.addEventListener('focus', _markActiveSessionViewedOnReturn);
 
 // Delegated click handler for the interim-progress-note collapse toggle (#2403).
 // Delegation (not a per-element listener) is required because the live turn's
@@ -5402,6 +5392,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const _doneData=JSON.parse(e.data);
       const _doneEvent=e;
       const _finishDone=()=>{
+        if(typeof _recordCompletionCandidate==='function') _recordCompletionCandidate(completedSid, streamId);
         // Bug A fix: cancel any pending rAF and mark stream finalized before
         // the DOM is settled by renderMessages, so no trailing token/reasoning rAF
         // can reintroduce a stale thinking card or duplicate content.
