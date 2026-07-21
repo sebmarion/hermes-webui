@@ -13125,7 +13125,7 @@ def handle_get(handler, parsed) -> bool:
                 return j(handler, result)
             if freshness:
                 return bad(handler, f"unknown models freshness: {freshness}", status=400)
-            return j(handler, get_available_models())
+            return j(handler, get_available_models(serve_stale_immediately=True))
         finally:
             if diag:
                 diag.finish()
@@ -15735,6 +15735,7 @@ def handle_post(handler, parsed) -> bool:
                     return j(handler, set_reasoning_display(False))
                 return bad(handler, f"display must be show|hide|on|off (got '{display}')")
             if effort is not None:
+                mode = body.get("mode")
                 model_id = str(body.get("model") or "").strip() or None
                 provider_id = str(body.get("provider") or "").strip() or None
                 base_url = str(body.get("base_url") or "").strip() or None
@@ -15742,6 +15743,7 @@ def handle_post(handler, parsed) -> bool:
                     handler,
                     set_reasoning_effort(
                         effort,
+                        mode=mode,
                         model_id=model_id,
                         provider_id=provider_id,
                         base_url=base_url,
@@ -22677,6 +22679,7 @@ def _start_chat_stream_for_session(
     goal_related: bool = False,
     source: str = "webui",
     moa_config=None,
+    bestplan_config=None,
     session_lock_held: bool = False,
     recovery_claim_token: str | None = None,
     recovery_fingerprint: str | None = None,
@@ -22893,6 +22896,8 @@ def _start_chat_stream_for_session(
         }
         if moa_config and not backend_is_gateway:
             worker_kwargs["moa_config"] = moa_config
+        if bestplan_config and not backend_is_gateway:
+            worker_kwargs["bestplan_config"] = bestplan_config
         thr = threading.Thread(
             target=worker_target,
             args=(s.session_id, msg, model, workspace, stream_id, attachments),
@@ -23046,6 +23051,7 @@ def _start_run(
     route: str,
     diag=None,
     moa_config=None,
+    bestplan_config=None,
     session_lock_held: bool = False,
     recovery_claim_token: str | None = None,
     recovery_fingerprint: str | None = None,
@@ -23096,6 +23102,7 @@ def _start_run(
                 goal_related=(request.source or source) == "goal_continuation",
                 source=request.source or source,
                 moa_config=moa_config,
+                bestplan_config=bestplan_config,
                 session_lock_held=session_lock_held,
                 recovery_claim_token=recovery_claim_token,
                 recovery_fingerprint=recovery_fingerprint,
@@ -23140,6 +23147,7 @@ def _start_run(
         goal_related=source == "goal_continuation",
         source=source,
         moa_config=moa_config,
+        bestplan_config=bestplan_config,
         session_lock_held=session_lock_held,
         recovery_claim_token=recovery_claim_token,
         recovery_fingerprint=recovery_fingerprint,
@@ -23933,6 +23941,7 @@ def _handle_chat_start(handler, body, diag=None):
         _pp_provider, _pp_default, _pp_cfg = _read_profile_model_config(s, requested_provider)
         explicit_model_pick = bool(body.get("explicit_model_pick"))
         moa_config = None
+        bestplan_config = None
         gateway_chat_enabled = webui_gateway_chat_enabled(get_config())
         if body.get("moa_config"):
             if gateway_chat_enabled:
@@ -23943,6 +23952,14 @@ def _handle_chat_start(handler, body, diag=None):
                 moa_config = resolve_moa_config()
             except RuntimeError as e:
                 return bad(handler, str(e), 503)
+        if body.get("bestplan_config"):
+            if gateway_chat_enabled:
+                return bad(handler, "BestPlan is unavailable on gateway-backed sessions", 409)
+            raw_bestplan = body.get("bestplan_config")
+            if not isinstance(raw_bestplan, dict):
+                return bad(handler, "Invalid BestPlan configuration", 400)
+            from agent.bestplan_orchestrator import normalize_count
+            bestplan_config = {"count": normalize_count(raw_bestplan.get("count", 3))}
         diag.stage("resolve_model_provider") if diag else None
         model, model_provider, normalized_model = _resolve_compatible_session_model_state(
             requested_model,
@@ -23992,6 +24009,8 @@ def _handle_chat_start(handler, body, diag=None):
         }
         if not gateway_chat_enabled and moa_config is not None:
             start_run_kwargs["moa_config"] = moa_config
+        if not gateway_chat_enabled and bestplan_config is not None:
+            start_run_kwargs["bestplan_config"] = bestplan_config
         recovery_cleared_for_start = None
         def _restore_cleared_recovery():
             if recovery_cleared_for_start is None:

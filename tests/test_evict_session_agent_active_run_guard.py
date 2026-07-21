@@ -24,6 +24,10 @@ class _FakeSessionDB:
 class _FakeAgent:
     def __init__(self):
         self._session_db = _FakeSessionDB()
+        self.release_calls = 0
+
+    def release_clients(self):
+        self.release_calls += 1
 
 
 def _seed_cache(session_id, agent):
@@ -51,6 +55,7 @@ def test_evict_skips_session_db_close_when_run_active(monkeypatch):
             assert sid not in config.SESSION_AGENT_CACHE
         # ... but the live worker's SessionDB must NOT be closed.
         assert agent._session_db.closed is False
+        assert agent.release_calls == 0
     finally:
         _clear_active_runs()
         with config.SESSION_AGENT_CACHE_LOCK:
@@ -74,6 +79,7 @@ def test_evict_closes_session_db_when_no_run_active(monkeypatch):
         with config.SESSION_AGENT_CACHE_LOCK:
             assert sid not in config.SESSION_AGENT_CACHE
         assert agent._session_db.closed is True
+        assert agent.release_calls == 1
     finally:
         _clear_active_runs()
         with config.SESSION_AGENT_CACHE_LOCK:

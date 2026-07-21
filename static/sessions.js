@@ -1874,7 +1874,10 @@ async function loadSession(sid){
     }else{
       const modelRefreshPromise=_deferSessionSideEffect(modelRefreshSid,()=>{
         if(!isActiveModelRefreshSession()) return undefined;
-        return populateModelDropdown({freshness:'session_visit'});
+        // Session navigation must not force a live provider-catalog rebuild.
+        // The normal models endpoint serves the cached catalog; explicit
+        // provider/profile changes own invalidation and live refresh.
+        return populateModelDropdown();
       }).catch(()=>{});
       if(typeof window!=='undefined') window._modelDropdownReady=modelRefreshPromise;
     }

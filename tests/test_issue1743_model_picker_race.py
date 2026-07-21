@@ -17,7 +17,7 @@ def test_model_picker_opens_before_async_model_catalog_finishes():
     body = _body_between(UI_JS, "async function toggleModelDropdown", "function closeModelDropdown")
 
     assert "window._ensureModelDropdownReady" in body
-    render_idx = body.index("renderModelDropdown()")
+    render_idx = body.index("_renderComposerModelDropdownIfDirty()")
     open_idx = body.index("dd.classList.add('open')")
     await_idx = body.find("await")
     assert render_idx < open_idx
@@ -28,6 +28,5 @@ def test_populate_model_dropdown_rerenders_if_picker_is_already_open():
     """If the async catalog finishes while open, refresh the visible custom rows."""
     body = _body_between(UI_JS, "async function populateModelDropdown", "// Cache so we don't re-fetch")
 
-    assert "composerModelDropdown" in body
-    assert "classList.contains('open')" in body or 'classList.contains("open")' in body
-    assert "renderModelDropdown()" in body
+    assert "_invalidateComposerModelDropdown()" in body
+    assert "renderModelDropdown()" not in body

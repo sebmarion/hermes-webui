@@ -746,6 +746,19 @@ EXPECT:
   - Hover shows the trash icon on any session
 FAIL: Titles overflow sidebar, order is wrong, trash icon never appears.
 
+### T10.3: Background Completion Shows a Blue Unread Dot
+STEPS:
+  1. Start a response in session A, then switch to session B before A finishes
+  2. Confirm A changes from its running spinner to a blue dot when the response completes
+  3. Open A and confirm the dot clears
+  4. Repeat with A still selected, but hide or unfocus the WebUI before completion
+  5. Return to the WebUI and confirm A keeps the blue dot until its sidebar row is explicitly reselected
+EXPECT:
+  - A completed-but-unacknowledged response remains blue and visible even on the selected lineage
+  - Merely returning focus does not erase it
+  - Approval and clarification states remain red and amber rather than blue
+FAIL: No dot appears, focus clears it before it can be seen, or action-required states turn blue.
+
 ---
 
 ## Section 11: Visual and Layout Checks

@@ -310,6 +310,63 @@ def test_budget_exceeded_uses_shape_only_stale_cache_before_static_fallback(
     assert cfg._cache_build_in_progress is False
 
 
+def test_picker_request_serves_stale_catalog_without_waiting_for_live_rebuild(
+    monkeypatch,
+    isolate_models_catalog_state,
+):
+    _configure_local_sources(
+        monkeypatch,
+        isolate_models_catalog_state["auth_store_path"],
+    )
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 4.0, raising=False)
+    models_cache_path = isolate_models_catalog_state["models_cache_path"]
+    models_cache_path.write_text(
+        json.dumps(_build_stale_disk_cache_payload()),
+        encoding="utf-8",
+    )
+
+    live_result = {
+        "active_provider": "openrouter",
+        "default_model": "openrouter/google/gemini-2.5-pro",
+        "configured_model_badges": {},
+        "groups": [
+            {
+                "provider": "OpenRouter",
+                "provider_id": "openrouter",
+                "models": [{"id": "openrouter/google/gemini-2.5-pro", "label": "Gemini 2.5 Pro"}],
+            }
+        ],
+        "aliases": {},
+    }
+
+    def _slow_rebuild(_builder):
+        time.sleep(0.25)
+        return copy.deepcopy(live_result)
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _slow_rebuild)
+
+    started = time.monotonic()
+    result = cfg.get_available_models(serve_stale_immediately=True)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.15
+    assert result["default_model"] == "ollama-cloud/chat-1"
+
+    follower_started = time.monotonic()
+    follower = cfg.get_available_models(serve_stale_immediately=True)
+    follower_elapsed = time.monotonic() - follower_started
+
+    assert follower_elapsed < 0.15
+    assert follower == result
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and cfg._available_models_cache != live_result:
+        time.sleep(0.01)
+
+    assert cfg._available_models_cache == live_result
+    assert cfg._cache_build_in_progress is False
+
+
 def test_budget_exceeded_fallback_uses_static_when_stale_disk_cache_invalid(
     monkeypatch,
     isolate_models_catalog_state,

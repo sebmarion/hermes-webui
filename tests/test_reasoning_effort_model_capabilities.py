@@ -3,6 +3,28 @@
 from api import config as cfg
 
 
+def test_gpt_56_sol_exposes_canonical_max_reasoning_effort():
+    efforts = cfg.resolve_model_reasoning_efforts(
+        "gpt-5.6-sol",
+        provider_id="openai-codex",
+    )
+    assert "max" in efforts
+    assert "ultra" not in efforts
+
+
+def test_gpt_56_alias_exposes_canonical_max_reasoning_effort():
+    efforts = cfg.resolve_model_reasoning_efforts(
+        "gpt-5.6",
+        provider_id="openai-codex",
+    )
+    assert "max" in efforts
+    assert "ultra" not in efforts
+
+
+def test_ultra_is_not_a_shared_reasoning_effort():
+    assert cfg.parse_reasoning_effort("ultra") is None
+
+
 def test_cursor_acp_models_do_not_support_reasoning_effort_levels():
     assert cfg.resolve_model_reasoning_efforts(
         "cursor/composer-2.5",
@@ -447,4 +469,3 @@ def test_datestamped_claude3_not_reasoning_capable_heuristic():
         assert cfg._candidate_supports_reasoning(model) is True, (
             f"{model} must remain reasoning-capable"
         )
-

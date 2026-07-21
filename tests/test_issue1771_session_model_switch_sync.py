@@ -47,7 +47,15 @@ const calls = {syncModelChip: 0, renderModelDropdown: 0, positionModelDropdown: 
 const _dynamicModelLabels = {};
 let modelSelect;
 let dropdownOpen = false;
-const dropdown = {classList: {contains: (name) => name === 'open' && dropdownOpen}};
+const dropdown = {
+  dataset: {},
+  classList: {
+    contains: (name) => name === 'open' && dropdownOpen,
+    add: (name) => { if (name === 'open') dropdownOpen = true; },
+    remove: (name) => { if (name === 'open') dropdownOpen = false; },
+  },
+  querySelector: () => null,
+};
 
 function makeOptGroup(provider, label) {
   return {
@@ -151,17 +159,26 @@ const document = {
   },
   createTextNode(text) { return {textContent: text}; },
 };
-const window = { _botName: 'Hermes', _defaultModel: null, _activeProvider: null };
+const window = {
+  _botName: 'Hermes', _defaultModel: null, _activeProvider: null,
+  _ensureModelDropdownReady(){ return Promise.resolve(); },
+};
+function closeProfileDropdown() {}
+function closeWsDropdown() {}
+function closeReasoningDropdown() {}
+function closeToolsetsDropdown() {}
+function closeModelDropdown() { dropdown.classList.remove('open'); }
 function fetch(url, opts) { calls.fetches.push({url: String(url), body: opts && opts.body || ''}); return Promise.resolve({ok: true}); }
 
 for (const name of [
   'assistantDisplayName',
   '_topbarLoadedMessageCount', '_topbarMessageMetaText',
   '_getOptionProviderId', '_providerFromModelValue', '_modelStateForSelect',
-  '_findModelInDropdown', '_refreshOpenModelDropdown', '_applyModelToDropdown',
+  '_findModelInDropdown', '_renderComposerModelDropdownIfDirty',
+  '_invalidateComposerModelDropdown', '_refreshOpenModelDropdown', '_applyModelToDropdown',
   '_addLiveModelsToSelect',
   '_modelStateFromAppliedDropdown', '_persistSessionModelCorrection',
-  '_applySessionModelFallback', 'syncTopbar'
+  '_applySessionModelFallback', 'toggleModelDropdown', 'syncTopbar'
 ]) {
   const src = extractFunc(name, {optional: name !== 'syncTopbar'});
   if (src) eval(src);
@@ -191,17 +208,20 @@ if (args.preapplyModel) {
 }
 if (args.liveProvider && Array.isArray(args.liveModels)) {
   _addLiveModelsToSelect(args.liveProvider, args.liveModels, modelSelect);
+  if (args.openAfterMutation) toggleModelDropdown();
 } else {
   syncTopbar();
 }
 
-process.stdout.write(JSON.stringify({
-  selectValue: modelSelect.value,
-  sessionModel: S.session.model,
-  sessionProvider: S.session.model_provider,
-  optionValues: modelSelect.options.map(o => o.value),
-  calls,
-}));
+Promise.resolve().then(() => {
+  process.stdout.write(JSON.stringify({
+    selectValue: modelSelect.value,
+    sessionModel: S.session.model,
+    sessionProvider: S.session.model_provider,
+    optionValues: modelSelect.options.map(o => o.value),
+    calls,
+  }));
+});
 """
 
 
@@ -258,6 +278,7 @@ def _run_add_live_models(
     live_models,
     session_provider=None,
     dropdown_open=False,
+    reopen_after_mutation=False,
 ):
     payload = {
         "sessionModel": session_model,
@@ -266,6 +287,7 @@ def _run_add_live_models(
         "defaultModel": "@safe:gpt-4o-mini",
         "activeProvider": live_provider,
         "dropdownOpen": dropdown_open,
+        "openAfterMutation": reopen_after_mutation,
         "liveProvider": live_provider,
         "liveModels": live_models,
         "options": [
@@ -351,6 +373,23 @@ def test_live_model_reapply_refreshes_open_dropdown_after_catalog_growth(driver_
     )
 
     assert got["selectValue"] == "@safe:gpt-4o-mini"
+    assert "@safe:gpt-4.1" in got["optionValues"]
+    assert got["calls"]["renderModelDropdown"] == 1
+    assert got["calls"]["positionModelDropdown"] == 1
+
+
+def test_closed_live_model_growth_renders_new_option_once_on_reopen(driver_path):
+    got = _run_add_live_models(
+        driver_path,
+        session_model="@safe:gpt-4o-mini",
+        session_provider="safe",
+        initial_value="@safe:gpt-4o-mini",
+        live_provider="safe",
+        live_models=[{"id": "gpt-4.1", "label": "GPT-4.1"}],
+        dropdown_open=False,
+        reopen_after_mutation=True,
+    )
+
     assert "@safe:gpt-4.1" in got["optionValues"]
     assert got["calls"]["renderModelDropdown"] == 1
     assert got["calls"]["positionModelDropdown"] == 1

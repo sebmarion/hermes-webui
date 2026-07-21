@@ -18,6 +18,7 @@ import math
 import os
 import queue
 import re
+import shutil
 import socket
 import sys
 import threading
@@ -245,8 +246,6 @@ def _discover_python(agent_dir: Path) -> str:
             return str(local_venv)
 
     # Fall back to system python3
-    import shutil
-
     for name in ("python3", "python"):
         found = shutil.which(name)
         if found:
@@ -737,6 +736,7 @@ def _config_for_yaml_save(config_data: dict) -> dict:
     if not isinstance(config_data, dict):
         return {}
     data = copy.deepcopy(config_data)
+    _canonicalize_legacy_reasoning_state_for_write(data)
     agent_cfg = data.get("agent")
     if isinstance(agent_cfg, dict):
         personalities = agent_cfg.get("personalities")
@@ -3141,7 +3141,9 @@ def get_effective_default_model(config_data: dict | None = None) -> str:
 # Mirrors hermes_constants.parse_reasoning_effort so WebUI can validate without
 # importing from the agent tree (which may not be installed).  Any drift here
 # will show up in the shared test suite since both sides accept the same set.
-# Keep this WebUI-visible set aligned with hermes-agent#29248.
+# Keep this WebUI-visible set aligned with the installed hermes-agent runtime.
+# Codex ``ultra`` is a control-plane execution mode, not a provider reasoning
+# effort.  It is deliberately modelled separately below.
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
 
@@ -3191,6 +3193,311 @@ def _strip_provider_hint_for_reasoning(model_id: str, provider: str | None = Non
     if ":" in model:
         return model.split(":", 1)[1]
     return model
+
+
+def _codex_ultra_model_identity(
+    model_id: str | None,
+    provider_id: str | None,
+) -> str | None:
+    """Return Codex's canonical Sol slug for an exact Ultra-capable identity.
+
+    Ultra is deliberately scoped to the Codex provider and to Sol (plus the
+    Hermes ``gpt-5.6`` alias).  Substring/prefix matching is avoided so a future
+    sibling such as ``gpt-5.6-sol-mini`` cannot accidentally inherit a control
+    mode it did not advertise.
+    """
+    provider = _resolve_provider_alias(str(provider_id or "").strip().lower())
+    if provider != "openai-codex":
+        return None
+    bare = _strip_provider_hint_for_reasoning(model_id or "", provider)
+    bare = bare.strip().lower()
+    if "/" in bare:
+        return None
+    if bare in {"gpt-5.6-sol", "gpt-5.6"}:
+        return "gpt-5.6-sol"
+    return None
+
+
+def _canonicalize_legacy_reasoning_state_for_write(config_data: dict) -> None:
+    """Remove the old raw ``ultra`` effort at every YAML write boundary.
+
+    Eligible Codex/Sol state becomes the canonical two-field representation.
+    An ineligible raw value is invalid historical state, so it is removed
+    instead of being re-persisted by an unrelated Settings write.
+    """
+    if not isinstance(config_data, dict):
+        return
+    agent_cfg = config_data.get("agent")
+    if not isinstance(agent_cfg, dict):
+        return
+    if str(agent_cfg.get("reasoning_effort") or "").strip().lower() != "ultra":
+        return
+
+    model_id, provider_id, _ = _reasoning_context_from_config(config_data)
+    if _codex_ultra_model_identity(model_id, provider_id) is not None:
+        agent_cfg["reasoning_effort"] = "max"
+        agent_cfg["reasoning_mode"] = "ultra"
+    else:
+        agent_cfg.pop("reasoning_effort", None)
+        agent_cfg.pop("reasoning_mode", None)
+
+
+def _read_codex_model_reasoning_levels(
+    model_id: str,
+    codex_home: str | Path | None = None,
+) -> tuple[str, ...]:
+    """Read one model's advertised effort levels from Codex's local catalog.
+
+    This is intentionally a cheap, offline capability read.  It never starts
+    Codex, refreshes the catalog, or writes to ``CODEX_HOME``.
+    """
+    bare = str(model_id or "").strip().lower().rsplit("/", 1)[-1]
+    if bare == "gpt-5.6":
+        bare = "gpt-5.6-sol"
+    if not bare:
+        return ()
+
+    home = Path(
+        codex_home
+        if codex_home is not None
+        else (os.getenv("CODEX_HOME", "").strip() or (HOME / ".codex"))
+    ).expanduser()
+    cache_path = home if home.name == "models_cache.json" else home / "models_cache.json"
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ()
+
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return ()
+    for entry in models:
+        if not isinstance(entry, dict):
+            continue
+        slug = str(entry.get("slug") or entry.get("id") or entry.get("model") or "").strip().lower()
+        if slug != bare:
+            continue
+        raw_levels = entry.get("supported_reasoning_levels")
+        if not isinstance(raw_levels, list):
+            return ()
+        levels: list[str] = []
+        for item in raw_levels:
+            effort = item.get("effort") if isinstance(item, dict) else item
+            normalized = str(effort or "").strip().lower()
+            if normalized and normalized not in levels:
+                levels.append(normalized)
+        return tuple(levels)
+    return ()
+
+
+def _hermes_agent_codex_app_server_available(
+    agent_dir: str | Path | None = None,
+) -> bool:
+    """Fail closed unless this install can carry real Ultra turn controls.
+
+    Ultra depends on both the Codex executable and Hermes Agent's app-server
+    adapter supporting per-turn ``model`` and ``effort`` overrides.  Source
+    markers keep capability discovery offline and avoid importing a second
+    agent package into the long-lived WebUI process.
+    """
+    root = Path(agent_dir).expanduser() if agent_dir is not None else _AGENT_DIR
+    if root is None or shutil.which("codex") is None:
+        return False
+
+    required_markers = (
+        (
+            root / "agent" / "agent_init.py",
+            ("codex_app_server", "reasoning_config"),
+        ),
+        (
+            root / "agent" / "codex_runtime.py",
+            (
+                "run_codex_app_server_turn",
+                ".run_turn(",
+                "model=",
+                "effort=",
+                "enable_multi_agent",
+            ),
+        ),
+        (
+            root / "agent" / "transports" / "codex_app_server_session.py",
+            (
+                "CodexAppServerSession",
+                'turn_params["model"]',
+                'turn_params["effort"]',
+                "multi_agent_enabled",
+                '"--enable", "multi_agent"',
+            ),
+        ),
+        (
+            root / "run_agent.py",
+            (
+                "_close_codex_app_server_session",
+                "def release_clients",
+                "def close",
+            ),
+        ),
+    )
+    try:
+        for path, markers in required_markers:
+            source = path.read_text(encoding="utf-8")
+            if not all(marker in source for marker in markers):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def _codex_ultra_available(
+    model_id: str | None,
+    provider_id: str | None,
+    *,
+    config_data: dict | None = None,
+    codex_home: str | Path | None = None,
+) -> bool:
+    """Return whether real Codex Ultra can serve this browser-chat context."""
+    canonical_model = _codex_ultra_model_identity(model_id, provider_id)
+    if canonical_model is None:
+        return False
+    if not _hermes_agent_codex_app_server_available():
+        return False
+    try:
+        # Lazy import avoids a config <-> gateway_chat import cycle.
+        from api.gateway_chat import webui_gateway_chat_enabled
+
+        if webui_gateway_chat_enabled(config_data):
+            return False
+    except Exception:
+        # Capability checks fail closed: a hidden Ultra option is safer than a
+        # raw provider request that silently changes semantics or returns 400.
+        return False
+    return "ultra" in _read_codex_model_reasoning_levels(
+        canonical_model,
+        codex_home=codex_home,
+    )
+
+
+def _canonical_reasoning_selection(
+    effort: str | None,
+    mode: str | None,
+    *,
+    model_id: str | None,
+    provider_id: str | None,
+    ultra_available: bool,
+) -> tuple[str, str]:
+    """Canonicalize persisted/ingress reasoning state without leaking Ultra.
+
+    Legacy raw ``effort: ultra`` is accepted only for an exact Sol/Codex
+    identity.  The returned effort is always in the shared effort enum (or
+    empty when invalid); the separate mode is effective only when capability
+    discovery and backend selection allow real Ultra.
+    """
+    raw_effort = str(effort or "").strip().lower()
+    raw_mode = str(mode or "").strip().lower()
+    ultra_identity = _codex_ultra_model_identity(model_id, provider_id) is not None
+
+    if raw_effort == "ultra":
+        if not ultra_identity:
+            return "", ""
+        raw_effort = "max"
+        raw_mode = "ultra"
+
+    if raw_effort != "none" and raw_effort not in VALID_REASONING_EFFORTS:
+        return "", ""
+
+    effective_mode = ""
+    if (
+        raw_mode == "ultra"
+        and raw_effort == "max"
+        and ultra_identity
+        and bool(ultra_available)
+    ):
+        effective_mode = "ultra"
+    return raw_effort, effective_mode
+
+
+def _reasoning_context_from_config(
+    config_data: dict,
+    *,
+    model_id: str | None = None,
+    provider_id: str | None = None,
+    base_url: str | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve the model/provider/base URL used for reasoning-state checks."""
+    resolve_model = str(model_id or "").strip() or None
+    resolve_provider = str(provider_id or "").strip() or None
+    resolve_base_url = str(base_url or "").strip() or None
+    model_cfg = config_data.get("model") if isinstance(config_data, dict) else None
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+
+    if not resolve_model:
+        resolve_model = str(model_cfg.get("default") or "").strip() or None
+    if not resolve_provider:
+        resolve_provider = str(model_cfg.get("provider") or "").strip() or None
+    if not resolve_base_url:
+        resolve_base_url = str(model_cfg.get("base_url") or "").strip() or None
+
+    if resolve_model and not resolve_provider:
+        try:
+            _, discovered_provider, discovered_base_url = resolve_model_provider(resolve_model)
+            resolve_provider = str(discovered_provider or "").strip() or None
+            if not resolve_base_url:
+                resolve_base_url = str(discovered_base_url or "").strip() or None
+        except Exception:
+            pass
+    return resolve_model, resolve_provider, resolve_base_url
+
+
+def _reasoning_selection_from_config(
+    config_data: dict,
+    *,
+    model_id: str | None = None,
+    provider_id: str | None = None,
+    base_url: str | None = None,
+) -> dict:
+    """Resolve canonical effort and the effective/requested Codex Ultra mode."""
+    resolve_model, resolve_provider, resolve_base_url = _reasoning_context_from_config(
+        config_data,
+        model_id=model_id,
+        provider_id=provider_id,
+        base_url=base_url,
+    )
+    agent_cfg = config_data.get("agent") if isinstance(config_data, dict) else None
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+    raw_effort = str(agent_cfg.get("reasoning_effort") or "").strip().lower()
+    raw_mode = str(agent_cfg.get("reasoning_mode") or "").strip().lower()
+    ultra_identity = _codex_ultra_model_identity(resolve_model, resolve_provider) is not None
+    ultra_requested = raw_mode == "ultra" or raw_effort == "ultra"
+    ultra_available = _codex_ultra_available(
+        resolve_model,
+        resolve_provider,
+        config_data=config_data,
+    )
+    canonical_effort, effective_mode = _canonical_reasoning_selection(
+        raw_effort,
+        raw_mode,
+        model_id=resolve_model,
+        provider_id=resolve_provider,
+        ultra_available=ultra_available,
+    )
+    effective_effort = coerce_reasoning_effort_for_model(
+        canonical_effort,
+        resolve_model,
+        provider_id=resolve_provider,
+        base_url=resolve_base_url,
+    )
+    return {
+        "model_id": resolve_model,
+        "provider_id": resolve_provider,
+        "base_url": resolve_base_url,
+        "reasoning_effort": effective_effort,
+        "reasoning_mode": effective_mode,
+        "ultra_available": bool(ultra_available),
+        "ultra_requested": bool(ultra_requested),
+        "ultra_identity": bool(ultra_identity),
+    }
 
 
 def _reasoning_name_candidates(model_id: str) -> list[str]:
@@ -3367,12 +3674,17 @@ def _filter_reasoning_efforts_for_provider(
     normalized = list(dict.fromkeys(normalized))
     provider = _resolve_provider_alias(str(provider_id or "").strip().lower())
     bare = _strip_provider_hint_for_reasoning(model_id).lower().rsplit("/", 1)[-1]
-    # OpenAI-family lanes (Codex, direct OpenAI, Azure Foundry) cap GPT-5 at xhigh
-    # and o-series at high — 'max' is a WebUI-only level none of them accept.
+    # OpenAI-family lanes (Codex, direct OpenAI, Azure Foundry) cap legacy GPT-5
+    # at xhigh and o-series at high. Codex-backed GPT-5.6 Sol (including the
+    # Hermes alias ``gpt-5.6``) supports canonical provider effort ``max``.
+    # Codex ``ultra`` remains a separate execution-mode capability and never
+    # enters this shared effort list.
     if provider in {"openai-codex", "openai", "openai-api", "azure-foundry", "azure-openai", "azure"}:
         if bare.startswith(("o1", "o3", "o4")):
             return [eff for eff in normalized if eff in {"low", "medium", "high"}]
         if bare.startswith("gpt-5"):
+            if provider == "openai-codex" and bare in {"gpt-5.6-sol", "gpt-5.6"}:
+                return normalized
             return [eff for eff in normalized if eff != "max"]
     # 'max' is a WebUI-level ceiling; providers whose native ladder tops out lower
     # must NOT advertise it, otherwise a stored/CLI 'max' degrades WORSE than the
@@ -3949,38 +4261,35 @@ def get_reasoning_status(
     """
     config_data = _load_yaml_config_file(_get_config_path())
     display_cfg = config_data.get("display") or {}
-    agent_cfg = config_data.get("agent") or {}
     show_raw = display_cfg.get("show_reasoning") if isinstance(display_cfg, dict) else None
-    effort_raw = agent_cfg.get("reasoning_effort") if isinstance(agent_cfg, dict) else None
-
-    resolve_model = model_id
-    resolve_provider = provider_id
-    resolve_base_url = base_url
-    if not resolve_model:
-        model_cfg = config_data.get("model") or {}
-        if isinstance(model_cfg, dict):
-            resolve_model = str(model_cfg.get("default") or "").strip() or None
-            if not resolve_provider and model_cfg.get("provider"):
-                resolve_provider = str(model_cfg["provider"]).strip()
-            if not resolve_base_url and model_cfg.get("base_url"):
-                resolve_base_url = str(model_cfg["base_url"]).strip()
-
-    supported_efforts = resolve_model_reasoning_efforts(
-        resolve_model,
-        provider_id=resolve_provider,
-        base_url=resolve_base_url,
+    selection = _reasoning_selection_from_config(
+        config_data,
+        model_id=model_id,
+        provider_id=provider_id,
+        base_url=base_url,
     )
-    return {
-        # Match CLI default (True if unset in config.yaml)
-        "show_reasoning": bool(show_raw) if isinstance(show_raw, bool) else True,
-        # Report the COERCED effort so boot/status/chip read paths agree with
-        # what streaming actually sends. (Codex review of the drop-max alignment.)
-        "reasoning_effort": coerce_reasoning_effort_for_model(
-            str(effort_raw or "").strip().lower(),
+    resolve_model = selection["model_id"]
+    resolve_provider = selection["provider_id"]
+    resolve_base_url = selection["base_url"]
+
+    supported_efforts = list(
+        resolve_model_reasoning_efforts(
             resolve_model,
             provider_id=resolve_provider,
             base_url=resolve_base_url,
-        ),
+        )
+    )
+    if selection["ultra_available"]:
+        # Compatibility alias for list-driven clients; provider effort remains max.
+        supported_efforts.append("ultra")
+    return {
+        # Match CLI default (True if unset in config.yaml)
+        "show_reasoning": bool(show_raw) if isinstance(show_raw, bool) else True,
+        # Report the COERCED canonical effort so boot/status/chip read paths
+        # agree with what streaming sends. Codex Ultra remains a separate mode.
+        "reasoning_effort": selection["reasoning_effort"],
+        "reasoning_mode": selection["reasoning_mode"],
+        "ultra_available": selection["ultra_available"],
         "supported_efforts": supported_efforts,
         "supports_reasoning_effort": bool(supported_efforts),
     }
@@ -4086,39 +4395,105 @@ def set_reasoning_display(show: bool) -> dict:
 def set_reasoning_effort(
     effort: str,
     *,
+    mode: str | None = None,
     model_id: str | None = None,
     provider_id: str | None = None,
     base_url: str | None = None,
 ) -> dict:
-    """Persist ``agent.reasoning_effort`` to the active profile's config.yaml.
+    """Persist canonical effort plus an optional Codex execution mode.
 
     Mirrors CLI ``/reasoning <level>``: same key, same valid values
     (``none`` | ``minimal`` | ``low`` | ``medium`` | ``high`` | ``xhigh`` | ``max``).
+    A legacy ingress-only ``effort=ultra`` spelling canonicalizes to
+    ``reasoning_effort=max`` plus ``reasoning_mode=ultra``.  If that legacy
+    request omits both model and provider, it uses the unique advertised
+    native Codex/Sol context; partial or conflicting context remains strict.
+    The mode is valid only when that context's local catalog advertises it.
     Raises ``ValueError`` on an unrecognised level so callers can return 400.
     """
     raw = str(effort or "").strip().lower()
+    legacy_ultra_ingress = raw == "ultra"
+    requested_mode = str(mode or "").strip().lower()
     if not raw:
         raise ValueError("effort is required")
+    if raw == "ultra":
+        raw = "max"
+        requested_mode = "ultra"
+    if requested_mode not in {"", "ultra"}:
+        raise ValueError(f"Unknown reasoning mode '{mode}'. Valid: ultra.")
     if raw != "none" and raw not in VALID_REASONING_EFFORTS:
         raise ValueError(
             f"Unknown reasoning effort '{effort}'. "
             f"Valid: none, {', '.join(VALID_REASONING_EFFORTS)}."
         )
+    if requested_mode == "ultra" and raw != "max":
+        raise ValueError("Ultra mode requires canonical reasoning effort 'max'.")
+
     config_path = _get_config_path()
     with _cfg_lock:
         config_data = _load_yaml_config_file(config_path)
+        # Older Hermex clients sent only ``{"effort": "ultra"}`` after the
+        # selector learned the alias.  Ultra has one advertised native
+        # context, so resolve that legacy spelling only when neither context
+        # field was supplied.  Explicit and partial context remains strict.
+        if legacy_ultra_ingress:
+            if (model_id is None) != (provider_id is None):
+                raise ValueError(
+                    "Legacy Ultra requires both model and provider context, or neither."
+                )
+            if model_id is None and provider_id is None:
+                model_id = "gpt-5.6-sol"
+                provider_id = "openai-codex"
+        resolve_model, resolve_provider, _ = _reasoning_context_from_config(
+            config_data,
+            model_id=model_id,
+            provider_id=provider_id,
+            base_url=base_url,
+        )
+        if requested_mode == "ultra" and not _codex_ultra_available(
+            resolve_model,
+            resolve_provider,
+            config_data=config_data,
+        ):
+            try:
+                from api.gateway_chat import webui_gateway_chat_enabled
+
+                gateway_enabled = webui_gateway_chat_enabled(config_data)
+            except Exception:
+                gateway_enabled = False
+            if gateway_enabled:
+                raise ValueError(
+                    "Ultra requires the native WebUI Codex runtime; Gateway-backed chat "
+                    "does not yet expose an equivalent request-scoped Ultra control plane."
+                )
+            raise ValueError(
+                "Ultra is unavailable for this model/provider or is not advertised "
+                "by the installed Codex model catalog."
+            )
         agent_cfg = config_data.get("agent")
         if not isinstance(agent_cfg, dict):
             agent_cfg = {}
         agent_cfg["reasoning_effort"] = raw
+        if requested_mode == "ultra":
+            agent_cfg["reasoning_mode"] = "ultra"
+        else:
+            agent_cfg.pop("reasoning_mode", None)
         config_data["agent"] = agent_cfg
         _save_yaml_config_file(config_path, config_data)
     reload_config()
-    return get_reasoning_status(
+    status = get_reasoning_status(
         model_id=model_id,
         provider_id=provider_id,
         base_url=base_url,
     )
+    if legacy_ultra_ingress:
+        # Legacy list-driven clients use the POST response's effort value as
+        # their selected row and do not understand ``reasoning_mode``. Keep
+        # the persisted/provider-facing value canonical, but return the UI
+        # alias for this ingress shape so Ultra does not snap back to Max.
+        status["canonical_reasoning_effort"] = status.get("reasoning_effort")
+        status["reasoning_effort"] = "ultra"
+    return status
 
 
 def _public_advanced_model_options(model_cfg: dict) -> dict:
@@ -4301,8 +4676,27 @@ def _main_model_request_overrides(
             overrides["service_tier"] = "priority"
     extra_body = model_cfg.get("extra_body")
     if isinstance(extra_body, dict) and extra_body:
+        _reject_ultra_reasoning_extra_body(extra_body)
         overrides["extra_body"] = copy.deepcopy(extra_body)
     return overrides
+
+
+def _reject_ultra_reasoning_extra_body(extra_body: dict) -> None:
+    """Reject raw overrides that could resurrect provider effort ``ultra``."""
+    if not isinstance(extra_body, dict):
+        return
+    candidates = [
+        extra_body.get("reasoning_effort"),
+        extra_body.get("reasoning.effort"),
+    ]
+    nested_reasoning = extra_body.get("reasoning")
+    if isinstance(nested_reasoning, dict):
+        candidates.append(nested_reasoning.get("effort"))
+    if any(str(value or "").strip().lower() == "ultra" for value in candidates):
+        raise ValueError(
+            "extra_body cannot set reasoning effort to Ultra. Use the Sol Ultra "
+            "selector so Hermes can route the turn through Codex app-server."
+        )
 
 
 def _apply_advanced_model_options(model_cfg: dict, advanced: dict | None) -> None:
@@ -4335,6 +4729,7 @@ def _apply_advanced_model_options(model_cfg: dict, advanced: dict | None) -> Non
         if extra_body in (None, ""):
             model_cfg.pop("extra_body", None)
         elif isinstance(extra_body, dict):
+            _reject_ultra_reasoning_extra_body(extra_body)
             if extra_body:
                 model_cfg["extra_body"] = extra_body
             else:
@@ -6344,7 +6739,12 @@ def _read_visible_codex_cache_model_ids() -> list[str]:
     return ordered
 
 
-def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = False) -> dict:
+def get_available_models(
+    *,
+    prefer_cache: bool = False,
+    force_refresh: bool = False,
+    serve_stale_immediately: bool = False,
+) -> dict:
     """
     Return available models grouped by provider.
 
@@ -6372,6 +6772,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     ``force_refresh=True`` is an internal escape hatch for bounded freshness
     checks that need a real live rebuild while preserving the default cache
     contract for every existing caller.
+
+    ``serve_stale_immediately=True`` is the interactive picker path: when a
+    shape-valid stale disk catalog exists, return it as soon as the detached
+    rebuild starts instead of spending the foreground rebuild budget. The
+    worker still publishes the refreshed catalog for the next request.
     """
     global _cache_build_in_progress, _available_models_cache, _available_models_cache_ts
     global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _cache_build_cv
@@ -7881,6 +8286,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # If another thread is already building, wait for its result instead
         # of re-entering the cold path (avoids duplicate 10s zai load_pool calls).
         if should_wait:
+            if serve_stale_immediately and stale_disk_groups is not None and not force_refresh:
+                # Interactive picker followers must not queue behind provider
+                # discovery already running for an earlier request. The active
+                # worker owns publication; this caller can safely reuse the
+                # same shape-valid disk snapshot immediately.
+                return copy.deepcopy(stale_disk_groups)
             wait_timeout = 60.0
             if force_refresh and force_refresh_started_at is not None:
                 if _LIVE_REBUILD_BUDGET_SECONDS <= 0:
@@ -8160,6 +8571,18 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             daemon=True,
         )
         _worker.start()
+
+        if serve_stale_immediately and stale_disk_groups is not None and not force_refresh:
+            # Picker opens are latency-sensitive. The stale catalog is already
+            # known to match the current schema, so render it now and let the
+            # profile-scoped worker refresh provider discovery out-of-band.
+            budget_exceeded.set()
+            if build_done.is_set():
+                if "result" in box and _claim_publish():
+                    _publish_models_result(box["result"])
+                elif "error" in box:
+                    _clear_build_in_progress()
+            return copy.deepcopy(stale_disk_groups)
 
         if build_done.wait(timeout=_LIVE_REBUILD_BUDGET_SECONDS):
             # Build finished within budget — foreground publishes
@@ -9024,6 +9447,16 @@ def _evict_session_agent(session_id: str) -> None:
     except Exception:
         should_close = False
         logger.debug("Lifecycle commit on eviction failed for %s", session_id, exc_info=True)
+    # The cache entry is gone permanently. Release provider transports even
+    # when a memory-provider commit must be retried later; release_clients()
+    # deliberately preserves session tool state and the memory provider while
+    # closing owned HTTP clients and Codex app-server subprocesses.
+    try:
+        release_clients = getattr(agent, 'release_clients', None)
+        if callable(release_clients):
+            release_clients()
+    except Exception:
+        logger.debug("Failed to release cached agent clients for %s", session_id, exc_info=True)
     if should_close and getattr(agent, '_session_db', None) is not None:
         try:
             agent._session_db.close()

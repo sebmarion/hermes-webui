@@ -21,7 +21,7 @@ from api.config import (
     STREAM_PARTIAL_TEXT,
     STREAM_REASONING_TEXT,
     _get_session_agent_lock,
-    coerce_reasoning_effort_for_model,
+    _reasoning_selection_from_config,
     gateway_approval_unavailable_reason,
     gateway_supports_approval,
     register_active_run,
@@ -182,15 +182,16 @@ def _gateway_reasoning_effort_for_request(cfg, *, model=None, model_provider=Non
     """Read and coerce user-configured reasoning effort for a gateway request."""
     try:
         cfg_data = cfg if isinstance(cfg, dict) else {}
-        effort_cfg = cfg_data.get("agent", {}) if isinstance(cfg_data, dict) else {}
-        effort_raw = effort_cfg.get("reasoning_effort") if isinstance(effort_cfg, dict) else None
-        coerced = coerce_reasoning_effort_for_model(
-            effort_raw,
-            model,
+        selection = _reasoning_selection_from_config(
+            cfg_data,
+            model_id=model,
             provider_id=model_provider,
         )
+        coerced = str(selection.get("reasoning_effort") or "").strip().lower()
+        if coerced == "ultra":
+            coerced = "max"
         # Preserve explicit "none" while still omitting absent or invalid effort.
-        return None if not coerced else str(coerced)
+        return None if not coerced else coerced
     except Exception:
         return None
 
@@ -662,6 +663,23 @@ def _run_gateway_chat_streaming(
         from api.config import get_config  # imported lazily to avoid config-cycle churn
 
         cfg = get_config()
+        reasoning_selection = _reasoning_selection_from_config(
+            cfg,
+            model_id=model,
+            provider_id=model_provider,
+        )
+        ultra_requested = bool(
+            reasoning_selection.get("ultra_requested")
+            or reasoning_selection.get("reasoning_mode") == "ultra"
+        )
+        if ultra_requested and reasoning_selection.get("ultra_identity"):
+            put_gateway_event("apperror", {
+                "label": "Ultra is unavailable through Gateway chat",
+                "type": "gateway_ultra_unsupported",
+                "message": "Real Ultra requires native WebUI chat and cannot run through the Gateway backend.",
+                "hint": "Use native WebUI chat for Ultra, or select Max to keep using Gateway chat.",
+            })
+            return
         reasoning_effort = _gateway_reasoning_effort_for_request(
             cfg,
             model=model,

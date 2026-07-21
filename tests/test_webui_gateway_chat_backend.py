@@ -15,6 +15,7 @@ from api.config import STREAMS, create_stream_channel
 from api.models import new_session
 from api.gateway_chat import (
     _gateway_http_error_event,
+    _gateway_reasoning_effort_for_request,
     _gateway_reasoning_delta,
     _gateway_sse_delta,
     _gateway_sse_reasoning_delta,
@@ -81,6 +82,149 @@ def test_gateway_chat_backend_env_wins_over_config_and_stays_safe():
         {"webui_chat_backend": "gateway"},
         {"HERMES_WEBUI_CHAT_BACKEND": "legacy-direct"},
     ) == "legacy"
+
+
+def test_gateway_reasoning_effort_canonicalizes_legacy_ultra_to_max():
+    effort = _gateway_reasoning_effort_for_request(
+        {"agent": {"reasoning_effort": "ultra"}},
+        model="gpt-5.6-sol",
+        model_provider="openai-codex",
+    )
+
+    assert effort == "max"
+    assert effort != "ultra"
+
+
+def test_gateway_ultra_fails_closed_before_any_gateway_request(tmp_path, monkeypatch):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setattr(
+        config,
+        "get_config",
+        lambda: {
+            "webui_chat_backend": "gateway",
+            "agent": {"reasoning_effort": "max", "reasoning_mode": "ultra"},
+        },
+    )
+    monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_USE_RUNS_API", "1")
+
+    gateway_calls = []
+
+    def unexpected_gateway_call(*args, **kwargs):
+        gateway_calls.append((args, kwargs))
+        raise AssertionError("Ultra guard must run before opening or probing the Gateway")
+
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", unexpected_gateway_call)
+    monkeypatch.setattr(gateway_chat, "gateway_supports_approval", unexpected_gateway_call)
+    monkeypatch.setattr(gateway_chat, "_run_gateway_runs_api_streaming", unexpected_gateway_call)
+
+    s = new_session()
+    stream_id = "stream-gateway-ultra-fail-closed"
+    s.active_stream_id = stream_id
+    s.pending_user_message = "Use real Ultra"
+    s.pending_attachments = []
+    s.pending_started_at = 123
+    s.save()
+    channel = create_stream_channel()
+    subscriber = channel.subscribe()
+    STREAMS[stream_id] = channel
+
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "Use real Ultra",
+        "gpt-5.6-sol",
+        str(tmp_path),
+        stream_id,
+        [],
+        model_provider="openai-codex",
+    )
+
+    events = []
+    while not subscriber.empty():
+        events.append(subscriber.get_nowait())
+    app_errors = [item[1] for item in events if item[0] == "apperror"]
+
+    assert gateway_calls == []
+    assert app_errors == [
+        {
+            "label": "Ultra is unavailable through Gateway chat",
+            "type": "gateway_ultra_unsupported",
+            "message": "Real Ultra requires native WebUI chat and cannot run through the Gateway backend.",
+            "hint": "Use native WebUI chat for Ultra, or select Max to keep using Gateway chat.",
+        }
+    ]
+    assert not any(item[0] in {"token", "done", "stream_end"} for item in events)
+
+
+def test_gateway_stale_ultra_mode_is_inert_after_switching_away_from_sol(tmp_path, monkeypatch):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setattr(
+        config,
+        "get_config",
+        lambda: {
+            "webui_chat_backend": "gateway",
+            "agent": {"reasoning_effort": "max", "reasoning_mode": "ultra"},
+        },
+    )
+    monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
+    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_USE_RUNS_API", raising=False)
+    monkeypatch.setattr(gateway_chat, "gateway_approval_unavailable_reason", lambda *_args: None)
+
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"normal request"}}]}\n\n'
+            yield b'data: [DONE]\n\n'
+
+    def fake_urlopen(req, timeout=0):
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
+
+    s = new_session()
+    stream_id = "stream-gateway-stale-ultra-mode"
+    s.active_stream_id = stream_id
+    s.pending_user_message = "Use the selected model"
+    s.pending_attachments = []
+    s.pending_started_at = 123
+    s.save()
+    channel = create_stream_channel()
+    subscriber = channel.subscribe()
+    STREAMS[stream_id] = channel
+
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "Use the selected model",
+        "gpt-5.5",
+        str(tmp_path),
+        stream_id,
+        [],
+        model_provider="openai-codex",
+    )
+
+    events = []
+    while not subscriber.empty():
+        events.append(subscriber.get_nowait())
+
+    assert captured["body"]["reasoning_effort"] == "xhigh"
+    assert captured["body"]["reasoning_effort"] != "ultra"
+    assert not any(item[0] == "apperror" for item in events)
 
 
 def test_gateway_sse_delta_extracts_openai_chat_chunks():

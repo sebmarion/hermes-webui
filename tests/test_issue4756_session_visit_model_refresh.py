@@ -670,7 +670,7 @@ def test_populate_model_dropdown_accepts_session_visit_freshness_and_guards_stal
     assert live_tail.count("requestSeq!==null&&requestSeq!==_modelDropdownRequestSeq") >= 4
 
 
-def test_load_session_schedules_session_visit_model_refresh_before_message_load():
+def test_load_session_reuses_cached_model_catalog_before_message_load():
     body = _extract_function_body(_read_static("sessions.js"), "async function loadSession(")
 
     assign_idx = body.index("S.session=data.session")
@@ -680,7 +680,7 @@ def test_load_session_schedules_session_visit_model_refresh_before_message_load(
     guard_helper_idx = body.index("const isActiveModelRefreshSession", model_block_idx)
     promise_idx = body.index("const modelRefreshPromise=_deferSessionSideEffect", model_block_idx)
     ready_idx = body.index("window._modelDropdownReady=modelRefreshPromise", promise_idx)
-    refresh_idx = body.index("populateModelDropdown({freshness:'session_visit'})", promise_idx)
+    refresh_idx = body.index("populateModelDropdown()", promise_idx)
 
     assert assign_idx < model_block_idx < message_load_idx < failure_return_idx
     assert model_block_idx < promise_idx < refresh_idx < ready_idx
@@ -691,7 +691,7 @@ def test_load_session_schedules_session_visit_model_refresh_before_message_load(
     )
 
 
-def test_session_visit_model_refresh_is_deferred_until_after_first_paint():
+def test_cached_model_catalog_refresh_is_deferred_until_after_first_paint():
     sessions = _read_static("sessions.js")
     defer_helper = _extract_function_body(sessions, "function _afterSessionFirstPaint(")
     side_effect_helper = _extract_function_body(sessions, "function _deferSessionSideEffect(")
@@ -702,7 +702,8 @@ def test_session_visit_model_refresh_is_deferred_until_after_first_paint():
     assert "return _afterSessionFirstPaint(()=>" in side_effect_helper
     assert "const modelRefreshPromise=_deferSessionSideEffect" in load_body
     assert "isActiveModelRefreshSession()" in load_body
-    assert "return populateModelDropdown({freshness:'session_visit'});" in load_body
+    assert "return populateModelDropdown();" in load_body
+    assert "freshness:'session_visit'" not in load_body
 
 
 def test_boot_model_dropdown_clears_cached_ready_on_401():

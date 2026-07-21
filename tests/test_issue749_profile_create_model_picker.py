@@ -75,6 +75,30 @@ def test_profile_model_config_writer_preserves_existing_model_settings(tmp_path)
     assert saved["model"]["provider"] == "openai-codex"
 
 
+def test_profile_model_writer_drops_ineligible_legacy_ultra(tmp_path):
+    profile_dir = tmp_path / "profiles" / "research"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text(
+        "model:\n"
+        "  default: gpt-5.6-sol\n"
+        "  provider: openai-codex\n"
+        "agent:\n"
+        "  reasoning_effort: ultra\n",
+        encoding="utf-8",
+    )
+
+    profiles._write_model_defaults_to_config(
+        profile_dir,
+        default_model="gpt-5.5",
+        model_provider="openai-codex",
+    )
+
+    saved = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))
+    assert saved["model"]["default"] == "gpt-5.5"
+    assert "agent" not in saved or "reasoning_effort" not in saved["agent"]
+    assert "agent" not in saved or "reasoning_mode" not in saved["agent"]
+
+
 def test_profile_model_selection_accepts_catalog_model_with_provider():
     catalog = {
         "groups": [

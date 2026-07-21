@@ -76,10 +76,12 @@ function extractFunc(name) {
   return src.slice(start, i);
 }
 
-// `let _currentReasoningEffort` / `_currentReasoningEffortsSupported` /
-// `_lastReasoningFetchKey` are module-scope state the functions close over;
-// declare them in this eval scope so the extracted functions can see them.
+// The current effort/mode/capability state and `_lastReasoningFetchKey` are
+// module-scope values the functions close over; declare them in this eval
+// scope so the extracted functions can see the same state shape as ui.js.
 var _currentReasoningEffort = null;
+var _currentReasoningMode = '';
+var _currentReasoningUltraAvailable = false;
 var _currentReasoningEffortsSupported = null;
 var _profileTransitionReasoningContext = null;
 var _lastReasoningFetchKey = null;

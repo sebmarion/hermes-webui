@@ -1456,6 +1456,7 @@ async function send(){
   }
   let _slashDisplayTextOverride=null;
   let _pendingMoaConfig=null;
+  let _pendingBestplanConfig=null;
   // Slash command intercept -- local commands handled without agent round-trip.
   // We push the user message BEFORE running the handler for echo-worthy
   // commands so chat order is correct: some handlers (e.g. cmdHelp) push
@@ -1563,6 +1564,19 @@ async function send(){
           S.messages.push({role:'assistant',content:'MoA unavailable: '+(_e&&_e.message||_e),_ts:Date.now()/1000});
           renderMessages();$('msg').value='';autoResize();hideCmdDropdown();return;
         }
+      }
+      if(_agentCmdName==='bestplan'||_agentCmdName==='bp'){
+        const _bpParts=text.trim().split(/\s+/).slice(1);
+        const _bpCount=/^\d+$/.test(_bpParts[0]||'')?Math.max(2,Math.min(5,Number(_bpParts.shift()))):3;
+        const _bpArgs=_bpParts.join(' ').trim();
+        if(!_bpArgs){
+          S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+          S.messages.push({role:'assistant',content:'BestPlan unavailable: provide a task after /bestplan.',_ts:Date.now()/1000});
+          renderMessages();$('msg').value='';autoResize();hideCmdDropdown();return;
+        }
+        _slashDisplayTextOverride=text;
+        text=_bpArgs;
+        _pendingBestplanConfig={count:_bpCount};
       }
       const _bundleCmd=!_agentCmd&&typeof getBundleCommandMetadata==='function'
         ? await getBundleCommandMetadata(_parsedCmd.name)
@@ -1800,9 +1814,11 @@ async function send(){
       profile:S.activeProfile||S.session.profile||'default',
       explicit_model_pick:_explicitPick||undefined,
       attachments:uploaded.length?uploaded:undefined,
-      moa_config:_pendingMoaConfig?true:undefined
+      moa_config:_pendingMoaConfig?true:undefined,
+      bestplan_config:_pendingBestplanConfig||undefined
     })});
     _pendingMoaConfig=null;
+    _pendingBestplanConfig=null;
     postStartData = startData;
   }catch(e){
     const errMsg=String((e&&e.message)||'');

@@ -55,6 +55,24 @@ class TestWriteEndpointToConfig:
         # New key added
         assert cfg["model"]["base_url"] == "http://localhost:1234"
 
+    def test_unrelated_endpoint_write_canonicalizes_legacy_sol_ultra(self, tmp_path):
+        """Profile writers must share the canonical config save boundary."""
+        existing = {
+            "model": {"default": "gpt-5.6-sol", "provider": "openai-codex"},
+            "agent": {"reasoning_effort": "ultra"},
+        }
+        (tmp_path / "config.yaml").write_text(yaml.dump(existing), encoding="utf-8")
+
+        from api.profiles import _write_endpoint_to_config
+
+        _write_endpoint_to_config(tmp_path, base_url="https://chatgpt.com/backend-api/codex")
+
+        cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+        assert cfg["agent"] == {
+            "reasoning_effort": "max",
+            "reasoning_mode": "ultra",
+        }
+
     def test_noop_when_both_none(self, tmp_path):
         from api.profiles import _write_endpoint_to_config
         _write_endpoint_to_config(tmp_path, base_url=None, api_key=None)

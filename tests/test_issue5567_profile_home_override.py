@@ -19,6 +19,7 @@ intentional mid-body `os.environ` clobber and NO mocking of the production reade
 Degrades gracefully on agents without the override (skips with a clear reason).
 """
 import os
+import queue
 import textwrap
 from pathlib import Path
 
@@ -34,6 +35,7 @@ HAS_OVERRIDE = hasattr(hermes_constants, "set_hermes_home_override") and hasattr
 )
 
 from api import profiles as profiles_api  # noqa: E402
+from api import streaming as streaming_api  # noqa: E402
 
 
 def _seed_profile_home(base: Path, name: str, provider: str, model: str) -> Path:
@@ -123,3 +125,235 @@ def test_graceful_degradation_resolver_is_optional():
         assert mod is not None and hasattr(mod, "set_hermes_home_override")
     else:
         assert mod is None  # older agent: graceful no-op, os.environ mirror stays
+
+
+class _StreamingSession:
+    """Small session double for the real streaming worker boundary."""
+
+    def __init__(self, workspace: Path):
+        self.session_id = "issue5567-streaming-home"
+        self.title = "Profile home override"
+        self.workspace = str(workspace)
+        self.model = "test-model"
+        self.model_provider = "test-provider"
+        self.profile = "alpha"
+        self.personality = None
+        self.messages = []
+        self.context_messages = []
+        self.tool_calls = []
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.estimated_cost = None
+        self.context_length = 0
+        self.threshold_tokens = 0
+        self.last_prompt_tokens = 0
+        self.active_stream_id = None
+        self.pending_user_message = None
+        self.pending_attachments = []
+        self.pending_started_at = None
+        self.llm_title_generated = True
+
+    def save(self, *args, **kwargs):
+        return None
+
+
+def _exercise_streaming_home_override(
+    monkeypatch,
+    tmp_path,
+    *,
+    failure_stage=None,
+    override_available=True,
+):
+    """Run the real worker with a fake Agent and return its home observations."""
+    from api import oauth
+
+    profile_home = tmp_path / "profiles" / "alpha"
+    clobber_home = tmp_path / "profiles" / "beta"
+    outer_home = tmp_path / "outer"
+    for home in (profile_home, clobber_home, outer_home):
+        home.mkdir(parents=True, exist_ok=True)
+
+    session = _StreamingSession(tmp_path)
+    stream_id = f"issue5567-{failure_stage or 'success'}"
+    session.active_stream_id = stream_id
+    observations = []
+    token_events = []
+
+    real_set_override = hermes_constants.set_hermes_home_override
+    real_reset_override = hermes_constants.reset_hermes_home_override
+
+    def tracking_set_override(path):
+        token = real_set_override(path)
+        token_events.append(("set", str(path), token))
+        return token
+
+    def tracking_reset_override(token):
+        token_events.append(("reset", token))
+        return real_reset_override(token)
+
+    monkeypatch.setattr(
+        hermes_constants,
+        "set_hermes_home_override",
+        tracking_set_override,
+    )
+    monkeypatch.setattr(
+        hermes_constants,
+        "reset_hermes_home_override",
+        tracking_reset_override,
+    )
+    if not override_available:
+        monkeypatch.setattr(
+            profiles_api,
+            "_resolve_hermes_home_override",
+            lambda: None,
+        )
+
+    class ObservingAgent:
+        def __init__(self, **kwargs):
+            observations.append(
+                (
+                    "construct",
+                    hermes_constants.get_hermes_home(),
+                    hermes_constants.get_hermes_home_override(),
+                )
+            )
+            if failure_stage == "construct":
+                raise RuntimeError("synthetic constructor failure")
+            self.session_id = kwargs.get("session_id")
+            self.context_compressor = None
+            self.ephemeral_system_prompt = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = None
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            # Model a sibling profile worker overwriting the process-global
+            # fallback while this turn is already running.
+            os.environ["HERMES_HOME"] = str(clobber_home)
+            observations.append(
+                (
+                    "run",
+                    hermes_constants.get_hermes_home(),
+                    hermes_constants.get_hermes_home_override(),
+                )
+            )
+            if failure_stage == "conversation":
+                raise RuntimeError("synthetic conversation failure")
+            return {
+                "completed": True,
+                "messages": [
+                    {"role": "user", "content": kwargs.get("persist_user_message", "")},
+                    {"role": "assistant", "content": "ok"},
+                ],
+            }
+
+        def interrupt(self, _message):
+            return None
+
+    monkeypatch.setattr(streaming_api, "get_session", lambda _sid: session)
+    monkeypatch.setattr(streaming_api, "_get_ai_agent", lambda: ObservingAgent)
+    monkeypatch.setattr(
+        streaming_api,
+        "resolve_model_provider",
+        lambda *_args, **_kwargs: ("test-model", "test-provider", None),
+    )
+    monkeypatch.setattr(streaming_api, "_maybe_schedule_title_refresh", lambda *args, **kwargs: None)
+    monkeypatch.setattr(profiles_api, "get_hermes_home_for_profile", lambda _profile: profile_home)
+    monkeypatch.setattr(profiles_api, "get_profile_runtime_env", lambda _home: {})
+    monkeypatch.setattr(
+        oauth,
+        "resolve_runtime_provider_with_anthropic_env_lock",
+        lambda _resolver, requested=None, **_kwargs: {
+            "provider": requested or "test-provider",
+            "api_key": "synthetic-key",
+            "base_url": None,
+        },
+    )
+    monkeypatch.setattr("api.config.get_config", lambda: {})
+    monkeypatch.setattr("api.config._resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("api.config.load_settings", lambda: {})
+
+    streaming_api.STREAMS[stream_id] = queue.Queue()
+    monkeypatch.setenv("HERMES_HOME", str(clobber_home))
+
+    outer_token = None
+    if override_available:
+        outer_token = hermes_constants.set_hermes_home_override(outer_home)
+    try:
+        streaming_api._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text="hello",
+            model="test-model",
+            model_provider="test-provider",
+            workspace=str(tmp_path),
+            stream_id=stream_id,
+            ephemeral=True,
+        )
+        if override_available:
+            assert hermes_constants.get_hermes_home_override() == str(outer_home)
+            assert hermes_constants.get_hermes_home() == outer_home
+        else:
+            assert hermes_constants.get_hermes_home_override() is None
+    finally:
+        if outer_token is not None:
+            hermes_constants.reset_hermes_home_override(outer_token)
+        streaming_api.STREAMS.pop(stream_id, None)
+
+    return profile_home, observations, token_events
+
+
+@pytest.mark.skipif(not HAS_OVERRIDE, reason="requires context-local Hermes home support")
+def test_streaming_binds_resolved_profile_home_through_agent_run(tmp_path, monkeypatch):
+    profile_home, observations, token_events = _exercise_streaming_home_override(
+        monkeypatch,
+        tmp_path,
+    )
+
+    assert observations == [
+        ("construct", profile_home, str(profile_home)),
+        ("run", profile_home, str(profile_home)),
+    ]
+    assert [event[:2] for event in token_events] == [
+        ("set", str(tmp_path / "outer")),
+        ("set", str(profile_home)),
+        ("reset", token_events[2][1]),
+        ("reset", token_events[3][1]),
+    ]
+    assert token_events[1][2] is token_events[2][1]
+    assert token_events[0][2] is token_events[3][1]
+
+
+@pytest.mark.skipif(not HAS_OVERRIDE, reason="requires context-local Hermes home support")
+@pytest.mark.parametrize("failure_stage", ["construct", "conversation"])
+def test_streaming_restores_exact_outer_home_override_on_failure(
+    tmp_path, monkeypatch, failure_stage
+):
+    profile_home, observations, token_events = _exercise_streaming_home_override(
+        monkeypatch,
+        tmp_path,
+        failure_stage=failure_stage,
+    )
+
+    assert observations[0] == ("construct", profile_home, str(profile_home))
+    if failure_stage == "conversation":
+        assert observations[1] == ("run", profile_home, str(profile_home))
+    assert token_events[1][2] is token_events[2][1]
+    assert token_events[0][2] is token_events[3][1]
+
+
+@pytest.mark.skipif(not HAS_OVERRIDE, reason="test harness needs the current override API")
+def test_streaming_degrades_to_noop_when_agent_has_no_home_override(
+    tmp_path,
+    monkeypatch,
+):
+    profile_home, observations, token_events = _exercise_streaming_home_override(
+        monkeypatch,
+        tmp_path,
+        override_available=False,
+    )
+
+    assert observations[0][:2] == ("construct", profile_home)
+    assert token_events == []

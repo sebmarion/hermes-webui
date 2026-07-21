@@ -41,6 +41,9 @@ from api.config import (
     load_settings,
     parse_reasoning_effort,
     coerce_reasoning_effort_for_model,
+    _canonical_reasoning_selection,
+    _codex_ultra_available,
+    _codex_ultra_model_identity,
     _main_model_request_overrides,
 )
 from api.helpers import redact_session_data, _redact_text
@@ -6553,6 +6556,25 @@ def _close_evicted_agent_at_session_boundary(session_id: str, agent) -> bool:
         should_close_evicted_agent = False
         logger.debug("Lifecycle commit on eviction failed for %s", session_id, exc_info=True)
 
+    # A cached app-server agent owns a live Codex subprocess. Retire that
+    # transport even if memory-provider cleanup must remain deferred; the
+    # popped cache entry can no longer serve another turn.
+    codex_session = getattr(agent, '_codex_session', None)
+    if codex_session is not None:
+        try:
+            codex_session.close()
+        except Exception:
+            logger.debug(
+                "Failed to close evicted Codex app-server session for %s",
+                session_id,
+                exc_info=True,
+            )
+        finally:
+            try:
+                agent._codex_session = None
+            except Exception:
+                pass
+
     if not should_close_evicted_agent:
         return False
 
@@ -6730,6 +6752,92 @@ def _refresh_cached_agent_primary_runtime_snapshot(agent) -> None:
             rt['is_anthropic_oauth'] = getattr(agent, '_is_anthropic_oauth')
 
 
+def _reasoning_runtime_for_turn(
+    config_data: dict,
+    *,
+    model_id: str | None,
+    provider_id: str | None,
+    base_url: str | None = None,
+    resolved_api_mode: str | None = None,
+) -> dict:
+    """Resolve canonical provider effort versus Codex's Ultra control mode.
+
+    Provider-facing efforts still end at ``max``.  Only an exact, advertised
+    Sol/OpenAI-Codex Ultra selection switches the AIAgent to app-server and
+    carries ``ultra`` inside Codex's own turn-control protocol.
+    """
+    cfg = config_data if isinstance(config_data, dict) else {}
+    agent_cfg = cfg.get('agent') if isinstance(cfg, dict) else None
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+    raw_effort = str(agent_cfg.get('reasoning_effort') or '').strip().lower()
+    raw_mode = str(agent_cfg.get('reasoning_mode') or '').strip().lower()
+    ultra_requested = raw_effort == 'ultra' or raw_mode == 'ultra'
+    canonical_ultra_model = _codex_ultra_model_identity(model_id, provider_id)
+    ultra_identity = canonical_ultra_model is not None
+    ultra_available = _codex_ultra_available(
+        model_id,
+        provider_id,
+        config_data=cfg,
+    )
+    canonical_effort, reasoning_mode = _canonical_reasoning_selection(
+        raw_effort,
+        raw_mode,
+        model_id=model_id,
+        provider_id=provider_id,
+        ultra_available=ultra_available,
+    )
+
+    if ultra_requested and ultra_identity and not ultra_available:
+        raise RuntimeError(
+            "Codex Ultra is selected but unavailable. Confirm the installed Codex "
+            "catalog advertises Ultra and use the native WebUI backend, or select Max."
+        )
+
+    if reasoning_mode == 'ultra':
+        return {
+            'api_mode': 'codex_app_server',
+            'model': canonical_ultra_model,
+            'reasoning_config': {'enabled': True, 'effort': 'ultra'},
+            'reasoning_mode': 'ultra',
+            'ultra_available': True,
+        }
+
+    effective_effort = coerce_reasoning_effort_for_model(
+        canonical_effort,
+        model_id,
+        provider_id=provider_id,
+        base_url=base_url,
+    )
+    return {
+        'api_mode': resolved_api_mode,
+        'model': model_id,
+        'reasoning_config': parse_reasoning_effort(effective_effort),
+        'reasoning_mode': '',
+        'ultra_available': bool(ultra_available),
+    }
+
+
+def _require_codex_ultra_agent_contract(
+    agent_params: set[str],
+    reasoning_mode: str | None,
+) -> None:
+    """Reject Ultra before construction when Hermes Agent is too old.
+
+    Silently omitting either constructor parameter can leak ``ultra`` into a
+    raw Responses request or execute a normal Max turn while the UI says Ultra.
+    """
+    if str(reasoning_mode or '').strip().lower() != 'ultra':
+        return
+    missing = {'api_mode', 'reasoning_config'} - set(agent_params or ())
+    if missing:
+        missing_text = ', '.join(sorted(missing))
+        raise RuntimeError(
+            "Codex Ultra requires a newer Hermes Agent app-server contract "
+            f"(missing: {missing_text}). Update Hermes Agent or select Max."
+        )
+
+
 def _run_agent_streaming(
     session_id,
     msg_text,
@@ -6742,6 +6850,7 @@ def _run_agent_streaming(
     model_provider=None,
     goal_related=False,
     moa_config=None,
+    bestplan_config=None,
     profile=None,
 ):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
@@ -6786,6 +6895,7 @@ def _run_agent_streaming(
     s = None
     _tool_limit_reached = False
     _rt = {}
+    _reasoning_mode = ''
     old_cwd = None
     old_exec_ask = None
     old_session_key = None
@@ -7200,6 +7310,8 @@ def _run_agent_streaming(
     # to the `try:` (preserves the Issue #765 static-locator invariant).
     _turn_session_identity_tokens = None
     _streaming_cron_profile_home_token = None
+    _agent_home_override_module = None
+    _agent_home_override_token = None
     _turn_pending_source = 'webui'
     # Initialised here (before any code that may raise) so the outer `finally`
     # block can safely check `if _checkpoint_stop is not None` even when an
@@ -7281,6 +7393,33 @@ def _run_agent_streaming(
             _profile_runtime_env = {}
             _safe_profile_runtime_env = {}
             patch_skill_home_modules = None
+
+        # Bind the resolved profile home to the Agent's task-local resolver for
+        # the whole construction + conversation lifetime. The process-global
+        # HERMES_HOME mirror below remains for legacy consumers, but concurrent
+        # profile workers can overwrite it while this turn is running. Newer
+        # Agent builds therefore receive an exact ContextVar token that the
+        # outer finally restores on every success and failure path. Older Agent
+        # builds expose no override API and keep the previous behavior.
+        if _profile_home:
+            try:
+                from api.profiles import _resolve_hermes_home_override
+
+                _agent_home_override_module = _resolve_hermes_home_override()
+                if _agent_home_override_module is not None:
+                    _agent_home_override_token = (
+                        _agent_home_override_module.set_hermes_home_override(
+                            _profile_home
+                        )
+                    )
+            except Exception:
+                _agent_home_override_module = None
+                _agent_home_override_token = None
+                logger.debug(
+                    "Failed to bind task-local Agent home for profile %s",
+                    getattr(s, 'profile', None),
+                    exc_info=True,
+                )
 
         # Profile-aware provider/model enrichment: when the session belongs
         # to a profile that specifies model.provider and model.default, use
@@ -8035,6 +8174,7 @@ def _run_agent_streaming(
             # Resolve API key via Hermes runtime provider (matches gateway behaviour).
             # Pass the resolved provider so non-default providers get their own credentials.
             resolved_api_key = None
+            _rt = {}
             try:
                 from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
                 from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -8204,25 +8344,32 @@ def _run_agent_streaming(
             except Exception:
                 _max_tokens_cfg = None
 
-            # CLI-parity reasoning effort: read agent.reasoning_effort from the
-            # active profile's config.yaml (the same key the CLI writes via
-            # `/reasoning <level>`) and hand the parsed dict to AIAgent.  When
-            # the key is absent or invalid, pass None → agent uses its default.
-            try:
-                _effort_cfg = _cfg.get('agent', {}) if isinstance(_cfg, dict) else {}
-                _effort_raw = _effort_cfg.get('reasoning_effort') if isinstance(_effort_cfg, dict) else None
-                _effort = coerce_reasoning_effort_for_model(
-                    _effort_raw,
-                    resolved_model,
-                    provider_id=resolved_provider,
-                    base_url=resolved_base_url,
-                )
-                _reasoning_config = parse_reasoning_effort(_effort)
-            except Exception:
-                _reasoning_config = None
+            # CLI-parity provider effort plus the distinct Codex Ultra control
+            # mode. Ordinary efforts stay on the runtime provider selected
+            # above. Eligible Sol Ultra turns move to Codex app-server, where
+            # ``ultra`` is a Codex turn control rather than a raw Responses
+            # ``reasoning.effort`` value.
+            _reasoning_runtime = _reasoning_runtime_for_turn(
+                _cfg,
+                model_id=resolved_model,
+                provider_id=resolved_provider,
+                base_url=resolved_base_url,
+                resolved_api_mode=_rt.get('api_mode'),
+            )
+            _reasoning_config = _reasoning_runtime['reasoning_config']
+            _reasoning_mode = _reasoning_runtime['reasoning_mode']
+            _effective_api_mode = _reasoning_runtime['api_mode']
+            _effective_runtime_model = _reasoning_runtime['model']
+            _require_codex_ultra_agent_contract(_agent_params, _reasoning_mode)
+            # An Ultra turn must fail in place if app-server fails. Falling
+            # through AIAgent's provider fallback would silently turn it into a
+            # different execution mode after side effects may already exist.
+            _effective_fallback_resolved = (
+                None if _reasoning_mode == 'ultra' else _fallback_resolved
+            )
 
             _agent_kwargs = dict(
-                model=resolved_model,
+                model=_effective_runtime_model,
                 provider=resolved_provider,
                 base_url=resolved_base_url,
                 api_key=resolved_api_key,
@@ -8231,7 +8378,7 @@ def _run_agent_streaming(
                 platform='webui',
                 quiet_mode=True,
                 enabled_toolsets=_toolsets,
-                fallback_model=_fallback_resolved,
+                fallback_model=_effective_fallback_resolved,
                 session_id=session_id,
                 session_db=_session_db,
                 prefill_messages=_prefill_messages,
@@ -8266,7 +8413,7 @@ def _run_agent_streaming(
                 _agent_kwargs['request_overrides'] = _main_request_overrides
             # Params added in newer hermes-agent — skip if not supported
             if 'api_mode' in _agent_params:
-                _agent_kwargs['api_mode'] = _rt.get('api_mode')
+                _agent_kwargs['api_mode'] = _effective_api_mode
             if 'acp_command' in _agent_params:
                 _agent_kwargs['acp_command'] = _rt.get('command')
             if 'acp_args' in _agent_params:
@@ -8292,17 +8439,17 @@ def _run_agent_streaming(
                 from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
                 _credential_pool = _rt.get('credential_pool')
                 _sig_blob = _json.dumps([
-                    resolved_model or '',
+                    _effective_runtime_model or '',
                     _agent_cache_api_key_sig(resolved_api_key, _credential_pool),
                     resolved_base_url or '',
                     resolved_provider or '',
-                    _rt.get('api_mode') or '',
+                    _effective_api_mode or '',
                     _rt.get('command') or '',
                     _rt.get('args') or [],
                     bool(_credential_pool),
                     _max_iterations_cfg or '',
                     _max_tokens_cfg or '',
-                    _fallback_resolved or {},
+                    _effective_fallback_resolved or {},
                     sorted(_toolsets) if _toolsets else [],
                     _reasoning_config or {},
                     _main_request_overrides or {},
@@ -8319,8 +8466,16 @@ def _run_agent_streaming(
 
                 agent = None
                 _identity_mismatch_entry = None
+                _signature_mismatch_entry = None
                 with SESSION_AGENT_CACHE_LOCK:
                     _cached = SESSION_AGENT_CACHE.get(session_id)
+                    if _cached and _cached[1] != _agent_sig:
+                        _signature_mismatch_entry = SESSION_AGENT_CACHE.pop(session_id, None)
+                        _cached = None
+                        logger.debug(
+                            '[webui] Retiring cached agent after runtime signature change: %s',
+                            session_id,
+                        )
                     if _cached and _cached[1] == _agent_sig:
                         _cached_agent = _cached[0]
                         if _cached_agent_matches_session(_cached_agent, session_id):
@@ -8348,6 +8503,12 @@ def _run_agent_streaming(
                         _close_cached_agent_entry_at_session_boundary(session_id, _identity_mismatch_entry)
                     except Exception:
                         logger.debug("Failed to close identity-mismatched cached agent for session %s", session_id, exc_info=True)
+
+                if _signature_mismatch_entry is not None:
+                    try:
+                        _close_cached_agent_entry_at_session_boundary(session_id, _signature_mismatch_entry)
+                    except Exception:
+                        logger.debug("Failed to close signature-mismatched cached agent for session %s", session_id, exc_info=True)
 
                 if agent is not None:
                     # Refresh volatile runtime credentials selected from provider
@@ -8627,7 +8788,7 @@ def _run_agent_streaming(
                 conversation_history=_sanitize_messages_for_api(
                     _previous_context_messages,
                     cfg=_cfg,
-                    effective_model=resolved_model,
+                    effective_model=_effective_runtime_model,
                     effective_provider=resolved_provider,
                     effective_base_url=resolved_base_url,
                 ),
@@ -8639,6 +8800,8 @@ def _run_agent_streaming(
             # run_conversation() predates the moa_config kwarg.
             if moa_config is not None:
                 _run_conversation_kwargs["moa_config"] = moa_config
+            if bestplan_config is not None:
+                _run_conversation_kwargs["bestplan_config"] = bestplan_config
             result = agent.run_conversation(**_run_conversation_kwargs)
             # #4729: the run is done — flush any reasoning tail still in the coalescing
             # buffer (the agent never calls reasoning_callback(None), and a turn can end on
@@ -9058,14 +9221,14 @@ def _run_agent_streaming(
                         _err_label = _classification['label']
                         _err_type = _classification['type']
                         _err_hint = _classification['hint']
-                    elif _is_auth and not _self_healed:
+                    elif _is_auth and not _self_healed and _reasoning_mode != 'ultra':
                         # ── Credential self-heal on 401 (#1401) ──
                         # Before emitting the error, try re-reading credentials
                         # and retrying once with a fresh agent.
                         _heal_result = None
                         _heal_rt = _attempt_credential_self_heal(
                             resolved_provider or '', session_id, _agent_lock,
-                            target_model=resolved_model,
+                            target_model=_effective_runtime_model,
                         )
                         if _heal_rt is not None:
                             logger.info('[webui] self-heal: retrying stream after credential refresh')
@@ -9083,7 +9246,7 @@ def _run_agent_streaming(
                             # Rebuild agent kwargs and create a fresh agent
                             _agent_kwargs['api_key'] = resolved_api_key
                             _agent_kwargs['base_url'] = resolved_base_url
-                            _agent_kwargs['model'] = resolved_model
+                            _agent_kwargs['model'] = _effective_runtime_model
                             _agent_kwargs['provider'] = resolved_provider
                             _replace_session_db_in_kwargs(_agent_kwargs, _state_db_path)
                             if 'credential_pool' in _agent_params:
@@ -10294,11 +10457,11 @@ def _run_agent_streaming(
                 _classification['label'], _classification['type'], _classification['hint'],
             )
         elif _exc_is_auth:
-            if not _self_healed:
+            if not _self_healed and _reasoning_mode != 'ultra':
                 # ── Credential self-heal on 401 (#1401) ──
                 _heal_rt = _attempt_credential_self_heal(
                     resolved_provider or '', session_id, _agent_lock,
-                    target_model=resolved_model,
+                    target_model=_effective_runtime_model,
                 )
                 if _heal_rt is not None:
                     logger.info('[webui] self-heal (except path): retrying stream after credential refresh')
@@ -10318,7 +10481,7 @@ def _run_agent_streaming(
                     _heal_kwargs = dict(_agent_kwargs) if '_agent_kwargs' in dir() else {}
                     _heal_kwargs['api_key'] = resolved_api_key
                     _heal_kwargs['base_url'] = resolved_base_url
-                    _heal_kwargs['model'] = resolved_model
+                    _heal_kwargs['model'] = _effective_runtime_model
                     _heal_kwargs['provider'] = resolved_provider
                     _replace_session_db_in_kwargs(_heal_kwargs, _state_db_path)
                     if 'credential_pool' in _agent_params:
@@ -10339,7 +10502,7 @@ def _run_agent_streaming(
                             conversation_history=_sanitize_messages_for_api(
                                 _previous_context_messages,
                                 cfg=_cfg,
-                                effective_model=resolved_model,
+                                effective_model=_effective_runtime_model,
                                 effective_provider=resolved_provider,
                                 effective_base_url=resolved_base_url,
                             ),
@@ -10547,12 +10710,40 @@ def _run_agent_streaming(
             _checkpoint_stop.set()
         if _ckpt_thread is not None:
             _ckpt_thread.join(timeout=15)
+        # /btw agents are intentionally uncached. Their provider resources
+        # therefore have no later cache-eviction boundary; close them here on
+        # every success, cancellation, and exception path so Codex app-server
+        # subprocesses cannot become orphans.
+        if ephemeral and agent is not None:
+            try:
+                agent.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close ephemeral agent for stream %s",
+                    stream_id,
+                    exc_info=True,
+                )
+            finally:
+                agent = None
         if (s is not None
                 and getattr(s, 'active_stream_id', None) == stream_id
                 and getattr(s, 'pending_user_message', None)):
             update_active_run(stream_id, phase="finalizing")
             _last_resort_sync_from_core(s, stream_id, _agent_lock)
         _clear_thread_env()  # TD1: always clear thread-local context
+        if (
+            _agent_home_override_module is not None
+            and _agent_home_override_token is not None
+        ):
+            try:
+                _agent_home_override_module.reset_hermes_home_override(
+                    _agent_home_override_token
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to restore task-local Agent home override",
+                    exc_info=True,
+                )
         if _streaming_cron_profile_home_token is not None:
             _STREAMING_CRON_PROFILE_HOME.reset(_streaming_cron_profile_home_token)
         # xsession wakeup misroute root fix (Option 1): restore the per-turn

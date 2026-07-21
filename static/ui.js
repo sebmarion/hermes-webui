@@ -3000,10 +3000,7 @@ function _findModelInDropdown(modelId, sel, preferredProviderId){
 // Returns the resolved value that was actually set, or null if nothing matched.
 function _refreshOpenModelDropdown(){
   const dd=$('composerModelDropdown');
-  if(dd&&dd.classList&&dd.classList.contains('open')&&typeof renderModelDropdown==='function'){
-    renderModelDropdown();
-    if(typeof _positionModelDropdown==='function') _positionModelDropdown();
-  }
+  if(dd&&dd.classList&&dd.classList.contains('open')) _invalidateComposerModelDropdown();
   const sdd=$('settingsModelDropdown');
   if(sdd&&sdd.classList&&sdd.classList.contains('open')&&typeof renderModelDropdown==='function'){
     // Re-rendering the OPEN settings picker (e.g. when a late live-model fetch
@@ -3039,7 +3036,10 @@ function _applyModelToDropdown(modelId, sel, preferredProviderId, opts){
         || String(currentState.model_provider||'')!==String(resolvedState.model_provider||'');
       if(sel.id==='modelSelect'&&typeof syncModelChip==='function') syncModelChip();
       if(sel.id==='settingsModel'&&typeof syncSettingsModelChip==='function') syncSettingsModelChip();
-      if(pickerChanged) _refreshOpenModelDropdown();
+      if(pickerChanged){
+        if(sel.id==='modelSelect') _invalidateComposerModelDropdown();
+        else _refreshOpenModelDropdown();
+      }
     }
     return resolved;
   }
@@ -3061,8 +3061,8 @@ function _ensureModelOptionInDropdown(modelId, sel, preferredProviderId){
   sel.appendChild(opt);
   sel.value=modelId;
   if(sel.id==='modelSelect'){
+    _invalidateComposerModelDropdown();
     if(typeof syncModelChip==='function') syncModelChip();
-    _refreshOpenModelDropdown();
   }
   if(sel.id==='settingsModel'){
     if(typeof syncSettingsModelChip==='function') syncSettingsModelChip();
@@ -3087,6 +3087,52 @@ function _persistSessionModelCorrection(model, provider, opts){
 }
 let _modelDropdownRequestSeq=0;
 let _modelCatalogFallbackRetried=false;
+let _modelCatalogBrowserCacheRestored=false;
+
+function _modelCatalogStorageKey(){
+  const profile=(typeof S!=='undefined'&&S&&S.activeProfile)||'default';
+  return `hermes-webui-model-catalog:${encodeURIComponent(String(profile))}`;
+}
+
+function _restoreCachedModelCatalog(sel){
+  if(_modelCatalogBrowserCacheRestored||!sel) return false;
+  _modelCatalogBrowserCacheRestored=true;
+  try{
+    const raw=localStorage.getItem(_modelCatalogStorageKey());
+    if(!raw) return false;
+    const cached=JSON.parse(raw);
+    if(!cached||cached.version!==1||typeof cached.html!=='string'||!cached.html) return false;
+    const previousSelection=sel.value;
+    sel.innerHTML=cached.html;
+    _dynamicModelLabels=(cached.labels&&typeof cached.labels==='object')?cached.labels:{};
+    window._activeProvider=cached.activeProvider||null;
+    window._defaultModel=cached.defaultModel||null;
+    window._configuredModelBadges=(cached.badges&&typeof cached.badges==='object')?cached.badges:{};
+    if(previousSelection) _applyModelToDropdown(previousSelection,sel,null);
+    _invalidateComposerModelDropdown();
+    if(typeof syncModelChip==='function') syncModelChip();
+    return true;
+  }catch(_e){
+    console.warn('Failed to restore cached model catalog:',_e&&_e.message||_e);
+    return false;
+  }
+}
+
+function _persistModelCatalogCache(sel){
+  if(!sel||!sel.innerHTML) return;
+  try{
+    localStorage.setItem(_modelCatalogStorageKey(),JSON.stringify({
+      version:1,
+      html:sel.innerHTML,
+      labels:_dynamicModelLabels,
+      activeProvider:window._activeProvider||null,
+      defaultModel:window._defaultModel||null,
+      badges:window._configuredModelBadges||{},
+    }));
+  }catch(_e){
+    console.warn('Failed to persist model catalog cache:',_e&&_e.message||_e);
+  }
+}
 
 function _applySessionModelFallback(sel){
   if(!sel) return null;
@@ -3099,8 +3145,8 @@ function _applySessionModelFallback(sel){
   if(first){
     sel.value=first.value;
     if(sel.id==='modelSelect'){
+      _invalidateComposerModelDropdown();
       if(typeof syncModelChip==='function') syncModelChip();
-      _refreshOpenModelDropdown();
     }
     return _modelStateFromAppliedDropdown(sel,first.value);
   }
@@ -3110,6 +3156,10 @@ function _applySessionModelFallback(sel){
 async function populateModelDropdown(opts={}){
   const sel=$('modelSelect');
   if(!sel) return;
+  // Restore the last complete profile catalog synchronously so opening the
+  // picker never waits on slow live-provider discovery. The request below is
+  // still authoritative and refreshes this snapshot in the background.
+  _restoreCachedModelCatalog(sel);
   // `_activeProvider` is refreshed from the /api/models response below.
   if(typeof _modelDropdownRequestSeq!=='number') _modelDropdownRequestSeq=0;
   if(typeof _modelCatalogFallbackRetried!=='boolean') _modelCatalogFallbackRetried=false;
@@ -3222,12 +3272,9 @@ async function populateModelDropdown(opts={}){
       sel.appendChild(og);
     }
     _reconcileModelDropdownSelection(sel,data,previousSelection,opts);
+    _persistModelCatalogCache(sel);
+    _invalidateComposerModelDropdown();
     if(typeof syncModelChip==='function') syncModelChip();
-    const dd=$('composerModelDropdown');
-    if(dd&&dd.classList.contains('open')&&typeof renderModelDropdown==='function'){
-      renderModelDropdown();
-      _positionModelDropdown();
-    }
     // Kick off a background live-model fetch for the active provider.
     // This runs after the static list is already shown (no blocking flicker).
     if(data.active_provider && !willRetry) _fetchLiveModels(data.active_provider, sel, requestSeq);
@@ -3328,6 +3375,7 @@ function _addLiveModelsToSelect(provider, models, sel){
     const reapplied=_applyModelToDropdown(S.session.model, sel, sessionProvider, {forceRefresh:added>0&&!sessionAlreadyRefreshed});
     if(reapplied && typeof syncModelChip==='function') syncModelChip();
   }
+  if(sel.id==='modelSelect'&&added>0) _invalidateComposerModelDropdown();
   return added;
 }
 
@@ -4292,6 +4340,33 @@ async function selectModelFromDropdown(value){
   if(typeof sel.onchange==='function') await sel.onchange();
 }
 
+function _renderComposerModelDropdownIfDirty(){
+  const dd=$('composerModelDropdown');
+  if(!dd) return false;
+  if(dd.dataset&&dd.dataset.renderCacheClean==='1') return false;
+  renderModelDropdown();
+  if(dd.dataset) dd.dataset.renderCacheClean='1';
+  return true;
+}
+
+function _invalidateComposerModelDropdown(){
+  const dd=$('composerModelDropdown');
+  if(!dd||!dd.dataset) return;
+  dd.dataset.renderCacheClean='0';
+  if(!dd.classList||!dd.classList.contains('open')) return;
+  if(dd.dataset.renderRefreshPending==='1') return;
+  dd.dataset.renderRefreshPending='1';
+  const flush=()=>{
+    dd.dataset.renderRefreshPending='0';
+    if(!dd.classList||!dd.classList.contains('open')) return;
+    if(_renderComposerModelDropdownIfDirty()&&typeof _positionModelDropdown==='function'){
+      _positionModelDropdown();
+    }
+  };
+  if(typeof queueMicrotask==='function') queueMicrotask(flush);
+  else Promise.resolve().then(flush);
+}
+
 async function toggleModelDropdown(){
   const dd=$('composerModelDropdown');
   const chip=$('composerModelChip');
@@ -4308,7 +4383,7 @@ async function toggleModelDropdown(){
     if(ready&&typeof ready.catch==='function') ready.catch(()=>{});
   }
   if(dd.classList.contains('open')) return;
-  renderModelDropdown();
+  _renderComposerModelDropdownIfDirty();
   dd.classList.add('open');
   _positionModelDropdown();
   const activeRow=dd.querySelector('.model-opt.active');
@@ -4526,6 +4601,8 @@ if(document.readyState==='loading'){
 
 // ── Reasoning effort chip ────────────────────────────────────────────────────
 let _currentReasoningEffort=null;
+let _currentReasoningMode='';
+let _currentReasoningUltraAvailable=false;
 let _currentReasoningEffortsSupported=null;
 let _profileTransitionReasoningContext=null;
 
@@ -4542,6 +4619,7 @@ function _formatReasoningEffortLabel(effort){
   if(effort==='high') return 'High';
   if(effort==='xhigh') return 'XHigh';
   if(effort==='max') return 'Max';
+  if(effort==='ultra') return 'Ultra';
   return effort.charAt(0).toUpperCase()+effort.slice(1);
 }
 
@@ -4572,12 +4650,17 @@ function _reasoningEffortQuery(){
   return qs?('?'+qs):'';
 }
 
-function _applyReasoningOptions(supportedEfforts){
+function _applyReasoningOptions(supportedEfforts, ultraAvailable){
   const dd=$('composerReasoningDropdown');
   if(!dd) return;
   const supported=new Set(Array.isArray(supportedEfforts)?supportedEfforts:[]);
   dd.querySelectorAll('.reasoning-option').forEach(function(opt){
     const effort=opt.dataset.effort;
+    const mode=_normalizeReasoningEffort(opt.dataset.reasoningMode);
+    if(mode==='ultra'){
+      opt.style.display=ultraAvailable?'':'none';
+      return;
+    }
     if(effort==='none'){
       opt.style.display='';
       return;
@@ -4597,6 +4680,12 @@ function _applyReasoningChip(eff){
   if(meta&&Array.isArray(meta.supported_efforts)){
     _currentReasoningEffortsSupported=meta.supported_efforts;
   }
+  if(meta&&Object.prototype.hasOwnProperty.call(meta,'reasoning_mode')){
+    _currentReasoningMode=_normalizeReasoningEffort(meta.reasoning_mode);
+  }
+  if(meta&&Object.prototype.hasOwnProperty.call(meta,'ultra_available')){
+    _currentReasoningUltraAvailable=meta.ultra_available===true;
+  }
   const wrap=$('composerReasoningWrap');
   const label=$('composerReasoningLabel');
   const chip=$('composerReasoningChip');
@@ -4607,7 +4696,7 @@ function _applyReasoningChip(eff){
     ?null
     :_currentReasoningEffortsSupported;
   const supports=Array.isArray(supportedEfforts)
-    ?supportedEfforts.length>0
+    ?(supportedEfforts.length>0||_currentReasoningUltraAvailable)
     :true;
   if(!supports){
     wrap.style.display='none';
@@ -4616,8 +4705,10 @@ function _applyReasoningChip(eff){
   }
   wrap.style.display='';
   if(mobileAction) mobileAction.style.display='';
-  if(typeof _applyReasoningOptions==='function') _applyReasoningOptions(supportedEfforts);
-  const text=_formatReasoningEffortLabel(effort);
+  if(typeof _applyReasoningOptions==='function'){
+    _applyReasoningOptions(supportedEfforts,_currentReasoningUltraAvailable);
+  }
+  const text=_formatReasoningEffortLabel(_currentReasoningMode||effort);
   label.textContent=text;
   if(mobileLabel) mobileLabel.textContent=text;
   if(chip){
@@ -4628,7 +4719,7 @@ function _applyReasoningChip(eff){
     chip.setAttribute('aria-label',labelText);
   }
   if(mobileAction) mobileAction.classList.toggle('inactive',!effort||effort==='none');
-  _highlightReasoningOption(effort);
+  _highlightReasoningOption(effort,_currentReasoningMode);
 }
 
 // Tracks the model/provider identity of the last reasoning fetch so routine
@@ -4661,17 +4752,19 @@ function fetchReasoningChip(keyOverride){
     // routine syncs retry after a genuine transient failure.
     if(seq!==_reasoningFetchSeq) return;
     _lastReasoningFetchKey=null;
-    _applyReasoningChip('', {supported_efforts:[]});
+    _applyReasoningChip('', {supported_efforts:[],reasoning_mode:'',ultra_available:false});
   });
 }
 
 function refreshProfileTransitionReasoningChip(model, provider){
   _profileTransitionReasoningContext={profile:(S&&S.activeProfile)||'default',model,provider};
   _currentReasoningEffort=null;
+  _currentReasoningMode='';
+  _currentReasoningUltraAvailable=false;
   _currentReasoningEffortsSupported=null;
   _lastReasoningFetchKey=null;
   ++_reasoningFetchSeq;
-  _applyReasoningChip('', {supported_efforts:[]});
+  _applyReasoningChip('', {supported_efforts:[],reasoning_mode:'',ultra_available:false});
   const params=new URLSearchParams();
   if(model) params.set('model',model);
   if(provider) params.set('provider',provider);
@@ -4706,11 +4799,16 @@ function syncReasoningChip(){
   fetchReasoningChip();
 }
 
-function _highlightReasoningOption(effort){
+function _highlightReasoningOption(effort, reasoningMode){
   const dd=$('composerReasoningDropdown');
   if(!dd) return;
+  const mode=_normalizeReasoningEffort(reasoningMode);
   dd.querySelectorAll('.reasoning-option').forEach(function(opt){
-    opt.classList.toggle('selected',opt.dataset.effort===effort);
+    const optMode=_normalizeReasoningEffort(opt.dataset.reasoningMode);
+    const selected=mode
+      ?(opt.dataset.effort===effort&&optMode===mode)
+      :(opt.dataset.effort===effort&&!optMode);
+    opt.classList.toggle('selected',selected);
   });
 }
 
@@ -4724,7 +4822,7 @@ function toggleReasoningDropdown(){
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   closeModelDropdown();
   if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
-  _highlightReasoningOption(_currentReasoningEffort);
+  _highlightReasoningOption(_currentReasoningEffort,_currentReasoningMode);
   dd.classList.add('open');
   _positionReasoningDropdown();
   chip.classList.add('active');
@@ -4766,14 +4864,20 @@ document.addEventListener('click',function(e){
   if(e.target.closest('.reasoning-option')){
     const opt=e.target.closest('.reasoning-option');
     const effort=opt&&opt.dataset.effort;
+    const reasoningMode=opt&&opt.dataset.reasoningMode;
     if(effort){
       const payload=Object.assign({effort:effort},_reasoningEffortContext());
+      if(reasoningMode) payload.mode=reasoningMode;
       api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
         .then(function(st){
           _applyReasoningChip((st&&st.reasoning_effort)||effort, st||{});
-          showToast('🧠 Reasoning effort set to '+((st&&st.reasoning_effort)||effort));
+          const selected=(st&&st.reasoning_mode)||(st&&st.reasoning_effort)||effort;
+          showToast('🧠 Reasoning effort set to '+_formatReasoningEffortLabel(selected));
         })
-        .catch(function(){showToast('🧠 Failed to set effort');});
+        .catch(function(err){
+          const detail=err&&err.message?': '+err.message:'';
+          showToast('🧠 Failed to set effort'+detail,5000,'error');
+        });
       closeReasoningDropdown();
     }
   }
