@@ -7078,7 +7078,7 @@ function _collapseSessionLineageForSidebar(sessions){
 }
 
 function _sessionDisplayTitle(s){
-  const rawTitle=String((s&&(s.display_title||s._state_db_title||s.title))||'Untitled').trim();
+  const rawTitle=String((s&&(s.display_title||s._state_db_title||s.title||s.preview))||'Untitled').trim();
   const strip=(typeof _stripAttachedFilesMarker==='function')
     ? _stripAttachedFilesMarker
     : (text)=>String(text||'').replace(/\n\n\[Attached files: [^\]]+\]$/,'').trim();

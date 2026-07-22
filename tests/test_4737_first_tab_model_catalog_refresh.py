@@ -147,6 +147,9 @@ function buildHarness(currentScenario) {
   globalThis._configuredModelBadges = {};
   globalThis._modelDropdownRequestSeq = 0;
   globalThis._modelCatalogFallbackRetried = false;
+  globalThis._restoreCachedModelCatalog = () => false;
+  globalThis._persistModelCatalogCache = () => {};
+  globalThis._invalidateComposerModelDropdown = () => {};
   globalThis.$ = (id) => {
     if (id === 'modelSelect') return select;
     if (id === 'composerModelDropdown') return dropdown;

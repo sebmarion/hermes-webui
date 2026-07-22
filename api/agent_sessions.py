@@ -285,7 +285,7 @@ def _normalize_source_name(value: object) -> str:
 def _looks_like_default_cli_title(row: dict) -> bool:
     """Return True when a CLI row looks like framework-generated metadata."""
     title = _safe_lower(row.get("title"))
-    if not title or title == "untitled":
+    if not title or title in {"untitled", "untitled session"}:
         return True
     if title in {"cli", "cli session"}:
         return True
@@ -1715,7 +1715,122 @@ def read_importable_agent_session_rows(
         projected = [row for row in projected if is_cli_session_row_visible(row)]
         if limit is None:
             return projected
-        return projected[:max(0, int(limit))]
+        projected = projected[:max(0, int(limit))]
+        _enrich_untitled_with_preview(projected, cur, message_cols)
+        return projected
+
+
+_UNTITLED_PREVIEW_MESSAGE_INSPECTION_LIMIT = 256
+
+
+def _build_untitled_preview_query(
+    session_id: str,
+    message_cols: set[str],
+) -> tuple[str, list[object]]:
+    """Build a per-session preview query with a hard message inspection cap."""
+    if not session_id:
+        raise ValueError("session_id must not be empty")
+    required = {"session_id", "role", "content", "timestamp"}
+    if not required.issubset(message_cols):
+        raise ValueError("messages schema cannot support indexed previews")
+
+    active_projection = "COALESCE(m.active, 1)" if "active" in message_cols else "1"
+    sql = f"""
+        SELECT substr(candidate.content, 1, 160) AS preview
+        FROM (
+            SELECT m.role,
+                   m.content,
+                   {active_projection} AS active,
+                   m.timestamp,
+                   m.rowid AS message_rowid
+            FROM messages m INDEXED BY idx_messages_session
+            WHERE m.session_id = ?
+            ORDER BY m.timestamp ASC, m.rowid ASC
+            LIMIT {_UNTITLED_PREVIEW_MESSAGE_INSPECTION_LIMIT}
+        ) AS candidate
+        WHERE LOWER(candidate.role) = 'user'
+          AND candidate.active = 1
+          AND candidate.content IS NOT NULL
+          AND TRIM(candidate.content) != ''
+        ORDER BY candidate.timestamp ASC, candidate.message_rowid ASC
+        LIMIT 1
+    """
+    return sql, [session_id]
+
+
+def _preview_query_plan_is_bounded(cur, sql: str, params: list[object]) -> bool:
+    """Require keyed session lookup with no sort before the inspection cap."""
+    try:
+        details = [
+            " ".join(str(row[3]).upper().split())
+            for row in cur.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
+        ]
+    except (sqlite3.Error, IndexError, TypeError):
+        return False
+    keyed_search = any(
+        "SEARCH M USING INDEX IDX_MESSAGES_SESSION" in detail
+        and "SESSION_ID=?" in detail
+        for detail in details
+    )
+    has_prelimit_sort = any("USE TEMP B-TREE" in detail for detail in details)
+    return keyed_search and not has_prelimit_sort
+
+
+def _enrich_untitled_with_preview(
+    rows: list[dict],
+    cur,
+    message_cols: set[str],
+) -> None:
+    """Add indexed first-user-message previews to an already bounded page."""
+    if not rows:
+        return
+    untitled_ids = [
+        str(row.get("id") or row.get("session_id") or "")
+        for row in rows
+        if not str(row.get("title") or "").strip()
+        and (row.get("id") or row.get("session_id"))
+    ]
+    if not untitled_ids:
+        return
+
+    try:
+        indexes = cur.execute("PRAGMA index_list(messages)").fetchall()
+    except sqlite3.Error:
+        return
+    if not any(str(index[1]) == "idx_messages_session" for index in indexes):
+        return
+    try:
+        index_columns = [
+            str(column[2])
+            for column in cur.execute(
+                "PRAGMA index_info('idx_messages_session')"
+            ).fetchall()
+        ]
+    except sqlite3.Error:
+        return
+    if index_columns[:2] != ["session_id", "timestamp"]:
+        return
+
+    try:
+        sql, params = _build_untitled_preview_query(untitled_ids[0], message_cols)
+        if not _preview_query_plan_is_bounded(cur, sql, params):
+            return
+        previews = {}
+        for session_id in untitled_ids:
+            sql, params = _build_untitled_preview_query(session_id, message_cols)
+            row = cur.execute(sql, params).fetchone()
+            if row and row[0]:
+                previews[session_id] = str(row[0])
+    except (sqlite3.Error, ValueError):
+        return
+
+    for row in rows:
+        if str(row.get("title") or "").strip():
+            continue
+        session_id = str(row.get("id") or row.get("session_id") or "")
+        preview = previews.get(session_id)
+        if preview:
+            row["preview"] = preview
 
 
 

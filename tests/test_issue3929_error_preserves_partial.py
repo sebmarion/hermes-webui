@@ -129,10 +129,21 @@ def test_silent_failure_preserves_partials(tmp_path):
     fake_queue = queue.Queue()
     streaming.STREAMS["test_stream_silent"] = fake_queue
     config.STREAM_PARTIAL_TEXT["test_stream_silent"] = ""
+    completion_calls = []
+    real_unregister_active_run = streaming.unregister_active_run
+
+    def _unregister_without_entry(*args, **kwargs):
+        real_unregister_active_run(*args, **kwargs)
+        return None
+
+    def _capture_completion(*args, **kwargs):
+        completion_calls.append((args, kwargs))
 
     with mock.patch.object(streaming, "get_session", return_value=fake_session), \
          mock.patch.object(streaming, "_get_ai_agent", return_value=SilentFailureAgent), \
          mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
+         mock.patch.object(streaming, "unregister_active_run", side_effect=_unregister_without_entry), \
+         mock.patch("api.state_sync.finish_session_activity", side_effect=_capture_completion), \
          mock.patch("api.config.get_config", return_value={}), \
          mock.patch("api.config._resolve_cli_toolsets", return_value=[]):
         
@@ -142,6 +153,7 @@ def test_silent_failure_preserves_partials(tmp_path):
             model="test-model",
             workspace=str(tmp_path),
             stream_id="test_stream_silent",
+            profile="fallback-profile",
         )
 
     # Reload session from disk/cache and verify
@@ -161,6 +173,18 @@ def test_silent_failure_preserves_partials(tmp_path):
 
     err_msg = saved.messages[-1]
     assert err_msg.get("_error") is True
+    assert completion_calls == [
+        (
+            ("test_sess_silent", "test_stream_silent"),
+            {
+                "profile": "fallback-profile",
+                "lineage_session_ids": {"test_sess_silent"},
+                "emit_completion": False,
+                "completion_session_id": "test_sess_silent",
+                "source": "webui-native",
+            },
+        )
+    ]
 
 
 def test_exception_preserves_partials(tmp_path):

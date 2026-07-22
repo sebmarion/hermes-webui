@@ -133,7 +133,7 @@ def test_explicit_title_is_preserved(fake_hermes_home):
 
 def test_non_cron_sessions_unaffected(fake_hermes_home):
     """The cron-name lookup must not run for cli-source sessions, so the
-    generic 'Cli Session' fallback still applies when title is empty."""
+    generic 'Untitled session' fallback applies when title is empty."""
     _write_jobs_json(fake_hermes_home, [
         {"id": "cd65df6fc1a8", "name": "wiki-auto-ingest"},
     ])
@@ -155,4 +155,4 @@ def test_non_cron_sessions_unaffected(fake_hermes_home):
 
     sessions = models.get_cli_sessions()
 
-    assert sessions[0]["title"] == "Cli Session"
+    assert sessions[0]["title"] == "Untitled session"

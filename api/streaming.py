@@ -10824,7 +10824,7 @@ def _run_agent_streaming(
             _entry = _finished_run_entry or {
                 "session_id": session_id,
                 "stream_id": stream_id,
-                "profile": _profile,
+                "profile": profile,
             }
             _completion_session_id = str(getattr(s, "session_id", session_id) or session_id)
             _emit_completion = bool(
@@ -10836,7 +10836,7 @@ def _run_agent_streaming(
             finish_session_activity(
                 str(_entry.get("session_id") or session_id),
                 stream_id,
-                profile=_entry.get("profile") or _profile,
+                profile=_entry.get("profile") or profile,
                 lineage_session_ids={session_id, _completion_session_id},
                 emit_completion=_emit_completion,
                 completion_session_id=_completion_session_id,
