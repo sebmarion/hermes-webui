@@ -12582,7 +12582,7 @@ def _acquire_legacy_dispatcher_lock(plan: dict) -> dict:
         parent.is_symlink()
         or parent.resolve(strict=True) != parent
         or parent.stat().st_uid != os.getuid()
-        or stat.S_IMODE(parent.stat().st_mode) & 0o077
+        or stat.S_IMODE(parent.stat().st_mode) & 0o022
         or path.is_symlink()
     ):
         raise ReleaseBuildError("legacy dispatcher lock path is unsafe")

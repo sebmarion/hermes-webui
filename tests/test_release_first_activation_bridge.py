@@ -531,6 +531,94 @@ def test_legacy_cron_tick_restore_accepts_only_receipted_snapshot_rebind(
     assert path.read_bytes() == payload
 
 
+def _dispatcher_plan(
+    tmp_path: Path,
+    *,
+    parent_mode: int,
+) -> tuple[dict, Path, Path]:
+    home = tmp_path / "hermes-home"
+    home.mkdir(mode=0o700)
+    store = home / "process_notifications.json"
+    store.write_text('{"version":1,"events":{}}\n', encoding="utf-8")
+    store.chmod(0o600)
+    parent = home / "kanban"
+    parent.mkdir(mode=parent_mode)
+    parent.chmod(parent_mode)
+    lock = parent / ".dispatcher.lock"
+    lock.touch(mode=0o644)
+    return (
+        {
+            "transaction_id": "dispatcher-lock-transaction-000001",
+            "synthetic_process_notifications_path": str(store),
+            "timeout_seconds": 1,
+            "interval_seconds": 0.01,
+        },
+        parent,
+        lock,
+    )
+
+
+def test_legacy_dispatcher_lock_accepts_owned_nonwritable_0755_parent(
+    tmp_path,
+):
+    plan, parent, lock = _dispatcher_plan(tmp_path, parent_mode=0o755)
+
+    try:
+        held = cutover._acquire_legacy_dispatcher_lock(plan)
+        verified = cutover._verify_legacy_dispatcher_lock(plan, held)
+
+        assert held["status"] == "held"
+        assert verified == held
+        assert parent.stat().st_mode & 0o777 == 0o755
+        assert lock.stat().st_mode & 0o777 == 0o600
+    finally:
+        cutover._release_legacy_dispatcher_lock(plan)
+
+
+@pytest.mark.parametrize("parent_mode", [0o775, 0o757])
+def test_legacy_dispatcher_lock_rejects_group_or_world_writable_parent(
+    tmp_path,
+    parent_mode,
+):
+    plan, _parent, lock = _dispatcher_plan(
+        tmp_path,
+        parent_mode=parent_mode,
+    )
+
+    with pytest.raises(cutover.ReleaseBuildError, match="path is unsafe"):
+        cutover._acquire_legacy_dispatcher_lock(plan)
+
+    assert lock.stat().st_mode & 0o777 == 0o644
+
+
+def test_legacy_dispatcher_lock_rejects_foreign_owned_parent(
+    tmp_path,
+    monkeypatch,
+):
+    plan, _parent, lock = _dispatcher_plan(tmp_path, parent_mode=0o755)
+    real_uid = os.getuid()
+    monkeypatch.setattr(cutover.os, "getuid", lambda: real_uid + 1)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="path is unsafe"):
+        cutover._acquire_legacy_dispatcher_lock(plan)
+
+    assert lock.stat().st_mode & 0o777 == 0o644
+
+
+def test_legacy_dispatcher_lock_rejects_leaf_symlink(tmp_path):
+    plan, _parent, lock = _dispatcher_plan(tmp_path, parent_mode=0o755)
+    foreign = tmp_path / "foreign-dispatcher.lock"
+    foreign.write_bytes(b"foreign\n")
+    lock.unlink()
+    lock.symlink_to(foreign)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="path is unsafe"):
+        cutover._acquire_legacy_dispatcher_lock(plan)
+
+    assert lock.is_symlink()
+    assert foreign.read_bytes() == b"foreign\n"
+
+
 def _write_json(path: Path, payload: dict, *, mode: int) -> bytes:
     encoded = (
         json.dumps(
