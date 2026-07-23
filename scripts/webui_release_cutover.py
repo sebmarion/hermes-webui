@@ -10663,7 +10663,11 @@ def _legacy_cron_tick_receipts_match_locked_mtime_churn(
             _legacy_cron_tick_lock_path(plan),
             os.fstat(handle.fileno()),
         )
-        _verify_legacy_cron_tick_lock(plan, held_receipt)
+        _verify_legacy_cron_tick_lock(
+            plan,
+            held_receipt,
+            allowed_modes={0o600, 0o644},
+        )
     except (OSError, ReleaseBuildError):
         return False
     return _legacy_cron_tick_receipts_differ_only_empty_mtime(
@@ -10866,6 +10870,74 @@ def _normalize_legacy_cron_tick_lock(plan: dict, intent: dict) -> dict:
             _FIRST_ACTIVATION_BOUNDED_HOST_ASSUMPTION
         ),
     }
+
+
+def _normalize_and_acquire_legacy_cron_tick_lock(
+    plan: dict,
+    intent: dict,
+) -> tuple[dict, dict]:
+    original = intent.get("original") if isinstance(intent, dict) else None
+    if not isinstance(original, dict):
+        raise ReleaseBuildError(
+            "legacy cron tick lock normalization intent is invalid"
+        )
+    transaction_id = str(plan.get("transaction_id") or "")
+    normalization = None
+    try:
+        if original.get("status") == "present":
+            original_mode = original.get("mode")
+            if original_mode not in {0o600, 0o644}:
+                raise ReleaseBuildError(
+                    "legacy cron tick lock normalization intent is invalid"
+                )
+            _acquire_legacy_cron_tick_lock_modes(
+                plan,
+                allowed_modes={0o600, int(original_mode)},
+            )
+        normalization = _normalize_legacy_cron_tick_lock(plan, intent)
+        held = _acquire_legacy_cron_tick_lock(plan)
+        current = _read_legacy_cron_tick_file_receipt(
+            plan,
+            allowed_modes={0o600},
+            allow_absent=False,
+        )
+        if not _legacy_cron_tick_receipts_match_locked_mtime_churn(
+            plan,
+            current,
+            normalization["normalized"],
+        ):
+            raise DrainIdentityMismatch(
+                "legacy cron tick lock changed after normalization"
+            )
+        return normalization, held
+    except Exception:
+        try:
+            handle = _LEGACY_CRON_TICK_LOCKS.get(transaction_id)
+            mode_changed = (
+                handle is not None
+                and not getattr(handle, "closed", True)
+                and stat.S_IMODE(os.fstat(handle.fileno()).st_mode)
+                != original.get("mode")
+            )
+            if (
+                original.get("status") == "present"
+                and handle is not None
+                and not getattr(handle, "closed", True)
+                and (normalization is not None or mode_changed)
+            ):
+                _restore_legacy_cron_tick_lock(
+                    plan,
+                    intent,
+                    normalization,
+                )
+        finally:
+            handle = _LEGACY_CRON_TICK_LOCKS.get(transaction_id)
+            if handle is not None and not getattr(handle, "closed", True):
+                _release_legacy_cron_tick_lock(
+                    plan,
+                    allow_restored_mode=True,
+                )
+        raise
 
 
 def _restore_legacy_cron_tick_lock(
@@ -11107,7 +11179,13 @@ def _legacy_cron_tick_lock_receipt(path: Path, opened: os.stat_result) -> dict:
     }
 
 
-def _verify_legacy_cron_tick_lock(plan: dict, receipt: dict) -> dict:
+def _verify_legacy_cron_tick_lock(
+    plan: dict,
+    receipt: dict,
+    *,
+    allowed_modes: set[int] | None = None,
+) -> dict:
+    accepted_modes = {0o600} if allowed_modes is None else set(allowed_modes)
     transaction_id = str(plan.get("transaction_id") or "")
     handle = _LEGACY_CRON_TICK_LOCKS.get(transaction_id)
     if handle is None or getattr(handle, "closed", True):
@@ -11125,7 +11203,7 @@ def _verify_legacy_cron_tick_lock(plan: dict, receipt: dict) -> dict:
         not stat.S_ISREG(opened.st_mode)
         or opened.st_uid != os.getuid()
         or opened.st_nlink != 1
-        or stat.S_IMODE(opened.st_mode) != 0o600
+        or stat.S_IMODE(opened.st_mode) not in accepted_modes
         or any(
             getattr(current, field) != getattr(opened, field)
             for field in fields
@@ -11138,15 +11216,17 @@ def _verify_legacy_cron_tick_lock(plan: dict, receipt: dict) -> dict:
     return actual
 
 
-def _acquire_legacy_cron_tick_lock(plan: dict) -> dict:
-    """Exclude legacy cron admission on one bounded, single-operator host.
-
-    This is an OS lock and exact inode proof, not a claim that a malicious
-    concurrent process running under the same uid has been excluded.
-    """
+def _acquire_legacy_cron_tick_lock_modes(
+    plan: dict,
+    *,
+    allowed_modes: set[int],
+) -> dict:
     transaction_id = str(plan.get("transaction_id") or "")
     if not _TRANSACTION_ID.fullmatch(transaction_id):
         raise ReleaseBuildError("legacy cron tick lock transaction is invalid")
+    accepted_modes = set(allowed_modes)
+    if not accepted_modes or not accepted_modes.issubset({0o600, 0o644}):
+        raise ReleaseBuildError("legacy cron tick lock modes are invalid")
     existing = _LEGACY_CRON_TICK_LOCKS.get(transaction_id)
     if existing is not None and not getattr(existing, "closed", True):
         opened = os.fstat(existing.fileno())
@@ -11154,7 +11234,11 @@ def _acquire_legacy_cron_tick_lock(plan: dict) -> dict:
             _legacy_cron_tick_lock_path(plan),
             opened,
         )
-        return _verify_legacy_cron_tick_lock(plan, receipt)
+        return _verify_legacy_cron_tick_lock(
+            plan,
+            receipt,
+            allowed_modes=accepted_modes,
+        )
     parent = _prepare_legacy_cron_lock_parent(plan)
     path = parent / ".tick.lock"
     nofollow = getattr(os, "O_NOFOLLOW", None)
@@ -11183,7 +11267,7 @@ def _acquire_legacy_cron_tick_lock(plan: dict) -> dict:
             not stat.S_ISREG(opened.st_mode)
             or opened.st_uid != os.getuid()
             or opened.st_nlink != 1
-            or stat.S_IMODE(opened.st_mode) != 0o600
+            or stat.S_IMODE(opened.st_mode) not in accepted_modes
             or any(
                 getattr(current, field) != getattr(opened, field)
                 for field in fields
@@ -11212,10 +11296,26 @@ def _acquire_legacy_cron_tick_lock(plan: dict) -> dict:
             )
         _LEGACY_CRON_TICK_LOCKS[transaction_id] = handle
         receipt = _legacy_cron_tick_lock_receipt(path, locked)
-        return _verify_legacy_cron_tick_lock(plan, receipt)
+        return _verify_legacy_cron_tick_lock(
+            plan,
+            receipt,
+            allowed_modes=accepted_modes,
+        )
     except Exception:
         handle.close()
         raise
+
+
+def _acquire_legacy_cron_tick_lock(plan: dict) -> dict:
+    """Exclude legacy cron admission on one bounded, single-operator host.
+
+    This is an OS lock and exact inode proof, not a claim that a malicious
+    concurrent process running under the same uid has been excluded.
+    """
+    return _acquire_legacy_cron_tick_lock_modes(
+        plan,
+        allowed_modes={0o600},
+    )
 
 
 def _release_legacy_cron_tick_lock(
@@ -15383,31 +15483,40 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                             cron_tick_lock = _acquire_legacy_cron_tick_lock(
                                 plan
                             )
-                        observed_tick_normalization = (
-                            _normalize_legacy_cron_tick_lock(
+                        if "legacy_cron_tick_lock_normalized" not in phases:
+                            (
+                                observed_tick_normalization,
+                                cron_tick_lock,
+                            ) = _normalize_and_acquire_legacy_cron_tick_lock(
                                 plan,
                                 phases[
                                     "legacy_cron_tick_lock_normalize_intent"
                                 ],
                             )
-                        )
-                        if "legacy_cron_tick_lock_normalized" not in phases:
                             journal = _record_bootstrap_phase(
                                 plan,
                                 "legacy_cron_tick_lock_normalized",
                                 observed_tick_normalization,
                             )
                             phases = journal["phases"]
-                        elif (
-                            not _legacy_cron_tick_normalizations_match(
+                        else:
+                            observed_tick_normalization = (
+                                _normalize_legacy_cron_tick_lock(
+                                    plan,
+                                    phases[
+                                        "legacy_cron_tick_lock_normalize_intent"
+                                    ],
+                                )
+                            )
+                            if not _legacy_cron_tick_normalizations_match(
                                 plan,
                                 observed_tick_normalization,
                                 phases["legacy_cron_tick_lock_normalized"],
-                            )
-                        ):
-                            raise DrainIdentityMismatch(
-                                "durable legacy cron tick lock normalization changed"
-                            )
+                            ):
+                                raise DrainIdentityMismatch(
+                                    "durable legacy cron tick lock "
+                                    "normalization changed"
+                                )
                         # Always reacquire the kernel lock on resume. A durable
                         # phase proves ordering, not continued lock ownership
                         # across process death.

@@ -336,6 +336,131 @@ def test_legacy_cron_tick_lock_normalization_is_durable_and_reversible(
     assert restored["status"] in {"already-restored", "restored"}
 
 
+def test_first_tick_lock_normalization_accepts_empty_mtime_churn_under_lock(
+    tmp_path,
+):
+    plan, path = _cron_plan(tmp_path)
+    path.parent.mkdir(mode=0o700)
+    path.write_bytes(b"")
+    path.chmod(0o644)
+    intent = cutover._legacy_cron_tick_lock_normalize_intent_receipt(plan)
+    before = path.stat()
+    os.utime(
+        path,
+        ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000),
+    )
+
+    normalized, held = (
+        cutover._normalize_and_acquire_legacy_cron_tick_lock(plan, intent)
+    )
+    try:
+        restored = cutover._restore_legacy_cron_tick_lock(
+            plan,
+            intent,
+            normalized,
+        )
+    finally:
+        cutover._release_legacy_cron_tick_lock(
+            plan,
+            allow_restored_mode=True,
+        )
+
+    assert held["status"] == "held"
+    assert normalized["normalized"]["mode"] == 0o600
+    assert restored["status"] == "restored"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_first_tick_lock_normalization_rejects_nonempty_mtime_churn(
+    tmp_path,
+):
+    plan, path = _cron_plan(tmp_path, lock_mode=0o644)
+    intent = cutover._legacy_cron_tick_lock_normalize_intent_receipt(plan)
+    before = path.stat()
+    os.utime(
+        path,
+        ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000),
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="changed before normalization",
+    ):
+        cutover._normalize_and_acquire_legacy_cron_tick_lock(plan, intent)
+
+
+def test_first_tick_lock_postcheck_failure_restores_mode_before_unlock(
+    tmp_path,
+    monkeypatch,
+):
+    plan, path = _cron_plan(tmp_path)
+    path.parent.mkdir(mode=0o700)
+    path.write_bytes(b"")
+    path.chmod(0o644)
+    intent = cutover._legacy_cron_tick_lock_normalize_intent_receipt(plan)
+    real_match = cutover._legacy_cron_tick_receipts_match_locked_mtime_churn
+    calls = 0
+
+    def fail_postcheck(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            return False
+        return real_match(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_cron_tick_receipts_match_locked_mtime_churn",
+        fail_postcheck,
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="changed after normalization",
+    ):
+        cutover._normalize_and_acquire_legacy_cron_tick_lock(plan, intent)
+
+    handle = cutover._LEGACY_CRON_TICK_LOCKS.get(plan["transaction_id"])
+    assert handle is None or handle.closed
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_first_tick_lock_normalize_failure_restores_mode_before_unlock(
+    tmp_path,
+    monkeypatch,
+):
+    plan, path = _cron_plan(tmp_path)
+    path.parent.mkdir(mode=0o700)
+    path.write_bytes(b"")
+    path.chmod(0o644)
+    intent = cutover._legacy_cron_tick_lock_normalize_intent_receipt(plan)
+    real_match = cutover._legacy_cron_tick_receipts_match_locked_mtime_churn
+    calls = 0
+
+    def fail_after_chmod(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            return False
+        return real_match(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_cron_tick_receipts_match_locked_mtime_churn",
+        fail_after_chmod,
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="changed during normalization",
+    ):
+        cutover._normalize_and_acquire_legacy_cron_tick_lock(plan, intent)
+
+    handle = cutover._LEGACY_CRON_TICK_LOCKS.get(plan["transaction_id"])
+    assert handle is None or handle.closed
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
 def test_legacy_cron_tick_lock_restore_refuses_foreign_mutation(tmp_path):
     plan, path = _cron_plan(tmp_path, lock_mode=0o644)
     intent, normalized = _normalize_tick_lock(plan)
