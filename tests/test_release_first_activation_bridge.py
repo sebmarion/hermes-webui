@@ -642,6 +642,77 @@ def _normalize_synthetic_stores(plan: dict) -> tuple[dict, dict]:
     return intent, normalized
 
 
+def test_synthetic_store_mode_cas_uses_one_descriptor_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    store = tmp_path / "async_delegations.json"
+    _write_json(
+        store,
+        {"version": 1, "records": {}},
+        mode=0o644,
+    )
+    expected, _value = cutover._read_synthetic_store_receipt(
+        store,
+        label="synthetic async delegation store",
+        allowed_modes={0o644},
+    )
+
+    def reject_second_path_snapshot(*_args, **_kwargs):
+        raise AssertionError("mode CAS reopened the path before descriptor CAS")
+
+    monkeypatch.setattr(
+        cutover,
+        "_read_synthetic_store_receipt",
+        reject_second_path_snapshot,
+    )
+
+    observed = cutover._set_synthetic_store_mode(
+        store,
+        label="synthetic async delegation store",
+        expected=expected,
+        allowed_current_modes={0o644},
+        target_mode=0o600,
+    )
+
+    assert observed["mode"] == 0o600
+    assert observed["sha256"] == expected["sha256"]
+    assert store.stat().st_ino == expected["inode"]
+
+
+def test_synthetic_store_mode_cas_is_idempotent_at_target_mode(
+    tmp_path,
+    monkeypatch,
+):
+    store = tmp_path / "async_delegations.json"
+    _write_json(
+        store,
+        {"version": 1, "records": {}},
+        mode=0o600,
+    )
+    expected, _value = cutover._read_synthetic_store_receipt(
+        store,
+        label="synthetic async delegation store",
+        allowed_modes={0o600},
+    )
+
+    def reject_mode_change(*_args, **_kwargs):
+        raise AssertionError("mode CAS changed a store already at the target mode")
+
+    monkeypatch.setattr(cutover.os, "fchmod", reject_mode_change)
+
+    observed = cutover._set_synthetic_store_mode(
+        store,
+        label="synthetic async delegation store",
+        expected=expected,
+        allowed_current_modes={0o644},
+        target_mode=0o600,
+    )
+
+    assert observed == expected
+    assert store.stat().st_mode & 0o777 == 0o600
+
+
 def test_synthetic_terminal_mixed_delivery_is_normalized_and_never_replayed(
     tmp_path,
 ):

@@ -9676,15 +9676,6 @@ def _set_synthetic_store_mode(
     allowed_current_modes: set[int],
     target_mode: int,
 ) -> dict:
-    current, _value = _read_synthetic_store_receipt(
-        path,
-        label=label,
-        allowed_modes=allowed_current_modes | {target_mode},
-    )
-    if not _synthetic_store_receipts_match_stable(current, expected):
-        raise DrainIdentityMismatch(f"{label} changed before mode CAS")
-    if current["mode"] == target_mode:
-        return current
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if not isinstance(nofollow, int) or nofollow == 0:
         raise ReleaseBuildError(f"{label} cannot be opened without O_NOFOLLOW")
@@ -9701,10 +9692,12 @@ def _set_synthetic_store_mode(
             path,
             descriptor,
             label=label,
-            allowed_modes={int(current["mode"])},
+            allowed_modes=allowed_current_modes | {target_mode},
         )
-        if opened != current:
+        if not _synthetic_store_receipts_match_stable(opened, expected):
             raise DrainIdentityMismatch(f"{label} changed before mode CAS")
+        if opened["mode"] == target_mode:
+            return opened
         os.fchmod(descriptor, target_mode)
         os.fsync(descriptor)
         changed, _value = _synthetic_store_receipt_from_descriptor(
