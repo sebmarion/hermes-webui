@@ -5703,6 +5703,215 @@ def test_resume_frozen_writers_resumes_parent_before_lower_pid_child(monkeypatch
     ]
 
 
+def test_restore_frozen_webui_adopts_exact_binding_after_root_retired(
+    monkeypatch,
+):
+    prepared = {
+        "legacy": {
+            "pid": 300,
+            "pid_start_token": "retired-root",
+        }
+    }
+    frozen = {
+        "writers": [
+            {
+                "role": "webui",
+                "status": "frozen",
+                "tree": [
+                    {
+                        "pid": 300,
+                        "pid_start_token": "retired-root",
+                        "ppid": None,
+                        "state": "Ts",
+                    }
+                ],
+            }
+        ]
+    }
+    binding = {
+        "status": "verified",
+        "pid": 901,
+        "pid_start_token": "restored-root",
+    }
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: False)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(
+        cutover,
+        "_attest_restored_legacy_binding",
+        lambda _plan, *, prepared, gateway: binding,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_resume_frozen_prepared_writers",
+        lambda _frozen: (_ for _ in ()).throw(
+            AssertionError("retired root cannot be resumed")
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootstrap_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exact restored binding must be adopted")
+        ),
+    )
+
+    receipt = cutover._restore_or_resume_frozen_legacy_webui(
+        {},
+        prepared=prepared,
+        frozen=frozen,
+    )
+
+    assert receipt["binding"] == binding
+    assert receipt["writers"] == {
+        "status": "adopted-exact-restored-binding",
+        "retired_root": {
+            "pid": 300,
+            "pid_start_token": "retired-root",
+        },
+        "restored_root": {
+            "pid": 901,
+            "pid_start_token": "restored-root",
+        },
+    }
+
+
+def test_restore_frozen_webui_resumes_exact_live_root(monkeypatch):
+    prepared = {
+        "legacy": {
+            "pid": 300,
+            "pid_start_token": "live-root",
+        }
+    }
+    frozen = {
+        "writers": [
+            {
+                "role": "webui",
+                "status": "frozen",
+                "tree": [
+                    {
+                        "pid": 300,
+                        "pid_start_token": "live-root",
+                        "ppid": None,
+                        "state": "Ts",
+                    }
+                ],
+            }
+        ]
+    }
+    binding = {
+        "status": "verified",
+        "pid": 300,
+        "pid_start_token": "live-root",
+    }
+    resumed = {"status": "resumed", "processes": [{"pid": 300}]}
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: True)
+    monkeypatch.setattr(
+        cutover,
+        "_resume_frozen_prepared_writers",
+        lambda actual: resumed if actual == frozen else None,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_wait_for_legacy_binding",
+        lambda _plan, *, prepared, gateway: binding,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootstrap_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("live root must be resumed")
+        ),
+    )
+
+    receipt = cutover._restore_or_resume_frozen_legacy_webui(
+        {},
+        prepared=prepared,
+        frozen=frozen,
+    )
+
+    assert receipt == {"writers": resumed, "binding": binding}
+
+
+def test_restore_frozen_webui_restarts_only_at_proven_absence(monkeypatch):
+    prepared = {
+        "legacy": {
+            "pid": 300,
+            "pid_start_token": "retired-root",
+        }
+    }
+    frozen = {
+        "writers": [
+            {
+                "role": "webui",
+                "status": "frozen",
+                "tree": [
+                    {
+                        "pid": 300,
+                        "pid_start_token": "retired-root",
+                        "ppid": None,
+                        "state": "Ts",
+                    }
+                ],
+            }
+        ]
+    }
+    binding = {
+        "status": "verified",
+        "pid": 902,
+        "pid_start_token": "restarted-root",
+    }
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: False)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(
+        cutover,
+        "_attest_restored_legacy_binding",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            cutover.ReleaseBuildError("binding absent")
+        ),
+    )
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: None)
+    monkeypatch.setattr(cutover, "_job_pid", lambda _plan, gateway: None)
+    monkeypatch.setattr(
+        cutover,
+        "_bootstrap_job",
+        lambda _plan, plist, *, gateway: {
+            "status": "started",
+            "plist": plist,
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_wait_for_legacy_binding",
+        lambda _plan, *, prepared, gateway: binding,
+    )
+
+    receipt = cutover._restore_or_resume_frozen_legacy_webui(
+        {
+            "listener_port": 8787,
+            "bootstrap_rollback_plist": "/tmp/rollback.plist",
+        },
+        prepared=prepared,
+        frozen=frozen,
+    )
+
+    assert receipt["binding"] == binding
+    assert receipt["writers"] == {
+        "status": "restarted-after-exact-root-retirement",
+        "retired_root": {
+            "pid": 300,
+            "pid_start_token": "retired-root",
+        },
+        "restored_root": {
+            "pid": 902,
+            "pid_start_token": "restarted-root",
+        },
+        "restart": {
+            "status": "started",
+            "plist": "/tmp/rollback.plist",
+        },
+    }
+
+
 def test_stop_prepared_service_kills_children_before_parent(monkeypatch):
     tree = [
         {
@@ -5745,6 +5954,96 @@ def test_stop_prepared_service_kills_children_before_parent(monkeypatch):
         (100, signal.SIGKILL),
         (300, signal.SIGKILL),
     ]
+
+
+def test_bootout_prepared_jobs_accepts_exact_frozen_root_retirement(
+    monkeypatch,
+):
+    prepared = {
+        "legacy": {
+            "pid": 300,
+            "pid_start_token": "root",
+        }
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: None if gateway else 300,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda _plan, *, gateway, required: {
+            "status": "stopped",
+            "gateway": gateway,
+            "required": required,
+        },
+    )
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: True)
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "T")
+
+    receipt = cutover._bootout_prepared_jobs({}, prepared)
+
+    assert receipt["status"] == "bootout-requested"
+    assert receipt["jobs"]["webui"]["retirement"] == (
+        "pending-exact-frozen-root"
+    )
+    assert receipt["jobs"]["gateway"] == {
+        "status": "already-gracefully-stopped"
+    }
+
+
+def test_stop_prepared_service_retires_pending_exact_launchd_job(
+    monkeypatch,
+):
+    root = {
+        "pid": 300,
+        "pid_start_token": "root",
+        "ppid": None,
+        "state": "Ts",
+    }
+    job_probes = 0
+
+    def job_pid(_plan, *, gateway):
+        nonlocal job_probes
+        assert gateway is False
+        job_probes += 1
+        return 300 if job_probes <= 2 else None
+
+    signaled = []
+    monkeypatch.setattr(cutover, "_job_pid", job_pid)
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: True)
+    monkeypatch.setattr(
+        cutover.os,
+        "kill",
+        lambda pid, sent_signal: signaled.append((pid, sent_signal)),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "wait_for_exact_process_exit",
+        lambda _process, _timeout, **_kwargs: None,
+    )
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: None)
+
+    receipt = cutover._stop_prepared_service(
+        {
+            "timeout_seconds": 1.0,
+            "interval_seconds": 0.001,
+            "listener_port": 8787,
+        },
+        {"pid": 300, "pid_start_token": "root"},
+        gateway=False,
+        frozen_tree={"tree": [root]},
+        bootout_receipt={
+            "status": "stopped",
+            "retirement": "pending-exact-frozen-root",
+        },
+    )
+
+    assert receipt["status"] == "stopped"
+    assert receipt["launchd_retirement"] == "verified-absent"
+    assert signaled == [(300, signal.SIGKILL)]
+    assert job_probes >= 3
 
 
 def test_darwin_pid_start_token_distinguishes_same_second_pid_reuse(monkeypatch):

@@ -13655,6 +13655,111 @@ def _remove_owned_private_json_marker(
     return {"status": "cleared", "path": str(path)}
 
 
+def _restore_or_resume_frozen_legacy_webui(
+    plan: dict,
+    *,
+    prepared: dict,
+    frozen: dict,
+) -> dict:
+    rows = frozen.get("writers") if isinstance(frozen, dict) else None
+    if (
+        not isinstance(rows, list)
+        or len(rows) != 1
+        or not isinstance(rows[0], dict)
+        or rows[0].get("role") != "webui"
+        or rows[0].get("status") != "frozen"
+    ):
+        raise ReleaseBuildError("frozen writer receipt is invalid")
+    raw_tree = rows[0].get("tree")
+    if not isinstance(raw_tree, list) or not raw_tree:
+        raise ReleaseBuildError("frozen process tree receipt is invalid")
+    tree = _validated_parent_first_frozen_tree(raw_tree)
+    expected_root = prepared.get("legacy")
+    if not isinstance(expected_root, dict):
+        raise ReleaseBuildError("prepared legacy WebUI identity is invalid")
+    root = tree[0]
+    if (
+        int(root["pid"]) != int(expected_root.get("pid", -1))
+        or root.get("pid_start_token") != expected_root.get("pid_start_token")
+    ):
+        raise DrainIdentityMismatch("frozen WebUI root identity changed")
+
+    if _exact_process_is_alive(root):
+        writers = _resume_frozen_prepared_writers(frozen)
+        binding = _wait_for_legacy_binding(
+            plan,
+            prepared=prepared,
+            gateway=False,
+        )
+        return {"writers": writers, "binding": binding}
+
+    if _pid_start_token(int(root["pid"])) is not None:
+        raise DrainIdentityMismatch(
+            "retired frozen WebUI root PID was reused before abort restore"
+        )
+    for process in tree[1:]:
+        if _exact_process_is_alive(process):
+            raise DrainIdentityMismatch(
+                "frozen WebUI child survived retired root before abort restore"
+            )
+        if _pid_start_token(int(process["pid"])) is not None:
+            raise DrainIdentityMismatch(
+                "retired frozen WebUI child PID was reused before abort restore"
+            )
+
+    retired_root = {
+        "pid": int(root["pid"]),
+        "pid_start_token": str(root["pid_start_token"]),
+    }
+    try:
+        binding = _attest_restored_legacy_binding(
+            plan,
+            prepared=prepared,
+            gateway=False,
+        )
+    except (DrainIdentityMismatch, ReleaseBuildError) as attestation_error:
+        try:
+            listener = _listener_pid(int(plan["listener_port"]))
+        except DrainIdentityMismatch as exc:
+            raise DrainIdentityMismatch(
+                "ambiguous WebUI listener blocks pre-snapshot abort restore"
+            ) from exc
+        job_pid = _job_pid(plan, gateway=False)
+        if listener is not None or job_pid is not None:
+            raise DrainIdentityMismatch(
+                "unexpected WebUI owner blocks pre-snapshot abort restore"
+            ) from attestation_error
+        started = _bootstrap_job(
+            plan,
+            plan["bootstrap_rollback_plist"],
+            gateway=False,
+        )
+        binding = _wait_for_legacy_binding(
+            plan,
+            prepared=prepared,
+            gateway=False,
+        )
+        writers = {
+            "status": "restarted-after-exact-root-retirement",
+            "retired_root": retired_root,
+            "restored_root": {
+                "pid": binding["pid"],
+                "pid_start_token": binding["pid_start_token"],
+            },
+            "restart": started,
+        }
+    else:
+        writers = {
+            "status": "adopted-exact-restored-binding",
+            "retired_root": retired_root,
+            "restored_root": {
+                "pid": binding["pid"],
+                "pid_start_token": binding["pid_start_token"],
+            },
+        }
+    return {"writers": writers, "binding": binding}
+
+
 def _restore_legacy_before_snapshot_abort(
     plan: dict,
     prepared: dict,
@@ -13783,12 +13888,12 @@ def _restore_legacy_before_snapshot_abort(
             ),
             "restart": started,
         }
-    resumed = _resume_frozen_prepared_writers(frozen)
-    webui = _wait_for_legacy_binding(
+    restored_webui = _restore_or_resume_frozen_legacy_webui(
         plan,
         prepared=prepared,
-        gateway=False,
+        frozen=frozen,
     )
+    webui = restored_webui["binding"]
     cron = _restore_watchdog_cron(plan, prepared)
     return {
         "status": "aborted",
@@ -13805,7 +13910,7 @@ def _restore_legacy_before_snapshot_abort(
             "restore": cron_tick_restore,
         },
         "synthetic_store_modes": synthetic_store_modes,
-        "writers": resumed,
+        "writers": restored_webui["writers"],
         "watchdog_cron": cron,
     }
 
@@ -13889,17 +13994,29 @@ def _bootout_prepared_jobs(plan: dict, prepared: dict) -> dict:
         raise DrainIdentityMismatch(
             "WebUI launchd job was replaced before bootout"
         )
-    receipts["webui"] = _bootout_job(plan, gateway=False, required=False)
+    webui_bootout = _bootout_job(plan, gateway=False, required=False)
     receipts["gateway"] = {"status": "already-gracefully-stopped"}
-    if _job_pid(plan, gateway=False) is not None:
-        raise DrainIdentityMismatch(
-            "WebUI launchd job survived frozen bootout"
-        )
+    remaining_webui_job = _job_pid(plan, gateway=False)
+    if remaining_webui_job is None:
+        webui_bootout["retirement"] = "verified-absent"
+        status = "verified-absent"
+    else:
+        if (
+            remaining_webui_job != int(original["pid"])
+            or not _exact_process_is_alive(original)
+            or "T" not in _ps_value(remaining_webui_job, "state").upper()
+        ):
+            raise DrainIdentityMismatch(
+                "WebUI launchd job changed during frozen bootout"
+            )
+        webui_bootout["retirement"] = "pending-exact-frozen-root"
+        status = "bootout-requested"
+    receipts["webui"] = webui_bootout
     if _job_pid(plan, gateway=True) is not None:
         raise DrainIdentityMismatch(
             "gateway launchd job reappeared after graceful stop"
         )
-    return {"status": "verified-absent", "jobs": receipts}
+    return {"status": status, "jobs": receipts}
 
 
 def _stop_prepared_service(
@@ -13910,7 +14027,17 @@ def _stop_prepared_service(
     frozen_tree: dict,
     bootout_receipt: dict,
 ) -> dict:
-    if _job_pid(plan, gateway=gateway) is not None:
+    job_pid = _job_pid(plan, gateway=gateway)
+    pending_retirement = (
+        not gateway
+        and bootout_receipt.get("retirement")
+        == "pending-exact-frozen-root"
+    )
+    if job_pid is not None and (
+        not pending_retirement
+        or job_pid != int(receipt["pid"])
+        or not _exact_process_is_alive(receipt)
+    ):
         raise DrainIdentityMismatch("launchd job reappeared before exact stop")
     tree = frozen_tree.get("tree") if isinstance(frozen_tree, dict) else None
     if not isinstance(tree, list):
@@ -13923,6 +14050,18 @@ def _stop_prepared_service(
                 float(plan["timeout_seconds"]),
                 allow_exact_signaled_zombie=True,
             )
+    deadline = time.monotonic() + float(plan["timeout_seconds"])
+    while time.monotonic() < deadline:
+        remaining_job = _job_pid(plan, gateway=gateway)
+        if remaining_job is None:
+            break
+        if remaining_job != int(receipt["pid"]):
+            raise DrainIdentityMismatch(
+                "launchd job was replaced during exact stop"
+            )
+        time.sleep(float(plan["interval_seconds"]))
+    else:
+        raise DrainTimeout("launchd job retirement timed out after exact stop")
     port_key = "gateway_listener_port" if gateway else "listener_port"
     try:
         replacement = _listener_pid(int(plan[port_key]))
@@ -13935,6 +14074,7 @@ def _stop_prepared_service(
         "pid": receipt["pid"],
         "pid_start_token": receipt["pid_start_token"],
         "bootout": bootout_receipt,
+        "launchd_retirement": "verified-absent",
     }
 
 
