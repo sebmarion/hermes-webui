@@ -6993,7 +6993,10 @@ def _complete_candidate_gateway_transition(plan: dict, result: dict) -> dict:
             manifest_path=paired_manifest,
             snapshot_id=plan["transaction_id"],
         )
-        paired_snapshot["writer_barrier"] = writer_barrier
+        paired_snapshot["writer_barrier"] = _prove_no_mutable_writers(
+            plan,
+            expected=writer_barrier,
+        )
         record("paired_state_snapshot_created", paired_snapshot)
     if "gateway_dispatcher_lock_released" not in phases:
         _verify_legacy_dispatcher_lock(
@@ -15477,11 +15480,54 @@ def _finish_release_watchdog_barrier(plan: dict, barrier: dict) -> dict:
     return {**outcome, "lock": release}
 
 
-def _prove_no_mutable_writers(plan: dict) -> dict:
+def _prove_no_mutable_writers(
+    plan: dict,
+    *,
+    expected: dict | None = None,
+) -> dict:
+    """Prove every writable handle is either absent or exactly STOP-frozen."""
     writers: set[int] = set()
     checked: list[str] = []
+    sqlite_wal: list[dict] = []
     for raw_path in plan["mutable_state_paths"]:
         path = Path(raw_path)
+        if path.suffix == ".db":
+            wal_path = Path(f"{path}-wal")
+            try:
+                opened = os.lstat(wal_path)
+            except FileNotFoundError:
+                sqlite_wal.append(
+                    {"path": str(wal_path), "status": "absent"}
+                )
+            except OSError as exc:
+                raise ReleaseBuildError(
+                    "mutable SQLite WAL identity is unavailable"
+                ) from exc
+            else:
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_uid != os.getuid()
+                    or opened.st_nlink != 1
+                ):
+                    raise ReleaseBuildError(
+                        "mutable SQLite WAL identity is unsafe"
+                    )
+                if opened.st_size != 0:
+                    raise ReleaseBuildError(
+                        f"mutable SQLite WAL is not checkpointed: {wal_path}"
+                    )
+                sqlite_wal.append(
+                    {
+                        "path": str(wal_path),
+                        "status": "empty",
+                        "device": opened.st_dev,
+                        "inode": opened.st_ino,
+                        "mode": stat.S_IMODE(opened.st_mode),
+                        "uid": opened.st_uid,
+                        "nlink": opened.st_nlink,
+                        "size": opened.st_size,
+                    }
+                )
         if not path.exists():
             checked.append(str(path))
             continue
@@ -15509,12 +15555,53 @@ def _prove_no_mutable_writers(plan: dict) -> dict:
                 writers.add(current_pid)
         checked.append(str(path))
     writers.discard(os.getpid())
-    if writers:
+    stopped_writers: list[dict] = []
+    runnable_writers: list[int] = []
+    for pid in sorted(writers):
+        start_token = _pid_start_token(pid)
+        if start_token is None:
+            raise DrainIdentityMismatch(
+                f"mutable writer identity is unavailable for PID {pid}"
+            )
+        state = _ps_value(pid, "state")
+        if _pid_start_token(pid) != start_token:
+            raise DrainIdentityMismatch(
+                f"mutable writer identity changed for PID {pid}"
+            )
+        if not state.upper().strip().startswith("T"):
+            runnable_writers.append(pid)
+            continue
+        receipt = {
+            "pid": pid,
+            "pid_start_token": start_token,
+            "state": "stopped",
+        }
+        if (
+            not _exact_process_is_alive(receipt)
+            or not _ps_value(pid, "state").upper().strip().startswith("T")
+        ):
+            raise DrainIdentityMismatch(
+                f"mutable writer resumed during barrier for PID {pid}"
+            )
+        stopped_writers.append(receipt)
+    if runnable_writers:
         raise ReleaseBuildError(
-            "mutable state still has writable handles: "
-            + ",".join(str(pid) for pid in sorted(writers))
+            "mutable state still has runnable writable handles: "
+            + ",".join(str(pid) for pid in runnable_writers)
         )
-    return {"status": "verified", "paths": checked, "writer_pids": []}
+    receipt = {
+        "status": "verified",
+        "paths": checked,
+        "sqlite_wal": sqlite_wal,
+        "writer_pids": [row["pid"] for row in stopped_writers],
+        "stopped_writers": stopped_writers,
+        "bounded_host_assumption": copy.deepcopy(
+            _FIRST_ACTIVATION_BOUNDED_HOST_ASSUMPTION
+        ),
+    }
+    if expected is not None and receipt != expected:
+        raise DrainIdentityMismatch("mutable writer barrier changed")
+    return receipt
 
 
 def _stop_current_service(
@@ -16689,7 +16776,12 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                         manifest_path=plan["snapshot_manifest"],
                         snapshot_id=plan["transaction_id"],
                     )
-                    snapshot_receipt["writer_barrier"] = writer_barrier
+                    snapshot_receipt["writer_barrier"] = (
+                        _prove_no_mutable_writers(
+                            plan,
+                            expected=writer_barrier,
+                        )
+                    )
                     journal = _record_bootstrap_phase(
                         plan,
                         "snapshot_created",

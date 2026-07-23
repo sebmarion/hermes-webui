@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import stat
+from types import SimpleNamespace
 
 import pytest
 
@@ -1254,6 +1255,169 @@ def test_gateway_bootout_never_resumes_reused_pid(monkeypatch):
         )
 
     assert signals == [signal.SIGSTOP]
+
+
+def test_mutable_writer_barrier_accepts_only_exact_stopped_writers(
+    tmp_path,
+    monkeypatch,
+):
+    state = tmp_path / "state.db"
+    state.write_bytes(b"state")
+    monkeypatch.setattr(
+        cutover.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="p41\naw\n",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_pid_start_token",
+        lambda pid: "writer-start" if pid == 41 else None,
+    )
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "T+")
+
+    receipt = cutover._prove_no_mutable_writers(
+        {"mutable_state_paths": [str(state)]}
+    )
+
+    assert receipt["writer_pids"] == [41]
+    assert receipt["stopped_writers"] == [
+        {
+            "pid": 41,
+            "pid_start_token": "writer-start",
+            "state": "stopped",
+        }
+    ]
+    assert (
+        receipt["bounded_host_assumption"]
+        == cutover._FIRST_ACTIVATION_BOUNDED_HOST_ASSUMPTION
+    )
+    assert (
+        cutover._prove_no_mutable_writers(
+            {"mutable_state_paths": [str(state)]},
+            expected=receipt,
+        )
+        == receipt
+    )
+
+
+def test_mutable_writer_barrier_rejects_uncheckpointed_sqlite_wal(
+    tmp_path,
+    monkeypatch,
+):
+    state = tmp_path / "state.db"
+    state.write_bytes(b"state")
+    Path(f"{state}-wal").write_bytes(b"committed-wal-data")
+    monkeypatch.setattr(
+        cutover.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="p41\naw\n",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_pid_start_token",
+        lambda pid: "writer-start" if pid == 41 else None,
+    )
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "T")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="SQLite WAL is not checkpointed",
+    ):
+        cutover._prove_no_mutable_writers(
+            {"mutable_state_paths": [str(state)]}
+        )
+
+
+def test_mutable_writer_barrier_rejects_runnable_writer(tmp_path, monkeypatch):
+    state = tmp_path / "state.db"
+    state.write_bytes(b"state")
+    monkeypatch.setattr(
+        cutover.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="p41\nau\n",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_pid_start_token",
+        lambda pid: "writer-start" if pid == 41 else None,
+    )
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "S")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="runnable writable handles: 41",
+    ):
+        cutover._prove_no_mutable_writers(
+            {"mutable_state_paths": [str(state)]}
+        )
+
+
+def test_mutable_writer_barrier_rejects_identity_loss(tmp_path, monkeypatch):
+    state = tmp_path / "state.db"
+    state.write_bytes(b"state")
+    monkeypatch.setattr(
+        cutover.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="p41\naw\n",
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "T")
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="writer identity is unavailable",
+    ):
+        cutover._prove_no_mutable_writers(
+            {"mutable_state_paths": [str(state)]}
+        )
+
+
+def test_mutable_writer_barrier_rejects_handle_set_change(
+    tmp_path,
+    monkeypatch,
+):
+    state = tmp_path / "state.db"
+    state.write_bytes(b"state")
+    outputs = iter(("p41\naw\n", ""))
+    monkeypatch.setattr(
+        cutover.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=next(outputs),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_pid_start_token",
+        lambda pid: "writer-start" if pid == 41 else None,
+    )
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "T")
+    plan = {"mutable_state_paths": [str(state)]}
+    receipt = cutover._prove_no_mutable_writers(plan)
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="mutable writer barrier changed",
+    ):
+        cutover._prove_no_mutable_writers(plan, expected=receipt)
 
 
 def test_legacy_shutdown_parser_accepts_natural_nonzero_to_zero_drain():
