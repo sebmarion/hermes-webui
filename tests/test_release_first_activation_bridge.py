@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 
 import pytest
@@ -1105,6 +1106,154 @@ def test_graceful_gateway_stop_takes_tick_lock_before_process_admission(
     assert events == ["tick-acquire", "tick-verify", "process-admission"]
     assert cutover._legacy_cron_tick_lock_path(plan).name == ".tick.lock"
     assert ".jobs.lock" not in str(cutover._legacy_cron_tick_lock_path(plan))
+
+
+def test_gateway_bootout_freezes_before_marker_and_resumes_after_bootout(
+    monkeypatch,
+):
+    identity = {"pid": 41, "pid_start_token": "gateway-start"}
+    events = []
+    process_state = {"value": "S"}
+
+    def signal_process(pid, sent_signal):
+        assert pid == 41
+        events.append(("signal", sent_signal))
+        process_state["value"] = "T" if sent_signal == signal.SIGSTOP else "S"
+
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: True)
+    monkeypatch.setattr(
+        cutover,
+        "_ps_value",
+        lambda _pid, _field: process_state["value"],
+    )
+    monkeypatch.setattr(cutover.os, "kill", signal_process)
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: 41,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda _plan, *, gateway, required: (
+            events.append(("bootout", gateway, required))
+            or {"status": "stopped"}
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "wait_for_exact_process_exit",
+        lambda row, timeout: events.append(("wait-exit", row, timeout)),
+    )
+
+    receipt = cutover._bootout_exact_frozen_legacy_gateway(
+        {"timeout_seconds": 1.0, "interval_seconds": 0.001},
+        identity,
+        prepare_stop=lambda: events.append(("prepare-stop",)) or {
+            "status": "prepared"
+        },
+    )
+
+    assert events == [
+        ("signal", signal.SIGSTOP),
+        ("prepare-stop",),
+        ("bootout", True, True),
+        ("signal", signal.SIGCONT),
+        ("wait-exit", identity, 1.0),
+    ]
+    assert receipt["status"] == "stopped"
+    assert receipt["bootout"]["retirement"] == "pending-exact-frozen-root"
+    assert receipt["prepare_stop"] == {"status": "prepared"}
+
+
+def test_gateway_bootout_resumes_exact_root_when_prepare_fails(monkeypatch):
+    identity = {"pid": 41, "pid_start_token": "gateway-start"}
+    signals = []
+    process_state = {"value": "S"}
+
+    def signal_process(_pid, sent_signal):
+        signals.append(sent_signal)
+        process_state["value"] = "T" if sent_signal == signal.SIGSTOP else "S"
+
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: True)
+    monkeypatch.setattr(
+        cutover,
+        "_ps_value",
+        lambda _pid, _field: process_state["value"],
+    )
+    monkeypatch.setattr(cutover.os, "kill", signal_process)
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("failed preparation must not boot out launchd")
+        ),
+    )
+
+    with pytest.raises(cutover.ReleaseBuildError, match="checkpoint changed"):
+        cutover._bootout_exact_frozen_legacy_gateway(
+            {"timeout_seconds": 1.0, "interval_seconds": 0.001},
+            identity,
+            prepare_stop=lambda: (_ for _ in ()).throw(
+                cutover.ReleaseBuildError("checkpoint changed")
+            ),
+        )
+
+    assert signals == [signal.SIGSTOP, signal.SIGCONT]
+
+
+def test_gateway_bootout_never_resumes_reused_pid(monkeypatch):
+    identity = {"pid": 41, "pid_start_token": "gateway-start"}
+    signals = []
+    process_state = {"value": "S", "exact": True}
+
+    def signal_process(_pid, sent_signal):
+        signals.append(sent_signal)
+        process_state["value"] = "T" if sent_signal == signal.SIGSTOP else "S"
+
+    def bootout(_plan, *, gateway, required):
+        assert gateway is True
+        assert required is True
+        process_state["exact"] = False
+        return {"status": "stopped"}
+
+    monkeypatch.setattr(
+        cutover,
+        "_exact_process_is_alive",
+        lambda _row: process_state["exact"],
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_ps_value",
+        lambda _pid, _field: process_state["value"],
+    )
+    monkeypatch.setattr(cutover.os, "kill", signal_process)
+    job_pids = iter([41, None])
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: next(job_pids),
+    )
+    monkeypatch.setattr(cutover, "_bootout_job", bootout)
+    monkeypatch.setattr(
+        cutover,
+        "wait_for_exact_process_exit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("identity loss must fail before exit wait")
+        ),
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="changed before SIGCONT",
+    ):
+        cutover._bootout_exact_frozen_legacy_gateway(
+            {"timeout_seconds": 1.0, "interval_seconds": 0.001},
+            identity,
+            prepare_stop=lambda: {"status": "prepared"},
+        )
+
+    assert signals == [signal.SIGSTOP]
 
 
 def test_legacy_shutdown_parser_accepts_natural_nonzero_to_zero_drain():

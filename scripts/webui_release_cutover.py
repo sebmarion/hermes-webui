@@ -13470,6 +13470,105 @@ def _legacy_gateway_terminal_status_receipt(
     }
 
 
+def _bootout_exact_frozen_legacy_gateway(
+    plan: dict,
+    gateway_identity: dict,
+    *,
+    prepare_stop: Callable[[], dict],
+) -> dict:
+    pid = int(gateway_identity["pid"])
+    if not _exact_process_is_alive(gateway_identity):
+        raise DrainIdentityMismatch(
+            "legacy gateway changed before frozen launchd bootout"
+        )
+    os.kill(pid, signal.SIGSTOP)
+    frozen = True
+    try:
+        deadline = time.monotonic() + min(
+            5.0,
+            float(plan["timeout_seconds"]),
+        )
+        while time.monotonic() < deadline:
+            if not _exact_process_is_alive(gateway_identity):
+                raise DrainIdentityMismatch(
+                    "legacy gateway changed while entering STOP barrier"
+                )
+            if "T" in _ps_value(pid, "state").upper():
+                break
+            time.sleep(float(plan["interval_seconds"]))
+        else:
+            raise DrainTimeout("legacy gateway did not enter STOP barrier")
+
+        prepared_stop = prepare_stop()
+        if (
+            not _exact_process_is_alive(gateway_identity)
+            or _job_pid(plan, gateway=True) != pid
+            or "T" not in _ps_value(pid, "state").upper()
+        ):
+            raise DrainIdentityMismatch(
+                "legacy gateway changed before frozen launchd bootout"
+            )
+        bootout = _bootout_job(plan, gateway=True, required=True)
+        remaining_job = _job_pid(plan, gateway=True)
+        if remaining_job is None:
+            retirement = "verified-absent"
+        elif (
+            remaining_job == pid
+            and _exact_process_is_alive(gateway_identity)
+            and "T" in _ps_value(pid, "state").upper()
+        ):
+            retirement = "pending-exact-frozen-root"
+        else:
+            raise DrainIdentityMismatch(
+                "legacy gateway launchd job changed during frozen bootout"
+            )
+
+        if not _exact_process_is_alive(gateway_identity):
+            raise DrainIdentityMismatch(
+                "legacy gateway changed before SIGCONT"
+            )
+        os.kill(pid, signal.SIGCONT)
+        deadline = time.monotonic() + min(
+            5.0,
+            float(plan["timeout_seconds"]),
+        )
+        while time.monotonic() < deadline:
+            if not _exact_process_is_alive(gateway_identity):
+                frozen = False
+                break
+            if "T" not in _ps_value(pid, "state").upper():
+                frozen = False
+                break
+            time.sleep(float(plan["interval_seconds"]))
+        else:
+            raise DrainTimeout(
+                "legacy gateway did not leave STOP barrier after bootout"
+            )
+        wait_for_exact_process_exit(
+            gateway_identity,
+            float(plan["timeout_seconds"]),
+        )
+    except Exception:
+        if frozen and _exact_process_is_alive(gateway_identity):
+            os.kill(pid, signal.SIGCONT)
+        raise
+    return {
+        "status": "stopped",
+        "gateway": copy.deepcopy(gateway_identity),
+        "prepare_stop": prepared_stop,
+        "freeze": {
+            "pid": pid,
+            "pid_start_token": gateway_identity["pid_start_token"],
+            "status": "resumed-for-single-signal-shutdown",
+        },
+        "bootout": {
+            **bootout,
+            "retirement": retirement,
+        },
+        "exact_exit_confirmed": True,
+    }
+
+
 def _gracefully_stop_legacy_gateway(
     plan: dict,
     prepared: dict,
@@ -13488,33 +13587,42 @@ def _gracefully_stop_legacy_gateway(
         "pid": int(prepared["gateway"]["pid"]),
         "pid_start_token": str(prepared["gateway"]["pid_start_token"]),
     }
+
     def stop_gateway() -> dict:
         gateway_alive = _exact_process_is_alive(gateway_identity)
         gateway_job = _job_pid(plan, gateway=True)
+        frozen_stop: dict | None = None
         if gateway_alive and gateway_job == int(gateway_identity["pid"]):
-            _write_exact_private_json(
-                Path(planned["path"]),
-                planned["payload"],
-                label="legacy gateway planned-stop marker",
-            )
-            # Preserve the final legacy-compatible recheck. Candidate runtimes
-            # additionally honor the admission lock held by the outer barrier.
-            _legacy_process_checkpoint_receipt(plan)
-            if (
-                _listener_pid(int(plan["gateway_listener_port"]))
-                != int(gateway_identity["pid"])
-                or _job_pid(plan, gateway=True) != int(gateway_identity["pid"])
-                or _pid_start_token(int(gateway_identity["pid"]))
-                != gateway_identity["pid_start_token"]
-            ):
-                raise DrainIdentityMismatch(
-                    "gateway owner changed immediately before graceful stop"
+            def prepare_frozen_stop() -> dict:
+                # With the exact gateway stopped, no marker watcher can race
+                # launchd's SIGTERM. Recheck durable work and ownership first,
+                # then expose the planned-stop marker immediately before
+                # bootout queues the sole shutdown signal.
+                checkpoint = _legacy_process_checkpoint_receipt(plan)
+                if (
+                    _listener_pid(int(plan["gateway_listener_port"]))
+                    != int(gateway_identity["pid"])
+                    or _job_pid(plan, gateway=True)
+                    != int(gateway_identity["pid"])
+                    or _pid_start_token(int(gateway_identity["pid"]))
+                    != gateway_identity["pid_start_token"]
+                ):
+                    raise DrainIdentityMismatch(
+                        "gateway owner changed immediately before graceful stop"
+                    )
+                marker = _write_exact_private_json(
+                    Path(planned["path"]),
+                    planned["payload"],
+                    label="legacy gateway planned-stop marker",
                 )
-            bootout = _bootout_job(plan, gateway=True, required=True)
-            wait_for_exact_process_exit(
+                return {"checkpoint": checkpoint, "marker": marker}
+
+            frozen_stop = _bootout_exact_frozen_legacy_gateway(
+                plan,
                 gateway_identity,
-                float(plan["timeout_seconds"]),
+                prepare_stop=prepare_frozen_stop,
             )
+            bootout = frozen_stop["bootout"]
         elif gateway_alive and gateway_job is None:
             bootout = {"status": "externally-reconciled"}
             wait_for_exact_process_exit(
@@ -13539,12 +13647,15 @@ def _gracefully_stop_legacy_gateway(
             raise DrainIdentityMismatch(
                 "legacy gateway did not reach an absent graceful-stop boundary"
             )
-        return {
+        receipt = {
             "status": "stopped",
             "gateway": copy.deepcopy(gateway_identity),
             "bootout": bootout,
             "exact_exit_confirmed": True,
         }
+        if frozen_stop is not None:
+            receipt["frozen_stop"] = frozen_stop
+        return receipt
 
     retirement = _run_process_registry_retirement_barrier(
         plan,

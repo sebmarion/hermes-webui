@@ -8141,13 +8141,24 @@ def test_gateway_stop_rechecks_checkpoint_before_bootout(tmp_path, monkeypatch):
         "_bootout_job",
         lambda *args, **kwargs: bootouts.append((args, kwargs)),
     )
+    process_state = {"value": "S"}
+
+    def signal_process(_pid, sent_signal):
+        process_state["value"] = "T" if sent_signal == signal.SIGSTOP else "S"
+
+    monkeypatch.setattr(cutover.os, "kill", signal_process)
+    monkeypatch.setattr(
+        cutover,
+        "_ps_value",
+        lambda _pid, _field: process_state["value"],
+    )
 
     with pytest.raises(cutover.ReleaseBuildError, match="process checkpoint"):
         cutover._gracefully_stop_legacy_gateway(plan, prepared, intent)
     cutover._release_legacy_cron_tick_lock(plan)
 
     assert bootouts == []
-    assert len(marker_writes) == 1
+    assert marker_writes == []
 
 
 def test_gateway_stop_rechecks_exact_owner_after_second_checkpoint(
@@ -8191,6 +8202,17 @@ def test_gateway_stop_rechecks_exact_owner_after_second_checkpoint(
         cutover,
         "_bootout_job",
         lambda *args, **kwargs: bootouts.append((args, kwargs)),
+    )
+    process_state = {"value": "S"}
+
+    def signal_process(_pid, sent_signal):
+        process_state["value"] = "T" if sent_signal == signal.SIGSTOP else "S"
+
+    monkeypatch.setattr(cutover.os, "kill", signal_process)
+    monkeypatch.setattr(
+        cutover,
+        "_ps_value",
+        lambda _pid, _field: process_state["value"],
     )
 
     with pytest.raises(
