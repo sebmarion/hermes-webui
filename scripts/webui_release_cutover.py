@@ -3610,7 +3610,11 @@ def _absolute_plan_path(value: object, *, label: str) -> Path:
     path = Path(str(value or ""))
     if not path.is_absolute() or Path(os.path.abspath(path)) != path:
         raise ReleaseBuildError(f"cutover plan {label} path is invalid")
-    if path.is_symlink() and label not in {"managed_interpreter", "cli_link"}:
+    if path.is_symlink() and label not in {
+        "managed_interpreter",
+        "expected_old_interpreter",
+        "cli_link",
+    }:
         raise ReleaseBuildError(f"cutover plan {label} must not be a symlink")
     return path
 

@@ -2774,6 +2774,24 @@ def test_internal_watchdog_registry_is_an_admitted_cutover_plan_path():
     assert "watchdog_scheduler_registry" in cutover._CUTOVER_PLAN_PATH_KEYS
 
 
+def test_expected_old_interpreter_plan_path_allows_only_its_leaf_symlink(tmp_path):
+    interpreter = tmp_path / "python3.11"
+    interpreter.write_text("#!/bin/sh\n", encoding="utf-8")
+    interpreter.chmod(0o700)
+    configured = tmp_path / "python"
+    configured.symlink_to(interpreter)
+
+    assert cutover._absolute_plan_path(
+        configured,
+        label="expected_old_interpreter",
+    ) == configured
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="installed_plist must not be a symlink",
+    ):
+        cutover._absolute_plan_path(configured, label="installed_plist")
+
+
 def test_internal_watchdog_receipt_is_scoped_to_exact_job(tmp_path):
     plan, registry = _internal_watchdog_plan(tmp_path)
 
