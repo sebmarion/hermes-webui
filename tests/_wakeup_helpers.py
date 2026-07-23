@@ -28,6 +28,8 @@ class FakeProcessRegistry:
         self._completion_consumed: set[str] = set()
         self.completion_queue: queue.Queue = queue.Queue()
         self._procs: dict[str, types.SimpleNamespace] = {}
+        self.finish_calls: list[tuple[dict, bool]] = []
+        self.fail_committed_delivery = False
 
     def register(self, process_id: str, session_key: str) -> None:
         self._procs[process_id] = types.SimpleNamespace(session_key=session_key)
@@ -38,6 +40,33 @@ class FakeProcessRegistry:
     def is_completion_consumed(self, process_id: str) -> bool:
         with self._lock:
             return process_id in self._completion_consumed
+
+    def mark_completion_consumed(self, event_or_process_id) -> bool:
+        process_id = (
+            str(event_or_process_id.get("session_id") or "")
+            if isinstance(event_or_process_id, dict)
+            else str(event_or_process_id or "")
+        )
+        if not process_id:
+            return False
+        with self._lock:
+            self._completion_consumed.add(process_id)
+        return True
+
+    def finish_notification_delivery(self, event: dict, committed: bool) -> bool:
+        """Mirror the paired Agent's atomic ACK-or-requeue contract."""
+        self.finish_calls.append((event, committed))
+        if committed and not self.fail_committed_delivery:
+            stable_id = str(
+                event.get("session_id") or event.get("delegation_id") or ""
+            )
+            if not stable_id:
+                return False
+            with self._lock:
+                self._completion_consumed.add(stable_id)
+            return True
+        self.completion_queue.put(event)
+        return False
 
 
 def install_fake_registry(monkeypatch, fake) -> None:
@@ -78,8 +107,25 @@ def install_fake_start_session_turn(monkeypatch, *, status: int = 200):
     holder = {"calls": [], "event": threading.Event()}
 
     def _fake(session_id, message, *, source="process_wakeup"):
+        process_completion_events = []
+        if source == "process_wakeup" and status < 400:
+            try:
+                from api.background_process import (
+                    claim_staged_process_completion_events,
+                )
+
+                process_completion_events = (
+                    claim_staged_process_completion_events(session_id)
+                )
+            except (ImportError, AttributeError):
+                process_completion_events = []
         holder["calls"].append(
-            {"session_id": session_id, "message": message, "source": source}
+            {
+                "session_id": session_id,
+                "message": message,
+                "source": source,
+                "process_completion_events": process_completion_events,
+            }
         )
         holder["event"].set()
         return {"stream_id": "fake-stream", "session_id": session_id, "_status": status}

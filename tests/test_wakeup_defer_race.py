@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import types
 
 
@@ -50,6 +51,7 @@ class _FakeProcessRegistry:
         self._completion_consumed: set[str] = set()
         self.completion_queue: queue.Queue = queue.Queue()
         self._procs: dict[str, types.SimpleNamespace] = {}
+        self.finish_calls: list[tuple[dict, bool]] = []
 
     def register(self, process_id: str, session_key: str) -> None:
         self._procs[process_id] = types.SimpleNamespace(session_key=session_key)
@@ -60,6 +62,32 @@ class _FakeProcessRegistry:
     def is_completion_consumed(self, process_id: str) -> bool:
         with self._lock:
             return process_id in self._completion_consumed
+
+    def mark_completion_consumed(self, event_or_process_id) -> bool:
+        process_id = (
+            str(event_or_process_id.get("session_id") or "")
+            if isinstance(event_or_process_id, dict)
+            else str(event_or_process_id or "")
+        )
+        if not process_id:
+            return False
+        with self._lock:
+            self._completion_consumed.add(process_id)
+        return True
+
+    def finish_notification_delivery(self, event: dict, committed: bool) -> bool:
+        self.finish_calls.append((event, committed))
+        if committed:
+            stable_id = str(
+                event.get("session_id") or event.get("delegation_id") or ""
+            )
+            if not stable_id:
+                return False
+            with self._lock:
+                self._completion_consumed.add(stable_id)
+            return True
+        self.completion_queue.put(event)
+        return False
 
 
 def _install_fake_registry(monkeypatch, fake):
@@ -115,7 +143,7 @@ def _wait_for(predicate, timeout=3.0, interval=0.02):
 
 
 def _reset_cfg_state():
-    from api import config as _cfg
+    from api import background_process as bp, config as _cfg
 
     with _cfg.PROCESS_SESSION_INDEX_LOCK:
         _cfg.PROCESS_SESSION_INDEX.clear()
@@ -123,6 +151,9 @@ def _reset_cfg_state():
     _cfg.BG_TASK_COMPLETE_EVENTS_SEEN.clear()
     with _cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
         _cfg.DEFERRED_PROCESS_WAKEUPS.clear()
+    if hasattr(bp, "_STAGED_PROCESS_COMPLETION_EVENTS"):
+        with bp._STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+            bp._STAGED_PROCESS_COMPLETION_EVENTS.clear()
     with _cfg.STREAMS_LOCK:
         _cfg.STREAMS.clear()
     if hasattr(_cfg, "ACTIVE_RUNS"):
@@ -132,12 +163,15 @@ def _reset_cfg_state():
 
 def _completion_evt(process_id: str, session_key: str) -> dict:
     return {
+        "event_id": f"process:{process_id}:completion",
         "type": "completion",
         "session_id": process_id,
         "session_key": session_key,
+        "platform": "webui",
         "command": "sleep 2",
         "exit_code": 0,
         "output": "done",
+        "created_at": time.time(),
     }
 
 
@@ -278,11 +312,16 @@ def test_next_user_turn_drain_and_teardown_hook_dont_double_fire(monkeypatch):
         with cfg.ACTIVE_RUNS_LOCK:
             cfg.ACTIVE_RUNS[stream_id] = {"session_id": sid}
 
-        bp._process_one(_completion_evt("proc-shared-1", sid))
-        # Shared dedupe contract: _process_one marked it seen + registry-
-        # consumed before deferring.
-        assert "proc-shared-1" in cfg.BG_TASK_COMPLETE_EVENTS_SEEN[sid]
-        assert fake.is_completion_consumed("proc-shared-1")
+        evt = _completion_evt("proc-shared-1", sid)
+        bp._process_one(evt)
+        # The in-memory claim prevents a raced next-turn drain, but the durable
+        # process completion is intentionally NOT ACKed until the replacement
+        # wakeup turn is accepted.
+        assert (
+            "process:proc-shared-1:completion"
+            in cfg.BG_TASK_COMPLETE_EVENTS_SEEN[sid]
+        )
+        assert not fake.is_completion_consumed("proc-shared-1")
         assert sid in cfg.DEFERRED_PROCESS_WAKEUPS
 
         # A user turn comes: the next-turn drain runs. Even if a duplicate
@@ -299,6 +338,10 @@ def test_next_user_turn_drain_and_teardown_hook_dont_double_fire(monkeypatch):
         started = bp.drain_deferred_wakeups_for_session(sid)
         assert started == 1
         assert _wait_for_wakeup(holder)
+        assert holder["calls"][0]["process_completion_events"] == [evt]
+        assert holder["calls"][0]["process_completion_events"][0] is evt
+        assert fake.finish_notification_delivery(evt, True) is True
+        assert fake.is_completion_consumed("proc-shared-1")
         assert len(holder["calls"]) == 1, (
             "deferred wakeup delivered more than once across next-turn drain "
             "+ teardown hook"
@@ -680,6 +723,44 @@ def test_idle_path_409_redefer_carries_process_id_and_dedups(monkeypatch):
         _reset_cfg_state()
 
 
+def test_release_fence_503_redefers_process_wakeup(monkeypatch):
+    """Maintenance admission must postpone, never discard, a durable wakeup."""
+    from api import background_process as bp, config as cfg, routes
+
+    _reset_cfg_state()
+    attempted = threading.Event()
+
+    def fenced_start(session_id, message, *, source="process_wakeup"):
+        attempted.set()
+        return {
+            "_status": 503,
+            "code": "maintenance_fence",
+            "retryable": True,
+        }
+
+    monkeypatch.setattr(routes, "start_session_turn", fenced_start)
+    sid = "sess-release-fence"
+    process_id = "proc-release-fence"
+    try:
+        bp._start_server_side_wakeup_turn(
+            sid,
+            "[IMPORTANT: durable wakeup]",
+            process_id=process_id,
+        )
+        assert attempted.wait(timeout=1.0)
+        assert _wait_for(
+            lambda: bool(cfg.DEFERRED_PROCESS_WAKEUPS.get(sid))
+        ), "maintenance fence discarded the process wakeup"
+        assert cfg.DEFERRED_PROCESS_WAKEUPS[sid] == [
+            {
+                "process_id": process_id,
+                "wakeup_prompt": "[IMPORTANT: durable wakeup]",
+            }
+        ]
+    finally:
+        _reset_cfg_state()
+
+
 # --------------------------------------------------------------------------
 # Async-delegation delivery ACK contract: the durable delegation id must
 # survive idle/deferred/409 paths and may be ACKed only after a replacement
@@ -705,9 +786,7 @@ def test_async_delegation_idle_wakeup_acks_after_turn_acceptance(monkeypatch):
     _install_fake_registry(monkeypatch, fake)
     _reset_cfg_state()
     holder = _install_fake_start_session_turn(monkeypatch)
-    acked: list[str] = []
     monkeypatch.setattr(bp, "format_wakeup_prompt", lambda _evt: "[ASYNC COMPLETE]")
-    monkeypatch.setattr(bp, "_ack_async_delegation_delivery", lambda did: acked.append(did) or True)
 
     sid = "sess-async-idle"
     did = "deleg_async_idle"
@@ -718,8 +797,13 @@ def test_async_delegation_idle_wakeup_acks_after_turn_acceptance(monkeypatch):
         bp._process_one(evt)
 
         assert _wait_for_wakeup(holder)
-        assert _wait_for(lambda: acked == [did])
+        assert holder["calls"][0]["process_completion_events"] == [evt]
+        assert holder["calls"][0]["process_completion_events"][0] is evt
+        assert not fake.is_completion_consumed(did)
+        assert fake.finish_calls == []
+        assert fake.finish_notification_delivery(evt, True) is True
         assert fake.is_completion_consumed(did)
+        assert fake.finish_calls == [(evt, True)]
         assert len(holder["calls"]) == 1
     finally:
         bp.unregister_process_session(sid)
@@ -733,9 +817,7 @@ def test_async_delegation_defer_preserves_id_until_redelivery_ack(monkeypatch):
     _install_fake_registry(monkeypatch, fake)
     _reset_cfg_state()
     holder = _install_fake_start_session_turn(monkeypatch)
-    acked: list[str] = []
     monkeypatch.setattr(bp, "format_wakeup_prompt", lambda _evt: "[ASYNC COMPLETE]")
-    monkeypatch.setattr(bp, "_ack_async_delegation_delivery", lambda did: acked.append(did) or True)
 
     sid = "sess-async-deferred"
     did = "deleg_async_deferred"
@@ -744,23 +826,27 @@ def test_async_delegation_defer_preserves_id_until_redelivery_ack(monkeypatch):
     try:
         with cfg.ACTIVE_RUNS_LOCK:
             cfg.ACTIVE_RUNS[stream_id] = {"session_id": sid}
-        bp._process_one(_async_delegation_evt(did, sid))
+        evt = _async_delegation_evt(did, sid)
+        bp._process_one(evt)
 
         assert holder["event"].wait(timeout=0.2) is False
-        assert acked == []
+        assert fake.finish_calls == []
         entries = cfg.DEFERRED_PROCESS_WAKEUPS[sid]
         assert entries == [
             {
                 "process_id": did,
                 "wakeup_prompt": "[ASYNC COMPLETE]",
                 "async_delegation_id": did,
+                "completion_event": evt,
             }
         ]
 
         cfg.unregister_active_run(stream_id)
         assert bp.drain_deferred_wakeups_for_session(sid) == 1
         assert _wait_for_wakeup(holder)
-        assert _wait_for(lambda: acked == [did])
+        assert holder["calls"][0]["process_completion_events"] == [evt]
+        assert fake.finish_notification_delivery(evt, True) is True
+        assert fake.is_completion_consumed(did)
     finally:
         with cfg.ACTIVE_RUNS_LOCK:
             cfg.ACTIVE_RUNS.pop(stream_id, None)
@@ -775,36 +861,38 @@ def test_async_delegation_409_redefer_retains_ack_identity(monkeypatch):
     _install_fake_registry(monkeypatch, fake)
     _reset_cfg_state()
     first = _install_fake_start_session_turn(monkeypatch, status=409)
-    acked: list[str] = []
     monkeypatch.setattr(bp, "format_wakeup_prompt", lambda _evt: "[ASYNC COMPLETE]")
-    monkeypatch.setattr(bp, "_ack_async_delegation_delivery", lambda did: acked.append(did) or True)
 
     sid = "sess-async-409"
     did = "deleg_async_409"
     bp.register_process_session(sid, sid)
     try:
-        bp._process_one(_async_delegation_evt(did, sid))
+        evt = _async_delegation_evt(did, sid)
+        bp._process_one(evt)
         assert _wait_for_wakeup(first)
         assert _wait_for(lambda: bool(cfg.DEFERRED_PROCESS_WAKEUPS.get(sid)))
-        assert acked == []
+        assert fake.finish_calls == []
         assert cfg.DEFERRED_PROCESS_WAKEUPS[sid][0]["process_id"] == did
         assert cfg.DEFERRED_PROCESS_WAKEUPS[sid][0]["async_delegation_id"] == did
+        assert cfg.DEFERRED_PROCESS_WAKEUPS[sid][0]["completion_event"] is evt
 
         accepted = _install_fake_start_session_turn(monkeypatch, status=200)
         assert bp.drain_deferred_wakeups_for_session(sid) == 1
         assert _wait_for_wakeup(accepted)
-        assert _wait_for(lambda: acked == [did])
+        assert accepted["calls"][0]["process_completion_events"] == [evt]
+        assert fake.finish_notification_delivery(evt, True) is True
+        assert fake.is_completion_consumed(did)
     finally:
         bp.unregister_process_session(sid)
         _reset_cfg_state()
 
 
 def test_async_delegation_failed_or_paused_launch_remains_unacked(monkeypatch):
-    from api import background_process as bp, routes
+    from api import background_process as bp, config as cfg, routes
 
     _reset_cfg_state()
-    acked: list[str] = []
-    monkeypatch.setattr(bp, "_ack_async_delegation_delivery", lambda did: acked.append(did) or True)
+    fake = _FakeProcessRegistry()
+    _install_fake_registry(monkeypatch, fake)
 
     def run_launch(status: int, error: str, did: str) -> None:
         called = threading.Event()
@@ -814,17 +902,28 @@ def test_async_delegation_failed_or_paused_launch_remains_unacked(monkeypatch):
             return {"_status": status, "error": error}
 
         monkeypatch.setattr(routes, "start_session_turn", fake_start)
+        evt = _async_delegation_evt(did, "sess-async-failed")
         bp._start_server_side_wakeup_turn(
             "sess-async-failed",
             "[ASYNC COMPLETE]",
             process_id=did,
             async_delegation_id=did,
+            completion_event=evt,
         )
         assert called.wait(timeout=1.0)
+        assert _wait_for(
+            lambda: any(
+                entry.get("completion_event") is evt
+                for entry in cfg.DEFERRED_PROCESS_WAKEUPS.get(
+                    "sess-async-failed", []
+                )
+            ),
+            timeout=1.0,
+        )
 
     try:
         run_launch(500, "launch failed", "deleg_async_failed")
         run_launch(409, "process_wakeup_paused", "deleg_async_paused")
-        assert _wait_for(lambda: acked == [], timeout=0.2)
+        assert fake.finish_calls == []
     finally:
         _reset_cfg_state()

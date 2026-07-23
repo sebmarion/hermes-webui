@@ -451,6 +451,15 @@ async function resolveBundleCommand(text,_meta){
   });
 }
 
+async function resolveSkillCommand(text,_meta){
+  const command=String(text||'').trim();
+  if(!command) throw new Error('command is required');
+  return api('/api/commands/skills/resolve',{
+    method:'POST',
+    body:JSON.stringify({command})
+  });
+}
+
 function _activeSlashCommandOffset(text){
   // Find the offset of the slash that begins the active command token.
   // A command token starts with / at the beginning of the line or after
@@ -2054,6 +2063,12 @@ async function getBundleCommandMetadata(name){
   if(!needle) return null;
   const bundles=await loadBundleCommands();
   return bundles.find(bundle=>String(bundle&&bundle.name||'').toLowerCase()===needle)||null;
+}
+async function getSkillCommandMetadata(name){
+  const needle=String(name||'').trim().toLowerCase();
+  if(!needle) return null;
+  const skills=await loadSkillCommands();
+  return skills.find(skill=>String(skill&&skill.name||'').toLowerCase()===needle)||null;
 }
 function refreshSlashCommandDropdown(){
   const ta=$('msg');if(!ta)return;

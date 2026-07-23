@@ -28,6 +28,22 @@ class TestAutoInstallAgentDeps:
                 assert not mock_run.called
         assert 'disabled' in capsys.readouterr().out.lower()
 
+    def test_managed_release_forces_auto_install_off(self, tmp_path, capsys):
+        agent_dir = tmp_path / 'hermes-agent'
+        agent_dir.mkdir()
+        (agent_dir / 'requirements.txt').write_text('pyyaml\n')
+        env = {
+            'HERMES_WEBUI_AGENT_DIR': str(agent_dir),
+            'HERMES_WEBUI_AUTO_INSTALL': '1',
+            'HERMES_WEBUI_RELEASE_PATH': str(tmp_path / 'release'),
+        }
+        with patch.dict('os.environ', env, clear=False):
+            with patch('api.startup._trusted_agent_dir', return_value=True):
+                with patch('subprocess.run') as mock_run:
+                    assert auto_install_agent_deps() is False
+                    assert not mock_run.called
+        assert 'managed release' in capsys.readouterr().out.lower()
+
     def test_installs_from_requirements_txt(self, tmp_path):
         agent_dir = tmp_path / 'hermes-agent'
         agent_dir.mkdir()

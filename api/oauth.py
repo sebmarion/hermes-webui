@@ -61,6 +61,20 @@ _OAUTH_START_LOCKS_LOCK = threading.Lock()
 _ANTHROPIC_ENV_KEYS = ("ANTHROPIC_TOKEN", "ANTHROPIC_API_KEY")
 
 
+def oauth_activity_snapshot() -> dict:
+    """Return pending OAuth work that must survive the current process."""
+    with _OAUTH_FLOWS_LOCK:
+        pending = sum(
+            1
+            for flow in _OAUTH_FLOWS.values()
+            if isinstance(flow, dict) and flow.get("status") == "pending"
+        )
+    return {
+        "pending_oauth_flows": pending,
+        "oauth_activity_available": True,
+    }
+
+
 def _oauth_start_key(provider: str, hermes_home: Path) -> tuple[str, str]:
     """Return the canonical single-flight key for onboarding OAuth starts."""
     return (_normalize_onboarding_oauth_provider(provider), str(Path(hermes_home)))

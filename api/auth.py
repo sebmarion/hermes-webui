@@ -54,6 +54,7 @@ PUBLIC_PATHS = frozenset({
     '/api/auth/oidc/start', '/api/auth/oidc/callback',
     '/api/auth/passkey/options', '/api/auth/passkey/login',
     '/api/internal/recovery/start',
+    '/api/internal/release-control',
     '/share',
     '/manifest.json', '/manifest.webmanifest',
     '/session/manifest.json', '/session/manifest.webmanifest',

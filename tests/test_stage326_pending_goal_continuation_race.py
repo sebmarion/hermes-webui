@@ -11,13 +11,15 @@ def _read_routes():
     return Path(__file__).parents[1].joinpath("api", "routes.py").read_text(encoding="utf-8")
 
 
-def test_streaming_settles_goal_only_after_parent_ownership_cleanup():
+def test_streaming_keeps_parent_active_through_settlement_then_recovers_successor():
     src = _read_streaming()
     pop_idx = src.find("STREAM_GOAL_RELATED.pop(stream_id")
-    unregister_idx = src.find("unregister_active_run(stream_id)", pop_idx)
-    settle_idx = src.find("settle_goal_continuation(session_id, stream_id)", unregister_idx)
-    assert -1 not in (pop_idx, unregister_idx, settle_idx)
-    assert pop_idx < unregister_idx < settle_idx
+    settle_idx = src.find("settle_goal_continuation(session_id, stream_id)", pop_idx)
+    finish_idx = src.find("finish_session_activity(", settle_idx)
+    unregister_idx = src.find("unregister_active_run(stream_id", finish_idx)
+    recover_idx = src.find("recover_pending_goal_continuations(", unregister_idx)
+    assert -1 not in (pop_idx, settle_idx, finish_idx, unregister_idx, recover_idx)
+    assert pop_idx < settle_idx < finish_idx < unregister_idx < recover_idx
 
 
 def test_routes_server_start_marks_goal_continuation_goal_related():

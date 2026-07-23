@@ -715,9 +715,11 @@ def test_goal_continuation_is_claimed_then_started_at_server_teardown_boundary()
     assert STREAMING_PY.index("claim_goal_continuation") < STREAMING_PY.index(
         "put('goal_continue'"
     )
-    cleanup = STREAMING_PY.index("unregister_active_run(stream_id)")
-    settle = STREAMING_PY.index("settle_goal_continuation", cleanup)
-    assert cleanup < settle
+    settle = STREAMING_PY.index("settle_goal_continuation")
+    finish = STREAMING_PY.index("finish_session_activity(", settle)
+    cleanup = STREAMING_PY.index("unregister_active_run(stream_id", finish)
+    recover = STREAMING_PY.index("recover_pending_goal_continuations", cleanup)
+    assert settle < finish < cleanup < recover
     assert 'source == "goal_continuation"' in ROUTES_PY
     assert "_recover_goal_continuations_on_startup" in ROUTES_PY
     assert "recover_pending_goal_continuations" in ROUTES_PY

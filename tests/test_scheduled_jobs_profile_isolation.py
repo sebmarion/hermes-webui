@@ -184,7 +184,7 @@ def test_cron_run_does_not_silently_swallow_profile_resolution_errors():
     # The spawn site must call get_active_hermes_home() unguarded (no
     # try/except around it specifically), because a silent fallback to None
     # is exactly what would re-introduce #1573.
-    spawn_idx = body.find("threading.Thread(target=_run_cron_tracked")
+    spawn_idx = body.find("threading.Thread(\n        target=_run_admitted_cron")
     assert spawn_idx != -1, "thread spawn not found in _handle_cron_run"
 
     # Look at the 1500 chars before the spawn — should NOT contain the

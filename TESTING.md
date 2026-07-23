@@ -1602,6 +1602,28 @@ Manual-only for Sprint 6:
 
 *Static: static/index.html + static/style.css + static/app.js*
 
+### Immutable release FIRST-activation checks
+
+Run the focused bridge and release-selector suites through the repository
+runner:
+
+```bash
+./scripts/test.sh tests/test_release_first_activation_bridge.py \
+  tests/test_webui_release_selector.py -q
+```
+
+The bridge coverage includes immutable CLI staging, maintenance-gate crash
+adoption, foreign-target and inode-swap refusal, exact legacy-link rollback,
+post-`pair_opened` public activation, private cron tick-lock acquisition and
+resume semantics, reversible legacy `0644` lock/store normalization,
+symlink/hardlink/inode/content-swap rejection, and natural nonzero-to-zero
+gateway shutdown counts. Synthetic-store cases include mixed delivered/queued
+terminal records, running/unknown/non-allowlisted rejection, crash adoption,
+exact quarantine bytes, and rollback that never replays quarantined
+completions. These tests model cooperating writers on a bounded
+single-operator host; they do not assert exclusion of a malicious same-uid
+actor.
+
 
 ---
 

@@ -101,7 +101,16 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 from api.auth import check_auth, reset_trusted_auth_request_state
-from api.config import HOST, PORT, STATE_DIR, SESSION_DIR, DEFAULT_WORKSPACE
+from api import config as api_config
+from api.config import (
+    HOST,
+    PORT,
+    STATE_DIR,
+    SESSION_DIR,
+    DEFAULT_WORKSPACE,
+    RunAdmissionClosed,
+    run_admission_scope,
+)
 from api.helpers import (
     j,
     get_profile_cookie,
@@ -113,6 +122,30 @@ from api.routes import handle_delete, handle_get, handle_patch, handle_post, han
 from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
 from api.crash_visibility import install_crash_visibility
+
+
+_STARTUP_FENCE_ALLOWED_REQUESTS = {
+    ("GET", "/health"),
+    ("POST", "/api/internal/release-control"),
+}
+_STARTUP_FENCE_PAYLOAD = {
+    "error": "WebUI candidate is awaiting release acceptance",
+    "code": "startup_fence",
+    "retryable": True,
+}
+
+
+def _startup_request_allowed(method: str, path: str) -> bool:
+    """Allow only health and authenticated release control before acceptance."""
+    if not api_config.startup_run_admission_is_closed():
+        return True
+    return (str(method or "").upper(), str(path or "")) in (
+        _STARTUP_FENCE_ALLOWED_REQUESTS
+    )
+
+
+def _deny_startup_fenced_request(handler) -> None:
+    j(handler, dict(_STARTUP_FENCE_PAYLOAD), status=503)
 
 
 class QuietHTTPServer(ThreadingHTTPServer):
@@ -374,11 +407,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self._req_t0 = time.time(); reset_trusted_auth_request_state(self)
-        cookie_profile = get_profile_cookie(self)
-        if cookie_profile:
-            set_request_profile(cookie_profile)
         try:
             parsed = urlparse(self.path)
+            if not _startup_request_allowed(self.command, parsed.path):
+                return _deny_startup_fenced_request(self)
+            cookie_profile = get_profile_cookie(self)
+            if cookie_profile:
+                set_request_profile(cookie_profile)
             if not check_auth(self, parsed): return
             result = handle_get(self, parsed)
             if result is False:
@@ -399,15 +434,40 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_write(self, route_func) -> None:
         self._req_t0 = time.time(); reset_trusted_auth_request_state(self)
-        cookie_profile = get_profile_cookie(self)
-        if cookie_profile:
-            set_request_profile(cookie_profile)
+        admission_scope = None
         try:
             parsed = urlparse(self.path)
+            if not _startup_request_allowed(self.command, parsed.path):
+                return _deny_startup_fenced_request(self)
+            cookie_profile = get_profile_cookie(self)
+            if cookie_profile:
+                set_request_profile(cookie_profile)
             _is_csp_report_post = (
                 parsed.path == "/api/csp-report" and self.command == "POST"
             )
             if not _is_csp_report_post and not check_auth(self, parsed): return
+            if parsed.path not in {
+                "/api/internal/release-control",
+                "/api/csp-report",
+            }:
+                admission_scope = run_admission_scope(
+                    kind="http_write",
+                    method=self.command,
+                    path=parsed.path,
+                )
+                try:
+                    admission_scope.__enter__()
+                except RunAdmissionClosed:
+                    admission_scope = None
+                    return j(
+                        self,
+                        {
+                            "error": "WebUI maintenance cutover is in progress",
+                            "code": "maintenance_fence",
+                            "retryable": True,
+                        },
+                        status=503,
+                    )
             result = route_func(self, parsed)
             if result is False:
                 return j(self, {'error': 'not found'}, status=404)
@@ -423,6 +483,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._safe_webui_print(traceback.format_exc())
         finally:
+            if admission_scope is not None:
+                admission_scope.__exit__(None, None, None)
             clear_request_profile()
 
     def do_POST(self) -> None:
@@ -437,6 +499,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         """Handle CORS preflight requests (headers emitted by api.routes)."""
         self._req_t0 = time.time()
+        parsed = urlparse(self.path)
+        if not _startup_request_allowed(self.command, parsed.path):
+            return _deny_startup_fenced_request(self)
         self.send_response(200)
         apply_cors_preflight_headers(self)
         # Frame the empty preflight: without Content-Length an HTTP/1.1 keep-alive
@@ -545,6 +610,212 @@ def _abort_if_already_serving(host: str, port: int) -> None:
         pass
 
 
+_DEFERRED_STARTUP_LOCK = threading.Lock()
+_DEFERRED_STARTUP_COMPLETED: set[str] = set()
+
+
+def _materialize_internal_recovery_key() -> None:
+    from api.atomic_recovery import ensure_internal_recovery_key
+
+    ensure_internal_recovery_key()
+
+
+def _create_state_directories() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    DEFAULT_WORKSPACE.mkdir(parents=True, exist_ok=True)
+
+
+def _recover_startup_sessions() -> None:
+    from api.models import _active_state_db_path
+    from api.session_recovery import recover_all_sessions_on_startup
+
+    result = recover_all_sessions_on_startup(
+        SESSION_DIR,
+        rebuild_index=True,
+        state_db_path=_active_state_db_path(),
+    )
+    if result.get("restored"):
+        print(
+            f"[recovery] Restored {result['restored']}/{result['scanned']} "
+            "sessions from .bak (see #1558).",
+            flush=True,
+        )
+
+
+def _load_startup_plugins() -> None:
+    from api.plugins import load_plugins
+
+    load_plugins()
+
+
+def _start_startup_background_services() -> None:
+    from api import background_process
+
+    drain_started = background_process.start_drain_thread()
+    drain_worker = getattr(background_process, "_DRAIN_THREAD", None)
+    if drain_worker is None or not drain_worker.is_alive():
+        if drain_started:
+            background_process.stop_drain_thread()
+        raise RuntimeError("bg_task_complete drain thread is not alive")
+    try:
+        reaper_started = background_process.start_session_channel_reaper()
+        reaper_worker = getattr(background_process, "_REAPER_THREAD", None)
+        if reaper_worker is None or not reaper_worker.is_alive():
+            raise RuntimeError("SessionChannel reaper thread is not alive")
+    except Exception:
+        if drain_started:
+            background_process.stop_drain_thread()
+        try:
+            background_process.stop_session_channel_reaper()
+        except Exception:
+            logger.exception("failed to stop rejected SessionChannel reaper")
+        raise
+    if drain_started:
+        print("[ok] bg_task_complete drain thread started", flush=True)
+    if reaper_started:
+        print("[ok] SessionChannel reaper thread started", flush=True)
+
+
+def _require_terminal_recovery_receipt(name: str, receipt: object) -> dict:
+    if not isinstance(receipt, dict) or receipt.get("status") != "complete":
+        raise RuntimeError(f"{name} did not report terminal success")
+    return receipt
+
+
+def _recover_tool_limit_continuations_for_startup() -> dict:
+    from api.routes import _recover_tool_limit_continuations_on_startup
+
+    return _require_terminal_recovery_receipt(
+        "tool-limit continuation recovery",
+        _recover_tool_limit_continuations_on_startup(strict=True),
+    )
+
+
+def _recover_goal_continuations_for_startup() -> dict:
+    from api.routes import _recover_goal_continuations_on_startup
+
+    return _require_terminal_recovery_receipt(
+        "goal continuation recovery",
+        _recover_goal_continuations_on_startup(strict=True),
+    )
+
+
+def _recover_process_completion_notifications() -> dict:
+    from tools.process_registry import process_registry
+
+    recover = getattr(process_registry, "recover_completion_notifications", None)
+    if not callable(recover):
+        if api_config.startup_run_admission_is_closed():
+            raise RuntimeError(
+                "paired Agent lacks durable process completion recovery"
+            )
+        logger.warning(
+            "durable process completion recovery unavailable in this Agent build"
+        )
+        return {"status": "unavailable", "recovered": 0}
+    recovered = recover()
+    if isinstance(recovered, bool) or not isinstance(recovered, int) or recovered < 0:
+        raise RuntimeError("process completion recovery returned an invalid receipt")
+    return {"status": "complete", "recovered": recovered}
+
+
+def _recover_async_delegation_notifications() -> dict:
+    try:
+        from tools.async_delegation import recover_async_delegations
+    except ImportError:
+        recover_async_delegations = None
+    if not callable(recover_async_delegations):
+        if api_config.startup_run_admission_is_closed():
+            raise RuntimeError(
+                "paired Agent lacks durable async delegation recovery"
+            )
+        logger.warning(
+            "durable async delegation recovery unavailable in this Agent build"
+        )
+        return {"status": "unavailable", "queued": 0, "lost": 0}
+    report = recover_async_delegations()
+    if not isinstance(report, dict) or report.get("error"):
+        raise RuntimeError("async delegation recovery returned a failure receipt")
+    queued = report.get("queued")
+    lost = report.get("lost")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (queued, lost)
+    ):
+        raise RuntimeError("async delegation recovery returned an invalid receipt")
+    return {"status": "complete", "queued": queued, "lost": lost}
+
+
+def _deferred_startup_steps():
+    """Ordered, individually idempotent process-start mutators."""
+    steps = [
+        ("credential_permissions", fix_credential_permissions),
+        ("internal_recovery_key", _materialize_internal_recovery_key),
+        ("state_directories", _create_state_directories),
+        ("startup_profile_state", api_config.apply_startup_profile_state),
+        ("provider_model_seed", api_config.seed_startup_provider_models),
+        (
+            "startup_configuration",
+            api_config.apply_deferred_startup_configuration,
+        ),
+        ("session_recovery", _recover_startup_sessions),
+        ("plugins", _load_startup_plugins),
+        (
+            "process_completion_recovery",
+            _recover_process_completion_notifications,
+        ),
+        (
+            "async_delegation_recovery",
+            _recover_async_delegation_notifications,
+        ),
+    ]
+    # api.routes normally schedules these at module import. Managed startup is
+    # already fenced by then, so those attempts are intentionally refused and
+    # must be replayed through the acceptor's transaction-scoped admission.
+    if api_config.startup_run_admission_is_closed():
+        steps.extend(
+            (
+                (
+                    "tool_limit_continuation_recovery",
+                    _recover_tool_limit_continuations_for_startup,
+                ),
+                (
+                    "goal_continuation_recovery",
+                    _recover_goal_continuations_for_startup,
+                ),
+            )
+        )
+    steps.append(("background_services", _start_startup_background_services))
+    return tuple(steps)
+
+
+def _run_deferred_startup_mutators() -> dict:
+    """Run each deferred mutator once; preserve progress across a safe retry."""
+    with _DEFERRED_STARTUP_LOCK:
+        for name, mutator in _deferred_startup_steps():
+            if name in _DEFERRED_STARTUP_COMPLETED:
+                continue
+            try:
+                mutator()
+            except Exception as exc:
+                raise RuntimeError(f"deferred startup step failed: {name}") from exc
+            _DEFERRED_STARTUP_COMPLETED.add(name)
+        return {
+            "status": "started",
+            "completed": sorted(_DEFERRED_STARTUP_COMPLETED),
+        }
+
+
+def _prepare_startup_mutators() -> str:
+    """Run normal startup now, or register it behind a managed startup fence."""
+    api_config.configure_startup_acceptor(_run_deferred_startup_mutators)
+    if api_config.startup_run_admission_is_closed():
+        return "deferred"
+    _run_deferred_startup_mutators()
+    return "started"
+
+
 def main() -> None:
     from api.config import print_startup_config, verify_hermes_imports, _HERMES_FOUND
 
@@ -565,24 +836,6 @@ def main() -> None:
         )
     elif fd_limit.get("status") == "error":
         print(f"[!!] WARNING: Could not raise file descriptor limit: {fd_limit.get('error')}", flush=True)
-
-    fix_credential_permissions()
-    from api.atomic_recovery import ensure_internal_recovery_key
-    ensure_internal_recovery_key()
-
-    try:
-        from api.models import _active_state_db_path
-        from api.session_recovery import recover_all_sessions_on_startup
-        result = recover_all_sessions_on_startup(
-            SESSION_DIR,
-            rebuild_index=True,
-            state_db_path=_active_state_db_path(),
-        )
-        if result.get("restored"):
-            print(f"[recovery] Restored {result['restored']}/{result['scanned']} sessions from .bak (see #1558).", flush=True)
-    except Exception as exc:
-        # Recovery is best-effort; never block server startup.
-        print(f"[recovery] startup recovery failed: {exc}", flush=True)
 
     within_container = False
     try:
@@ -617,40 +870,31 @@ def main() -> None:
         print(f'[!!] Warning: Hermes agent found but missing modules: {missing}', flush=True)
         for mod, err in errors.items():
             print(f'     {mod}: {err}', flush=True)
-        print('     Attempting to install missing dependencies from agent requirements.txt...', flush=True)
-        auto_install_agent_deps()
-        ok, missing, errors = verify_hermes_imports()
-        if not ok:
-            print(f'[!!] Still missing after install attempt: {missing}', flush=True)
-            for mod, err in errors.items():
-                print(f'     {mod}: {err}', flush=True)
-            print('     Agent features may not work correctly.', flush=True)
+        if api_config.startup_run_admission_is_closed():
+            print(
+                "[!!] Managed release dependency verification failed; "
+                "automatic installation is disabled and startup remains fenced.",
+                flush=True,
+            )
         else:
-            print('[ok] Agent dependencies installed successfully.', flush=True)
+            print('     Attempting to install missing dependencies from agent requirements.txt...', flush=True)
+            auto_install_agent_deps()
+            ok, missing, errors = verify_hermes_imports()
+            if not ok:
+                print(f'[!!] Still missing after install attempt: {missing}', flush=True)
+                for mod, err in errors.items():
+                    print(f'     {mod}: {err}', flush=True)
+                print('     Agent features may not work correctly.', flush=True)
+            else:
+                print('[ok] Agent dependencies installed successfully.', flush=True)
 
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    DEFAULT_WORKSPACE.mkdir(parents=True, exist_ok=True)
-
-    try:
-        from api.background_process import start_drain_thread
-        if start_drain_thread():
-            print('[ok] bg_task_complete drain thread started', flush=True)
-    except Exception as e:
-        print(f'[!!] WARNING: bg_task_complete drain failed to start: {e}', flush=True)
-
-    try:
-        from api.background_process import start_session_channel_reaper
-        if start_session_channel_reaper():
-            print('[ok] SessionChannel reaper thread started', flush=True)
-    except Exception as e:
-        print(f'[!!] WARNING: SessionChannel reaper failed to start: {e}', flush=True)
-
-    try:
-        from api.plugins import load_plugins
-        load_plugins()
-    except Exception as e:
-        print(f'[!!] WARNING: Plugin loading failed: {e}', flush=True)
+    startup_mutators = _prepare_startup_mutators()
+    if startup_mutators == "deferred":
+        print(
+            "[ok] Managed candidate listening startup-fenced; "
+            "state mutators await signed release acceptance.",
+            flush=True,
+        )
 
     _abort_if_already_serving(HOST, PORT)
     httpd = QuietHTTPServer((HOST, PORT), Handler)

@@ -313,6 +313,69 @@ def ensure_python_has_webui_deps(python_exe: str, agent_dir: Path | None = None)
     )
 
 
+_MANAGED_BOOTSTRAP_KEYS = (
+    "HERMES_WEBUI_RELEASE_ROOT",
+    "HERMES_WEBUI_RELEASE_PATH",
+    "HERMES_WEBUI_MANIFEST_SHA256",
+    "HERMES_WEBUI_SELECTOR_GENERATION",
+    "HERMES_WEBUI_SELECTOR_PATH",
+    "HERMES_WEBUI_INTERPRETER_PATH",
+    "HERMES_WEBUI_LAUNCH_MODE",
+    "HERMES_WEBUI_PYTHON",
+    "HERMES_WEBUI_SERVER_CWD",
+)
+
+
+def _managed_bootstrap_python(agent_dir: Path | None) -> str | None:
+    """Return the pinned managed interpreter or fail without fallback."""
+    values = {key: os.environ.get(key) for key in _MANAGED_BOOTSTRAP_KEYS}
+    managed_present = any(
+        values[key] is not None
+        for key in (
+            "HERMES_WEBUI_RELEASE_ROOT",
+            "HERMES_WEBUI_RELEASE_PATH",
+            "HERMES_WEBUI_MANIFEST_SHA256",
+            "HERMES_WEBUI_LAUNCH_MODE",
+        )
+    )
+    if not managed_present:
+        return None
+    if any(value is None or not str(value).strip() for value in values.values()):
+        raise RuntimeError("Managed release bootstrap environment is incomplete")
+
+    release_root = Path(str(values["HERMES_WEBUI_RELEASE_ROOT"]))
+    release_path = Path(str(values["HERMES_WEBUI_RELEASE_PATH"]))
+    server_cwd = Path(str(values["HERMES_WEBUI_SERVER_CWD"]))
+    configured_python = Path(str(values["HERMES_WEBUI_INTERPRETER_PATH"]))
+    launcher_python = Path(str(values["HERMES_WEBUI_PYTHON"]))
+    for label, path in (
+        ("release root", release_root),
+        ("release path", release_path),
+        ("server cwd", server_cwd),
+        ("interpreter", configured_python),
+        ("launcher interpreter", launcher_python),
+    ):
+        if not path.is_absolute() or Path(os.path.abspath(path)) != path:
+            raise RuntimeError(f"Managed {label} path is not absolute and canonical")
+    if release_path.parent != release_root:
+        raise RuntimeError("Managed release path is outside the release root")
+    if release_path.resolve(strict=True) != REPO_ROOT.resolve(strict=True):
+        raise RuntimeError("Managed release path does not match bootstrap code root")
+    if server_cwd != release_path or server_cwd.resolve(strict=True) != release_path:
+        raise RuntimeError("Managed server cwd does not match the immutable release")
+    if launcher_python != configured_python:
+        raise RuntimeError("Managed launcher interpreter does not match manifest")
+    if Path(sys.executable).absolute() != configured_python:
+        raise RuntimeError("Managed bootstrap process uses the wrong interpreter")
+    if not os.access(configured_python, os.X_OK):
+        raise RuntimeError("Managed interpreter is not executable")
+    if not _python_can_run_webui_and_agent(str(configured_python), agent_dir):
+        raise RuntimeError(
+            "Managed interpreter cannot import WebUI and Hermes Agent dependencies"
+        )
+    return str(configured_python)
+
+
 def hermes_command_exists() -> bool:
     return shutil.which("hermes") is not None
 
@@ -535,7 +598,11 @@ def main() -> int:
         install_hermes_agent()
         agent_dir = discover_agent_dir()
 
-    python_exe = ensure_python_has_webui_deps(discover_launcher_python(agent_dir), agent_dir)
+    python_exe = _managed_bootstrap_python(agent_dir)
+    if python_exe is None:
+        python_exe = ensure_python_has_webui_deps(
+            discover_launcher_python(agent_dir), agent_dir
+        )
     state_dir = Path(
         os.getenv("HERMES_WEBUI_STATE_DIR")
         or Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes")) / "webui"

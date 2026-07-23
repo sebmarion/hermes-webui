@@ -89,6 +89,17 @@ def _trusted_agent_dir(agent_dir: Path) -> bool:
 
 
 def auto_install_agent_deps() -> bool:
+    if any(
+        os.environ.get(key) is not None
+        for key in (
+            'HERMES_WEBUI_RELEASE_ROOT',
+            'HERMES_WEBUI_RELEASE_PATH',
+            'HERMES_WEBUI_MANIFEST_SHA256',
+            'HERMES_WEBUI_LAUNCH_MODE',
+        )
+    ):
+        print('[!!] Auto-install disabled for managed release.', flush=True)
+        return False
     enabled = os.environ.get('HERMES_WEBUI_AUTO_INSTALL', '').strip().lower() in ('1', 'true', 'yes')
     if not enabled:
         print('[!!] Auto-install disabled. Set HERMES_WEBUI_AUTO_INSTALL=1 to enable.', flush=True)

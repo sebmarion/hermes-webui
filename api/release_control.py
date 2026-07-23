@@ -1,0 +1,415 @@
+"""Loopback-HMAC release fence for exact-process WebUI cutovers."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import threading
+import time
+
+from api.auth import _is_loopback, _signing_key
+from api.build_identity import get_build_identity
+from api import config
+from api.process_identity import process_start_token
+
+
+_AUTH_WINDOW_SECONDS = 60
+_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+_SEEN_NONCES: dict[str, float] = {}
+_SEEN_NONCES_LOCK = threading.Lock()
+
+
+def _release_control_signing_key() -> bytes:
+    """Read the pre-provisioned key without mutating startup-fenced state."""
+    if not config.startup_run_admission_is_closed():
+        return _signing_key()
+    key_path = config.STATE_DIR / ".signing_key"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(key_path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise RuntimeError("release control signing key is unsafe")
+        raw = os.read(descriptor, 33)
+    finally:
+        os.close(descriptor)
+    if len(raw) < 32:
+        raise RuntimeError("release control signing key is invalid")
+    return raw[:32]
+
+
+def _canonical_request_body(body: dict) -> bytes:
+    return json.dumps(
+        body,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def release_control_signing_bytes(body: dict, timestamp: str) -> bytes:
+    return (
+        b"hermes-webui-release-control-v1\n"
+        + str(timestamp).encode("ascii")
+        + b"\n"
+        + _canonical_request_body(body)
+    )
+
+
+def release_control_response_signing_bytes(payload: dict) -> bytes:
+    return (
+        b"hermes-webui-release-control-response-v1\n"
+        + _canonical_request_body(payload)
+    )
+
+
+def _attest_release_control_response(payload: dict) -> dict:
+    receipt = dict(payload)
+    receipt["attestation"] = hmac.new(
+        _release_control_signing_key(),
+        release_control_response_signing_bytes(receipt),
+        hashlib.sha256,
+    ).hexdigest()
+    return receipt
+
+
+def _claim_nonce(nonce: str, now: float) -> bool:
+    with _SEEN_NONCES_LOCK:
+        cutoff = now - _AUTH_WINDOW_SECONDS
+        for prior, seen_at in list(_SEEN_NONCES.items()):
+            if seen_at < cutoff:
+                _SEEN_NONCES.pop(prior, None)
+        if nonce in _SEEN_NONCES:
+            return False
+        if len(_SEEN_NONCES) >= 4096:
+            oldest = min(_SEEN_NONCES, key=_SEEN_NONCES.get)
+            _SEEN_NONCES.pop(oldest, None)
+        _SEEN_NONCES[nonce] = now
+        return True
+
+
+def verify_release_control_request(handler, body: dict) -> tuple[bool, str | None]:
+    """Authenticate one fresh loopback request without trusting proxy headers."""
+    try:
+        remote = str(handler.client_address[0])
+    except Exception:
+        return False, "Release control requires a loopback client"
+    if not _is_loopback(remote) or not isinstance(body, dict):
+        return False, "Release control requires a loopback client"
+    timestamp = str(
+        getattr(handler, "headers", {}).get("X-Hermes-Release-Timestamp") or ""
+    ).strip()
+    signature = str(
+        getattr(handler, "headers", {}).get("X-Hermes-Release-Signature") or ""
+    ).strip().lower()
+    nonce = str(body.get("nonce") or "").strip()
+    try:
+        request_time = int(timestamp)
+    except (TypeError, ValueError):
+        return False, "Release control authentication failed"
+    now = time.time()
+    if abs(now - request_time) > _AUTH_WINDOW_SECONDS:
+        return False, "Release control authentication failed"
+    if not re.fullmatch(r"[0-9a-f]{64}", signature) or not _NONCE_RE.fullmatch(nonce):
+        return False, "Release control authentication failed"
+    try:
+        expected = hmac.new(
+            _release_control_signing_key(),
+            release_control_signing_bytes(body, timestamp),
+            hashlib.sha256,
+        ).hexdigest()
+    except Exception:
+        return False, "Release control authentication failed"
+    if not hmac.compare_digest(signature, expected):
+        return False, "Release control authentication failed"
+    if not _claim_nonce(nonce, now):
+        return False, "Release control authentication failed"
+    return True, None
+
+
+def current_release_process_identity(*, build_identity: dict | None = None) -> dict:
+    """Return the exact flat process/build identity required by fence requests."""
+    build = (
+        dict(build_identity)
+        if isinstance(build_identity, dict)
+        # The build-identity cache is keyed by every immutable managed env
+        # field and bounded to one PID. Release-control calls are frequent
+        # during drain and must not re-hash the sealed runtime on every poll.
+        # Candidate/accepted binding still forces a fresh deep /health proof.
+        else get_build_identity(refresh=False)
+    )
+    executable = Path(sys.executable).absolute()
+    try:
+        resolved_executable = executable.resolve(strict=True)
+    except OSError:
+        resolved_executable = executable
+    try:
+        cwd = str(Path.cwd().resolve(strict=True))
+    except OSError:
+        cwd = str(Path.cwd().absolute())
+    pid_start_token = process_start_token(os.getpid()) or ""
+    return {
+        "pid": os.getpid(),
+        "pid_start_token": pid_start_token,
+        "started_at": config.SERVER_START_TIME,
+        "instance_id": config.SERVER_INSTANCE_ID,
+        "cwd": cwd,
+        "executable": str(executable),
+        "executable_resolved": str(resolved_executable),
+        "build_status": str(build.get("status") or "unknown"),
+        "build_valid": build.get("valid"),
+        "build_id": build.get("build_id"),
+        "commit": build.get("commit"),
+        "tree": build.get("tree"),
+        "manifest_sha256": build.get("manifest_sha256"),
+        "agent_commit": build.get("agent_commit"),
+        "agent_tree": build.get("agent_tree"),
+        "agent_manifest_sha256": build.get("agent_manifest_sha256"),
+        "runtime_manifest_sha256": build.get("runtime_manifest_sha256"),
+        "selector_generation": build.get("selector_generation"),
+        "release_path": build.get("release_path"),
+        "launch_mode": build.get("launch_mode"),
+        "selector_verified": build.get("selector_verified"),
+        "selector_state_path": build.get("selector_state_path"),
+        "selector_lock_path": build.get("selector_lock_path"),
+        "launchd_label": build.get("launchd_label"),
+        "startup_fenced": build.get("startup_fenced"),
+        "startup_transaction_id": build.get("startup_transaction_id"),
+    }
+
+
+def _active_async_delegation_count() -> tuple[int, bool]:
+    try:
+        from tools.async_delegation import active_count
+
+        count = active_count()
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            return 0, False
+        return count, True
+    except Exception:
+        return 0, False
+
+
+def _component_activity_snapshot(loader, *, availability_key: str) -> dict:
+    try:
+        snapshot = loader()
+        if not isinstance(snapshot, dict) or snapshot.get(availability_key) is not True:
+            raise ValueError("release activity source is unavailable")
+        for key, value in snapshot.items():
+            if key == availability_key:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError("release activity source returned an invalid count")
+        return dict(snapshot)
+    except Exception:
+        return {availability_key: False}
+
+
+def release_activity_snapshot() -> dict:
+    with config.STREAMS_LOCK:
+        active_streams = len(config.STREAMS)
+    active_delegations, available = _active_async_delegation_count()
+    snapshot = {
+        "active_streams": active_streams,
+        "active_async_delegations": active_delegations,
+        "async_delegations_available": available,
+    }
+    from api.oauth import oauth_activity_snapshot
+    from api.session_lifecycle import background_commit_activity_snapshot
+    from api.terminal import terminal_activity_snapshot
+
+    snapshot.update(
+        _component_activity_snapshot(
+            background_commit_activity_snapshot,
+            availability_key="memory_commit_activity_available",
+        )
+    )
+    snapshot.update(
+        _component_activity_snapshot(
+            oauth_activity_snapshot,
+            availability_key="oauth_activity_available",
+        )
+    )
+    snapshot.update(
+        _component_activity_snapshot(
+            terminal_activity_snapshot,
+            availability_key="terminal_activity_available",
+        )
+    )
+    try:
+        from tools.process_registry import process_registry
+
+        process_loader = process_registry.completion_activity_snapshot
+    except Exception:
+        process_loader = lambda: {"process_completion_activity_available": False}
+    snapshot.update(
+        _component_activity_snapshot(
+            process_loader,
+            availability_key="process_completion_activity_available",
+        )
+    )
+    return snapshot
+
+
+def _require_current_identity(expected_identity: dict) -> dict:
+    current = current_release_process_identity()
+    if not isinstance(expected_identity, dict) or expected_identity != current:
+        raise config.RunAdmissionIdentityMismatch(
+            "release control process identity changed"
+        )
+    return current
+
+
+def _require_external_activity_drained(snapshot: dict) -> None:
+    availability = (
+        "async_delegations_available",
+        "memory_commit_activity_available",
+        "oauth_activity_available",
+        "terminal_activity_available",
+        "process_completion_activity_available",
+    )
+    unavailable = [key for key in availability if snapshot.get(key) is not True]
+    if unavailable:
+        raise config.RunAdmissionBusy(
+            "release activity state is unavailable: " + ", ".join(unavailable)
+        )
+    counts = (
+        "active_streams",
+        "active_async_delegations",
+        "active_background_memory_commits",
+        "in_flight_memory_commits",
+        "pending_oauth_flows",
+        "active_terminals",
+        "running_processes",
+        "finalizing_processes",
+        "durable_undelivered_completions",
+    )
+    busy = [key for key in counts if int(snapshot.get(key, -1)) != 0]
+    if busy:
+        raise config.RunAdmissionBusy(
+            "release activity has not drained: " + ", ".join(busy)
+        )
+
+
+def commit_release_control(
+    token: str,
+    *,
+    expected_identity: dict,
+    transaction_id: str | None = None,
+) -> dict:
+    """Commit only after external activity is zero before and after transition."""
+    current = _require_current_identity(expected_identity)
+    before = release_activity_snapshot()
+    _require_external_activity_drained(before)
+    admission = config.commit_run_admission(
+        token,
+        expected_identity=current,
+        transaction_id=transaction_id,
+    )
+    after = release_activity_snapshot()
+    try:
+        _require_external_activity_drained(after)
+        _require_current_identity(expected_identity)
+    except Exception:
+        config.revert_run_admission_commit(
+            token,
+            expected_identity=current,
+            transaction_id=transaction_id,
+        )
+        raise
+    return {"status": "committing", "admission": admission, "activity": after}
+
+
+def execute_release_control(body: dict, *, fence_token: str | None = None) -> dict:
+    action = str(body.get("action") or "").strip().lower()
+    transaction_id = str(body.get("transaction_id") or "").strip()
+    request_nonce = str(body.get("nonce") or "").strip()
+    if not _NONCE_RE.fullmatch(transaction_id):
+        raise ValueError("release control transaction identity is invalid")
+    if action == "inspect":
+        return _attest_release_control_response(
+            {
+                "status": "inspected",
+                "transaction_id": transaction_id,
+                "request_nonce": request_nonce,
+                "identity": current_release_process_identity(),
+                "admission": config.run_admission_snapshot(),
+                "activity": release_activity_snapshot(),
+            }
+        )
+    expected = body.get("expected")
+    current = _require_current_identity(expected)
+    if action == "fence":
+        result = config.fence_run_admission(
+            current,
+            transaction_id=transaction_id,
+        )
+        status = str(result["admission"].get("state") or "fenced")
+        return _attest_release_control_response(
+            {
+                "status": status,
+                "transaction_id": transaction_id,
+                "request_nonce": request_nonce,
+                "fence_token": result["token"],
+                "admission": result["admission"],
+                "identity": current,
+                "activity": release_activity_snapshot(),
+            }
+        )
+    if action == "accept":
+        admission = config.accept_startup_run_admission(
+            str(fence_token or ""),
+            expected_identity=current,
+            transaction_id=transaction_id,
+        )
+        return _attest_release_control_response(
+            {
+                "status": "accepted",
+                "transaction_id": transaction_id,
+                "request_nonce": request_nonce,
+                "admission": admission,
+                "identity": current,
+                "activity": release_activity_snapshot(),
+            }
+        )
+    if action == "abort":
+        admission = config.abort_run_admission(
+            str(fence_token or ""),
+            expected_identity=current,
+            transaction_id=transaction_id,
+        )
+        return _attest_release_control_response(
+            {
+                "status": "aborted",
+                "transaction_id": transaction_id,
+                "request_nonce": request_nonce,
+                "admission": admission,
+                "identity": current,
+            }
+        )
+    if action == "commit":
+        result = commit_release_control(
+            str(fence_token or ""),
+            expected_identity=current,
+            transaction_id=transaction_id,
+        )
+        return _attest_release_control_response(
+            {
+                **result,
+                "transaction_id": transaction_id,
+                "request_nonce": request_nonce,
+                "identity": current,
+            }
+        )
+    raise ValueError("release control action is invalid")

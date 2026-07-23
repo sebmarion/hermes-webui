@@ -1,0 +1,6537 @@
+"""Release 0B immutable selector, build identity, and cutover contracts."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import socket
+import stat
+import subprocess
+import sys
+import threading
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from api import build_identity
+from scripts import webui_release_cutover as cutover
+from scripts import webui_release_selector as selector
+
+
+@pytest.fixture(autouse=True)
+def _restore_immutable_tmp_permissions(tmp_path):
+    """Make fixture-owned immutable release trees removable by pytest."""
+    yield
+    for root, directories, filenames in os.walk(tmp_path, topdown=False):
+        root_path = Path(root)
+        for filename in filenames:
+            try:
+                (root_path / filename).chmod(0o600)
+            except FileNotFoundError:
+                pass
+        for directory in directories:
+            try:
+                (root_path / directory).chmod(0o700)
+            except FileNotFoundError:
+                pass
+        try:
+            root_path.chmod(0o700)
+        except FileNotFoundError:
+            pass
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_cutover_script_is_directly_executable_from_outside_repo(tmp_path):
+    completed = subprocess.run(
+        [sys.executable, str(Path(cutover.__file__).resolve()), "--help"],
+        cwd=tmp_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "Hermes WebUI immutable cutover driver" in completed.stdout
+
+
+def _write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def _chmod(path: Path, mode: int) -> None:
+    path.chmod(mode)
+
+
+def _identity_receipt(path: Path) -> dict[str, str]:
+    return {
+        "path": str(path),
+        "resolved_path": str(path.resolve()),
+        "sha256": _sha(path.resolve()),
+    }
+
+
+def _release_metadata(changed_files: set[str]) -> dict:
+    return {
+        "patch_decisions": {
+            path: {"decision": "ship", "rationale": "covered by release test"}
+            for path in sorted(changed_files)
+        },
+        "test_receipts": [
+            {
+                "name": "release-selector-focused",
+                "status": "passed",
+                "receipt_sha256": "c" * 64,
+            }
+        ],
+        "artifact_hashes": {"preserved_worktree_patch": "d" * 64},
+    }
+
+
+def _agent_source_snapshot(tmp_path: Path) -> dict:
+    contents = {
+        "agent/__init__.py": b"# immutable agent package\n",
+        "hermes_cli/__init__.py": b"# immutable cli package\n",
+        "run_agent.py": b"def main():\n    return 0\n",
+        "tools/__init__.py": b"# immutable tools package\n",
+        "tools/process_registry.py": b"PROCESS_REGISTRY = True\n",
+    }
+    commit = "e" * 40
+    tree = "f" * 40
+    manifest = {
+        "version": 1,
+        "origin_url": "git@github.com:NousResearch/hermes-agent.git",
+        "base_commit": "d" * 40,
+        "commit": commit,
+        "tree": tree,
+        "changed_files": [],
+        "files": {
+            relative: hashlib.sha256(content).hexdigest()
+            for relative, content in sorted(contents.items())
+        },
+    }
+    encoded_manifest = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    manifest_sha256 = hashlib.sha256(encoded_manifest).hexdigest()
+    release_root = tmp_path / "agent-releases"
+    snapshots_root = release_root / "snapshots"
+    manifests_root = release_root / "manifests"
+    source_path = snapshots_root / manifest_sha256
+    manifest_path = manifests_root / f"{manifest_sha256}.json"
+    snapshots_root.mkdir(parents=True, exist_ok=True)
+    manifests_root.mkdir(parents=True, exist_ok=True)
+    if not source_path.exists():
+        source_path.mkdir()
+        for relative, content in contents.items():
+            destination = source_path / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+            _chmod(destination, 0o444)
+        for directory in sorted(
+            (path for path in source_path.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            _chmod(directory, 0o555)
+        _chmod(source_path, 0o555)
+    if not manifest_path.exists():
+        manifest_path.write_bytes(encoded_manifest)
+        _chmod(manifest_path, 0o444)
+    identity = {
+        "path": str(source_path),
+        "resolved_path": str(source_path.resolve()),
+        "commit": commit,
+        "tree": tree,
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": manifest_sha256,
+    }
+    return {
+        "identity": identity,
+        "release_root": release_root,
+        "source_path": source_path,
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "manifest_sha256": manifest_sha256,
+    }
+
+
+def _rewrite_release_manifest(release: dict, manifest: dict) -> str:
+    _chmod(release["manifest_path"], 0o644)
+    release["manifest_path"].write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    _chmod(release["manifest_path"], 0o444)
+    release["manifest"] = manifest
+    release["manifest_sha256"] = _sha(release["manifest_path"])
+    return release["manifest_sha256"]
+
+
+def _attest_runtime_agent(
+    monkeypatch,
+    release: dict,
+    *,
+    agent_dir: Path | None = None,
+    run_agent_file: Path | None = None,
+    module_files: dict[str, Path] | None = None,
+) -> None:
+    from api import config as api_config
+
+    source_path = release["agent_source"]["source_path"]
+    monkeypatch.setattr(api_config, "_AGENT_DIR", agent_dir or source_path)
+    monkeypatch.setattr(
+        api_config,
+        "__file__",
+        str(release["release_path"] / "api" / "config.py"),
+    )
+    monkeypatch.setattr(
+        build_identity,
+        "__file__",
+        str(release["release_path"] / "api" / "build_identity.py"),
+    )
+    critical_webui_modules = {
+        "api.routes": release["release_path"] / "api" / "routes.py",
+        "api.release_control": release["release_path"] / "api" / "release_control.py",
+        "api.streaming": release["release_path"] / "api" / "streaming.py",
+        "server": release["release_path"] / "server.py",
+    }
+    for module_name, module_path in critical_webui_modules.items():
+        module = sys.modules.get(module_name)
+        if module is not None:
+            monkeypatch.setattr(module, "__file__", str(module_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "run_agent",
+        SimpleNamespace(__file__=str(run_agent_file or (source_path / "run_agent.py"))),
+    )
+    expected_modules = {
+        "agent": source_path / "agent" / "__init__.py",
+        "hermes_cli": source_path / "hermes_cli" / "__init__.py",
+        "tools": source_path / "tools" / "__init__.py",
+        "tools.process_registry": source_path / "tools" / "process_registry.py",
+    }
+    expected_modules.update(module_files or {})
+    for module_name, module_path in expected_modules.items():
+        monkeypatch.setitem(
+            sys.modules,
+            module_name,
+            SimpleNamespace(__file__=str(module_path)),
+        )
+
+
+def _runtime_snapshot(tmp_path: Path) -> dict:
+    contents = {
+        "python-home/bin/python3.11": b"#!/bin/sh\nexit 0\n",
+        "python-home/lib/python3.11/os.py": b"# sealed stdlib\n",
+        "site-packages/yaml/__init__.py": b"VALUE = 1\n",
+    }
+    manifest = {
+        "version": 1,
+        "interpreter_relative_path": "python-home/bin/python3.11",
+        "site_packages_relative_path": "site-packages",
+        "files": {
+            relative: hashlib.sha256(content).hexdigest()
+            for relative, content in sorted(contents.items())
+        },
+    }
+    encoded = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    manifest_sha256 = hashlib.sha256(encoded).hexdigest()
+    root = tmp_path / "runtime-releases"
+    runtime_path = root / "snapshots" / manifest_sha256
+    manifest_path = root / "manifests" / f"{manifest_sha256}.json"
+    if not runtime_path.exists():
+        for relative, content in contents.items():
+            destination = runtime_path / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+            _chmod(
+                destination,
+                0o555 if relative == "python-home/bin/python3.11" else 0o444,
+            )
+        for directory in sorted(
+            (path for path in runtime_path.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            _chmod(directory, 0o555)
+        _chmod(runtime_path, 0o555)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    if not manifest_path.exists():
+        manifest_path.write_bytes(encoded)
+        _chmod(manifest_path, 0o444)
+    interpreter = runtime_path / "python-home" / "bin" / "python3.11"
+    identity = {
+        "path": str(runtime_path),
+        "resolved_path": str(runtime_path.resolve()),
+        "python_home_path": str(runtime_path / "python-home"),
+        "site_packages_path": str(runtime_path / "site-packages"),
+        "interpreter_path": str(interpreter),
+        "interpreter_resolved_path": str(interpreter.resolve()),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": manifest_sha256,
+    }
+    return {"identity": identity, "manifest": manifest, "path": runtime_path}
+
+
+def _sealed_runtime_for_build(tmp_path: Path) -> tuple[dict, Path]:
+    identity = _runtime_snapshot(tmp_path)["identity"]
+    return identity, Path(identity["interpreter_path"])
+
+
+def _managed_release(
+    tmp_path: Path,
+    build_id: str = "build-1",
+    *,
+    symlink_interpreter: bool = False,
+) -> dict:
+    agent_source = _agent_source_snapshot(tmp_path)
+    runtime = _runtime_snapshot(tmp_path)
+    selector_path = tmp_path / "bin" / "webui-release-selector.py"
+    interpreter_path = Path(runtime["identity"]["interpreter_path"])
+    _write(selector_path, "# trusted selector\n")
+    _chmod(selector_path, 0o755)
+
+    release_root = tmp_path / "releases"
+    release_path = release_root / build_id
+    _write(release_path / "bootstrap.py", "print('boot')\n")
+    _write(release_path / "api" / "app.py", "VALUE = 1\n")
+    _write(release_path / "api" / "build_identity.py", "# build identity\n")
+    _write(release_path / "api" / "config.py", "# config\n")
+    _write(release_path / "api" / "routes.py", "# routes\n")
+    _write(release_path / "api" / "release_control.py", "# release control\n")
+    _write(release_path / "api" / "streaming.py", "# streaming\n")
+    _write(release_path / "server.py", "# server\n")
+    files = {
+        "api/app.py": _sha(release_path / "api" / "app.py"),
+        "api/build_identity.py": _sha(release_path / "api" / "build_identity.py"),
+        "api/config.py": _sha(release_path / "api" / "config.py"),
+        "api/routes.py": _sha(release_path / "api" / "routes.py"),
+        "api/release_control.py": _sha(
+            release_path / "api" / "release_control.py"
+        ),
+        "api/streaming.py": _sha(release_path / "api" / "streaming.py"),
+        "bootstrap.py": _sha(release_path / "bootstrap.py"),
+        "server.py": _sha(release_path / "server.py"),
+    }
+    manifest = {
+        "version": 1,
+        "build_id": build_id,
+        "origin_url": "git@github.com:nesquena/hermes-webui.git",
+        "base_commit": "c" * 40,
+        "commit": "a" * 40,
+        "tree": "b" * 40,
+        "changed_files": ["api/app.py"],
+        **_release_metadata({"api/app.py"}),
+        "files": files,
+        "selector": {
+            "path": str(selector_path),
+            "resolved_path": str(selector_path.resolve()),
+            "sha256": _sha(selector_path),
+        },
+        "interpreter": {
+            "path": str(interpreter_path),
+            "resolved_path": str(interpreter_path.resolve()),
+            "sha256": _sha(interpreter_path),
+        },
+        "runtime": runtime["identity"],
+        "agent_source": agent_source["identity"],
+    }
+    manifest_path = release_path / selector.MANIFEST_NAME
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    for file_path in release_path.rglob("*"):
+        if file_path.is_file():
+            _chmod(file_path, 0o444)
+    for directory in sorted(
+        (path for path in release_path.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        _chmod(directory, 0o555)
+    _chmod(release_path, 0o555)
+    _chmod(release_root, 0o755)
+    return {
+        "build_id": build_id,
+        "selector_path": selector_path,
+        "interpreter_path": interpreter_path,
+        "release_root": release_root,
+        "release_path": release_path,
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "manifest_sha256": _sha(manifest_path),
+        "agent_source": agent_source,
+        "runtime": runtime,
+        "record": {
+            "manifest_sha256": _sha(manifest_path),
+            "commit": manifest["commit"],
+            "tree": manifest["tree"],
+        },
+    }
+
+
+def _managed_env(release: dict, generation: int = 7) -> dict[str, str]:
+    agent_identity = release["agent_source"]["identity"]
+    return {
+        "HERMES_WEBUI_RELEASE_ROOT": str(release["release_root"]),
+        "HERMES_WEBUI_RELEASE_PATH": str(release["release_path"]),
+        "HERMES_WEBUI_MANIFEST_SHA256": release["manifest_sha256"],
+        "HERMES_WEBUI_SELECTOR_GENERATION": str(generation),
+        "HERMES_WEBUI_SELECTOR_PATH": str(release["selector_path"]),
+        "HERMES_WEBUI_SELECTOR_STATE": str(release["release_root"].parent / "selector.json"),
+        "HERMES_WEBUI_SELECTOR_LOCK": str(release["release_root"].parent / "selector.lock"),
+        "HERMES_WEBUI_LAUNCHD_LABEL": "com.example.hermes-webui",
+        "HERMES_WEBUI_INTERPRETER_PATH": str(release["interpreter_path"]),
+        "HERMES_WEBUI_LAUNCH_MODE": "selector",
+        "HERMES_WEBUI_AGENT_DIR": agent_identity["path"],
+        "HERMES_WEBUI_AGENT_COMMIT": agent_identity["commit"],
+        "HERMES_WEBUI_AGENT_TREE": agent_identity["tree"],
+        "HERMES_WEBUI_AGENT_MANIFEST_PATH": agent_identity["manifest_path"],
+        "HERMES_WEBUI_AGENT_MANIFEST_SHA256": agent_identity["manifest_sha256"],
+        "HERMES_WEBUI_RUNTIME_PATH": release["runtime"]["identity"]["path"],
+        "HERMES_WEBUI_RUNTIME_PYTHON_HOME": release["runtime"]["identity"][
+            "python_home_path"
+        ],
+        "HERMES_WEBUI_RUNTIME_SITE_PACKAGES": release["runtime"]["identity"][
+            "site_packages_path"
+        ],
+        "HERMES_WEBUI_RUNTIME_MANIFEST_PATH": release["runtime"]["identity"][
+            "manifest_path"
+        ],
+        "HERMES_WEBUI_RUNTIME_MANIFEST_SHA256": release["runtime"]["identity"][
+            "manifest_sha256"
+        ],
+    }
+
+
+def test_complete_manifest_and_external_identities_verify(tmp_path):
+    release = _managed_release(tmp_path)
+
+    verified = selector.verify_release(
+        release["release_path"],
+        release_root=release["release_root"],
+        expected_manifest_sha256=release["manifest_sha256"],
+        selector_path=release["selector_path"],
+    )
+
+    assert verified["build_id"] == "build-1"
+    assert verified["commit"] == "a" * 40
+    assert verified["tree"] == "b" * 40
+    assert verified["interpreter_path"] == str(release["interpreter_path"].resolve())
+    assert verified["agent_source_path"] == str(
+        release["agent_source"]["source_path"]
+    )
+    assert verified["agent_source_commit"] == "e" * 40
+    assert verified["agent_source_tree"] == "f" * 40
+    assert verified["agent_source_manifest_sha256"] == release["agent_source"][
+        "manifest_sha256"
+    ]
+
+
+def test_candidate_identity_match_projects_full_release_to_signed_process(tmp_path):
+    release = _managed_release(tmp_path)
+    transaction_id = "candidate-projection-transaction-000001"
+    verified = selector.verify_release(
+        release["release_path"],
+        release_root=release["release_root"],
+        expected_manifest_sha256=release["manifest_sha256"],
+        selector_path=release["selector_path"],
+    )
+    expected = {
+        **verified,
+        "selector_generation": 2,
+        "launch_mode": "selector",
+        "selector_state_path": str(tmp_path / "control" / "selector.json"),
+        "selector_lock_path": str(tmp_path / "control" / "selector.lock"),
+        "launchd_label": "com.example.hermes-webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    actual = {
+        "build_id": verified["build_id"],
+        "commit": verified["commit"],
+        "tree": verified["tree"],
+        "manifest_sha256": verified["manifest_sha256"],
+        "agent_commit": verified["agent_source_commit"],
+        "agent_tree": verified["agent_source_tree"],
+        "agent_manifest_sha256": verified["agent_source_manifest_sha256"],
+        "runtime_manifest_sha256": verified["runtime_manifest_sha256"],
+        "selector_generation": 2,
+        "release_path": verified["release_path"],
+        "launch_mode": "selector",
+        "selector_verified": True,
+        "selector_state_path": str(tmp_path / "control" / "selector.json"),
+        "selector_lock_path": str(tmp_path / "control" / "selector.lock"),
+        "launchd_label": "com.example.hermes-webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+
+    assert cutover._candidate_identity_matches(actual, expected)
+
+    actual["agent_manifest_sha256"] = "0" * 64
+    assert not cutover._candidate_identity_matches(actual, expected)
+
+
+def test_expected_release_identity_is_reverified_before_cutover(tmp_path):
+    release = _managed_release(tmp_path)
+    verified = selector.verify_release(
+        release["release_path"],
+        release_root=release["release_root"],
+        expected_manifest_sha256=release["manifest_sha256"],
+        selector_path=release["selector_path"],
+    )
+
+    assert (
+        cutover._attest_expected_release_identity(
+            verified,
+            selector_path=str(release["selector_path"]),
+            label="candidate",
+        )
+        == verified
+    )
+
+    drifted = {
+        **verified,
+        "runtime_site_packages_path": str(tmp_path / "foreign-site-packages"),
+    }
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="candidate release identity mismatch: runtime_site_packages_path",
+    ):
+        cutover._attest_expected_release_identity(
+            drifted,
+            selector_path=str(release["selector_path"]),
+            label="candidate",
+        )
+
+
+def test_manifest_requires_paired_agent_source_identity(tmp_path):
+    release = _managed_release(tmp_path)
+    manifest = json.loads(release["manifest_path"].read_text(encoding="utf-8"))
+    manifest.pop("agent_source")
+    expected_hash = _rewrite_release_manifest(release, manifest)
+
+    with pytest.raises(selector.SelectorError, match="agent source identity"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=expected_hash,
+            selector_path=release["selector_path"],
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["extra", "missing", "hash", "symlink", "writable-file", "writable-directory"],
+)
+def test_manifest_rejects_paired_agent_source_drift(tmp_path, mutation):
+    release = _managed_release(tmp_path)
+    source_path = release["agent_source"]["source_path"]
+    run_agent = source_path / "run_agent.py"
+    if mutation == "extra":
+        _chmod(source_path, 0o755)
+        _write(source_path / "unexpected.py", "EXTRA = True\n")
+        _chmod(source_path / "unexpected.py", 0o444)
+        _chmod(source_path, 0o555)
+    elif mutation == "missing":
+        _chmod(source_path, 0o755)
+        run_agent.unlink()
+        _chmod(source_path, 0o555)
+    elif mutation == "hash":
+        _chmod(run_agent, 0o644)
+        _write(run_agent, "TAMPERED = True\n")
+        _chmod(run_agent, 0o444)
+    elif mutation == "symlink":
+        _chmod(source_path, 0o755)
+        run_agent.unlink()
+        run_agent.symlink_to(source_path / "agent" / "__init__.py")
+        _chmod(source_path, 0o555)
+    elif mutation == "writable-file":
+        _chmod(run_agent, 0o644)
+    else:
+        _chmod(source_path / "agent", 0o755)
+
+    with pytest.raises(selector.SelectorError, match="agent source"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        )
+    if mutation == "symlink":
+        _chmod(source_path, 0o755)
+        run_agent.unlink()
+        _chmod(source_path, 0o555)
+
+
+def test_manifest_rejects_paired_agent_manifest_tamper(tmp_path):
+    release = _managed_release(tmp_path)
+    manifest_path = release["agent_source"]["manifest_path"]
+    _chmod(manifest_path, 0o644)
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    _chmod(manifest_path, 0o444)
+
+    with pytest.raises(selector.SelectorError, match="agent source manifest hash"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        )
+
+
+def test_manifest_rejects_writable_paired_agent_manifest(tmp_path):
+    release = _managed_release(tmp_path)
+    _chmod(release["agent_source"]["manifest_path"], 0o644)
+
+    with pytest.raises(selector.SelectorError, match="agent source manifest.*read-only"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        )
+
+
+def test_manifest_rejects_noncanonical_paired_agent_path(tmp_path):
+    release = _managed_release(tmp_path)
+    source_path = release["agent_source"]["source_path"]
+    noncanonical = source_path.parent / ".." / "snapshots" / source_path.name
+    manifest = json.loads(release["manifest_path"].read_text(encoding="utf-8"))
+    manifest["agent_source"]["path"] = str(noncanonical)
+    expected_hash = _rewrite_release_manifest(release, manifest)
+
+    with pytest.raises(selector.SelectorError, match="absolute and canonical"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=expected_hash,
+            selector_path=release["selector_path"],
+        )
+
+
+def test_manifest_rejects_non_content_addressed_agent_root(tmp_path):
+    release = _managed_release(tmp_path)
+    source_path = release["agent_source"]["source_path"]
+    renamed = source_path.with_name("not-the-manifest-digest")
+    source_path.rename(renamed)
+    manifest = json.loads(release["manifest_path"].read_text(encoding="utf-8"))
+    manifest["agent_source"]["path"] = str(renamed)
+    manifest["agent_source"]["resolved_path"] = str(renamed.resolve())
+    expected_hash = _rewrite_release_manifest(release, manifest)
+
+    with pytest.raises(selector.SelectorError, match="content-addressed"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=expected_hash,
+            selector_path=release["selector_path"],
+        )
+
+
+@pytest.mark.parametrize("mutation", ["extra", "missing", "hash"])
+def test_manifest_rejects_file_set_and_hash_drift(tmp_path, mutation):
+    release = _managed_release(tmp_path)
+    if mutation == "extra":
+        _chmod(release["release_path"], 0o755)
+        _write(release["release_path"] / "unexpected.txt", "extra\n")
+        _chmod(release["release_path"] / "unexpected.txt", 0o444)
+        _chmod(release["release_path"], 0o555)
+    elif mutation == "missing":
+        _chmod(release["release_path"] / "api", 0o755)
+        (release["release_path"] / "api" / "app.py").unlink()
+        _chmod(release["release_path"] / "api", 0o555)
+    else:
+        _chmod(release["release_path"] / "api" / "app.py", 0o644)
+        _write(release["release_path"] / "api" / "app.py", "tampered\n")
+        _chmod(release["release_path"] / "api" / "app.py", 0o444)
+
+    with pytest.raises(selector.SelectorError, match=mutation):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        )
+
+
+@pytest.mark.parametrize("target", ["selector", "interpreter"])
+def test_manifest_rejects_external_identity_drift(tmp_path, target):
+    release = _managed_release(tmp_path)
+    if target == "interpreter":
+        _chmod(release[f"{target}_path"], 0o755)
+    _write(release[f"{target}_path"], "tampered external binary\n")
+
+    with pytest.raises(selector.SelectorError, match=target):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        )
+
+
+def test_manifest_rejects_root_escape_symlinks_and_traversal(tmp_path):
+    release = _managed_release(tmp_path)
+    outside = tmp_path / "outside"
+    _write(outside / "bootstrap.py", "outside\n")
+
+    with pytest.raises(selector.SelectorError, match="root"):
+        selector.verify_release(
+            outside,
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        )
+
+    symlinked_release = release["release_root"] / "linked"
+    symlinked_release.symlink_to(release["release_path"], target_is_directory=True)
+    with pytest.raises(selector.SelectorError, match="symlink"):
+        selector.verify_release(
+            symlinked_release,
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        )
+    symlinked_release.unlink()
+    manifest = json.loads(release["manifest_path"].read_text(encoding="utf-8"))
+    manifest["files"]["../escape.py"] = "0" * 64
+    _chmod(release["manifest_path"], 0o644)
+    release["manifest_path"].write_text(json.dumps(manifest), encoding="utf-8")
+    _chmod(release["manifest_path"], 0o444)
+    with pytest.raises(selector.SelectorError, match="path"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=_sha(release["manifest_path"]),
+            selector_path=release["selector_path"],
+        )
+
+
+def test_manifest_rejects_symlinked_content(tmp_path):
+    release = _managed_release(tmp_path)
+    app_path = release["release_path"] / "api" / "app.py"
+    _chmod(app_path.parent, 0o755)
+    app_path.unlink()
+    app_path.symlink_to(release["release_path"] / "bootstrap.py")
+    _chmod(app_path.parent, 0o555)
+    manifest = json.loads(release["manifest_path"].read_text(encoding="utf-8"))
+    manifest["files"]["api/app.py"] = _sha(app_path)
+    _chmod(release["manifest_path"], 0o644)
+    release["manifest_path"].write_text(json.dumps(manifest), encoding="utf-8")
+    _chmod(release["manifest_path"], 0o444)
+
+    with pytest.raises(selector.SelectorError, match="symlink"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=_sha(release["manifest_path"]),
+            selector_path=release["selector_path"],
+        )
+    _chmod(app_path.parent, 0o755)
+    app_path.unlink()
+
+
+def test_manifest_rejects_selector_invocation_alias(tmp_path):
+    release = _managed_release(tmp_path)
+    alias = release["selector_path"].with_name("selector-alias.py")
+    alias.symlink_to(release["selector_path"])
+
+    with pytest.raises(selector.SelectorError, match="invocation path"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=alias,
+        )
+
+
+@pytest.mark.parametrize("length", [39, 41, 63, 65])
+def test_selector_rejects_noncanonical_git_object_id_lengths(tmp_path, length):
+    release = _managed_release(tmp_path)
+    manifest = json.loads(release["manifest_path"].read_text(encoding="utf-8"))
+    manifest["commit"] = "a" * length
+    _chmod(release["manifest_path"], 0o644)
+    release["manifest_path"].write_text(json.dumps(manifest), encoding="utf-8")
+    _chmod(release["manifest_path"], 0o444)
+
+    with pytest.raises(selector.SelectorError, match="commit or tree"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=_sha(release["manifest_path"]),
+            selector_path=release["selector_path"],
+        )
+
+
+def test_release_0b_manifest_requires_admission_receipts(tmp_path):
+    release = _managed_release(tmp_path)
+    manifest = json.loads(release["manifest_path"].read_text(encoding="utf-8"))
+    manifest.pop("artifact_hashes")
+    _chmod(release["manifest_path"], 0o644)
+    release["manifest_path"].write_text(json.dumps(manifest), encoding="utf-8")
+    _chmod(release["manifest_path"], 0o444)
+
+    with pytest.raises(selector.SelectorError, match="artifact hashes"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=_sha(release["manifest_path"]),
+            selector_path=release["selector_path"],
+        )
+
+
+def test_manifest_rejects_writable_release_leaf_and_unsafe_release_root(tmp_path):
+    release = _managed_release(tmp_path)
+    _chmod(release["release_path"] / "bootstrap.py", 0o644)
+
+    with pytest.raises(selector.SelectorError, match="read-only"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        )
+
+    _chmod(release["release_path"] / "bootstrap.py", 0o444)
+    _chmod(release["release_root"], 0o777)
+    with pytest.raises(selector.SelectorError, match="ownership or mode"):
+        selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        )
+
+
+def test_build_identity_managed_unmanaged_and_invalid(monkeypatch, tmp_path):
+    for key in build_identity.MANAGED_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    assert build_identity.get_build_identity(refresh=True) == {
+        "status": "unmanaged",
+        "valid": False,
+    }
+
+    release = _managed_release(tmp_path)
+    _attest_runtime_agent(monkeypatch, release)
+    for key, value in _managed_env(release).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        build_identity, "_running_code_root", lambda: release["release_path"]
+    )
+    monkeypatch.setattr(
+        build_identity,
+        "_running_interpreter",
+        lambda: release["interpreter_path"].resolve(),
+    )
+    managed = build_identity.get_build_identity(refresh=True)
+    assert {
+        key: managed[key]
+        for key in (
+            "status",
+            "valid",
+            "build_id",
+            "commit",
+            "tree",
+            "manifest_sha256",
+            "agent_commit",
+            "agent_tree",
+            "agent_manifest_sha256",
+            "runtime_manifest_sha256",
+            "selector_generation",
+            "release_path",
+            "launch_mode",
+            "selector_state_path",
+            "selector_lock_path",
+            "launchd_label",
+            "startup_fenced",
+            "startup_transaction_id",
+        )
+    } == {
+        "status": "managed",
+        "valid": True,
+        "build_id": "build-1",
+        "commit": "a" * 40,
+        "tree": "b" * 40,
+        "manifest_sha256": release["manifest_sha256"],
+        "agent_commit": "e" * 40,
+        "agent_tree": "f" * 40,
+        "agent_manifest_sha256": release["agent_source"]["manifest_sha256"],
+        "runtime_manifest_sha256": release["runtime"]["identity"][
+            "manifest_sha256"
+        ],
+        "selector_generation": 7,
+        "release_path": str(release["release_path"].resolve()),
+        "launch_mode": "selector",
+        "selector_state_path": str(
+            release["release_root"].parent / "selector.json"
+        ),
+        "selector_lock_path": str(
+            release["release_root"].parent / "selector.lock"
+        ),
+        "launchd_label": "com.example.hermes-webui",
+        "startup_fenced": False,
+        "startup_transaction_id": None,
+    }
+    assert managed["attestation"] == "fresh"
+    assert managed["verification_age_seconds"] >= 0
+
+    startup_transaction = "candidate-startup-transaction-00001"
+    monkeypatch.setenv("HERMES_WEBUI_STARTUP_FENCED", "1")
+    monkeypatch.setenv(
+        "HERMES_WEBUI_STARTUP_TRANSACTION_ID",
+        startup_transaction,
+    )
+    candidate_identity = build_identity.get_build_identity(refresh=True)
+    assert candidate_identity["startup_fenced"] is True
+    assert candidate_identity["startup_transaction_id"] == startup_transaction
+    monkeypatch.delenv("HERMES_WEBUI_STARTUP_FENCED")
+    monkeypatch.delenv("HERMES_WEBUI_STARTUP_TRANSACTION_ID")
+
+    wrong_interpreter = tmp_path / "runtime" / "wrong-python"
+    _write(wrong_interpreter, "wrong interpreter\n")
+    monkeypatch.setattr(
+        build_identity, "_running_interpreter", lambda: wrong_interpreter.resolve()
+    )
+    wrong_runtime = build_identity.get_build_identity(refresh=True)
+    assert wrong_runtime["status"] == "invalid"
+    assert wrong_runtime["error_code"] == "manifest_verification_failed"
+    monkeypatch.setattr(
+        build_identity,
+        "_running_interpreter",
+        lambda: release["interpreter_path"].resolve(),
+    )
+
+    _chmod(release["release_path"] / "bootstrap.py", 0o644)
+    _write(release["release_path"] / "bootstrap.py", "tampered\n")
+    _chmod(release["release_path"] / "bootstrap.py", 0o444)
+    invalid = build_identity.get_build_identity(refresh=True)
+    assert invalid["status"] == "invalid"
+    assert invalid["valid"] is False
+    assert invalid["error_code"] == "manifest_verification_failed"
+
+
+def test_direct_fallback_health_does_not_depend_on_external_selector(
+    monkeypatch, tmp_path
+):
+    release = _managed_release(tmp_path)
+    _attest_runtime_agent(monkeypatch, release)
+    environment = _managed_env(release)
+    environment["HERMES_WEBUI_LAUNCH_MODE"] = "direct-fallback"
+    for key, value in environment.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        build_identity, "_running_code_root", lambda: release["release_path"]
+    )
+    monkeypatch.setattr(
+        build_identity,
+        "_running_interpreter",
+        lambda: release["interpreter_path"].absolute(),
+    )
+
+    release["selector_path"].unlink()
+
+    identity = build_identity.get_build_identity(refresh=True)
+    assert identity["status"] == "managed"
+    assert identity["valid"] is True
+    assert identity["launch_mode"] == "direct-fallback"
+
+
+def test_managed_health_rejects_present_but_empty_environment(monkeypatch):
+    for key in build_identity.MANAGED_ENV_KEYS:
+        monkeypatch.setenv(key, "")
+
+    identity = build_identity.get_build_identity(refresh=True)
+
+    assert identity["status"] == "invalid"
+    assert identity["valid"] is False
+    assert identity["error_code"] == "empty_managed_environment"
+
+
+def test_unmanaged_agent_dir_setting_does_not_claim_managed_release(monkeypatch, tmp_path):
+    for key in build_identity.MANAGED_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HERMES_WEBUI_AGENT_DIR", str(tmp_path / "development-agent"))
+
+    assert build_identity.get_build_identity(refresh=True) == {
+        "status": "unmanaged",
+        "valid": False,
+    }
+
+
+def test_unmanaged_build_identity_imports_without_posix_selector(monkeypatch):
+    for key in build_identity.MANAGED_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    original_import = __import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "scripts.webui_release_selector":
+            raise AssertionError("unmanaged identity must not import the POSIX selector")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", guarded_import)
+    assert build_identity.get_build_identity(refresh=True)["status"] == "unmanaged"
+
+
+def test_managed_health_detects_post_start_release_drift(monkeypatch, tmp_path):
+    release = _managed_release(tmp_path)
+    _attest_runtime_agent(monkeypatch, release)
+    for key, value in _managed_env(release).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        build_identity, "_running_code_root", lambda: release["release_path"]
+    )
+    monkeypatch.setattr(
+        build_identity,
+        "_running_interpreter",
+        lambda: release["interpreter_path"].absolute(),
+    )
+    assert build_identity.get_build_identity(refresh=True)["valid"] is True
+    bootstrap = release["release_path"] / "bootstrap.py"
+    _chmod(bootstrap, 0o644)
+    _write(bootstrap, "drifted after startup\n")
+    _chmod(bootstrap, 0o444)
+
+    refreshed = build_identity.get_build_identity(refresh=True)
+
+    assert refreshed["status"] == "invalid"
+    assert refreshed["error_code"] == "manifest_verification_failed"
+
+
+@pytest.mark.parametrize("runtime_mismatch", ["configured-root", "imported-module"])
+def test_managed_health_rejects_wrong_runtime_agent_identity(
+    monkeypatch, tmp_path, runtime_mismatch
+):
+    release = _managed_release(tmp_path)
+    outside = tmp_path / "outside-agent"
+    _write(outside / "run_agent.py", "OUTSIDE = True\n")
+    if runtime_mismatch == "configured-root":
+        _attest_runtime_agent(monkeypatch, release, agent_dir=outside)
+    else:
+        _attest_runtime_agent(
+            monkeypatch,
+            release,
+            run_agent_file=outside / "run_agent.py",
+        )
+    for key, value in _managed_env(release).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        build_identity, "_running_code_root", lambda: release["release_path"]
+    )
+    monkeypatch.setattr(
+        build_identity,
+        "_running_interpreter",
+        lambda: release["interpreter_path"].absolute(),
+    )
+
+    identity = build_identity.get_build_identity(refresh=True)
+
+    assert identity["status"] == "invalid"
+    assert identity["error_code"] == "manifest_verification_failed"
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ["agent", "hermes_cli", "tools", "tools.process_registry"],
+)
+def test_managed_health_attests_every_imported_agent_module_root(
+    monkeypatch, tmp_path, module_name
+):
+    release = _managed_release(tmp_path)
+    outside = tmp_path / "outside-agent" / Path(*module_name.split("."))
+    outside = outside.with_suffix(".py")
+    _write(outside, "OUTSIDE = True\n")
+    _attest_runtime_agent(
+        monkeypatch,
+        release,
+        module_files={module_name: outside},
+    )
+    for key, value in _managed_env(release).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        build_identity, "_running_code_root", lambda: release["release_path"]
+    )
+    monkeypatch.setattr(
+        build_identity,
+        "_running_interpreter",
+        lambda: release["interpreter_path"].absolute(),
+    )
+
+    identity = build_identity.get_build_identity(refresh=True)
+
+    assert identity["status"] == "invalid"
+    assert identity["error_code"] == "manifest_verification_failed"
+
+
+def test_managed_health_detects_post_start_agent_source_drift(monkeypatch, tmp_path):
+    release = _managed_release(tmp_path)
+    _attest_runtime_agent(monkeypatch, release)
+    for key, value in _managed_env(release).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        build_identity, "_running_code_root", lambda: release["release_path"]
+    )
+    monkeypatch.setattr(
+        build_identity,
+        "_running_interpreter",
+        lambda: release["interpreter_path"].absolute(),
+    )
+    assert build_identity.get_build_identity(refresh=True)["valid"] is True
+    run_agent = release["agent_source"]["source_path"] / "run_agent.py"
+    _chmod(run_agent, 0o644)
+    _write(run_agent, "DRIFTED = True\n")
+    _chmod(run_agent, 0o444)
+
+    refreshed = build_identity.get_build_identity(refresh=True)
+
+    assert refreshed["status"] == "invalid"
+    assert refreshed["error_code"] == "manifest_verification_failed"
+
+
+def test_plain_health_attestation_is_bounded_singleflight(monkeypatch):
+    calls = []
+    threads = []
+    monkeypatch.setattr(
+        build_identity,
+        "_compute_identity",
+        lambda: calls.append("compute") or {"status": "managed", "valid": True},
+    )
+    monkeypatch.setattr(build_identity, "_CACHED_ENV_SIGNATURE", None)
+    monkeypatch.setattr(build_identity, "_CACHED_IDENTITY", None)
+    monkeypatch.setattr(build_identity, "_CACHED_VERIFIED_AT", None)
+    monkeypatch.setattr(build_identity, "_CACHED_MONOTONIC", None)
+    monkeypatch.setattr(build_identity, "_REFRESH_IN_PROGRESS", False)
+    build_identity.get_build_identity(refresh=True)
+    monkeypatch.setattr(
+        build_identity,
+        "_CACHED_MONOTONIC",
+        time.monotonic() - build_identity.ATTESTATION_TTL_SECONDS - 1,
+    )
+
+    class DeferredThread:
+        def __init__(self, *, target, args, **_kwargs):
+            threads.append((target, args))
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(build_identity.threading, "Thread", DeferredThread)
+
+    results = [build_identity.get_build_identity() for _ in range(25)]
+
+    assert calls == ["compute"]
+    assert len(threads) == 1
+    assert all(result["attestation"] == "refreshing" for result in results)
+
+
+def test_selector_state_lifecycle_and_immutable_bootstrap_fallback(tmp_path):
+    base = _managed_release(tmp_path, "base")
+    candidate = _managed_release(tmp_path, "candidate")
+    candidate_2 = _managed_release(tmp_path, "candidate-2")
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    first_transaction = "selector-lifecycle-transaction-000001"
+    second_transaction = "selector-lifecycle-transaction-000002"
+
+    state = selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=base["release_root"],
+        bootstrap_build_id="base",
+        bootstrap_record=base["record"],
+    )
+    assert state["generation"] == 0
+    assert state["current"] == state["last_good"] == state["bootstrap_fallback"] == "base"
+
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=0,
+        transition=lambda current: selector.stage_candidate(
+            current,
+            "candidate",
+            candidate["record"],
+            transaction_id=first_transaction,
+        ),
+    )
+    assert state["candidate"] == "candidate" and state["current"] == "base"
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=1,
+        transition=selector.activate_candidate,
+    )
+    assert state["current"] == "candidate" and state["last_good"] == "base"
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=2,
+        transition=selector.promote_candidate,
+    )
+    assert state["current"] == state["last_good"] == "candidate"
+    assert state["candidate"] is None and state["bootstrap_fallback"] == "base"
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=3,
+        transition=lambda current: selector.stage_candidate(
+            current,
+            "candidate-2",
+            candidate_2["record"],
+            transaction_id=second_transaction,
+        ),
+    )
+    assert state["generation"] == 4
+    assert state["current"] == "candidate" and state["candidate"] == "candidate-2"
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=4,
+        transition=selector.activate_candidate,
+    )
+    assert state["generation"] == 5
+    assert state["current"] == "candidate-2" and state["last_good"] == "candidate"
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=5,
+        transition=selector.rollback_to_last_good,
+    )
+    assert state["generation"] == 6
+    assert state["current"] == "candidate"
+    assert state["candidate"] is None
+    assert state["bootstrap_fallback"] == "base"
+
+
+def test_selector_v2_reads_v1_state_and_fences_candidate_with_exact_transaction(
+    tmp_path,
+):
+    base = _managed_release(tmp_path, "base")
+    candidate = _managed_release(tmp_path, "candidate")
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    state = selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=base["release_root"],
+        bootstrap_build_id="base",
+        bootstrap_record=base["record"],
+    )
+
+    legacy = dict(state)
+    legacy["version"] = 1
+    legacy.pop("pending_transaction_id", None)
+    state_path.write_text(
+        json.dumps(legacy, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    _chmod(state_path, 0o600)
+
+    compatible = selector.read_selector_state(state_path, lock_path=lock_path)
+    assert compatible["version"] == 2
+    assert compatible["pending_transaction_id"] is None
+
+    transaction_id = "transaction-candidate-000000000001"
+    staged = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=0,
+        transition=lambda current: selector.stage_candidate(
+            current,
+            "candidate",
+            candidate["record"],
+            transaction_id=transaction_id,
+        ),
+    )
+    active = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=staged["generation"],
+        transition=selector.activate_candidate,
+    )
+    selected = selector.resolve_selection(
+        state_path,
+        lock_path=lock_path,
+        selector_path=base["selector_path"],
+    )
+
+    assert active["pending_transaction_id"] == transaction_id
+    assert selected["environment"]["HERMES_WEBUI_STARTUP_FENCED"] == "1"
+    assert (
+        selected["environment"]["HERMES_WEBUI_STARTUP_TRANSACTION_ID"]
+        == transaction_id
+    )
+
+    promoted = selector.promote_candidate(active)
+    assert promoted["pending_transaction_id"] is None
+    assert "HERMES_WEBUI_STARTUP_FENCED" not in selector._selection_from_state(
+        promoted,
+        selector_path=base["selector_path"],
+    )["environment"]
+
+
+def test_selector_refuses_to_activate_candidate_without_startup_transaction(tmp_path):
+    base = _managed_release(tmp_path, "base")
+    candidate = _managed_release(tmp_path, "candidate")
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    state = selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=base["release_root"],
+        bootstrap_build_id="base",
+        bootstrap_record=base["record"],
+    )
+    staged = selector.stage_candidate(state, "candidate", candidate["record"])
+
+    with pytest.raises(selector.SelectorError, match="transaction"):
+        selector.activate_candidate(staged)
+
+
+def test_selector_state_generation_and_path_guards(tmp_path):
+    release = _managed_release(tmp_path)
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=release["release_root"],
+        bootstrap_build_id=release["build_id"],
+        bootstrap_record=release["record"],
+    )
+
+    with pytest.raises(selector.SelectorError, match="generation"):
+        selector.update_selector_state(
+            state_path,
+            lock_path=lock_path,
+            expected_generation=99,
+            transition=selector.rollback_to_last_good,
+        )
+    with pytest.raises(selector.SelectorError, match="parent"):
+        selector.read_selector_state(
+            state_path,
+            lock_path=tmp_path / "other" / "selector.lock",
+        )
+
+    with pytest.raises(selector.SelectorError, match="absolute"):
+        selector.read_selector_state(
+            Path("selector.json"),
+            lock_path=Path("selector.lock"),
+        )
+
+    real_parent = tmp_path / "real-control"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-control"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(selector.SelectorError, match="symlinked ancestor"):
+        selector.initialize_selector_state(
+            linked_parent / "selector.json",
+            lock_path=linked_parent / "selector.lock",
+            release_root=release["release_root"],
+            bootstrap_build_id=release["build_id"],
+            bootstrap_record=release["record"],
+        )
+
+    lock_path.unlink()
+    unrelated = tmp_path / "unrelated-lock-target"
+    _write(unrelated, "must remain untouched\n")
+    lock_path.symlink_to(unrelated)
+    with pytest.raises(selector.SelectorError, match="must not be symlinks"):
+        selector.read_selector_state(state_path, lock_path=lock_path)
+    assert unrelated.read_text(encoding="utf-8") == "must remain untouched\n"
+
+
+def test_selector_state_rejects_unsafe_mode_and_non_allowlisted_release_root(tmp_path):
+    release = _managed_release(tmp_path)
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=release["release_root"],
+        bootstrap_build_id=release["build_id"],
+        bootstrap_record=release["record"],
+    )
+    _chmod(state_path, 0o666)
+    with pytest.raises(selector.SelectorError, match="private mode"):
+        selector.read_selector_state(state_path, lock_path=lock_path)
+
+    other_root = tmp_path / "other-releases"
+    other_root.mkdir()
+    _chmod(other_root, 0o755)
+    with pytest.raises(selector.SelectorError, match="allowlisted"):
+        selector.initialize_selector_state(
+            tmp_path / "other-selector.json",
+            lock_path=tmp_path / "other-selector.lock",
+            release_root=other_root,
+            bootstrap_build_id=release["build_id"],
+            bootstrap_record=release["record"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("crash_at", "activation_current", "rollback_current"),
+    [
+        ("after_temp_fsync", "base", "candidate"),
+        ("after_replace", "candidate", "base"),
+    ],
+)
+def test_selector_activation_and_rollback_crashes_leave_complete_old_or_new_state(
+    tmp_path, crash_at, activation_current, rollback_current
+):
+    transaction_id = "selector-crash-transaction-000000001"
+    base = _managed_release(tmp_path, "base")
+    candidate = _managed_release(tmp_path, "candidate")
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=base["release_root"],
+        bootstrap_build_id=base["build_id"],
+        bootstrap_record=base["record"],
+    )
+    selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=0,
+        transition=lambda current: selector.stage_candidate(
+            current,
+            "candidate",
+            candidate["record"],
+            transaction_id=transaction_id,
+        ),
+    )
+
+    with pytest.raises(selector.InjectedCrash):
+        selector.update_selector_state(
+            state_path,
+            lock_path=lock_path,
+            expected_generation=1,
+            transition=selector.activate_candidate,
+            crash_at=crash_at,
+        )
+
+    state = selector.read_selector_state(state_path, lock_path=lock_path)
+    assert state["current"] == activation_current
+    assert state["candidate"] == "candidate"
+    assert state["last_good"] == state["bootstrap_fallback"] == "base"
+    if state["current"] == "base":
+        state = selector.update_selector_state(
+            state_path,
+            lock_path=lock_path,
+            expected_generation=1,
+            transition=selector.activate_candidate,
+        )
+
+    with pytest.raises(selector.InjectedCrash):
+        selector.update_selector_state(
+            state_path,
+            lock_path=lock_path,
+            expected_generation=2,
+            transition=selector.rollback_to_last_good,
+            crash_at=crash_at,
+        )
+
+    state = selector.read_selector_state(state_path, lock_path=lock_path)
+    assert state["current"] == rollback_current
+    assert state["candidate"] == ("candidate" if crash_at == "after_temp_fsync" else None)
+    assert state["last_good"] == state["bootstrap_fallback"] == "base"
+
+
+def test_resolve_selection_verifies_state_manifest_and_sets_identity_env(tmp_path):
+    release = _managed_release(tmp_path)
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=release["release_root"],
+        bootstrap_build_id=release["build_id"],
+        bootstrap_record=release["record"],
+    )
+
+    selected = selector.resolve_selection(
+        state_path,
+        lock_path=lock_path,
+        selector_path=release["selector_path"],
+    )
+
+    assert selected["bootstrap"] == release["release_path"] / "bootstrap.py"
+    assert selected["interpreter"] == release["interpreter_path"].resolve()
+    assert selected["environment"]["HERMES_WEBUI_SELECTOR_GENERATION"] == "0"
+    assert selected["environment"]["HERMES_WEBUI_MANIFEST_SHA256"] == release[
+        "manifest_sha256"
+    ]
+    assert selected["environment"]["PYTHONPATH"] == os.pathsep.join(
+        [
+            str(release["agent_source"]["source_path"]),
+            release["runtime"]["identity"]["site_packages_path"],
+        ]
+    )
+    assert selected["environment"]["HERMES_WEBUI_AUTO_INSTALL"] == "0"
+    agent_identity = release["agent_source"]["identity"]
+    assert {
+        key: selected["environment"][key]
+        for key in (
+            "HERMES_WEBUI_AGENT_DIR",
+            "HERMES_WEBUI_AGENT_COMMIT",
+            "HERMES_WEBUI_AGENT_TREE",
+            "HERMES_WEBUI_AGENT_MANIFEST_PATH",
+            "HERMES_WEBUI_AGENT_MANIFEST_SHA256",
+        )
+    } == {
+        "HERMES_WEBUI_AGENT_DIR": agent_identity["path"],
+        "HERMES_WEBUI_AGENT_COMMIT": agent_identity["commit"],
+        "HERMES_WEBUI_AGENT_TREE": agent_identity["tree"],
+        "HERMES_WEBUI_AGENT_MANIFEST_PATH": agent_identity["manifest_path"],
+        "HERMES_WEBUI_AGENT_MANIFEST_SHA256": agent_identity["manifest_sha256"],
+    }
+
+
+def test_resolve_selection_uses_exact_sealed_runtime_interpreter(tmp_path):
+    release = _managed_release(tmp_path, symlink_interpreter=True)
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=release["release_root"],
+        bootstrap_build_id=release["build_id"],
+        bootstrap_record=release["record"],
+    )
+
+    selected = selector.resolve_selection(
+        state_path,
+        lock_path=lock_path,
+        selector_path=release["selector_path"],
+    )
+
+    assert selected["interpreter"] == release["interpreter_path"]
+    assert selected["interpreter"] == release["interpreter_path"].resolve()
+
+
+def test_selector_main_execs_configured_venv_path_and_preserves_bootstrap_args(
+    monkeypatch, tmp_path
+):
+    release = _managed_release(tmp_path, symlink_interpreter=True)
+    captured = {}
+
+    def fake_chdir(path):
+        captured["chdir"] = Path(path)
+
+    def fake_execve(executable, argv, environment):
+        captured.update(
+            executable=executable,
+            argv=argv,
+            environment=environment,
+        )
+        raise RuntimeError("execve intercepted")
+
+    monkeypatch.setattr(
+        selector,
+        "_resolve_selection_unlocked",
+        lambda *_args, **_kwargs: {
+            "release_path": release["release_path"],
+            "bootstrap": release["release_path"] / "bootstrap.py",
+            "interpreter": release["interpreter_path"],
+            "environment": {
+                "HERMES_WEBUI_RELEASE_PATH": str(release["release_path"]),
+                "HERMES_WEBUI_AGENT_DIR": str(release["agent_source"]["source_path"]),
+                "PYTHONPATH": str(release["agent_source"]["source_path"]),
+                "HERMES_WEBUI_AUTO_INSTALL": "0",
+            },
+        },
+    )
+    monkeypatch.setenv("PYTHONPATH", "/attacker/pythonpath")
+    monkeypatch.setenv("PYTHONHOME", "/attacker/pythonhome")
+    monkeypatch.setenv("PYTHONUSERBASE", "/attacker/userbase")
+    monkeypatch.setenv("VIRTUAL_ENV", "/attacker/venv")
+    monkeypatch.setenv("PYTHONINSPECT", "1")
+    monkeypatch.setenv("PYTHONSTARTUP", "/attacker/startup.py")
+    monkeypatch.setenv("HERMES_WEBUI_ATTACKER_PATH", "/attacker/hermes")
+    monkeypatch.setenv("HERMES_WEBUI_AUTO_INSTALL", "1")
+    monkeypatch.setenv("HERMES_WEBUI_AGENT_DIR", "/attacker/agent")
+    monkeypatch.setattr(selector.os, "chdir", fake_chdir)
+    monkeypatch.setattr(selector.os, "execve", fake_execve)
+
+    with pytest.raises(RuntimeError, match="intercepted"):
+        selector.main(
+            [
+                "--selector-state",
+                str(tmp_path / "state.json"),
+                "--selector-lock",
+                str(tmp_path / "state.lock"),
+                "--launchd-label",
+                "com.example.hermes-webui",
+                "--foreground",
+                "--no-browser",
+            ]
+        )
+
+    configured = str(release["interpreter_path"])
+    assert captured["executable"] == configured
+    assert captured["argv"] == [
+        configured,
+        "-S",
+        str(release["release_path"] / "bootstrap.py"),
+        "--foreground",
+        "--no-browser",
+    ]
+    assert captured["chdir"] == release["release_path"]
+    assert captured["environment"]["HERMES_WEBUI_RELEASE_PATH"] == str(
+        release["release_path"]
+    )
+    assert captured["environment"]["PYTHONPATH"] == str(
+        release["agent_source"]["source_path"]
+    )
+    assert captured["environment"]["HERMES_WEBUI_AGENT_DIR"] == str(
+        release["agent_source"]["source_path"]
+    )
+    assert captured["environment"]["HERMES_WEBUI_AUTO_INSTALL"] == "0"
+    assert captured["environment"]["HERMES_WEBUI_SELECTOR_STATE"] == str(
+        tmp_path / "state.json"
+    )
+    assert captured["environment"]["HERMES_WEBUI_SELECTOR_LOCK"] == str(
+        tmp_path / "state.lock"
+    )
+    assert captured["environment"]["HERMES_WEBUI_LAUNCHD_LABEL"] == (
+        "com.example.hermes-webui"
+    )
+    for unsafe in (
+        "PYTHONHOME",
+        "PYTHONUSERBASE",
+        "VIRTUAL_ENV",
+        "PYTHONINSPECT",
+        "PYTHONSTARTUP",
+        "HERMES_WEBUI_ATTACKER_PATH",
+    ):
+        assert unsafe not in captured["environment"]
+    assert captured["environment"]["PYTHONNOUSERSITE"] == "1"
+
+
+def test_selector_main_holds_state_lock_until_exec_transition(monkeypatch, tmp_path):
+    release = _managed_release(tmp_path)
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=release["release_root"],
+        bootstrap_build_id=release["build_id"],
+        bootstrap_record=release["record"],
+    )
+    attempted = threading.Event()
+    completed = threading.Event()
+    worker = {}
+
+    def transition(state):
+        return state
+
+    def update_state():
+        attempted.set()
+        selector.update_selector_state(
+            state_path,
+            lock_path=lock_path,
+            expected_generation=0,
+            transition=transition,
+        )
+        completed.set()
+
+    def fake_execve(_executable, _argv, _environment):
+        thread = threading.Thread(target=update_state, daemon=True)
+        worker["thread"] = thread
+        thread.start()
+        assert attempted.wait(1)
+        assert not completed.wait(0.1)
+        raise RuntimeError("execve intercepted")
+
+    monkeypatch.setattr(selector.os, "chdir", lambda _path: None)
+    monkeypatch.setattr(selector.os, "execve", fake_execve)
+    monkeypatch.setattr(selector, "__file__", str(release["selector_path"]))
+
+    with pytest.raises(RuntimeError, match="intercepted"):
+        selector.main(
+            [
+                "--selector-state",
+                str(state_path),
+                "--selector-lock",
+                str(lock_path),
+                "--launchd-label",
+                "com.example.hermes-webui",
+                "--foreground",
+            ]
+        )
+
+    worker["thread"].join(timeout=2)
+    assert completed.is_set()
+    assert selector.read_selector_state(state_path, lock_path=lock_path)[
+        "generation"
+    ] == 1
+
+
+def test_launchd_transform_preserves_unrelated_fields_and_input(tmp_path):
+    old_bootstrap = tmp_path / "old" / "bootstrap.py"
+    interpreter = tmp_path / "venv" / "bin" / "python"
+    selector_path = tmp_path / "control" / "selector.py"
+    _write(old_bootstrap, "print('old')\n")
+    _write(interpreter, "python\n")
+    _write(selector_path, "# selector\n")
+    selector_state = tmp_path / "control" / "selector.json"
+    selector_lock = tmp_path / "control" / "selector.lock"
+    _write(selector_state, "{}\n")
+    _write(selector_lock, "")
+    _chmod(interpreter, 0o755)
+    _chmod(selector_path, 0o755)
+    original = {
+        "Label": "com.example.webui",
+        "Program": "/attacker/python",
+        "ProgramArguments": [
+            str(interpreter),
+            str(old_bootstrap),
+            "--foreground",
+        ],
+        "WorkingDirectory": "/old",
+        "KeepAlive": {"SuccessfulExit": False},
+        "EnvironmentVariables": {
+            "A": "B",
+            "PYTHONPATH": "/attacker/pythonpath",
+            "PYTHONHOME": "/attacker/pythonhome",
+            "HERMES_WEBUI_AUTO_INSTALL": "1",
+            "HERMES_WEBUI_AGENT_DIR": "/attacker/agent",
+            "PYTHONUSERBASE": "/attacker/userbase",
+            "VIRTUAL_ENV": "/attacker/venv",
+            "PYTHONINSPECT": "1",
+            "PYTHONSTARTUP": "/attacker/startup.py",
+            "HERMES_WEBUI_ATTACKER_PATH": "/attacker/hermes",
+            "HERMES_WEBUI_SELECTOR_STATE": "/wrong/state.json",
+        },
+        "StandardOutPath": "/logs/out",
+    }
+    before = copy.deepcopy(original)
+
+    transformed = cutover.transform_launchd_target(
+        original,
+        str(selector_path),
+        expected_label="com.example.webui",
+        expected_old_interpreter=str(interpreter),
+        managed_interpreter=str(interpreter),
+        expected_old_target=str(old_bootstrap),
+        selector_state_path=str(selector_state),
+        selector_lock_path=str(selector_lock),
+    )
+
+    assert original == before
+    assert transformed["ProgramArguments"] == [
+        str(interpreter),
+        "-S",
+        str(selector_path),
+        "--selector-state",
+        str(selector_state),
+        "--selector-lock",
+        str(selector_lock),
+        "--launchd-label",
+        "com.example.webui",
+        "--foreground",
+    ]
+    expected_unrelated = {
+        key: value
+        for key, value in transformed.items()
+        if key not in {"ProgramArguments", "EnvironmentVariables", "WorkingDirectory"}
+    }
+    assert expected_unrelated == {
+        key: value
+        for key, value in original.items()
+        if key not in {
+            "Program",
+            "ProgramArguments",
+            "EnvironmentVariables",
+            "WorkingDirectory",
+        }
+    }
+    assert "Program" not in transformed
+    assert transformed["WorkingDirectory"] == str(selector_state.parent)
+    assert "A" not in transformed["EnvironmentVariables"]
+    assert transformed["EnvironmentVariables"]["HERMES_WEBUI_SELECTOR_STATE"] == str(
+        selector_state
+    )
+    assert transformed["EnvironmentVariables"]["HERMES_WEBUI_SELECTOR_LOCK"] == str(
+        selector_lock
+    )
+    assert transformed["EnvironmentVariables"]["HERMES_WEBUI_LAUNCHD_LABEL"] == (
+        "com.example.webui"
+    )
+    assert transformed["EnvironmentVariables"]["HERMES_WEBUI_AUTO_INSTALL"] == "0"
+    for unsafe in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONUSERBASE",
+        "VIRTUAL_ENV",
+        "PYTHONINSPECT",
+        "PYTHONSTARTUP",
+        "HERMES_WEBUI_AGENT_DIR",
+        "HERMES_WEBUI_ATTACKER_PATH",
+    ):
+        assert unsafe not in transformed["EnvironmentVariables"]
+    assert transformed["EnvironmentVariables"]["PYTHONNOUSERSITE"] == "1"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["wrong-label", "python-module", "wrong-interpreter", "wrong-old-target"],
+)
+def test_launchd_transform_rejects_wrong_job_shape(tmp_path, mutation):
+    interpreter = tmp_path / "venv" / "python"
+    old_target = tmp_path / "old" / "bootstrap.py"
+    selector_path = tmp_path / "control" / "selector.py"
+    for path in (interpreter, old_target, selector_path):
+        _write(path, "payload\n")
+    selector_state = tmp_path / "control" / "selector.json"
+    selector_lock = tmp_path / "control" / "selector.lock"
+    _write(selector_state, "{}\n")
+    _write(selector_lock, "")
+    _chmod(interpreter, 0o755)
+    _chmod(selector_path, 0o755)
+    plist = {
+        "Label": "com.example.webui",
+        "ProgramArguments": [str(interpreter), str(old_target), "--foreground"],
+    }
+    if mutation == "wrong-label":
+        plist["Label"] = "com.example.gateway"
+    elif mutation == "python-module":
+        plist["ProgramArguments"][1] = "-m"
+    elif mutation == "wrong-interpreter":
+        plist["ProgramArguments"][0] = str(tmp_path / "other-python")
+    else:
+        plist["ProgramArguments"][1] = str(tmp_path / "other-bootstrap.py")
+
+    with pytest.raises(ValueError):
+        cutover.transform_launchd_target(
+            plist,
+            str(selector_path),
+            expected_label="com.example.webui",
+            expected_old_interpreter=str(interpreter),
+            managed_interpreter=str(interpreter),
+            expected_old_target=str(old_target),
+            selector_state_path=str(selector_state),
+            selector_lock_path=str(selector_lock),
+        )
+
+
+def test_launchd_transform_rejects_inherited_selector_arguments(tmp_path):
+    interpreter = tmp_path / "venv" / "python"
+    old_target = tmp_path / "old" / "bootstrap.py"
+    selector_path = tmp_path / "control" / "selector.py"
+    selector_state = tmp_path / "control" / "selector.json"
+    selector_lock = tmp_path / "control" / "selector.lock"
+    for path in (interpreter, old_target, selector_path, selector_state, selector_lock):
+        _write(path, "payload\n")
+    _chmod(interpreter, 0o755)
+    _chmod(selector_path, 0o755)
+    plist = {
+        "Label": "com.example.webui",
+        "ProgramArguments": [
+            str(interpreter),
+            str(old_target),
+            "--selector-state=/attacker/state",
+        ],
+    }
+
+    with pytest.raises(ValueError, match="selector control argument"):
+        cutover.transform_launchd_target(
+            plist,
+            str(selector_path),
+            expected_label="com.example.webui",
+            expected_old_interpreter=str(interpreter),
+            managed_interpreter=str(interpreter),
+            expected_old_target=str(old_target),
+            selector_state_path=str(selector_state),
+            selector_lock_path=str(selector_lock),
+        )
+
+
+def test_gateway_launchd_transform_binds_immutable_agent_runtime_and_routing(tmp_path):
+    release = _managed_release(tmp_path)
+    identity = {
+        **selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        ),
+        "selector_generation": 7,
+    }
+    transaction_id = "release-transaction-00000000000001"
+    legacy_python = tmp_path / "legacy-agent" / "venv" / "bin" / "python"
+    managed_shim = tmp_path / "control" / "hermes-candidate"
+    _write(legacy_python, "#!/bin/sh\nexit 0\n")
+    _write(managed_shim, "#!/bin/sh\nexit 0\n")
+    _chmod(legacy_python, 0o755)
+    _chmod(managed_shim, 0o555)
+    routing = {
+        "HERMES_WEBUI_DEFAULT_PROVIDER": "openai-codex",
+        "HERMES_WEBUI_DEFAULT_MODEL": "gpt-5.5",
+        "HERMES_WEBUI_HOST": "127.0.0.1",
+        "HERMES_WEBUI_PORT": "8787",
+    }
+    original = {
+        "Label": "ai.hermes.gateway",
+        "Program": "/attacker/python",
+        "ProgramArguments": [
+            str(legacy_python),
+            "-m",
+            "hermes_cli.main",
+            "gateway",
+            "run",
+            "--replace",
+        ],
+        "WorkingDirectory": str(tmp_path / "dirty-agent"),
+        "KeepAlive": True,
+        "EnvironmentVariables": {
+            "PATH": "/attacker/bin",
+            "PYTHONPATH": "/attacker/pythonpath",
+            "PYTHONHOME": "/attacker/pythonhome",
+            "VIRTUAL_ENV": "/attacker/venv",
+            "HERMES_WEBUI_DEFAULT_PROVIDER": "wrong-provider",
+            "HERMES_WEBUI_DEFAULT_MODEL": "wrong-model",
+        },
+    }
+
+    transformed = cutover.transform_gateway_launchd_target(
+        original,
+        expected_label="ai.hermes.gateway",
+        expected_old_program=str(legacy_python),
+        managed_cli_shim=str(managed_shim),
+        release_identity=identity,
+        managed_routing_environment=routing,
+        release_transaction_id=transaction_id,
+    )
+
+    assert transformed["ProgramArguments"] == [
+        str(managed_shim),
+        "gateway",
+        "run",
+        "--replace",
+    ]
+    assert transformed["WorkingDirectory"] == identity["agent_source_path"]
+    assert transformed["KeepAlive"] is True
+    assert "Program" not in transformed
+    environment = transformed["EnvironmentVariables"]
+    assert {key: environment[key] for key in routing} == routing
+    assert environment["PYTHONHOME"] == identity["runtime_python_home_path"]
+    assert environment["PYTHONPATH"] == os.pathsep.join(
+        [identity["agent_source_path"], identity["runtime_site_packages_path"]]
+    )
+    assert environment["HERMES_WEBUI_AGENT_DIR"] == identity["agent_source_path"]
+    assert environment["HERMES_WEBUI_LAUNCH_MODE"] == "managed-gateway"
+    assert environment["HERMES_SELECTOR_GENERATION"] == "7"
+    assert environment["HERMES_RELEASE_TRANSACTION_ID"] == transaction_id
+    assert environment["HERMES_RELEASE_PAIR_ID"] == selector.release_pair_id(
+        identity,
+        selector_generation=7,
+        transaction_id=transaction_id,
+    )
+    assert environment["PATH"].startswith(str(Path(identity["interpreter_path"]).parent))
+    assert "VIRTUAL_ENV" not in environment
+
+
+@pytest.mark.parametrize("mutation", ["wrong-label", "wrong-module", "wrong-program"])
+def test_gateway_launchd_transform_rejects_unattested_legacy_shape(
+    tmp_path, mutation
+):
+    release = _managed_release(tmp_path)
+    identity = {
+        **selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        ),
+        "selector_generation": 7,
+    }
+    legacy_python = tmp_path / "legacy" / "python"
+    managed_shim = tmp_path / "managed" / "hermes"
+    _write(legacy_python, "python\n")
+    _write(managed_shim, "#!/bin/sh\n")
+    _chmod(legacy_python, 0o755)
+    _chmod(managed_shim, 0o555)
+    plist = {
+        "Label": "ai.hermes.gateway",
+        "ProgramArguments": [
+            str(legacy_python),
+            "-m",
+            "hermes_cli.main",
+            "gateway",
+            "run",
+        ],
+    }
+    expected_program = str(legacy_python)
+    if mutation == "wrong-label":
+        plist["Label"] = "ai.hermes.other"
+    elif mutation == "wrong-module":
+        plist["ProgramArguments"][2] = "attacker.main"
+    else:
+        expected_program = str(tmp_path / "other-python")
+
+    with pytest.raises(ValueError, match="gateway launchd"):
+        cutover.transform_gateway_launchd_target(
+            plist,
+            expected_label="ai.hermes.gateway",
+            expected_old_program=expected_program,
+            managed_cli_shim=str(managed_shim),
+            release_identity=identity,
+            managed_routing_environment={
+                "HERMES_WEBUI_DEFAULT_PROVIDER": "openai-codex",
+                "HERMES_WEBUI_DEFAULT_MODEL": "gpt-5.5",
+                "HERMES_WEBUI_HOST": "127.0.0.1",
+                "HERMES_WEBUI_PORT": "8787",
+            },
+            release_transaction_id="release-transaction-00000000000001",
+        )
+
+
+def test_fallback_plist_reports_managed_last_good_identity(tmp_path):
+    release = _managed_release(tmp_path)
+    old_target = tmp_path / "old" / "bootstrap.py"
+    _write(old_target, "print('old')\n")
+    original = {
+        "Label": "com.example.webui",
+        "Program": "/attacker/python",
+        "ProgramArguments": [
+            str(release["interpreter_path"]),
+            str(old_target),
+            "--foreground",
+            "--no-browser",
+        ],
+        "WorkingDirectory": str(tmp_path / "dirty-checkout"),
+        "EnvironmentVariables": {
+            "PRESERVE_ME": "yes",
+            "PYTHONPATH": "/attacker/pythonpath",
+            "PYTHONHOME": "/attacker/pythonhome",
+            "HERMES_WEBUI_AUTO_INSTALL": "1",
+            "HERMES_WEBUI_AGENT_DIR": "/attacker/agent",
+            "PYTHONUSERBASE": "/attacker/userbase",
+            "VIRTUAL_ENV": "/attacker/venv",
+            "PYTHONINSPECT": "1",
+            "PYTHONSTARTUP": "/attacker/startup.py",
+            "HERMES_WEBUI_ATTACKER_PATH": "/attacker/hermes",
+        },
+    }
+    identity = selector.verify_release(
+        release["release_path"],
+        release_root=release["release_root"],
+        expected_manifest_sha256=release["manifest_sha256"],
+        selector_path=release["selector_path"],
+    )
+
+    fallback = cutover.build_direct_fallback_plist(
+        original,
+        expected_label="com.example.webui",
+        expected_old_interpreter=str(release["interpreter_path"]),
+        expected_old_target=str(old_target),
+        release_identity=identity,
+        selector_generation=9,
+        selector_state_path=str(tmp_path / "control" / "selector.json"),
+        selector_lock_path=str(tmp_path / "control" / "selector.lock"),
+    )
+
+    assert fallback["ProgramArguments"] == [
+        str(release["interpreter_path"]),
+        "-S",
+        str(release["release_path"] / "bootstrap.py"),
+        "--foreground",
+        "--no-browser",
+    ]
+    assert "Program" not in fallback
+    assert fallback["WorkingDirectory"] == str(release["release_path"])
+    environment = fallback["EnvironmentVariables"]
+    assert "PRESERVE_ME" not in environment
+    assert environment["HERMES_WEBUI_LAUNCH_MODE"] == "direct-fallback"
+    assert environment["HERMES_WEBUI_RELEASE_PATH"] == str(release["release_path"])
+    assert environment["HERMES_WEBUI_SERVER_CWD"] == str(release["release_path"])
+    assert environment["HERMES_WEBUI_PYTHON"] == str(release["interpreter_path"])
+    assert environment["HERMES_WEBUI_AUTO_INSTALL"] == "0"
+    assert environment["PYTHONNOUSERSITE"] == "1"
+    assert environment["PYTHONHOME"] == release["runtime"]["identity"][
+        "python_home_path"
+    ]
+    assert environment["PYTHONPATH"] == os.pathsep.join(
+        [
+            str(release["agent_source"]["source_path"]),
+            release["runtime"]["identity"]["site_packages_path"],
+        ]
+    )
+    assert environment["HERMES_WEBUI_SELECTOR_STATE"] == str(
+        tmp_path / "control" / "selector.json"
+    )
+    assert environment["HERMES_WEBUI_SELECTOR_LOCK"] == str(
+        tmp_path / "control" / "selector.lock"
+    )
+    assert environment["HERMES_WEBUI_LAUNCHD_LABEL"] == "com.example.webui"
+    for unsafe in (
+        "PYTHONUSERBASE",
+        "VIRTUAL_ENV",
+        "PYTHONINSPECT",
+        "PYTHONSTARTUP",
+        "HERMES_WEBUI_ATTACKER_PATH",
+    ):
+        assert unsafe not in environment
+    agent_identity = release["agent_source"]["identity"]
+    assert environment["HERMES_WEBUI_AGENT_DIR"] == agent_identity["path"]
+    assert environment["HERMES_WEBUI_AGENT_COMMIT"] == agent_identity["commit"]
+    assert environment["HERMES_WEBUI_AGENT_TREE"] == agent_identity["tree"]
+    assert environment["HERMES_WEBUI_AGENT_MANIFEST_PATH"] == agent_identity[
+        "manifest_path"
+    ]
+    assert environment["HERMES_WEBUI_AGENT_MANIFEST_SHA256"] == agent_identity[
+        "manifest_sha256"
+    ]
+
+
+def test_fallback_plist_generation_survives_deleted_selector(tmp_path):
+    release = _managed_release(tmp_path)
+    old_target = tmp_path / "old" / "bootstrap.py"
+    _write(old_target, "print('old')\n")
+    original = {
+        "Label": "com.example.webui",
+        "ProgramArguments": [
+            str(release["interpreter_path"]),
+            str(old_target),
+            "--foreground",
+        ],
+    }
+    identity = selector.verify_release(
+        release["release_path"],
+        release_root=release["release_root"],
+        expected_manifest_sha256=release["manifest_sha256"],
+        selector_path=release["selector_path"],
+    )
+    release["selector_path"].unlink()
+
+    fallback = cutover.build_direct_fallback_plist(
+        original,
+        expected_label="com.example.webui",
+        expected_old_interpreter=str(release["interpreter_path"]),
+        expected_old_target=str(old_target),
+        release_identity=identity,
+        selector_generation=9,
+        selector_state_path=str(tmp_path / "control" / "selector.json"),
+        selector_lock_path=str(tmp_path / "control" / "selector.lock"),
+    )
+
+    assert fallback["ProgramArguments"][1] == "-S"
+    assert fallback["ProgramArguments"][2] == str(
+        release["release_path"] / "bootstrap.py"
+    )
+    assert fallback["EnvironmentVariables"]["HERMES_WEBUI_LAUNCH_MODE"] == (
+        "direct-fallback"
+    )
+
+
+def test_fallback_plist_rejects_forged_release_identity(tmp_path):
+    release = _managed_release(tmp_path)
+    old_target = tmp_path / "old" / "bootstrap.py"
+    _write(old_target, "print('old')\n")
+    original = {
+        "Label": "com.example.webui",
+        "ProgramArguments": [
+            str(release["interpreter_path"]),
+            str(old_target),
+            "--foreground",
+        ],
+    }
+    identity = selector.verify_release(
+        release["release_path"],
+        release_root=release["release_root"],
+        expected_manifest_sha256=release["manifest_sha256"],
+        selector_path=release["selector_path"],
+    )
+    identity["manifest_sha256"] = "0" * 64
+
+    with pytest.raises(selector.SelectorError, match="manifest hash"):
+        cutover.build_direct_fallback_plist(
+            original,
+            expected_label="com.example.webui",
+            expected_old_interpreter=str(release["interpreter_path"]),
+            expected_old_target=str(old_target),
+            release_identity=identity,
+            selector_generation=9,
+            selector_state_path=str(tmp_path / "control" / "selector.json"),
+            selector_lock_path=str(tmp_path / "control" / "selector.lock"),
+        )
+
+
+def test_fallback_plist_rejects_drifted_agent_source(tmp_path):
+    release = _managed_release(tmp_path)
+    old_target = tmp_path / "old" / "bootstrap.py"
+    _write(old_target, "print('old')\n")
+    original = {
+        "Label": "com.example.webui",
+        "ProgramArguments": [
+            str(release["interpreter_path"]),
+            str(old_target),
+            "--foreground",
+        ],
+    }
+    identity = selector.verify_release(
+        release["release_path"],
+        release_root=release["release_root"],
+        expected_manifest_sha256=release["manifest_sha256"],
+        selector_path=release["selector_path"],
+    )
+    run_agent = release["agent_source"]["source_path"] / "run_agent.py"
+    _chmod(run_agent, 0o644)
+    _write(run_agent, "DRIFTED = True\n")
+    _chmod(run_agent, 0o444)
+
+    with pytest.raises(selector.SelectorError, match="agent source"):
+        cutover.build_direct_fallback_plist(
+            original,
+            expected_label="com.example.webui",
+            expected_old_interpreter=str(release["interpreter_path"]),
+            expected_old_target=str(old_target),
+            release_identity=identity,
+            selector_generation=9,
+            selector_state_path=str(tmp_path / "control" / "selector.json"),
+            selector_lock_path=str(tmp_path / "control" / "selector.lock"),
+        )
+
+
+def test_cutover_cli_materializes_selector_and_fallback_plists(tmp_path, capsys):
+    release = _managed_release(tmp_path)
+    old_target = tmp_path / "old" / "bootstrap.py"
+    _write(old_target, "print('old')\n")
+    original = {
+        "Label": "com.example.webui",
+        "ProgramArguments": [
+            str(release["interpreter_path"]),
+            str(old_target),
+            "--foreground",
+        ],
+        "WorkingDirectory": str(tmp_path / "dirty-checkout"),
+        "EnvironmentVariables": {"PRESERVE_ME": "yes"},
+    }
+    source_plist = tmp_path / "source.plist"
+    selector_plist = tmp_path / "selector.plist"
+    fallback_plist = tmp_path / "fallback.plist"
+    selector_state = tmp_path / "control" / "selector.json"
+    selector_lock = tmp_path / "control" / "selector.lock"
+    _write(selector_state, "{}\n")
+    _write(selector_lock, "")
+    source_plist.write_bytes(plistlib.dumps(original))
+    identity = selector.verify_release(
+        release["release_path"],
+        release_root=release["release_root"],
+        expected_manifest_sha256=release["manifest_sha256"],
+        selector_path=release["selector_path"],
+    )
+    identity_json = tmp_path / "identity.json"
+    identity_json.write_text(json.dumps(identity), encoding="utf-8")
+
+    assert (
+        cutover.main(
+            [
+                "plist-selector",
+                "--input",
+                str(source_plist),
+                "--output",
+                str(selector_plist),
+                "--selector",
+                str(release["selector_path"]),
+                "--selector-state",
+                str(selector_state),
+                "--selector-lock",
+                str(selector_lock),
+                "--expected-label",
+                "com.example.webui",
+                "--expected-interpreter",
+                str(release["interpreter_path"]),
+                "--managed-interpreter",
+                str(release["interpreter_path"]),
+                "--expected-old-target",
+                str(old_target),
+            ]
+        )
+        == 0
+    )
+    selector_job = plistlib.loads(selector_plist.read_bytes())
+    assert selector_job["ProgramArguments"][1:3] == [
+        "-S",
+        str(release["selector_path"]),
+    ]
+    assert selector_job["ProgramArguments"][3:7] == [
+        "--selector-state",
+        str(selector_state),
+        "--selector-lock",
+        str(selector_lock),
+    ]
+    assert "PRESERVE_ME" not in selector_job["EnvironmentVariables"]
+
+    assert (
+        cutover.main(
+            [
+                "plist-fallback",
+                "--input",
+                str(source_plist),
+                "--output",
+                str(fallback_plist),
+                "--release-identity-json",
+                str(identity_json),
+                "--selector-generation",
+                "9",
+                "--expected-label",
+                "com.example.webui",
+                "--expected-interpreter",
+                str(release["interpreter_path"]),
+                "--expected-old-target",
+                str(old_target),
+                "--selector-state",
+                str(selector_state),
+                "--selector-lock",
+                str(selector_lock),
+            ]
+        )
+        == 0
+    )
+    fallback_job = plistlib.loads(fallback_plist.read_bytes())
+    assert fallback_job["ProgramArguments"][1:3] == [
+        "-S",
+        str(release["release_path"] / "bootstrap.py"),
+    ]
+    assert fallback_job["EnvironmentVariables"]["HERMES_WEBUI_LAUNCH_MODE"] == (
+        "direct-fallback"
+    )
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["status"] == "ok"
+
+
+def test_cutover_cli_drives_selector_state_lifecycle(tmp_path, capsys):
+    base = _managed_release(tmp_path, "base")
+    candidate = _managed_release(tmp_path, "candidate")
+    state_path = tmp_path / "selector.json"
+    lock_path = tmp_path / "selector.lock"
+    base_record = tmp_path / "base-record.json"
+    candidate_record = tmp_path / "candidate-record.json"
+    base_record.write_text(json.dumps(base["record"]), encoding="utf-8")
+    candidate_record.write_text(json.dumps(candidate["record"]), encoding="utf-8")
+
+    commands = [
+        [
+            "state-init",
+            "--state",
+            str(state_path),
+            "--lock",
+            str(lock_path),
+            "--release-root",
+            str(base["release_root"]),
+            "--build-id",
+            "base",
+            "--record-json",
+            str(base_record),
+        ],
+        [
+            "state-stage",
+            "--state",
+            str(state_path),
+            "--lock",
+            str(lock_path),
+            "--expected-generation",
+            "0",
+            "--build-id",
+            "candidate",
+            "--record-json",
+            str(candidate_record),
+            "--transaction-id",
+            "selector-cli-transaction-00000001",
+        ],
+        [
+            "state-activate",
+            "--state",
+            str(state_path),
+            "--lock",
+            str(lock_path),
+            "--expected-generation",
+            "1",
+        ],
+        [
+            "state-promote",
+            "--state",
+            str(state_path),
+            "--lock",
+            str(lock_path),
+            "--expected-generation",
+            "2",
+        ],
+        [
+            "state-rollback",
+            "--state",
+            str(state_path),
+            "--lock",
+            str(lock_path),
+            "--expected-generation",
+            "3",
+        ],
+        [
+            "state-show",
+            "--state",
+            str(state_path),
+            "--lock",
+            str(lock_path),
+        ],
+    ]
+    for command in commands:
+        assert cutover.main(command) == 0
+
+    final_state = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert final_state["generation"] == 4
+    assert final_state["current"] == "candidate"
+    assert final_state["last_good"] == "candidate"
+    assert final_state["candidate"] is None
+
+
+def test_transaction_journal_is_fsynced_idempotent_and_crash_resumable(tmp_path):
+    journal_path = tmp_path / "control" / "transactions" / "txn.json"
+    transaction_id = "journal-transaction-00000000000001"
+    expected_candidate = {
+        "build_id": "candidate",
+        "manifest_sha256": "a" * 64,
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    initialized = cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=expected_candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "b" * 64,
+            "state_snapshot_id": "snapshot-before-candidate",
+            "state_snapshot_sha256": "c" * 64,
+        },
+    )
+    assert initialized["phases"] == {}
+    assert stat.S_IMODE(journal_path.stat().st_mode) == 0o600
+
+    cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase="staged",
+        receipt={"generation": 1, "build_id": "candidate"},
+    )
+    with pytest.raises(cutover.InjectedCutoverCrash, match="after_replace"):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase="plist_installed",
+            receipt={"plist_sha256": "c" * 64},
+            crash_at="after_replace",
+        )
+
+    resumed = cutover.read_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+    )
+    assert set(resumed["phases"]) == {"staged", "plist_installed"}
+    assert cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase="plist_installed",
+        receipt={"plist_sha256": "c" * 64},
+    ) == resumed
+    with pytest.raises(cutover.ReleaseBuildError, match="different receipt"):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase="plist_installed",
+            receipt={"plist_sha256": "d" * 64},
+        )
+    with pytest.raises(cutover.ReleaseBuildError, match="sensitive"):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase="old_fenced",
+            receipt={"fence_token": "must-not-persist"},
+        )
+
+
+def _candidate_gateway_start_transaction(tmp_path: Path) -> tuple[dict, dict]:
+    transaction_id = "paired-gateway-transaction-00000001"
+    journal_path = tmp_path / "control" / "transaction.json"
+    candidate = {
+        "build_id": "candidate",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    last_good = {"build_id": "last-good"}
+    runtime = {
+        "pid": 41,
+        "pid_start_token": "gateway-old-start",
+        "command": "managed-last-good-gateway",
+        "comm": "hermes",
+        "cwd": "/immutable/agent-last-good",
+        "program_arguments": ["/immutable/hermes-last-good", "gateway", "run"],
+        "program_identity": {"sha256": "1" * 64},
+    }
+    binding = {
+        "status": "verified",
+        "listener_pid": 41,
+        "launchd_pid": 41,
+        "pid_start_token": "gateway-old-start",
+        "runtime": runtime,
+    }
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "a" * 64,
+        "state_snapshot_id": "snapshot-before-candidate",
+        "state_snapshot_sha256": "b" * 64,
+        },
+    )
+    receipts = (
+        ("staged", {}),
+        ("plist_installed", {}),
+        ("gateway_last_good_attested", {"binding": binding}),
+        (
+            "watchdog_cron_disable_intent",
+            {"prepared": {"status": "prepared"}},
+        ),
+        (
+            "watchdog_cron_disabled",
+            {"status": "disabled"},
+        ),
+        (
+            "watchdog_state_reconciled",
+            {"status": "reconciled"},
+        ),
+        ("gateway_drain_intent", {"status": "drained"}),
+        ("gateway_drained", {"status": "drained"}),
+        ("gateway_stop_intent", {"status": "planned"}),
+        ("gateway_gracefully_stopped", {"status": "stopped"}),
+        ("gateway_dispatcher_lock_acquired", {"status": "locked"}),
+        ("gateway_workers_quiescent", {"status": "quiescent"}),
+        (
+            "paired_state_snapshot_created",
+            {
+                "status": "created",
+                "state_snapshot_id": transaction_id,
+                "state_snapshot_sha256": "c" * 64,
+            },
+        ),
+        ("gateway_dispatcher_lock_released", {"status": "released"}),
+        (
+            "candidate_gateway_start_intent",
+            {
+                "last_good_binding": binding,
+                "candidate_build_id": candidate["build_id"],
+                "candidate_shim_sha256": "d" * 64,
+            },
+        ),
+    )
+    for phase, receipt in receipts:
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipt,
+        )
+    plan = {
+        "transaction_id": transaction_id,
+        "transaction_journal": str(journal_path),
+        "gateway_listener_port": 8642,
+        "gateway_installed_plist": str(tmp_path / "gateway.plist"),
+        "expected_candidate_identity": candidate,
+        "last_good_identity": last_good,
+    }
+    return plan, binding
+
+
+def test_candidate_gateway_resumes_after_joint_snapshot_before_candidate_start(
+    tmp_path,
+    monkeypatch,
+):
+    plan, _last_good_binding = _candidate_gateway_start_transaction(tmp_path)
+    state = {"owner": "absent"}
+    calls = {"start": 0}
+    candidate_binding = {
+        "status": "verified",
+        "listener_pid": 42,
+        "launchd_pid": 42,
+        "pid_start_token": "gateway-candidate-start",
+        "runtime": {"command": "candidate"},
+    }
+
+    def attest(_plan, identity, *, expected_admission=None):
+        assert expected_admission == "rejecting_new_work"
+        if state["owner"] == identity["build_id"]:
+            return candidate_binding
+        raise cutover.DrainIdentityMismatch("not current")
+
+    def listener(_port):
+        if state["owner"] == "absent":
+            raise cutover.DrainIdentityMismatch("absent")
+        return 42
+
+    def start(*_args, **_kwargs):
+        calls["start"] += 1
+        state["owner"] = "candidate"
+        return {"status": "started"}
+
+    monkeypatch.setattr(cutover, "_attest_managed_gateway_binding", attest)
+    monkeypatch.setattr(cutover, "_listener_pid", listener)
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, gateway: None if state["owner"] == "absent" else listener(8642),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_install_managed_gateway_plist",
+        lambda *_args: {"status": "installed"},
+    )
+    monkeypatch.setattr(cutover, "_bootstrap_job", start)
+
+    result = cutover._complete_candidate_gateway_transition(
+        plan,
+        {"status": "startup-fenced"},
+    )
+
+    assert result["gateway"]["binding"] == candidate_binding
+    assert calls == {"start": 1}
+
+
+def test_candidate_gateway_adopts_launch_after_crash_before_accept_receipt(
+    tmp_path, monkeypatch
+):
+    plan, _last_good_binding = _candidate_gateway_start_transaction(tmp_path)
+    state = {"owner": "absent"}
+    calls = {"start": 0}
+    candidate_binding = {
+        "status": "verified",
+        "listener_pid": 52,
+        "launchd_pid": 52,
+        "pid_start_token": "gateway-candidate-start",
+        "runtime": {"command": "candidate"},
+    }
+
+    def attest(_plan, identity, *, expected_admission=None):
+        assert expected_admission == "rejecting_new_work"
+        if state["owner"] == identity["build_id"]:
+            return candidate_binding
+        raise cutover.DrainIdentityMismatch("not current")
+
+    def listener(_port):
+        if state["owner"] == "absent":
+            raise cutover.DrainIdentityMismatch("absent")
+        return 52
+
+    def start(*_args, **_kwargs):
+        calls["start"] += 1
+        state["owner"] = "candidate"
+        return {"status": "started"}
+
+    monkeypatch.setattr(cutover, "_attest_managed_gateway_binding", attest)
+    monkeypatch.setattr(cutover, "_listener_pid", listener)
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, gateway: None if state["owner"] == "absent" else listener(8642),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_install_managed_gateway_plist",
+        lambda *_args: {"status": "installed"},
+    )
+    monkeypatch.setattr(cutover, "_bootstrap_job", start)
+    real_record = cutover.record_transaction_phase
+    crash_once = {"value": True}
+
+    def crash_before_accept(*args, **kwargs):
+        if kwargs.get("phase") == "candidate_gateway_accepted" and crash_once["value"]:
+            crash_once["value"] = False
+            raise cutover.InjectedCutoverCrash("before-gateway-accept-receipt")
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(cutover, "record_transaction_phase", crash_before_accept)
+    with pytest.raises(
+        cutover.InjectedCutoverCrash, match="before-gateway-accept-receipt"
+    ):
+        cutover._complete_candidate_gateway_transition(
+            plan,
+            {"status": "startup-fenced"},
+        )
+    assert state["owner"] == "candidate"
+
+    result = cutover._complete_candidate_gateway_transition(
+        plan,
+        {"status": "startup-fenced"},
+    )
+
+    assert result["gateway"]["binding"] == candidate_binding
+    assert calls == {"start": 1}
+
+
+def _watchdog_barrier_transaction(tmp_path: Path) -> tuple[dict, dict]:
+    transaction_id = "watchdog-barrier-transaction-000001"
+    journal_path = tmp_path / "watchdog-barrier.json"
+    candidate = {
+        "build_id": "candidate",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "a" * 64,
+            "state_snapshot_id": "snapshot-before-candidate",
+            "state_snapshot_sha256": "b" * 64,
+        },
+    )
+    for phase, receipt in (
+        ("staged", {}),
+        ("plist_installed", {"plist_sha256": "c" * 64}),
+        ("gateway_last_good_attested", {"binding": {"status": "verified"}}),
+    ):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipt,
+        )
+    return {
+        "transaction_id": transaction_id,
+        "transaction_journal": str(journal_path),
+        "watchdog_crontab_rollback": str(tmp_path / "crontab.backup"),
+    }, candidate
+
+
+def test_release_watchdog_barrier_disables_reconciles_and_holds_exact_lock(
+    tmp_path,
+    monkeypatch,
+):
+    plan, _candidate = _watchdog_barrier_transaction(tmp_path)
+    prepared = {
+        "watchdog_cron": {
+            "backup_path": str(tmp_path / "crontab.backup"),
+            "backup_sha256": "d" * 64,
+            "crontab_sha256": "e" * 64,
+            "watchdog_command": "* * * * * watchdog",
+        }
+    }
+    expected_state = {
+        "path": str(tmp_path / "state.json"),
+        "exists": True,
+        "sha256": "f" * 64,
+        "schema_version": 1,
+        "claim_revision": 7,
+    }
+    lock = object()
+    events = []
+    monkeypatch.setattr(
+        cutover,
+        "_disable_watchdog_cron",
+        lambda _plan, _prepared: events.append("disable")
+        or {"status": "disabled"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_watchdog_reconcile_receipt",
+        lambda _plan, _prepared: events.append("reconcile")
+        or {
+            "status": "no_reconcilable_slot",
+            "state_before": {**expected_state, "claim_revision": 6},
+            "state_after": expected_state,
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_acquire_watchdog_state_lock",
+        lambda _plan: events.append("acquire") or lock,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_verify_watchdog_state_lock",
+        lambda _plan, actual: events.append("verify-lock")
+        or {"status": "locked"}
+        if actual is lock
+        else pytest.fail("wrong lock"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_watchdog_state_receipt",
+        lambda _plan: events.append("state") or expected_state,
+    )
+
+    barrier = cutover._begin_release_watchdog_barrier(
+        plan,
+        prepared=prepared,
+    )
+
+    assert barrier["lock"] is lock
+    assert barrier["prepared"] == prepared
+    assert barrier["state"] == expected_state
+    assert events == ["disable", "reconcile", "acquire", "verify-lock", "state"]
+    phases = cutover.read_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+    )["phases"]
+    assert phases["watchdog_cron_disable_intent"]["prepared"] == prepared
+    assert phases["watchdog_cron_disabled"] == {"status": "disabled"}
+    assert phases["watchdog_state_reconciled"]["state_after"] == expected_state
+
+
+def test_release_watchdog_barrier_rejects_state_change_and_leaves_cron_disabled(
+    tmp_path,
+    monkeypatch,
+):
+    plan, _candidate = _watchdog_barrier_transaction(tmp_path)
+    prepared = {
+        "watchdog_cron": {
+            "backup_path": str(tmp_path / "crontab.backup"),
+            "backup_sha256": "d" * 64,
+            "crontab_sha256": "e" * 64,
+            "watchdog_command": "* * * * * watchdog",
+        }
+    }
+    expected_state = {
+        "path": str(tmp_path / "state.json"),
+        "exists": True,
+        "sha256": "f" * 64,
+        "schema_version": 1,
+        "claim_revision": 7,
+    }
+    changed_state = {**expected_state, "sha256": "0" * 64, "claim_revision": 8}
+    lock = object()
+    events = []
+    monkeypatch.setattr(
+        cutover,
+        "_disable_watchdog_cron",
+        lambda *_args: {"status": "disabled"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_watchdog_reconcile_receipt",
+        lambda *_args: {
+            "status": "no_reconcilable_slot",
+            "state_before": expected_state,
+            "state_after": expected_state,
+        },
+    )
+    monkeypatch.setattr(cutover, "_acquire_watchdog_state_lock", lambda _plan: lock)
+    monkeypatch.setattr(
+        cutover,
+        "_verify_watchdog_state_lock",
+        lambda _plan, _lock: {"status": "locked"},
+    )
+    monkeypatch.setattr(cutover, "_watchdog_state_receipt", lambda _plan: changed_state)
+    monkeypatch.setattr(
+        cutover,
+        "_release_watchdog_state_lock",
+        lambda _plan, actual: events.append(("release", actual)),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_watchdog_cron",
+        lambda *_args: pytest.fail("unsafe state must not restore cron"),
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="watchdog state changed before writer barrier",
+    ):
+        cutover._begin_release_watchdog_barrier(plan, prepared=prepared)
+
+    assert events == [("release", lock)]
+    phases = cutover.read_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+    )["phases"]
+    assert "watchdog_cron_disabled" in phases
+    assert "watchdog_cron_restored" not in phases
+
+
+def _record_webui_pair_commit_phases(
+    plan: dict,
+    candidate: dict,
+    *,
+    through: str,
+) -> None:
+    phases = (
+        ("old_fenced", {}),
+        ("old_committed", {}),
+        ("selection_activated", {}),
+        ("old_stopped", {}),
+        ("replacement_proved", {"identity": candidate}),
+        ("candidate_fenced_health_proved", {"identity": candidate}),
+        ("pair_ready", {"status": "ready"}),
+        ("pair_gate_install_intent", {"status": "prepared"}),
+        ("pair_gate_installed", {"status": "installed"}),
+        ("pair_commit_intent", {"status": "committing"}),
+        ("promoted", {"status": "promoted"}),
+        ("gateway_opened", {"status": "opened"}),
+        (
+            "candidate_accepted",
+            {"identity": candidate, "admission": {"state": "open"}},
+        ),
+        ("accepted_health_proved", {"status": "healthy"}),
+        ("pair_accepted", {"status": "accepted"}),
+        ("pair_gate_release_intent", {"status": "prepared"}),
+        ("pair_released", {"status": "released"}),
+        ("pair_opened", {"status": "opened"}),
+    )
+    for phase, receipt in phases:
+        cutover.record_transaction_phase(
+            plan["transaction_journal"],
+            transaction_id=plan["transaction_id"],
+            phase=phase,
+            receipt=receipt,
+        )
+        if phase == through:
+            return
+    raise AssertionError(f"unknown pair phase: {through}")
+
+
+def test_release_watchdog_barrier_restores_cron_under_lock_after_pair_opened(
+    tmp_path,
+    monkeypatch,
+):
+    plan, candidate = _watchdog_barrier_transaction(tmp_path)
+    prepared = {
+        "watchdog_cron": {
+            "backup_path": str(tmp_path / "crontab.backup"),
+            "backup_sha256": "d" * 64,
+            "crontab_sha256": "e" * 64,
+            "watchdog_command": "* * * * * watchdog",
+        }
+    }
+    state = {"sha256": "f" * 64, "claim_revision": 7}
+    lock = object()
+    for phase, receipt in (
+        ("watchdog_cron_disable_intent", {"prepared": prepared}),
+        ("watchdog_cron_disabled", {"status": "disabled"}),
+        (
+            "watchdog_state_reconciled",
+            {"status": "no_reconcilable_slot", "state_after": state},
+        ),
+    ):
+        cutover.record_transaction_phase(
+            plan["transaction_journal"],
+            transaction_id=plan["transaction_id"],
+            phase=phase,
+            receipt=receipt,
+        )
+    _record_webui_pair_commit_phases(plan, candidate, through="pair_opened")
+    disabled = {
+        "status": "disabled",
+        "crontab_sha256": "a" * 64,
+        "marker_sha256": "b" * 64,
+    }
+    barrier = {
+        "lock": lock,
+        "prepared": prepared,
+        "disabled": disabled,
+        "state": state,
+    }
+    events = []
+    monkeypatch.setattr(
+        cutover,
+        "_verify_watchdog_state_lock",
+        lambda _plan, actual: events.append("verify-lock")
+        or {"status": "locked"}
+        if actual is lock
+        else pytest.fail("wrong lock"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_watchdog_state_receipt",
+        lambda _plan: events.append("state") or state,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_watchdog_cron",
+        lambda _plan, _prepared: events.append("restore")
+        or {"crontab_sha256": "e" * 64, "watchdog_command": "* * * * * watchdog"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_release_watchdog_state_lock",
+        lambda _plan, actual: events.append("release")
+        or {"status": "released"}
+        if actual is lock
+        else pytest.fail("wrong lock"),
+    )
+
+    result = cutover._finish_release_watchdog_barrier(plan, barrier)
+
+    assert result["status"] == "restored-after-pair-opened"
+    assert events == ["verify-lock", "state", "restore", "release"]
+    phases = cutover.read_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+    )["phases"]
+    assert phases["watchdog_cron_restored"]["watchdog_command"].endswith(
+        "watchdog"
+    )
+    assert phases["watchdog_cron_restore_intent"]["status"] == "prepared"
+
+
+def test_release_watchdog_barrier_keeps_cron_disabled_after_pair_commit_failure(
+    tmp_path,
+    monkeypatch,
+):
+    plan, candidate = _watchdog_barrier_transaction(tmp_path)
+    prepared = {
+        "watchdog_cron": {
+            "backup_path": str(tmp_path / "crontab.backup"),
+            "backup_sha256": "d" * 64,
+            "crontab_sha256": "e" * 64,
+            "watchdog_command": "* * * * * watchdog",
+        }
+    }
+    disabled = {"status": "disabled"}
+    state = {"sha256": "f" * 64, "claim_revision": 7}
+    for phase, receipt in (
+        ("watchdog_cron_disable_intent", {"prepared": prepared}),
+        ("watchdog_cron_disabled", disabled),
+        (
+            "watchdog_state_reconciled",
+            {"status": "no_reconcilable_slot", "state_after": state},
+        ),
+    ):
+        cutover.record_transaction_phase(
+            plan["transaction_journal"],
+            transaction_id=plan["transaction_id"],
+            phase=phase,
+            receipt=receipt,
+        )
+    _record_webui_pair_commit_phases(plan, candidate, through="promoted")
+    lock = object()
+    barrier = {
+        "lock": lock,
+        "prepared": prepared,
+        "disabled": disabled,
+        "state": state,
+    }
+    events = []
+    monkeypatch.setattr(
+        cutover,
+        "_verify_watchdog_state_lock",
+        lambda *_args: {"status": "locked"},
+    )
+    monkeypatch.setattr(cutover, "_watchdog_state_receipt", lambda _plan: state)
+    monkeypatch.setattr(
+        cutover,
+        "_attest_disabled_watchdog_cron",
+        lambda _plan, _prepared: events.append("attest-disabled") or disabled,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_watchdog_cron",
+        lambda *_args: pytest.fail("pair-commit failure must not restore cron"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_release_watchdog_state_lock",
+        lambda _plan, actual: events.append("release")
+        or {"status": "released"}
+        if actual is lock
+        else pytest.fail("wrong lock"),
+    )
+
+    result = cutover._finish_release_watchdog_barrier(plan, barrier)
+
+    assert result["status"] == "disabled-for-roll-forward"
+    assert events == ["attest-disabled", "release"]
+    phases = cutover.read_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+    )["phases"]
+    assert "watchdog_cron_restored" not in phases
+
+
+def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
+    transaction_id = "release-transaction-00000000000001"
+    old_identity = {
+        "pid": 123,
+        "pid_start_token": "old-start",
+        "instance_id": "instance-a",
+    }
+    expected_candidate = {
+        "build_id": "candidate",
+        "manifest_sha256": "a" * 64,
+        "agent_manifest_sha256": "b" * 64,
+        "runtime_manifest_sha256": "c" * 64,
+        "selector_generation": 2,
+        "release_path": "/immutable/releases/candidate",
+        "launchd_label": "com.example.webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    candidate_identity = {
+        **expected_candidate,
+        "pid": 456,
+        "pid_start_token": "candidate-start",
+        "instance_id": "instance-b",
+    }
+    journal_path = tmp_path / "transactions" / "release.json"
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=expected_candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "d" * 64,
+            "state_snapshot_id": "snapshot-before-candidate",
+            "state_snapshot_sha256": "f" * 64,
+        },
+    )
+    cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase="staged",
+        receipt={"build_id": "candidate", "generation": 1},
+    )
+    cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase="plist_installed",
+        receipt={"plist_sha256": "e" * 64},
+    )
+    drained = {
+        "status": "inspected",
+        "transaction_id": transaction_id,
+        "identity": old_identity,
+        "admission": {
+            "state": "fenced",
+            "reservations": 0,
+            "active_runs": 0,
+        },
+        "activity": {
+            "active_streams": 0,
+            "active_async_delegations": 0,
+            "async_delegations_available": True,
+            "active_background_memory_commits": 0,
+            "in_flight_memory_commits": 0,
+            "memory_commit_activity_available": True,
+            "pending_oauth_flows": 0,
+            "oauth_activity_available": True,
+            "active_terminals": 0,
+            "terminal_activity_available": True,
+            "running_processes": 0,
+            "finalizing_processes": 0,
+            "durable_undelivered_completions": 0,
+            "process_completion_activity_available": True,
+        },
+    }
+    inspection_rows = iter(
+        [
+            {
+                "status": "inspected",
+                "transaction_id": transaction_id,
+                "identity": old_identity,
+                **{key: value for key, value in drained.items() if key != "identity"},
+            },
+            {
+                "status": "inspected",
+                "transaction_id": transaction_id,
+                "identity": candidate_identity,
+                "admission": {
+                    "state": "startup-fenced",
+                    "lease_expires_at": None,
+                    "transaction_id": transaction_id,
+                    "startup_error": None,
+                },
+            },
+            {
+                "status": "inspected",
+                "transaction_id": transaction_id,
+                "identity": candidate_identity,
+                "admission": {"state": "open", "transaction_id": None},
+            },
+        ]
+    )
+    actions = []
+
+    def send_control(action, expected, fence_token=None):
+        actions.append((action, expected, fence_token))
+        if action == "fence" and expected == old_identity:
+            return {
+                "status": "fenced",
+                "transaction_id": transaction_id,
+                "fence_token": "old-secret-token",
+                "identity": old_identity,
+            }
+        if action == "commit":
+            assert fence_token == "old-secret-token"
+            return {
+                "status": "committing",
+                "transaction_id": transaction_id,
+                "identity": old_identity,
+                "admission": {"state": "committing"},
+            }
+        if action == "fence":
+            assert expected == candidate_identity
+            return {
+                "status": "startup-fenced",
+                "transaction_id": transaction_id,
+                "fence_token": "candidate-secret-token",
+                "identity": candidate_identity,
+                "admission": {
+                    "state": "startup-fenced",
+                    "lease_expires_at": None,
+                    "transaction_id": transaction_id,
+                    "startup_error": None,
+                },
+            }
+        assert action == "accept"
+        assert expected == candidate_identity
+        assert fence_token == "candidate-secret-token"
+        lifecycle.append("webui-accepted")
+        return {
+            "status": "accepted",
+            "transaction_id": transaction_id,
+            "identity": candidate_identity,
+            "admission": {"state": "open", "transaction_id": None},
+        }
+
+    lifecycle = []
+    deep_health_calls = []
+
+    def inspect_deep_candidate(_identity):
+        state = "startup-fenced" if not deep_health_calls else "open"
+        deep_health_calls.append(state)
+        lifecycle.append(f"candidate-{state}-health")
+        return {
+            "status": "verified",
+            "launchd_pid": 456,
+            "listener_pid": 456,
+            "signed_health_pid": 456,
+            "pid_start_token": "candidate-start",
+            "deep_health": {
+                "status": "ok",
+                "build": {
+                    "status": "managed",
+                    "valid": True,
+                    **{
+                        key: expected_candidate[key]
+                        for key in (
+                            "build_id",
+                            "manifest_sha256",
+                            "agent_manifest_sha256",
+                            "runtime_manifest_sha256",
+                            "selector_generation",
+                        )
+                    },
+                },
+                "admission": {"state": state},
+                "checks": {
+                    "streams_lock": {"status": "ok"},
+                    "stream_runtime": {"status": "ok"},
+                    "sessions": {"status": "ok"},
+                    "projects": {"status": "ok"},
+                    "state_db": {"status": "ok"},
+                },
+            },
+        }
+
+    result = cutover.run_release_control_cutover(
+        initial_inspection={
+            "status": "inspected",
+            "transaction_id": transaction_id,
+            "identity": old_identity,
+        },
+        inspect_control=lambda: next(inspection_rows),
+        send_control=send_control,
+        attest_selector_state=lambda: {
+            "status": "verified",
+            "transaction_id": transaction_id,
+            "current": "last-good",
+            "candidate": "candidate",
+            "pending_transaction_id": transaction_id,
+        },
+        attest_installed_plist=lambda: {
+            "status": "verified",
+            "launchd_label": "com.example.webui",
+            "plist_sha256": "e" * 64,
+        },
+        activate_selection=lambda: lifecycle.append("activated") or {"generation": 2},
+        promote_selection=lambda: lifecycle.append("promoted") or {"generation": 3},
+        rollback_selection=lambda: lifecycle.append("rolled-back"),
+        restore_plist=lambda: lifecycle.append("plist-restored"),
+        stop_failed_candidate=lambda: lifecycle.append("candidate-stopped"),
+        restore_state_snapshot=lambda: lifecycle.append("state-restored"),
+        restart_selection=lambda: lifecycle.append("restarted"),
+        verify_rollback=lambda: {"status": "verified"},
+        signal_process=lambda exact: lifecycle.append(("signalled", exact)),
+        wait_for_process_exit=lambda exact, timeout: lifecycle.append(
+            ("exited", exact, timeout)
+        ),
+        inspect_candidate_binding=lambda _identity: lifecycle.append(
+            "candidate-binding"
+        ) or {
+            "status": "verified",
+            "launchd_pid": 456,
+            "listener_pid": 456,
+            "signed_health_pid": 456,
+            "pid_start_token": "candidate-start",
+            "deep_health": {
+                "status": "ok",
+                "build": {
+                    "status": "managed",
+                    "valid": True,
+                    **{
+                        key: expected_candidate[key]
+                        for key in (
+                            "build_id",
+                            "manifest_sha256",
+                            "agent_manifest_sha256",
+                            "runtime_manifest_sha256",
+                            "selector_generation",
+                        )
+                    },
+                },
+                "admission": {"state": "startup-fenced"},
+            },
+        },
+        inspect_accepted_binding=inspect_deep_candidate,
+        prepare_pair_before_commit=lambda _identity: lifecycle.append(
+            "pair-ready"
+        ) or {"status": "ready"},
+        open_pair_after_promotion=lambda _identity: lifecycle.append(
+            "gateway-opened"
+        ) or {"status": "opened"},
+        expected_candidate_identity=expected_candidate,
+        transaction_id=transaction_id,
+        transaction_journal_path=journal_path,
+        timeout_seconds=2,
+        interval_seconds=0.01,
+    )
+
+    assert [row[0] for row in actions] == ["fence", "commit", "fence", "accept"]
+    assert result["status"] == "accepted"
+    assert result["identity"] == candidate_identity
+    assert lifecycle[0] == "activated"
+    assert lifecycle[1] == ("signalled", old_identity)
+    assert lifecycle[2][0:2] == ("exited", old_identity)
+    assert lifecycle[3:] == [
+        "candidate-binding",
+        "candidate-startup-fenced-health",
+        "pair-ready",
+        "promoted",
+        "gateway-opened",
+        "webui-accepted",
+        "candidate-open-health",
+    ]
+    assert "secret-token" not in json.dumps(result)
+    journal = cutover.read_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+    )
+    assert set(journal["phases"]) == {
+        "staged",
+        "plist_installed",
+        "old_fenced",
+        "old_committed",
+        "selection_activated",
+        "old_stopped",
+        "replacement_proved",
+        "candidate_fenced_health_proved",
+        "pair_ready",
+        "pair_commit_intent",
+        "promoted",
+        "gateway_opened",
+        "candidate_accepted",
+        "accepted_health_proved",
+        "pair_accepted",
+    }
+
+
+@pytest.mark.parametrize(
+    "resume_phase,expected_old_commit,expected_activate,expected_accept,expected_promote",
+    [
+        ("old_fenced", 1, 1, 1, 1),
+        ("old_committed", 0, 1, 1, 1),
+        ("selection_activated", 0, 0, 1, 1),
+        ("old_stopped", 0, 0, 1, 1),
+        ("replacement_proved", 0, 0, 1, 1),
+        ("candidate_fenced_health_proved", 0, 0, 1, 1),
+        ("pair_ready", 0, 0, 1, 1),
+        ("pair_commit_intent", 0, 0, 1, 1),
+        ("promoted", 0, 0, 1, 0),
+        ("gateway_opened", 0, 0, 1, 0),
+        ("candidate_accepted", 0, 0, 0, 0),
+        ("accepted_health_proved", 0, 0, 0, 0),
+        ("pair_accepted", 0, 0, 0, 0),
+    ],
+)
+def test_release_transaction_resumes_from_each_durable_external_phase(
+    tmp_path,
+    resume_phase,
+    expected_old_commit,
+    expected_activate,
+    expected_accept,
+    expected_promote,
+):
+    transaction_id = "resume-transaction-000000000000001"
+    old_identity = {"pid": 101, "pid_start_token": "old-start"}
+    expected_candidate = {
+        "build_id": "candidate",
+        "manifest_sha256": "a" * 64,
+        "agent_manifest_sha256": "b" * 64,
+        "runtime_manifest_sha256": "c" * 64,
+        "selector_generation": 2,
+        "release_path": "/immutable/releases/candidate",
+        "launchd_label": "com.example.webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    candidate_identity = {
+        **expected_candidate,
+        "pid": 202,
+        "pid_start_token": "candidate-start",
+    }
+    journal_path = tmp_path / f"{resume_phase}.json"
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=expected_candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "d" * 64,
+            "state_snapshot_id": "snapshot-before-candidate",
+            "state_snapshot_sha256": "f" * 64,
+        },
+    )
+    phase_order = [
+        "staged",
+        "plist_installed",
+        "old_fenced",
+        "old_committed",
+        "selection_activated",
+        "old_stopped",
+        "replacement_proved",
+        "candidate_fenced_health_proved",
+        "pair_ready",
+        "pair_commit_intent",
+        "promoted",
+        "gateway_opened",
+        "candidate_accepted",
+        "accepted_health_proved",
+        "pair_accepted",
+    ]
+    receipts = {
+        "staged": {"generation": 1},
+        "plist_installed": {"plist_sha256": "e" * 64},
+        "old_fenced": {"identity": old_identity},
+        "old_committed": {"identity": old_identity},
+        "selection_activated": {"selection": {"generation": 2}},
+        "old_stopped": {"identity": old_identity},
+        "replacement_proved": {"identity": candidate_identity},
+        "candidate_fenced_health_proved": {"identity": candidate_identity},
+        "pair_ready": {"pair": {"status": "ready"}},
+        "pair_commit_intent": {"build_id": "candidate"},
+        "promoted": {"promotion": {"generation": 3}},
+        "gateway_opened": {"gateway": {"status": "opened"}},
+        "candidate_accepted": {
+            "identity": candidate_identity,
+            "admission": {"state": "open"},
+        },
+        "accepted_health_proved": {"identity": candidate_identity},
+        "pair_accepted": {"identity": candidate_identity},
+    }
+    for phase in phase_order:
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipts[phase],
+        )
+        if phase == resume_phase:
+            break
+
+    candidate_open = resume_phase in {
+        "candidate_accepted",
+        "accepted_health_proved",
+        "pair_accepted",
+    }
+    initial_identity = (
+        old_identity
+        if resume_phase in {"old_fenced", "old_committed", "selection_activated"}
+        else candidate_identity
+    )
+    initial = {
+        "status": "inspected",
+        "transaction_id": transaction_id,
+        "identity": initial_identity,
+        "admission": (
+            {"state": "open", "transaction_id": None}
+            if candidate_open
+            else {
+                "state": "startup-fenced",
+                "lease_expires_at": None,
+                "transaction_id": transaction_id,
+                "startup_error": None,
+            }
+        ),
+    }
+    drained_old = {
+        "status": "inspected",
+        "transaction_id": transaction_id,
+        "identity": old_identity,
+        "admission": {"state": "fenced", "reservations": 0, "active_runs": 0},
+        "activity": {
+            "active_streams": 0,
+            "active_async_delegations": 0,
+            "async_delegations_available": True,
+            "active_background_memory_commits": 0,
+            "in_flight_memory_commits": 0,
+            "memory_commit_activity_available": True,
+            "pending_oauth_flows": 0,
+            "oauth_activity_available": True,
+            "active_terminals": 0,
+            "terminal_activity_available": True,
+            "running_processes": 0,
+            "finalizing_processes": 0,
+            "durable_undelivered_completions": 0,
+            "process_completion_activity_available": True,
+        },
+    }
+    candidate_startup = {
+        "status": "inspected",
+        "transaction_id": transaction_id,
+        "identity": candidate_identity,
+        "admission": {
+            "state": "startup-fenced",
+            "lease_expires_at": None,
+            "transaction_id": transaction_id,
+            "startup_error": None,
+        },
+    }
+    candidate_open_receipt = {
+        "status": "inspected",
+        "transaction_id": transaction_id,
+        "identity": candidate_identity,
+        "admission": {"state": "open", "transaction_id": None},
+    }
+    queued = []
+    if resume_phase == "old_fenced":
+        queued.append(drained_old)
+    if resume_phase == "old_committed":
+        committed_old = copy.deepcopy(drained_old)
+        committed_old["admission"]["state"] = "committing"
+        queued.append(committed_old)
+    if initial_identity == old_identity:
+        queued.append(candidate_startup)
+    queued.append(candidate_open_receipt)
+    inspections = iter(queued)
+    counters = {"old_commit": 0, "activate": 0, "accept": 0, "promote": 0}
+
+    def send_control(action, expected, token=None):
+        if action == "fence" and expected == old_identity:
+            return {
+                "status": (
+                    "committing" if resume_phase == "old_committed" else "fenced"
+                ),
+                "transaction_id": transaction_id,
+                "identity": old_identity,
+                "fence_token": "old-token",
+            }
+        if action == "commit":
+            counters["old_commit"] += 1
+            return {
+                "status": "committing",
+                "transaction_id": transaction_id,
+                "identity": old_identity,
+            }
+        if action == "fence":
+            return {
+                "status": "startup-fenced",
+                "transaction_id": transaction_id,
+                "identity": candidate_identity,
+                "fence_token": "candidate-token",
+                "admission": candidate_startup["admission"],
+            }
+        if action == "accept":
+            counters["accept"] += 1
+            return {
+                "status": "accepted",
+                "transaction_id": transaction_id,
+                "identity": candidate_identity,
+                "admission": {"state": "open"},
+            }
+        raise AssertionError(f"unexpected action: {action}")
+
+    preaccepted_health = {
+        "status": "verified",
+        "launchd_pid": 202,
+        "listener_pid": 202,
+        "signed_health_pid": 202,
+        "pid_start_token": "candidate-start",
+        "deep_health": {
+            "status": "ok",
+            "build": {"status": "managed", "valid": True, **{
+                key: expected_candidate[key]
+                for key in (
+                    "build_id",
+                    "manifest_sha256",
+                    "agent_manifest_sha256",
+                    "runtime_manifest_sha256",
+                    "selector_generation",
+                )
+            }},
+            "admission": {"state": "startup-fenced"},
+        },
+    }
+    preaccepted_health["deep_health"]["checks"] = {
+        name: {"status": "ok"}
+        for name in (
+            "streams_lock",
+            "stream_runtime",
+            "sessions",
+            "projects",
+            "state_db",
+        )
+    }
+    accepted_health = copy.deepcopy(preaccepted_health)
+    accepted_health["deep_health"]["admission"] = {"state": "open"}
+    accepted_health["deep_health"]["checks"] = {
+        name: {"status": "ok"}
+        for name in (
+            "streams_lock",
+            "stream_runtime",
+            "sessions",
+            "projects",
+            "state_db",
+        )
+    }
+    if phase_order.index(resume_phase) >= phase_order.index("promoted"):
+        selector_attestation = {
+            "current": "candidate",
+            "candidate": None,
+            "pending_transaction_id": None,
+        }
+    elif phase_order.index(resume_phase) >= phase_order.index(
+        "selection_activated"
+    ):
+        selector_attestation = {
+            "current": "candidate",
+            "candidate": "candidate",
+            "pending_transaction_id": transaction_id,
+        }
+    else:
+        selector_attestation = {
+            "current": "last-good",
+            "candidate": "candidate",
+            "pending_transaction_id": transaction_id,
+        }
+
+    deep_health_calls = []
+
+    def inspect_deep_candidate(_identity):
+        if candidate_open:
+            return accepted_health
+        deep_health_calls.append("called")
+        return preaccepted_health if len(deep_health_calls) == 1 else accepted_health
+
+    result = cutover.run_release_control_cutover(
+        initial_inspection=initial,
+        inspect_control=lambda: next(inspections),
+        send_control=send_control,
+        attest_selector_state=lambda: {
+            "status": "verified",
+            "transaction_id": transaction_id,
+            **selector_attestation,
+        },
+        attest_installed_plist=lambda: {
+            "status": "verified",
+            "launchd_label": "com.example.webui",
+            "plist_sha256": "e" * 64,
+        },
+        activate_selection=lambda: counters.__setitem__(
+            "activate", counters["activate"] + 1
+        )
+        or {"generation": 2},
+        promote_selection=lambda: counters.__setitem__(
+            "promote", counters["promote"] + 1
+        )
+        or {"generation": 3},
+        rollback_selection=lambda: None,
+        restore_plist=lambda: None,
+        stop_failed_candidate=lambda: None,
+        restore_state_snapshot=lambda: None,
+        restart_selection=lambda: None,
+        verify_rollback=lambda: {"status": "verified"},
+        signal_process=lambda _identity: None,
+        wait_for_process_exit=lambda _identity, _timeout: None,
+        inspect_candidate_binding=lambda _identity: preaccepted_health,
+        inspect_accepted_binding=inspect_deep_candidate,
+        expected_candidate_identity=expected_candidate,
+        transaction_id=transaction_id,
+        transaction_journal_path=journal_path,
+        timeout_seconds=2,
+        interval_seconds=0.01,
+    )
+
+    assert result["status"] == "accepted"
+    assert counters == {
+        "old_commit": expected_old_commit,
+        "activate": expected_activate,
+        "accept": expected_accept,
+        "promote": expected_promote,
+    }
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    [
+        "attestation",
+        "inspect",
+        "fence",
+        "old_fenced",
+        "old_committed",
+        "rollback_started",
+    ],
+)
+def test_release_early_failure_matrix_always_restores_selector_and_plist(
+    tmp_path,
+    failure_point,
+):
+    transaction_id = "early-rollback-transaction-00000001"
+    old_identity = {
+        "pid": 101,
+        "pid_start_token": "old-start-token",
+        "instance_id": "old-instance",
+    }
+    expected_candidate = {
+        "build_id": "candidate",
+        "launchd_label": "com.example.webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    snapshot_sha256 = "c" * 64
+    journal_path = tmp_path / f"early-{failure_point}.json"
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=expected_candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "a" * 64,
+            "state_snapshot_id": "pre-candidate-snapshot",
+            "state_snapshot_sha256": snapshot_sha256,
+        },
+    )
+    for phase, receipt in (
+        ("staged", {"generation": 1}),
+        ("plist_installed", {"plist_sha256": "b" * 64}),
+    ):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipt,
+        )
+    if failure_point in {"old_fenced", "old_committed", "rollback_started"}:
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase="old_fenced",
+            receipt={"identity": old_identity},
+        )
+    if failure_point in {"old_committed", "rollback_started"}:
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase="old_committed",
+            receipt={"identity": old_identity},
+        )
+    if failure_point == "rollback_started":
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase="rollback_started",
+            receipt={
+                "old_identity": old_identity,
+                "failed_after_activation": False,
+                "old_process_exited": False,
+                "error_type": "InjectedCrash",
+            },
+        )
+
+    admission_state = {
+        "value": (
+            "committing"
+            if failure_point in {"old_committed", "rollback_started"}
+            else "fenced"
+            if failure_point == "old_fenced"
+            else "open"
+        )
+    }
+    injected = set()
+    actions = []
+    counters = {
+        "selector": 0,
+        "plist": 0,
+        "stop": 0,
+        "snapshot": 0,
+        "restart": 0,
+        "verify": 0,
+    }
+    drained_activity = {
+        "active_streams": 0,
+        "active_async_delegations": 0,
+        "async_delegations_available": True,
+        "active_background_memory_commits": 0,
+        "in_flight_memory_commits": 0,
+        "memory_commit_activity_available": True,
+        "pending_oauth_flows": 0,
+        "oauth_activity_available": True,
+        "active_terminals": 0,
+        "terminal_activity_available": True,
+        "running_processes": 0,
+        "finalizing_processes": 0,
+        "durable_undelivered_completions": 0,
+        "process_completion_activity_available": True,
+    }
+
+    def inspect_control():
+        actions.append("inspect")
+        if failure_point == "inspect" and "inspect" not in injected:
+            injected.add("inspect")
+            raise RuntimeError("injected-inspect-failure")
+        return {
+            "status": "inspected",
+            "transaction_id": transaction_id,
+            "identity": old_identity,
+            "admission": {
+                "state": admission_state["value"],
+                "reservations": 0,
+                "active_runs": 0,
+            },
+            "activity": drained_activity,
+        }
+
+    def send_control(action, expected, token=None):
+        actions.append(action)
+        assert expected == old_identity
+        if action == "fence":
+            admission_state["value"] = "fenced"
+            if failure_point == "fence" and "fence" not in injected:
+                injected.add("fence")
+                raise RuntimeError("injected-fence-response-loss")
+            return {
+                "status": "fenced",
+                "transaction_id": transaction_id,
+                "identity": old_identity,
+                "fence_token": "recovered-token",
+                "admission": {"state": "fenced"},
+            }
+        if action == "commit":
+            if failure_point == "old_fenced" and "commit" not in injected:
+                injected.add("commit")
+                raise RuntimeError("injected-after-old-fenced")
+            admission_state["value"] = "committing"
+            return {
+                "status": "committing",
+                "transaction_id": transaction_id,
+                "identity": old_identity,
+                "admission": {"state": "committing"},
+            }
+        assert action == "abort"
+        assert token == "recovered-token"
+        admission_state["value"] = "open"
+        return {
+            "status": "aborted",
+            "transaction_id": transaction_id,
+            "identity": old_identity,
+            "admission": {"state": "open"},
+        }
+
+    def attest_selector_state():
+        if failure_point == "attestation" and "attestation" not in injected:
+            injected.add("attestation")
+            raise RuntimeError("injected-attestation-failure")
+        return {
+            "status": "verified",
+            "transaction_id": transaction_id,
+            "current": "last-good",
+            "candidate": "candidate",
+            "pending_transaction_id": transaction_id,
+        }
+
+    def activate_selection():
+        if failure_point == "old_committed":
+            raise RuntimeError("injected-after-old-committed")
+        raise AssertionError("early failure unexpectedly reached activation")
+
+    def verify_rollback():
+        counters["verify"] += 1
+        assert admission_state["value"] == "open"
+        return {
+            "status": "verified",
+            "state_snapshot_id": "pre-candidate-snapshot",
+            "state_snapshot_sha256": snapshot_sha256,
+        }
+
+    initial = None if failure_point == "inspect" else {
+        "status": "inspected",
+        "transaction_id": transaction_id,
+        "identity": old_identity,
+        "admission": {"state": admission_state["value"]},
+    }
+    with pytest.raises(Exception):
+        cutover.run_release_control_cutover(
+            initial_inspection=initial,
+            inspect_control=inspect_control,
+            send_control=send_control,
+            attest_selector_state=attest_selector_state,
+            attest_installed_plist=lambda: {
+                "status": "verified",
+                "launchd_label": "com.example.webui",
+                "plist_sha256": "b" * 64,
+            },
+            activate_selection=activate_selection,
+            promote_selection=lambda: None,
+            rollback_selection=lambda: counters.__setitem__(
+                "selector", counters["selector"] + 1
+            )
+            or {"current": "last-good"},
+            restore_plist=lambda: counters.__setitem__(
+                "plist", counters["plist"] + 1
+            )
+            or {"plist_sha256": "a" * 64},
+            stop_failed_candidate=lambda: counters.__setitem__(
+                "stop", counters["stop"] + 1
+            ),
+            restore_state_snapshot=lambda: counters.__setitem__(
+                "snapshot", counters["snapshot"] + 1
+            ),
+            restart_selection=lambda: counters.__setitem__(
+                "restart", counters["restart"] + 1
+            ),
+            verify_rollback=verify_rollback,
+            signal_process=lambda _identity: None,
+            wait_for_process_exit=lambda _identity, _timeout: None,
+            inspect_candidate_binding=lambda _identity: {},
+            inspect_accepted_binding=lambda _identity: {},
+            expected_candidate_identity=expected_candidate,
+            transaction_id=transaction_id,
+            transaction_journal_path=journal_path,
+            timeout_seconds=2,
+            interval_seconds=0.01,
+        )
+
+    assert counters == {
+        "selector": 1,
+        "plist": 1,
+        "stop": 0,
+        "snapshot": 0,
+        "restart": 0,
+        "verify": 1,
+    }
+    journal = cutover.read_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+    )
+    assert {
+        "rollback_started",
+        "state_rolled_back",
+        "plist_restored",
+        "failed_candidate_stopped",
+        "state_snapshot_restored",
+        "last_good_restarted",
+        "rollback_verified",
+    }.issubset(journal["phases"])
+    assert journal["phases"]["state_snapshot_restored"] == {
+        "status": "not-required",
+        "reason": "candidate_never_accepted",
+        "state_snapshot_id": "pre-candidate-snapshot",
+        "state_snapshot_sha256": snapshot_sha256,
+    }
+    if failure_point in {"fence", "old_fenced", "old_committed", "rollback_started"}:
+        assert actions[-3:] == ["fence", "abort", "inspect"]
+    else:
+        assert "abort" not in actions
+
+
+def _candidate_gateway_precommit_receipts(
+    *,
+    candidate_identity: dict,
+    state_snapshot_id: str,
+    state_snapshot_sha256: str,
+) -> tuple[tuple[str, dict], ...]:
+    last_good_binding = {
+        "status": "verified",
+        "listener_pid": 41,
+        "launchd_pid": 41,
+        "pid_start_token": "gateway-old-start",
+        "runtime": {"command": "managed-last-good-gateway"},
+    }
+    candidate_binding = {
+        "status": "verified",
+        "listener_pid": 42,
+        "launchd_pid": 42,
+        "pid_start_token": "gateway-candidate-start",
+        "runtime": {"command": "managed-candidate-gateway"},
+        "admission": "rejecting_new_work",
+    }
+    return (
+        ("gateway_last_good_attested", {"binding": last_good_binding}),
+        (
+            "watchdog_cron_disable_intent",
+            {"prepared": {"status": "prepared"}},
+        ),
+        ("watchdog_cron_disabled", {"status": "disabled"}),
+        ("watchdog_state_reconciled", {"status": "reconciled"}),
+        ("gateway_drain_intent", {"status": "drained"}),
+        ("gateway_drained", {"status": "drained"}),
+        ("gateway_stop_intent", {"status": "planned"}),
+        ("gateway_gracefully_stopped", {"status": "stopped"}),
+        ("gateway_dispatcher_lock_acquired", {"status": "locked"}),
+        ("gateway_workers_quiescent", {"status": "quiescent"}),
+        (
+            "paired_state_snapshot_created",
+            {
+                "status": "created",
+                "state_snapshot_id": state_snapshot_id,
+                "state_snapshot_sha256": state_snapshot_sha256,
+            },
+        ),
+        ("gateway_dispatcher_lock_released", {"status": "released"}),
+        (
+            "candidate_gateway_start_intent",
+            {
+                "candidate_build_id": candidate_identity["build_id"],
+                "last_good_binding": last_good_binding,
+            },
+        ),
+        ("candidate_gateway_accepted", {"binding": candidate_binding}),
+    )
+
+
+def test_release_rollback_reentry_accepts_already_applied_external_state(tmp_path):
+    transaction_id = "rollback-reentry-transaction-000001"
+    old_identity = {"pid": 101, "pid_start_token": "old-start"}
+    expected_candidate = {
+        "build_id": "candidate",
+        "launchd_label": "com.example.webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    candidate_identity = {
+        **expected_candidate,
+        "pid": 202,
+        "pid_start_token": "candidate-start",
+    }
+    snapshot_sha256 = "e" * 64
+    journal_path = tmp_path / "rollback-reentry.json"
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=expected_candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "a" * 64,
+            "state_snapshot_id": "pre-candidate-snapshot",
+            "state_snapshot_sha256": snapshot_sha256,
+        },
+    )
+    forward_phases = [
+        ("staged", {"generation": 1}),
+        ("plist_installed", {"plist_sha256": "b" * 64}),
+        *_candidate_gateway_precommit_receipts(
+            candidate_identity=candidate_identity,
+            state_snapshot_id="pre-candidate-snapshot",
+            state_snapshot_sha256=snapshot_sha256,
+        ),
+        ("old_fenced", {"identity": old_identity}),
+        ("old_committed", {"identity": old_identity}),
+        ("selection_activated", {"selection": {"generation": 2}}),
+        ("old_stopped", {"identity": old_identity}),
+        ("replacement_proved", {"identity": candidate_identity}),
+        (
+            "candidate_fenced_health_proved",
+            {
+                "identity": candidate_identity,
+                "admission": {"state": "startup-fenced"},
+            },
+        ),
+    ]
+    for phase, receipt in forward_phases:
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipt,
+        )
+    cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase="rollback_started",
+        receipt={
+            "old_identity": old_identity,
+            "failed_after_activation": True,
+            "old_process_exited": True,
+            "error_type": "InjectedCrash",
+        },
+    )
+
+    calls = []
+    with pytest.raises(cutover.ReleaseBuildError, match="resuming durable rollback"):
+        cutover.run_release_control_cutover(
+            initial_inspection=None,
+            inspect_control=lambda: {
+                "status": "inspected",
+                "transaction_id": transaction_id,
+                "identity": candidate_identity,
+                "admission": {"state": "startup-fenced"},
+            },
+            send_control=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("stopped old process must not be reopened")
+            ),
+            attest_selector_state=lambda: {
+                "status": "verified",
+                "transaction_id": transaction_id,
+                "current": "last-good",
+                "candidate": None,
+                "pending_transaction_id": None,
+            },
+            attest_installed_plist=lambda: {
+                "status": "verified",
+                "launchd_label": "com.example.webui",
+                "plist_sha256": "a" * 64,
+            },
+            activate_selection=lambda: None,
+            promote_selection=lambda: None,
+            rollback_selection=lambda: calls.append("selector") or {"generation": 3},
+            restore_plist=lambda: calls.append("plist") or {"plist_sha256": "a" * 64},
+            stop_failed_candidate=lambda: calls.append("stop") or {"pid": 202},
+            restore_state_snapshot=lambda: calls.append("snapshot") or {
+                "status": "restored",
+                "state_snapshot_id": "pre-candidate-snapshot",
+                "state_snapshot_sha256": snapshot_sha256,
+            },
+            restart_selection=lambda: calls.append("restart") or {"pid": 303},
+            verify_rollback=lambda: calls.append("verify") or {
+                "status": "verified",
+                "state_snapshot_id": "pre-candidate-snapshot",
+                "state_snapshot_sha256": snapshot_sha256,
+            },
+            signal_process=lambda _identity: None,
+            wait_for_process_exit=lambda _identity, _timeout: None,
+            inspect_candidate_binding=lambda _identity: {},
+            inspect_accepted_binding=lambda _identity: {},
+            expected_candidate_identity=expected_candidate,
+            transaction_id=transaction_id,
+            transaction_journal_path=journal_path,
+            timeout_seconds=2,
+            interval_seconds=0.01,
+        )
+
+    assert calls == ["selector", "plist", "stop", "snapshot", "restart", "verify"]
+
+
+@pytest.mark.parametrize(
+    "resume_phase",
+    [
+        "rollback_started",
+        "state_rolled_back",
+        "plist_restored",
+        "failed_candidate_stopped",
+        "state_snapshot_restored",
+        "last_good_restarted",
+        "rollback_verified",
+    ],
+)
+def test_release_transaction_resumes_rollback_and_restores_preaccept_state(
+    tmp_path,
+    resume_phase,
+):
+    transaction_id = "rollback-resume-transaction-000001"
+    expected_candidate = {
+        "build_id": "candidate",
+        "launchd_label": "com.example.webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    candidate_identity = {
+        **expected_candidate,
+        "pid": 303,
+        "pid_start_token": "candidate-start",
+    }
+    journal_path = tmp_path / f"{resume_phase}.json"
+    snapshot_path = tmp_path / "state.snapshot"
+    state_path = tmp_path / "state.db"
+    snapshot_path.write_text("preaccept-state", encoding="utf-8")
+    state_path.write_text("candidate-mutation", encoding="utf-8")
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=expected_candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "a" * 64,
+            "state_snapshot_id": "snapshot-before-candidate",
+            "state_snapshot_sha256": _sha(snapshot_path),
+        },
+    )
+    old_identity = {"pid": 101, "pid_start_token": "old-start"}
+    forward_phases = [
+        ("staged", {"generation": 1}),
+        ("plist_installed", {"plist_sha256": "b" * 64}),
+        *_candidate_gateway_precommit_receipts(
+            candidate_identity=candidate_identity,
+            state_snapshot_id="snapshot-before-candidate",
+            state_snapshot_sha256=_sha(snapshot_path),
+        ),
+        ("old_fenced", {"identity": old_identity}),
+        ("old_committed", {"identity": old_identity}),
+        ("selection_activated", {"selection": {"generation": 2}}),
+        ("old_stopped", {"identity": old_identity}),
+        ("replacement_proved", {"identity": candidate_identity}),
+        (
+            "candidate_fenced_health_proved",
+            {
+                "identity": candidate_identity,
+                "admission": {"state": "startup-fenced"},
+            },
+        ),
+    ]
+    for phase, receipt in forward_phases:
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipt,
+        )
+    rollback_order = [
+        "rollback_started",
+        "state_rolled_back",
+        "plist_restored",
+        "failed_candidate_stopped",
+        "state_snapshot_restored",
+        "last_good_restarted",
+        "rollback_verified",
+    ]
+    for phase in rollback_order:
+        if phase == "state_snapshot_restored":
+            receipt = {
+                "status": "restored",
+                "state_snapshot_id": "snapshot-before-candidate",
+                "state_snapshot_sha256": _sha(snapshot_path),
+            }
+        elif phase == "rollback_verified":
+            receipt = {
+                "status": "verified",
+                "state_snapshot_id": "snapshot-before-candidate",
+                "state_snapshot_sha256": _sha(snapshot_path),
+            }
+        else:
+            receipt = {"status": phase}
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipt,
+        )
+        if phase == "state_snapshot_restored":
+            state_path.write_text(snapshot_path.read_text(encoding="utf-8"), encoding="utf-8")
+        if phase == resume_phase:
+            break
+
+    counters = {
+        "state": 0,
+        "plist": 0,
+        "stop": 0,
+        "snapshot": 0,
+        "restart": 0,
+        "verify": 0,
+    }
+
+    def restore_snapshot():
+        counters["snapshot"] += 1
+        state_path.write_text(snapshot_path.read_text(encoding="utf-8"), encoding="utf-8")
+        return {
+            "status": "restored",
+            "state_snapshot_id": "snapshot-before-candidate",
+            "state_snapshot_sha256": _sha(snapshot_path),
+        }
+
+    def verify_last_good():
+        counters["verify"] += 1
+        assert state_path.read_text(encoding="utf-8") == "preaccept-state"
+        return {
+            "status": "verified",
+            "build_id": "last-good",
+            "state_snapshot_id": "snapshot-before-candidate",
+            "state_snapshot_sha256": _sha(snapshot_path),
+        }
+
+    state_was_rolled_back = rollback_order.index(resume_phase) >= rollback_order.index(
+        "state_rolled_back"
+    )
+    plist_was_restored = rollback_order.index(resume_phase) >= rollback_order.index(
+        "plist_restored"
+    )
+
+    with pytest.raises(cutover.ReleaseBuildError, match="resuming durable rollback"):
+        cutover.run_release_control_cutover(
+            initial_inspection={
+                "status": "inspected",
+                "transaction_id": transaction_id,
+                "identity": candidate_identity,
+                "admission": {"state": "startup-fenced"},
+            },
+            inspect_control=lambda: (_ for _ in ()).throw(
+                AssertionError("rollback resume must not inspect candidate")
+            ),
+            send_control=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("rollback resume must not send release actions")
+            ),
+            attest_selector_state=lambda: {
+                "status": "verified",
+                "transaction_id": transaction_id,
+                "current": "last-good" if state_was_rolled_back else "candidate",
+                "candidate": None if state_was_rolled_back else "candidate",
+                "pending_transaction_id": (
+                    None if state_was_rolled_back else transaction_id
+                ),
+            },
+            attest_installed_plist=lambda: {
+                "status": "verified",
+                "launchd_label": "com.example.webui",
+                "plist_sha256": ("a" if plist_was_restored else "b") * 64,
+            },
+            activate_selection=lambda: None,
+            promote_selection=lambda: None,
+            rollback_selection=lambda: counters.__setitem__(
+                "state", counters["state"] + 1
+            )
+            or {"generation": 3},
+            restore_plist=lambda: counters.__setitem__(
+                "plist", counters["plist"] + 1
+            )
+            or {"plist_sha256": "a" * 64},
+            stop_failed_candidate=lambda: counters.__setitem__(
+                "stop", counters["stop"] + 1
+            )
+            or {"pid": 303},
+            restore_state_snapshot=restore_snapshot,
+            restart_selection=lambda: counters.__setitem__(
+                "restart", counters["restart"] + 1
+            )
+            or {"pid": 404},
+            verify_rollback=verify_last_good,
+            signal_process=lambda _identity: None,
+            wait_for_process_exit=lambda _identity, _timeout: None,
+            inspect_candidate_binding=lambda _identity: {},
+            inspect_accepted_binding=lambda _identity: {},
+            expected_candidate_identity=expected_candidate,
+            transaction_id=transaction_id,
+            transaction_journal_path=journal_path,
+            timeout_seconds=2,
+            interval_seconds=0.01,
+        )
+
+    resume_index = rollback_order.index(resume_phase)
+    for index, key in enumerate(
+        ("state", "plist", "stop", "snapshot", "restart", "verify"),
+        start=1,
+    ):
+        assert counters[key] == int(resume_index < index)
+    assert state_path.read_text(encoding="utf-8") == "preaccept-state"
+    final = cutover.read_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+    )
+    assert "rollback_verified" in final["phases"]
+
+
+def test_release_control_driver_aborts_on_process_identity_change(tmp_path):
+    transaction_id = "abort-transaction-0000000000000001"
+    identity = {
+        "pid": 123,
+        "pid_start_token": "old-start",
+        "instance_id": "instance-a",
+    }
+    changed = {**identity, "pid": 999}
+    expected_candidate = {
+        "build_id": "candidate",
+        "launchd_label": "com.example.webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    journal_path = tmp_path / "abort-transaction.json"
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=expected_candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "c" * 64,
+            "state_snapshot_id": "snapshot-before-candidate",
+            "state_snapshot_sha256": "d" * 64,
+        },
+    )
+    for phase, receipt in (
+        ("staged", {"generation": 1}),
+        ("plist_installed", {"plist_sha256": "a" * 64}),
+    ):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipt,
+        )
+    inspection_rows = iter(
+        [
+            {
+                "status": "inspected",
+                "transaction_id": transaction_id,
+                "identity": changed,
+                "admission": {
+                    "state": "fenced",
+                    "reservations": 0,
+                },
+            },
+            {
+                "status": "inspected",
+                "transaction_id": transaction_id,
+                "identity": identity,
+                "admission": {"state": "fenced"},
+            },
+            {
+                "status": "inspected",
+                "transaction_id": transaction_id,
+                "identity": identity,
+                "admission": {"state": "open"},
+            },
+        ]
+    )
+    actions = []
+
+    def send_control(action, expected, fence_token=None):
+        actions.append(action)
+        if action == "fence":
+            return {
+                "status": "fenced",
+                "transaction_id": transaction_id,
+                "fence_token": "secret",
+                "identity": identity,
+            }
+        return {
+            "status": "aborted",
+            "transaction_id": transaction_id,
+            "identity": identity,
+        }
+
+    with pytest.raises(cutover.DrainIdentityMismatch):
+        cutover.run_release_control_cutover(
+            initial_inspection={
+                "status": "inspected",
+                "transaction_id": transaction_id,
+                "identity": identity,
+            },
+            inspect_control=lambda: next(inspection_rows),
+            send_control=send_control,
+            attest_selector_state=lambda: {
+                "status": "verified",
+                "transaction_id": transaction_id,
+                "current": "last-good",
+                "candidate": "candidate",
+                "pending_transaction_id": transaction_id,
+            },
+            attest_installed_plist=lambda: {
+                "status": "verified",
+                "launchd_label": "com.example.webui",
+                "plist_sha256": "a" * 64,
+            },
+            activate_selection=lambda: None,
+            promote_selection=lambda: None,
+            rollback_selection=lambda: None,
+            restore_plist=lambda: None,
+            stop_failed_candidate=lambda: None,
+            restore_state_snapshot=lambda: None,
+            restart_selection=lambda: None,
+            verify_rollback=lambda: {
+                "status": "verified",
+                "state_snapshot_id": "snapshot-before-candidate",
+                "state_snapshot_sha256": "d" * 64,
+            },
+            signal_process=lambda _identity: None,
+            wait_for_process_exit=lambda _identity, _timeout: None,
+            inspect_candidate_binding=lambda _identity: {"status": "verified"},
+            inspect_accepted_binding=lambda _identity: {"status": "verified"},
+            expected_candidate_identity=expected_candidate,
+            transaction_id=transaction_id,
+            transaction_journal_path=journal_path,
+            timeout_seconds=2,
+            interval_seconds=0.01,
+        )
+
+    assert actions == ["fence", "fence", "abort"]
+
+
+def test_release_control_driver_surfaces_every_rollback_failure(tmp_path):
+    transaction_id = "rollback-transaction-0000000000001"
+    identity = {"pid": 123, "pid_start_token": "start-a", "instance_id": "i"}
+    inspection = {
+        "status": "inspected",
+        "transaction_id": transaction_id,
+        "identity": identity,
+        "admission": {"state": "fenced", "reservations": 0, "active_runs": 0},
+        "activity": {
+            "active_streams": 0,
+            "active_async_delegations": 0,
+            "async_delegations_available": True,
+            "active_background_memory_commits": 0,
+            "in_flight_memory_commits": 0,
+            "memory_commit_activity_available": True,
+            "pending_oauth_flows": 0,
+            "oauth_activity_available": True,
+            "active_terminals": 0,
+            "terminal_activity_available": True,
+            "running_processes": 0,
+            "finalizing_processes": 0,
+            "durable_undelivered_completions": 0,
+            "process_completion_activity_available": True,
+        },
+    }
+    expected_candidate = {
+        "build_id": "candidate",
+        "launchd_label": "com.example.webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    journal_path = tmp_path / "rollback-transaction.json"
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=expected_candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "c" * 64,
+            "state_snapshot_id": "snapshot-before-candidate",
+            "state_snapshot_sha256": "d" * 64,
+        },
+    )
+    for phase, receipt in (
+        ("staged", {"generation": 1}),
+        ("plist_installed", {"plist_sha256": "b" * 64}),
+    ):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipt,
+        )
+    actions = []
+    admission_state = {"value": "open"}
+
+    def send_control(action, _expected, _token=None):
+        actions.append(action)
+        if action == "fence":
+            admission_state["value"] = "fenced"
+            return {
+                "status": "fenced",
+                "transaction_id": transaction_id,
+                "fence_token": "token",
+                "identity": identity,
+            }
+        if action == "commit":
+            admission_state["value"] = "committing"
+            return {
+                "status": "committing",
+                "transaction_id": transaction_id,
+                "identity": identity,
+            }
+        admission_state["value"] = "open"
+        return {
+            "status": "aborted",
+            "transaction_id": transaction_id,
+            "identity": identity,
+        }
+
+    with pytest.raises(cutover.ReleaseBuildError) as failure:
+        cutover.run_release_control_cutover(
+            initial_inspection={
+                "status": "inspected",
+                "transaction_id": transaction_id,
+                "identity": identity,
+            },
+            inspect_control=lambda: {
+                **inspection,
+                "admission": {
+                    **inspection["admission"],
+                    "state": admission_state["value"],
+                },
+            },
+            send_control=send_control,
+            attest_selector_state=lambda: {
+                "status": "verified",
+                "transaction_id": transaction_id,
+                "current": "last-good",
+                "candidate": "candidate",
+                "pending_transaction_id": transaction_id,
+            },
+            attest_installed_plist=lambda: {
+                "status": "verified",
+                "launchd_label": "com.example.webui",
+                "plist_sha256": "b" * 64,
+            },
+            activate_selection=lambda: actions.append("activate"),
+            promote_selection=lambda: actions.append("promote"),
+            rollback_selection=lambda: (_ for _ in ()).throw(
+                RuntimeError("rollback-state-error")
+            ),
+            restore_plist=lambda: (_ for _ in ()).throw(
+                RuntimeError("restore-plist-error")
+            ),
+            stop_failed_candidate=lambda: (_ for _ in ()).throw(
+                RuntimeError("stop-candidate-error")
+            ),
+            restore_state_snapshot=lambda: (_ for _ in ()).throw(
+                RuntimeError("restore-state-error")
+            ),
+            restart_selection=lambda: (_ for _ in ()).throw(
+                RuntimeError("restart-label-error")
+            ),
+            verify_rollback=lambda: (_ for _ in ()).throw(
+                RuntimeError("rollback-proof-error")
+            ),
+            signal_process=lambda _identity: (_ for _ in ()).throw(
+                cutover.DrainIdentityMismatch("signal identity changed")
+            ),
+            wait_for_process_exit=lambda _identity, _timeout: None,
+            inspect_candidate_binding=lambda _identity: {"status": "verified"},
+            inspect_accepted_binding=lambda _identity: {"status": "verified"},
+            expected_candidate_identity=expected_candidate,
+            transaction_id=transaction_id,
+            transaction_journal_path=journal_path,
+            timeout_seconds=2,
+            interval_seconds=0.01,
+        )
+
+    message = str(failure.value)
+    assert "signal identity changed" in message
+    assert "rollback-state-error" in message
+    assert "restore-plist-error" in message
+    assert "stop-candidate-error" in message
+    assert "restore-state-error" not in message
+    assert "restart-label-error" not in message
+    assert "rollback-proof-error" in message
+    assert actions == ["fence", "commit", "activate", "fence", "abort"]
+
+
+def test_release_control_receipt_rejects_forged_attestation():
+    key = b"r" * 32
+    receipt = {
+        "status": "inspected",
+        "transaction_id": "t" * 32,
+        "request_nonce": "n" * 32,
+        "identity": {"pid": 123},
+        "attestation": "0" * 64,
+    }
+
+    with pytest.raises(cutover.ReleaseBuildError, match="attestation"):
+        cutover._verify_release_control_receipt(
+            receipt,
+            signing_key=key,
+            transaction_id="t" * 32,
+            request_nonce="n" * 32,
+        )
+
+
+def test_exact_process_signal_refuses_pid_reuse(monkeypatch):
+    killed = []
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "new-process")
+    monkeypatch.setattr(cutover.os, "kill", lambda *args: killed.append(args))
+
+    with pytest.raises(cutover.DrainIdentityMismatch, match="identity changed"):
+        cutover.signal_exact_release_process(
+            {"pid": 123, "pid_start_token": "old-process"}
+        )
+    assert killed == []
+
+
+def test_state_snapshot_adopts_manifest_gap_and_restores_exact_directory(tmp_path):
+    state_dir = tmp_path / "mutable" / "state"
+    state_dir.mkdir(parents=True)
+    _write(state_dir / "state.db", "before-db")
+    _write(state_dir / "state.db-wal", "before-wal")
+    snapshot_root = tmp_path / "control" / "snapshot"
+    manifest_path = tmp_path / "control" / "snapshot.json"
+    snapshot_id = "snapshot-transaction-00000000000001"
+
+    created = cutover.create_state_snapshot(
+        [str(state_dir)],
+        snapshot_root=snapshot_root,
+        manifest_path=manifest_path,
+        snapshot_id=snapshot_id,
+    )
+    original_manifest = manifest_path.read_bytes()
+    manifest_path.unlink()
+
+    adopted = cutover.create_state_snapshot(
+        [str(state_dir)],
+        snapshot_root=snapshot_root,
+        manifest_path=manifest_path,
+        snapshot_id=snapshot_id,
+    )
+
+    assert manifest_path.read_bytes() == original_manifest
+    assert adopted["state_snapshot_sha256"] == created["state_snapshot_sha256"]
+    _write(state_dir / "state.db", "candidate-db")
+    _write(state_dir / "candidate-created.registry", "must disappear")
+    (state_dir / "state.db-wal").unlink()
+
+    restored = cutover.restore_state_snapshot_from_manifest(
+        manifest_path,
+        expected_snapshot_id=snapshot_id,
+        expected_manifest_sha256=created["state_snapshot_sha256"],
+    )
+
+    assert restored == {
+        "status": "restored",
+        "state_snapshot_id": snapshot_id,
+        "state_snapshot_sha256": created["state_snapshot_sha256"],
+    }
+    assert (state_dir / "state.db").read_text() == "before-db"
+    assert (state_dir / "state.db-wal").read_text() == "before-wal"
+    assert not (state_dir / "candidate-created.registry").exists()
+
+
+def test_state_snapshot_tombstone_removes_candidate_created_optional_target(tmp_path):
+    mutable_parent = tmp_path / "mutable"
+    mutable_parent.mkdir()
+    optional_target = mutable_parent / "optional-registry.json"
+    snapshot_root = tmp_path / "control" / "snapshot"
+    manifest_path = tmp_path / "control" / "snapshot.json"
+    snapshot_id = "snapshot-tombstone-transaction-000001"
+
+    created = cutover.create_state_snapshot(
+        [str(optional_target)],
+        snapshot_root=snapshot_root,
+        manifest_path=manifest_path,
+        snapshot_id=snapshot_id,
+    )
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["metadata_contract"] == "path-kind-content-mode"
+    assert manifest["entries"][0]["kind"] == "absent"
+
+    _write(optional_target, "candidate-created\n")
+    restored = cutover.restore_state_snapshot_from_manifest(
+        manifest_path,
+        expected_snapshot_id=snapshot_id,
+        expected_manifest_sha256=created["state_snapshot_sha256"],
+    )
+
+    assert restored["status"] == "restored"
+    assert not optional_target.exists()
+
+
+@pytest.mark.parametrize("crash_point", ["after-backup", "after-publish"])
+def test_directory_snapshot_restore_recovers_atomic_replace_crash(
+    tmp_path, monkeypatch, crash_point
+):
+    state_dir = tmp_path / "mutable" / "state"
+    state_dir.mkdir(parents=True)
+    _write(state_dir / "state.db", "before\n")
+    _chmod(state_dir / "state.db", 0o640)
+    snapshot_root = tmp_path / "control" / "snapshot"
+    manifest_path = tmp_path / "control" / "snapshot.json"
+    snapshot_id = f"snapshot-restore-{crash_point}-000000001"
+    created = cutover.create_state_snapshot(
+        [str(state_dir)],
+        snapshot_root=snapshot_root,
+        manifest_path=manifest_path,
+        snapshot_id=snapshot_id,
+    )
+    _write(state_dir / "state.db", "candidate\n")
+    _write(state_dir / "candidate-only", "remove me\n")
+
+    stage = state_dir.parent / (
+        f".{state_dir.name}.hermes-restore-{snapshot_id}-0000.stage"
+    )
+    backup = state_dir.parent / (
+        f".{state_dir.name}.hermes-restore-{snapshot_id}-0000.replaced"
+    )
+    real_replace = cutover.os.replace
+    crashed = False
+
+    def crash_after_replace(source, destination):
+        nonlocal crashed
+        source_path = Path(source)
+        destination_path = Path(destination)
+        should_crash = (
+            crash_point == "after-backup"
+            and source_path == state_dir
+            and destination_path == backup
+        ) or (
+            crash_point == "after-publish"
+            and source_path == stage
+            and destination_path == state_dir
+        )
+        real_replace(source, destination)
+        if should_crash and not crashed:
+            crashed = True
+            raise cutover.InjectedCutoverCrash(crash_point)
+
+    monkeypatch.setattr(cutover.os, "replace", crash_after_replace)
+    with pytest.raises(cutover.InjectedCutoverCrash, match=crash_point):
+        cutover.restore_state_snapshot_from_manifest(
+            manifest_path,
+            expected_snapshot_id=snapshot_id,
+            expected_manifest_sha256=created["state_snapshot_sha256"],
+        )
+    monkeypatch.setattr(cutover.os, "replace", real_replace)
+
+    restored = cutover.restore_state_snapshot_from_manifest(
+        manifest_path,
+        expected_snapshot_id=snapshot_id,
+        expected_manifest_sha256=created["state_snapshot_sha256"],
+    )
+
+    assert restored["status"] == "restored"
+    assert (state_dir / "state.db").read_text() == "before\n"
+    assert stat.S_IMODE((state_dir / "state.db").stat().st_mode) == 0o640
+    assert not (state_dir / "candidate-only").exists()
+    assert not stage.exists()
+    assert not backup.exists()
+
+
+def test_atomic_copy_streams_without_path_read_bytes(tmp_path, monkeypatch):
+    source = tmp_path / "source.db"
+    destination = tmp_path / "destination.db"
+    source.write_bytes(b"state" * 1024 * 1024)
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(path):
+        if path == source:
+            raise AssertionError("large mutable files must not be read into memory")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+
+    receipt = cutover._atomic_copy_file(source, destination)
+
+    assert receipt["sha256"] == _sha(destination)
+    assert destination.stat().st_size == source.stat().st_size
+
+
+def test_wait_for_exact_process_exit_does_not_treat_ps_failure_as_exit(monkeypatch):
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(cutover.os, "kill", lambda _pid, _signal: None)
+
+    with pytest.raises(cutover.DrainIdentityMismatch, match="probe failed"):
+        cutover.wait_for_exact_process_exit(
+            {"pid": 123, "pid_start_token": "same-live-process"},
+            0.2,
+        )
+
+
+def test_darwin_pid_start_token_distinguishes_same_second_pid_reuse(monkeypatch):
+    start_times = iter([(123456, 100), (123456, 900)])
+
+    class FakeProcPidInfo:
+        argtypes = None
+        restype = None
+
+        def __call__(self, pid, flavor, arg, buffer, buffer_size):
+            assert pid == 123
+            assert flavor == 3
+            assert arg == 0
+            assert buffer_size == 136
+            seconds, microseconds = next(start_times)
+            import struct as struct_module
+
+            struct_module.pack_into("=QQ", buffer, 120, seconds, microseconds)
+            return buffer_size
+
+    fake_proc_pidinfo = FakeProcPidInfo()
+    fake_libproc = SimpleNamespace(proc_pidinfo=fake_proc_pidinfo)
+    monkeypatch.setattr(cutover.sys, "platform", "darwin")
+    monkeypatch.setattr(cutover.ctypes, "CDLL", lambda *_args, **_kwargs: fake_libproc)
+
+    first = cutover._pid_start_token(123)
+    second = cutover._pid_start_token(123)
+
+    assert first == "darwin-proc:123:123456:100"
+    assert second == "darwin-proc:123:123456:900"
+    assert first != second
+
+
+def test_writer_barrier_freezes_root_and_complete_descendant_tree(monkeypatch):
+    tokens = {10: "root-start", 11: "child-start", 12: "grandchild-start"}
+    table = {10: 1, 11: 10, 12: 11, 99: 1}
+    signals = []
+    monkeypatch.setattr(cutover, "_process_parent_table", lambda: dict(table))
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda pid: tokens.get(pid))
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, field: "T" if field == "state" else "")
+    monkeypatch.setattr(
+        cutover.os,
+        "kill",
+        lambda pid, sent_signal: signals.append((pid, sent_signal)),
+    )
+
+    receipt = cutover._freeze_exact_process_tree(
+        {"pid": 10, "pid_start_token": "root-start"},
+        role="webui",
+    )
+
+    assert [row["pid"] for row in receipt["tree"]] == [10, 11, 12]
+    assert {pid for pid, _signal in signals} == {10, 11, 12}
+    assert all(sent_signal == cutover.signal.SIGSTOP for _pid, sent_signal in signals)
+
+
+def test_cutover_controller_starts_adopts_and_exactly_stops_ingress_gate(tmp_path):
+    gate_script = Path(cutover.__file__).resolve().parents[2] / "evidence" / "ingress_gate.py"
+    assert gate_script.is_file()
+    control = tmp_path / "gate-control"
+    control.mkdir(mode=0o700)
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    port = int(probe.getsockname()[1])
+    probe.close()
+    plan = {
+        "base_url": f"http://127.0.0.1:{port}",
+        "listener_port": port,
+        "timeout_seconds": 5,
+        "interval_seconds": 0.02,
+        "managed_interpreter": sys.executable,
+        "ingress_gate_script": str(gate_script),
+        "ingress_gate_expected_sha256": _sha(gate_script),
+        "ingress_gate_token_file": str(control / "controller.token"),
+        "ingress_gate_ready_receipt": str(control / "ready.json"),
+    }
+
+    started = cutover._start_or_adopt_ingress_gate(plan)
+    try:
+        assert started["status"] == "started"
+        adopted = cutover._start_or_adopt_ingress_gate(plan)
+        assert adopted["status"] == "adopted"
+        assert adopted["binding"]["pid"] == started["binding"]["pid"]
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as client:
+            client.sendall(
+                b"POST /api/chat/start HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Length: 0\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            chunks = []
+            while True:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            response = b"".join(chunks)
+        assert response.startswith(b"HTTP/1.1 503")
+        assert b"ingress_fenced" in response
+    finally:
+        stopped = cutover._stop_ingress_gate(plan, started)
+    assert stopped["status"] == "stopped"
+    assert not Path(plan["ingress_gate_ready_receipt"]).exists()
+    rebound = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        rebound.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        rebound.bind(("127.0.0.1", port))
+    finally:
+        rebound.close()
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def test_drain_resets_on_activity_and_requires_final_identity():
+    clock = _Clock()
+    samples = iter(
+        [
+            {"active_runs": 0, "active_streams": 0, "pid": 10},  # t=0
+            {"active_runs": 0, "active_streams": 0, "pid": 10},  # t=1
+            {"active_runs": 1, "active_streams": 0, "pid": 10},  # t=2 reset
+            {"active_runs": 0, "active_streams": 0, "pid": 10},  # t=3
+            {"active_runs": 0, "active_streams": 0, "pid": 10},  # t=4
+            {"active_runs": 0, "active_streams": 0, "pid": 10},  # t=5
+            {"active_runs": 0, "active_streams": 0, "pid": 10},  # t=6
+            {"active_runs": 0, "active_streams": 0, "pid": 10},  # final
+        ]
+    )
+
+    final = cutover.wait_for_zero_activity(
+        lambda: next(samples),
+        identity_matches=lambda health: health["pid"] == 10,
+        continuous_seconds=3,
+        timeout_seconds=20,
+        interval_seconds=1,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert final["pid"] == 10
+    assert clock.now == 6
+
+
+def test_drain_final_identity_mismatch_fails_closed():
+    clock = _Clock()
+
+    with pytest.raises(cutover.DrainIdentityMismatch):
+        cutover.wait_for_zero_activity(
+            lambda: {"active_runs": 0, "active_streams": 0, "pid": 11},
+            identity_matches=lambda health: health["pid"] == 10,
+            continuous_seconds=2,
+            timeout_seconds=10,
+            interval_seconds=1,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+        )
+
+
+def _git(repo: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _release_repo(tmp_path: Path, name: str = "repo") -> tuple[Path, str]:
+    repo = tmp_path / name
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Hermes Release Test")
+    _git(repo, "config", "user.email", "release-test@example.invalid")
+    _git(repo, "remote", "add", "origin", "git@github.com:nesquena/hermes-webui.git")
+    _write(repo / "bootstrap.py", "print('base')\n")
+    _write(repo / "app.py", "VALUE = 1\n")
+    _git(repo, "add", "bootstrap.py", "app.py")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    _write(repo / "app.py", "VALUE = 2\n")
+    _git(repo, "add", "app.py")
+    _git(repo, "commit", "-q", "-m", "candidate")
+    return repo, base
+
+
+def _agent_repo(tmp_path: Path, name: str = "agent-repo") -> Path:
+    repo = tmp_path / name
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.name", "Hermes Agent Release Test")
+    _git(repo, "config", "user.email", "agent-release-test@example.invalid")
+    _git(repo, "remote", "add", "origin", "git@github.com:NousResearch/hermes-agent.git")
+    _write(repo / "run_agent.py", "def main():\n    return 0\n")
+    _write(repo / "agent" / "__init__.py", "# agent package\n")
+    _write(repo / "hermes_cli" / "__init__.py", "# cli package\n")
+    _write(repo / "tools" / "__init__.py", "# tools package\n")
+    _write(repo / "tools" / "process_registry.py", "VERSION = 1\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "agent base")
+    _write(repo / "tools" / "process_registry.py", "VERSION = 2\n")
+    _git(repo, "add", "tools/process_registry.py")
+    _git(repo, "commit", "-q", "-m", "agent candidate")
+    return repo
+
+
+def test_sealed_runtime_builder_is_content_addressed_complete_and_read_only(
+    monkeypatch, tmp_path, capsys
+):
+    python_home = tmp_path / "runtime-input" / "python-home"
+    site_packages = tmp_path / "runtime-input" / "site-packages"
+    _write(python_home / "bin" / "python3.11", "#!/bin/sh\nexit 0\n")
+    _chmod(python_home / "bin" / "python3.11", 0o755)
+    _write(python_home / "lib" / "python3.11" / "os.py", "# stdlib\n")
+    _write(site_packages / "yaml" / "__init__.py", "VALUE = 1\n")
+    _write(site_packages / "httpx" / "__init__.py", "VALUE = 1\n")
+    _write(site_packages / "__pycache__" / "bad.pyc", "cache\n")
+    _write(site_packages / "__editable___hermes_agent.pth", "/mutable/agent\n")
+    _write(site_packages / "__editable___hermes_agent_finder.py", "MUTABLE = True\n")
+    probes = []
+    monkeypatch.setattr(
+        cutover,
+        "_probe_sealed_runtime",
+        lambda identity, agent_identity: probes.append(
+            (identity, agent_identity["manifest_sha256"])
+        ),
+    )
+    agent_identity = _agent_source_snapshot(tmp_path)["identity"]
+
+    identity = cutover.build_immutable_runtime(
+        python_home,
+        site_packages,
+        release_root=tmp_path / "runtime-releases",
+        interpreter_relative_path="bin/python3.11",
+        agent_source_identity=agent_identity,
+    )
+
+    runtime_path = Path(identity["path"])
+    assert runtime_path.name == identity["manifest_sha256"]
+    assert Path(identity["interpreter_path"]) == (
+        runtime_path / "python-home" / "bin" / "python3.11"
+    )
+    assert Path(identity["site_packages_path"]) == runtime_path / "site-packages"
+    assert not (runtime_path / "site-packages" / "__pycache__").exists()
+    assert not (runtime_path / "site-packages" / "__editable___hermes_agent.pth").exists()
+    assert not (
+        runtime_path / "site-packages" / "__editable___hermes_agent_finder.py"
+    ).exists()
+    assert not stat.S_IMODE(runtime_path.stat().st_mode) & 0o222
+    assert probes and probes[0][1] == agent_identity["manifest_sha256"]
+    assert selector.verify_runtime(identity)["manifest_sha256"] == identity[
+        "manifest_sha256"
+    ]
+
+    stdlib = runtime_path / "python-home" / "lib" / "python3.11" / "os.py"
+    _chmod(stdlib, 0o644)
+    _write(stdlib, "TAMPERED = True\n")
+    _chmod(stdlib, 0o444)
+    with pytest.raises(selector.SelectorError, match="runtime.*hash"):
+        selector.verify_runtime(identity)
+
+    agent_json = tmp_path / "agent-identity.json"
+    agent_json.write_text(json.dumps(agent_identity))
+    assert cutover.main(
+        [
+            "build-runtime",
+            "--python-home",
+            str(python_home),
+            "--site-packages",
+            str(site_packages),
+            "--release-root",
+            str(tmp_path / "cli-runtime-releases"),
+            "--interpreter-relative-path",
+            "bin/python3.11",
+            "--agent-source-identity-json",
+            str(agent_json),
+        ]
+    ) == 0
+    cli_identity = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert selector.verify_runtime(cli_identity)["manifest_sha256"] == cli_identity[
+        "manifest_sha256"
+    ]
+
+
+def test_runtime_builder_rejects_external_symlinks_and_fsyncs_every_file(
+    monkeypatch, tmp_path
+):
+    python_home = tmp_path / "input" / "python-home"
+    site_packages = tmp_path / "input" / "site-packages"
+    _write(python_home / "bin" / "python3.11", "#!/bin/sh\nexit 0\n")
+    _chmod(python_home / "bin" / "python3.11", 0o755)
+    _write(site_packages / "safe.py", "SAFE = True\n")
+    external = tmp_path / "external.py"
+    _write(external, "EXTERNAL = True\n")
+    (site_packages / "escape.py").symlink_to(external)
+    monkeypatch.setattr(cutover, "_probe_sealed_runtime", lambda *_args: None)
+    agent_identity = _agent_source_snapshot(tmp_path)["identity"]
+
+    with pytest.raises(cutover.ReleaseBuildError, match="symlink.*escapes"):
+        cutover.build_immutable_runtime(
+            python_home,
+            site_packages,
+            release_root=tmp_path / "rejected",
+            interpreter_relative_path="bin/python3.11",
+            agent_source_identity=agent_identity,
+        )
+
+    (site_packages / "escape.py").unlink()
+    fsynced = []
+    real_fsync_file = cutover._fsync_runtime_file
+    monkeypatch.setattr(
+        cutover,
+        "_fsync_runtime_file",
+        lambda path: fsynced.append(Path(path).name) or real_fsync_file(path),
+    )
+    identity = cutover.build_immutable_runtime(
+        python_home,
+        site_packages,
+        release_root=tmp_path / "accepted",
+        interpreter_relative_path="bin/python3.11",
+        agent_source_identity=agent_identity,
+    )
+    assert sorted(fsynced) == ["python3.11", "safe.py"]
+    assert selector.verify_runtime(identity)["manifest_sha256"] == identity[
+        "manifest_sha256"
+    ]
+
+
+def test_sealed_runtime_probe_asserts_all_critical_origins(monkeypatch, tmp_path):
+    runtime = _runtime_snapshot(tmp_path)["identity"]
+    agent = _agent_source_snapshot(tmp_path)["identity"]
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cutover.subprocess, "run", fake_run)
+    cutover._probe_sealed_runtime(runtime, agent)
+
+    probe = captured["argv"][-1]
+    assert captured["argv"][:2] == [runtime["interpreter_path"], "-S"]
+    assert captured["env"]["PYTHONHOME"] == runtime["python_home_path"]
+    assert captured["env"]["PYTHONPATH"] == os.pathsep.join(
+        [agent["path"], runtime["site_packages_path"]]
+    )
+    for evidence in (
+        "sys.executable",
+        "sys.prefix",
+        "sys.base_prefix",
+        "os.__file__",
+        "encodings.__file__",
+        "run_agent.__file__",
+        "tools.process_registry.__file__",
+    ):
+        assert evidence in probe
+
+
+def test_release_and_launch_paths_bind_only_the_sealed_runtime(tmp_path):
+    release = _managed_release(tmp_path)
+    old_interpreter = tmp_path / "legacy-venv" / "bin" / "python"
+    old_target = tmp_path / "legacy" / "bootstrap.py"
+    _write(old_interpreter, "legacy mutable python\n")
+    _write(old_target, "print('legacy')\n")
+    _chmod(old_interpreter, 0o755)
+    state_path = tmp_path / "control" / "selector.json"
+    lock_path = tmp_path / "control" / "selector.lock"
+    _write(state_path, "{}\n")
+    _write(lock_path, "")
+    original = {
+        "Label": "com.example.webui",
+        "ProgramArguments": [
+            str(old_interpreter),
+            str(old_target),
+            "--foreground",
+        ],
+    }
+    identity = selector.verify_release(
+        release["release_path"],
+        release_root=release["release_root"],
+        expected_manifest_sha256=release["manifest_sha256"],
+        selector_path=release["selector_path"],
+    )
+    assert identity["runtime_manifest_sha256"] == release["runtime"]["identity"][
+        "manifest_sha256"
+    ]
+
+    selector_plist = cutover.transform_launchd_target(
+        original,
+        str(release["selector_path"]),
+        expected_label="com.example.webui",
+        expected_old_interpreter=str(old_interpreter),
+        managed_interpreter=str(release["interpreter_path"]),
+        expected_old_target=str(old_target),
+        selector_state_path=str(state_path),
+        selector_lock_path=str(lock_path),
+    )
+    assert selector_plist["ProgramArguments"][:3] == [
+        str(release["interpreter_path"]),
+        "-S",
+        str(release["selector_path"]),
+    ]
+    assert selector_plist["ProgramArguments"][7:9] == [
+        "--launchd-label",
+        "com.example.webui",
+    ]
+
+    transaction_id = "direct-fallback-transaction-000001"
+    fallback = cutover.build_direct_fallback_plist(
+        original,
+        expected_label="com.example.webui",
+        expected_old_interpreter=str(old_interpreter),
+        expected_old_target=str(old_target),
+        release_identity=identity,
+        selector_generation=9,
+        selector_state_path=str(state_path),
+        selector_lock_path=str(lock_path),
+        startup_transaction_id=transaction_id,
+    )
+    assert fallback["ProgramArguments"][:3] == [
+        str(release["interpreter_path"]),
+        "-S",
+        str(release["release_path"] / "bootstrap.py"),
+    ]
+    environment = fallback["EnvironmentVariables"]
+    assert environment["HERMES_WEBUI_STARTUP_FENCED"] == "1"
+    assert environment["HERMES_WEBUI_STARTUP_TRANSACTION_ID"] == transaction_id
+    assert environment["PYTHONHOME"] == release["runtime"]["identity"][
+        "python_home_path"
+    ]
+    assert environment["PYTHONPATH"] == os.pathsep.join(
+        [
+            release["agent_source"]["identity"]["path"],
+            release["runtime"]["identity"]["site_packages_path"],
+        ]
+    )
+    _write(old_interpreter, "MUTATED LEGACY VENV\n")
+    assert fallback["ProgramArguments"][0] != str(old_interpreter)
+
+
+def test_release_builder_embeds_and_requires_the_sealed_runtime(tmp_path):
+    repo, base = _release_repo(tmp_path)
+    runtime = _runtime_snapshot(tmp_path)["identity"]
+    external_selector = tmp_path / "control" / "selector.py"
+    _write(external_selector, "# selector\n")
+    _chmod(external_selector, 0o755)
+    interpreter = Path(runtime["interpreter_path"])
+    built = cutover.build_immutable_release(
+        repo,
+        "HEAD",
+        release_root=tmp_path / "releases",
+        build_id="candidate",
+        base_ref=base,
+        expected_base_commit=base,
+        expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+        allowed_changed_paths={"app.py"},
+        selector_path=external_selector,
+        interpreter_path=interpreter,
+        expected_selector_identity=_identity_receipt(external_selector),
+        expected_interpreter_identity=_identity_receipt(interpreter),
+        runtime_identity=runtime,
+        agent_source_identity=_agent_source_snapshot(tmp_path)["identity"],
+        metadata=_release_metadata({"app.py"}),
+    )
+    manifest = json.loads(
+        (Path(built["release_path"]) / selector.MANIFEST_NAME).read_text()
+    )
+    assert manifest["runtime"] == runtime
+
+    mutable_interpreter = tmp_path / "mutable-venv" / "python"
+    _write(mutable_interpreter, "mutable\n")
+    _chmod(mutable_interpreter, 0o755)
+    with pytest.raises(cutover.ReleaseBuildError, match="sealed runtime"):
+        cutover.build_immutable_release(
+            repo,
+            "HEAD",
+            release_root=tmp_path / "rejected-releases",
+            build_id="rejected",
+            base_ref=base,
+            expected_base_commit=base,
+            expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+            allowed_changed_paths={"app.py"},
+            selector_path=external_selector,
+            interpreter_path=mutable_interpreter,
+            expected_selector_identity=_identity_receipt(external_selector),
+            expected_interpreter_identity=_identity_receipt(mutable_interpreter),
+            runtime_identity=runtime,
+            agent_source_identity=_agent_source_snapshot(tmp_path)["identity"],
+            metadata=_release_metadata({"app.py"}),
+        )
+
+
+def test_agent_builder_requires_exact_product_ancestry_diff_and_layout(tmp_path):
+    repo = _agent_repo(tmp_path)
+    common = {
+        "release_root": tmp_path / "installed-agent-releases",
+        "expected_origin_url": "git@github.com:NousResearch/hermes-agent.git",
+        "base_ref": "HEAD^",
+        "expected_base_commit": _git(repo, "rev-parse", "HEAD^"),
+        "allowed_changed_paths": {"tools/process_registry.py"},
+    }
+
+    identity = cutover.build_immutable_agent_source(repo, "HEAD", **common)
+    manifest = json.loads(Path(identity["manifest_path"]).read_text())
+    assert manifest["origin_url"] == common["expected_origin_url"]
+    assert manifest["base_commit"] == _git(repo, "rev-parse", "HEAD^")
+    assert manifest["changed_files"] == ["tools/process_registry.py"]
+
+    wrong_origin = {**common, "release_root": tmp_path / "wrong-origin"}
+    wrong_origin["expected_origin_url"] = "git@example.invalid:wrong/agent.git"
+    with pytest.raises(cutover.ReleaseBuildError, match="origin"):
+        cutover.build_immutable_agent_source(repo, "HEAD", **wrong_origin)
+
+    wrong_ancestry = {
+        **common,
+        "release_root": tmp_path / "wrong-ancestry",
+        "base_ref": "HEAD",
+        "expected_base_commit": _git(repo, "rev-parse", "HEAD"),
+    }
+    with pytest.raises(cutover.ReleaseBuildError, match="ancestor"):
+        cutover.build_immutable_agent_source(repo, "HEAD^", **wrong_ancestry)
+
+    wrong_diff = {
+        **common,
+        "release_root": tmp_path / "wrong-diff",
+        "allowed_changed_paths": {"run_agent.py"},
+    }
+    with pytest.raises(cutover.ReleaseBuildError, match="changed paths"):
+        cutover.build_immutable_agent_source(repo, "HEAD", **wrong_diff)
+
+    _git(repo, "rm", "hermes_cli/__init__.py")
+    _git(repo, "commit", "-q", "-m", "break required topology")
+    incomplete = {
+        **common,
+        "release_root": tmp_path / "incomplete",
+        "base_ref": "HEAD^",
+        "expected_base_commit": _git(repo, "rev-parse", "HEAD^"),
+        "allowed_changed_paths": {"hermes_cli/__init__.py"},
+    }
+    with pytest.raises(cutover.ReleaseBuildError, match="layout"):
+        cutover.build_immutable_agent_source(repo, "HEAD", **incomplete)
+
+
+def test_agent_source_builder_freezes_content_addressed_readonly_snapshot(tmp_path):
+    repo = _agent_repo(tmp_path)
+    release_root = tmp_path / "installed-agent-releases"
+    base = _git(repo, "rev-parse", "HEAD^")
+
+    identity = cutover.build_immutable_agent_source(
+        repo,
+        "HEAD",
+        release_root=release_root,
+        expected_origin_url="git@github.com:NousResearch/hermes-agent.git",
+        base_ref="HEAD^",
+        expected_base_commit=base,
+        allowed_changed_paths={"tools/process_registry.py"},
+    )
+
+    source_path = Path(identity["path"])
+    manifest_path = Path(identity["manifest_path"])
+    assert source_path.name == identity["manifest_sha256"]
+    assert manifest_path.name == f"{identity['manifest_sha256']}.json"
+    assert source_path.parent == release_root / "snapshots"
+    assert manifest_path.parent == release_root / "manifests"
+    assert not stat.S_IMODE(source_path.stat().st_mode) & 0o222
+    assert not stat.S_IMODE((source_path / "run_agent.py").stat().st_mode) & 0o222
+    assert not stat.S_IMODE(manifest_path.stat().st_mode) & 0o222
+    assert selector.verify_agent_source(identity)["manifest_sha256"] == identity[
+        "manifest_sha256"
+    ]
+
+
+@pytest.mark.parametrize("mutation", ["dirty", "symlink"])
+def test_agent_source_builder_rejects_uncommitted_or_symlinked_source(
+    tmp_path, mutation
+):
+    repo = _agent_repo(tmp_path)
+    if mutation == "dirty":
+        _write(repo / "untracked.py", "DIRTY = True\n")
+    else:
+        (repo / "linked.py").symlink_to("run_agent.py")
+        _git(repo, "add", "linked.py")
+        _git(repo, "commit", "-q", "-m", "tracked symlink")
+    base = _git(repo, "rev-parse", "HEAD^")
+    allowed = {"linked.py"} if mutation == "symlink" else {"tools/process_registry.py"}
+
+    with pytest.raises(cutover.ReleaseBuildError, match=mutation):
+        cutover.build_immutable_agent_source(
+            repo,
+            "HEAD",
+            release_root=tmp_path / "installed-agent-releases",
+            expected_origin_url="git@github.com:NousResearch/hermes-agent.git",
+            base_ref="HEAD^",
+            expected_base_commit=base,
+            allowed_changed_paths=allowed,
+        )
+
+
+def test_cutover_cli_builds_agent_source_identity(tmp_path, capsys):
+    repo = _agent_repo(tmp_path)
+
+    assert (
+        cutover.main(
+            [
+                "build-agent-source",
+                "--repo",
+                str(repo),
+                "--ref",
+                "HEAD",
+                "--release-root",
+                str(tmp_path / "installed-agent-releases"),
+                "--expected-origin-url",
+                "git@github.com:NousResearch/hermes-agent.git",
+                "--base-ref",
+                "HEAD^",
+                "--expected-base-commit",
+                _git(repo, "rev-parse", "HEAD^"),
+                "--allowed-changed-path",
+                "tools/process_registry.py",
+            ]
+        )
+        == 0
+    )
+
+    identity = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert selector.verify_agent_source(identity)["commit"] == _git(
+        repo, "rev-parse", "HEAD"
+    )
+
+
+def test_release_builder_enforces_admission_and_builds_readonly(tmp_path):
+    repo, base = _release_repo(tmp_path)
+    external_selector = tmp_path / "control" / "selector.py"
+    runtime, interpreter = _sealed_runtime_for_build(tmp_path)
+    _write(external_selector, "# external selector\n")
+    _chmod(external_selector, 0o755)
+    selector_receipt = _identity_receipt(external_selector)
+    interpreter_receipt = _identity_receipt(interpreter)
+    release_root = tmp_path / "installed-releases"
+
+    with pytest.raises(cutover.ReleaseBuildError, match="admission"):
+        cutover.build_immutable_release(
+            repo,
+            "HEAD",
+            release_root=release_root,
+            build_id="rejected",
+            base_ref=base,
+            expected_base_commit=base,
+            expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+            allowed_changed_paths=set(),
+            selector_path=external_selector,
+            interpreter_path=interpreter,
+            expected_selector_identity=selector_receipt,
+            expected_interpreter_identity=interpreter_receipt,
+            runtime_identity=runtime,
+            agent_source_identity=_agent_source_snapshot(tmp_path)["identity"],
+            metadata=_release_metadata({"app.py"}),
+        )
+
+    built = cutover.build_immutable_release(
+        repo,
+        "HEAD",
+        release_root=release_root,
+        build_id="candidate",
+        base_ref=base,
+        expected_base_commit=base,
+        expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+        allowed_changed_paths={"app.py"},
+        selector_path=external_selector,
+        interpreter_path=interpreter,
+        expected_selector_identity=selector_receipt,
+        expected_interpreter_identity=interpreter_receipt,
+        runtime_identity=runtime,
+        agent_source_identity=_agent_source_snapshot(tmp_path)["identity"],
+        metadata=_release_metadata({"app.py"}),
+    )
+
+    release_path = release_root / "candidate"
+    manifest = json.loads((release_path / selector.MANIFEST_NAME).read_text())
+    assert built["release_path"] == str(release_path.resolve())
+    assert manifest["base_commit"] == base
+    assert manifest["changed_files"] == ["app.py"]
+    assert manifest["agent_source"] == _agent_source_snapshot(tmp_path)["identity"]
+    assert manifest["test_receipts"][0]["status"] == "passed"
+    assert not stat.S_IMODE((release_path / "app.py").stat().st_mode) & 0o222
+    assert not stat.S_IMODE(release_path.stat().st_mode) & 0o222
+    selector.verify_release(
+        release_path,
+        release_root=release_root,
+        expected_manifest_sha256=built["manifest_sha256"],
+        selector_path=external_selector,
+    )
+
+
+def test_webui_builder_requires_exact_product_origin_ancestry_and_diff(tmp_path):
+    repo, base = _release_repo(tmp_path)
+    external_selector = tmp_path / "control" / "selector.py"
+    runtime, interpreter = _sealed_runtime_for_build(tmp_path)
+    _write(external_selector, "# selector\n")
+    _chmod(external_selector, 0o755)
+    common = {
+        "repo": repo,
+        "ref": "HEAD",
+        "build_id": "candidate",
+        "base_ref": base,
+        "allowed_changed_paths": {"app.py"},
+        "selector_path": external_selector,
+        "interpreter_path": interpreter,
+        "expected_selector_identity": _identity_receipt(external_selector),
+        "expected_interpreter_identity": _identity_receipt(interpreter),
+        "runtime_identity": runtime,
+        "agent_source_identity": _agent_source_snapshot(tmp_path)["identity"],
+        "metadata": _release_metadata({"app.py"}),
+        "expected_origin_url": "git@github.com:nesquena/hermes-webui.git",
+        "expected_base_commit": base,
+    }
+
+    built = cutover.build_immutable_release(
+        release_root=tmp_path / "valid-release",
+        **common,
+    )
+    manifest = json.loads(
+        (Path(built["release_path"]) / selector.MANIFEST_NAME).read_text()
+    )
+    assert manifest["origin_url"] == common["expected_origin_url"]
+
+    wrong_origin = {**common, "build_id": "wrong-origin"}
+    wrong_origin["expected_origin_url"] = "git@example.invalid:wrong/webui.git"
+    with pytest.raises(cutover.ReleaseBuildError, match="origin"):
+        cutover.build_immutable_release(
+            release_root=tmp_path / "wrong-origin-release",
+            **wrong_origin,
+        )
+
+    wrong_ancestry = {
+        **common,
+        "ref": base,
+        "base_ref": "HEAD",
+        "expected_base_commit": _git(repo, "rev-parse", "HEAD"),
+        "build_id": "wrong-ancestry",
+        "allowed_changed_paths": {"app.py"},
+    }
+    with pytest.raises(cutover.ReleaseBuildError, match="ancestor"):
+        cutover.build_immutable_release(
+            release_root=tmp_path / "wrong-ancestry-release",
+            **wrong_ancestry,
+        )
+
+    wrong_diff = {
+        **common,
+        "build_id": "wrong-diff",
+        "allowed_changed_paths": {"app.py", "not-changed.py"},
+    }
+    with pytest.raises(cutover.ReleaseBuildError, match="changed paths"):
+        cutover.build_immutable_release(
+            release_root=tmp_path / "wrong-diff-release",
+            **wrong_diff,
+        )
+
+
+def test_product_builders_ignore_git_replacement_object_attacks(tmp_path):
+    agent_repo = _agent_repo(tmp_path, "agent")
+    agent_target = _git(agent_repo, "rev-parse", "HEAD")
+    agent_base = _git(agent_repo, "rev-parse", "HEAD^")
+    _write(agent_repo / "tools" / "process_registry.py", "MALICIOUS = True\n")
+    _git(agent_repo, "add", "tools/process_registry.py")
+    _git(agent_repo, "commit", "-q", "-m", "replacement payload")
+    _git(agent_repo, "replace", agent_target, "HEAD")
+
+    agent_identity = cutover.build_immutable_agent_source(
+        agent_repo,
+        agent_target,
+        release_root=tmp_path / "agent-releases",
+        expected_origin_url="git@github.com:NousResearch/hermes-agent.git",
+        base_ref=agent_base,
+        expected_base_commit=agent_base,
+        allowed_changed_paths={"tools/process_registry.py"},
+    )
+    assert (
+        Path(agent_identity["path"]) / "tools" / "process_registry.py"
+    ).read_text() == "VERSION = 2\n"
+
+    webui_repo, webui_base = _release_repo(tmp_path, "webui")
+    webui_target = _git(webui_repo, "rev-parse", "HEAD")
+    _write(webui_repo / "app.py", "MALICIOUS = True\n")
+    _git(webui_repo, "add", "app.py")
+    _git(webui_repo, "commit", "-q", "-m", "replacement payload")
+    _git(webui_repo, "replace", webui_target, "HEAD")
+    external_selector = tmp_path / "control" / "selector.py"
+    runtime, interpreter = _sealed_runtime_for_build(tmp_path)
+    _write(external_selector, "# selector\n")
+    _chmod(external_selector, 0o755)
+
+    built = cutover.build_immutable_release(
+        webui_repo,
+        webui_target,
+        release_root=tmp_path / "webui-releases",
+        build_id="candidate",
+        base_ref=webui_base,
+        expected_base_commit=webui_base,
+        expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+        allowed_changed_paths={"app.py"},
+        selector_path=external_selector,
+        interpreter_path=interpreter,
+        expected_selector_identity=_identity_receipt(external_selector),
+        expected_interpreter_identity=_identity_receipt(interpreter),
+        runtime_identity=runtime,
+        agent_source_identity=_agent_source_snapshot(tmp_path)["identity"],
+        metadata=_release_metadata({"app.py"}),
+    )
+    assert (Path(built["release_path"]) / "app.py").read_text() == "VALUE = 2\n"
+
+
+def test_release_builder_reverifies_agent_source_before_embedding(tmp_path):
+    repo, base = _release_repo(tmp_path)
+    external_selector = tmp_path / "control" / "selector.py"
+    runtime, interpreter = _sealed_runtime_for_build(tmp_path)
+    _write(external_selector, "# external selector\n")
+    _chmod(external_selector, 0o755)
+    agent_identity = _agent_source_snapshot(tmp_path)["identity"]
+    run_agent = Path(agent_identity["path"]) / "run_agent.py"
+    _chmod(run_agent, 0o644)
+    _write(run_agent, "DRIFTED = True\n")
+    _chmod(run_agent, 0o444)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="agent source"):
+        cutover.build_immutable_release(
+            repo,
+            "HEAD",
+            release_root=tmp_path / "installed-releases",
+            build_id="candidate",
+            base_ref=base,
+            expected_base_commit=base,
+            expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+            allowed_changed_paths={"app.py"},
+            selector_path=external_selector,
+            interpreter_path=interpreter,
+            expected_selector_identity=_identity_receipt(external_selector),
+            expected_interpreter_identity=_identity_receipt(interpreter),
+            runtime_identity=runtime,
+            agent_source_identity=agent_identity,
+            metadata=_release_metadata({"app.py"}),
+        )
+
+
+def test_release_builder_fsyncs_read_only_modes_before_publish(monkeypatch, tmp_path):
+    repo, base = _release_repo(tmp_path)
+    agent_source_identity = _agent_source_snapshot(tmp_path)["identity"]
+    runtime = _runtime_snapshot(tmp_path)["identity"]
+    external_selector = tmp_path / "control" / "selector.py"
+    interpreter = Path(runtime["interpreter_path"])
+    _write(external_selector, "# selector\n")
+    _chmod(external_selector, 0o755)
+    events = []
+    real_fchmod = cutover.os.fchmod
+    real_fsync = cutover.os.fsync
+    real_chmod = cutover.os.chmod
+    real_directory_fsync = cutover._fsync_directory
+
+    def recording_fchmod(descriptor, mode):
+        events.append(("fchmod", descriptor, mode))
+        return real_fchmod(descriptor, mode)
+
+    def recording_fsync(descriptor):
+        events.append(("fsync", descriptor))
+        return real_fsync(descriptor)
+
+    def recording_chmod(path, mode):
+        events.append(("chmod", str(path), mode))
+        return real_chmod(path, mode)
+
+    def recording_directory_fsync(path):
+        events.append(("directory_fsync", str(path)))
+        return real_directory_fsync(path)
+
+    monkeypatch.setattr(cutover.os, "fchmod", recording_fchmod)
+    monkeypatch.setattr(cutover.os, "fsync", recording_fsync)
+    monkeypatch.setattr(cutover.os, "chmod", recording_chmod)
+    monkeypatch.setattr(cutover, "_fsync_directory", recording_directory_fsync)
+
+    cutover.build_immutable_release(
+        repo,
+        "HEAD",
+        release_root=tmp_path / "installed-releases",
+        build_id="candidate",
+        base_ref=base,
+        expected_base_commit=base,
+        expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+        allowed_changed_paths={"app.py"},
+        selector_path=external_selector,
+        interpreter_path=interpreter,
+        expected_selector_identity=_identity_receipt(external_selector),
+        expected_interpreter_identity=_identity_receipt(interpreter),
+        runtime_identity=runtime,
+        agent_source_identity=agent_source_identity,
+        metadata=_release_metadata({"app.py"}),
+    )
+
+    for index, event in enumerate(events):
+        if event[0] == "fchmod" and event[2] in {0o444, 0o555}:
+            assert ("fsync", event[1]) in events[index + 1 :]
+        if event[0] == "chmod" and event[2] == 0o555 and ".candidate." in event[1]:
+            assert ("directory_fsync", event[1]) in events[index + 1 :]
+
+
+def test_release_builder_rejects_tracked_symlink(tmp_path):
+    repo, base = _release_repo(tmp_path)
+    (repo / "linked.py").symlink_to("app.py")
+    _git(repo, "add", "linked.py")
+    _git(repo, "commit", "-q", "-m", "symlink")
+    runtime = _runtime_snapshot(tmp_path)["identity"]
+    external_selector = tmp_path / "control" / "selector.py"
+    interpreter = Path(runtime["interpreter_path"])
+    _write(external_selector, "# external selector\n")
+    _chmod(external_selector, 0o755)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="symlink"):
+        cutover.build_immutable_release(
+            repo,
+            "HEAD",
+            release_root=tmp_path / "installed-releases",
+            build_id="candidate",
+            base_ref=base,
+            expected_base_commit=base,
+            expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+            allowed_changed_paths={"app.py", "linked.py"},
+            selector_path=external_selector,
+            interpreter_path=interpreter,
+            expected_selector_identity=_identity_receipt(external_selector),
+            expected_interpreter_identity=_identity_receipt(interpreter),
+            runtime_identity=runtime,
+            agent_source_identity=_agent_source_snapshot(tmp_path)["identity"],
+            metadata=_release_metadata({"app.py", "linked.py"}),
+        )
+
+
+def test_release_builder_rejects_relative_root_and_nonexecutable_runtime(
+    monkeypatch, tmp_path
+):
+    repo, base = _release_repo(tmp_path)
+    runtime = _runtime_snapshot(tmp_path)["identity"]
+    external_selector = tmp_path / "control" / "selector.py"
+    interpreter = Path(runtime["interpreter_path"])
+    _write(external_selector, "# external selector\n")
+    _chmod(external_selector, 0o755)
+    _chmod(interpreter, 0o444)
+    selector_receipt = _identity_receipt(external_selector)
+    interpreter_receipt = _identity_receipt(interpreter)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="runtime interpreter"):
+        cutover.build_immutable_release(
+            repo,
+            "HEAD",
+            release_root=tmp_path / "installed-releases",
+            build_id="candidate",
+            base_ref=base,
+            expected_base_commit=base,
+            expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+            allowed_changed_paths={"app.py"},
+            selector_path=external_selector,
+            interpreter_path=interpreter,
+            expected_selector_identity=selector_receipt,
+            expected_interpreter_identity=interpreter_receipt,
+            runtime_identity=runtime,
+            agent_source_identity=_agent_source_snapshot(tmp_path)["identity"],
+            metadata=_release_metadata({"app.py"}),
+        )
+
+    _chmod(interpreter, 0o755)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(cutover.ReleaseBuildError, match="absolute"):
+        cutover.build_immutable_release(
+            repo,
+            "HEAD",
+            release_root=Path("installed-releases"),
+            build_id="candidate",
+            base_ref=base,
+            expected_base_commit=base,
+            expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+            allowed_changed_paths={"app.py"},
+            selector_path=external_selector,
+            interpreter_path=interpreter,
+            expected_selector_identity=selector_receipt,
+            expected_interpreter_identity=_identity_receipt(interpreter),
+            runtime_identity=runtime,
+            agent_source_identity=_agent_source_snapshot(tmp_path)["identity"],
+            metadata=_release_metadata({"app.py"}),
+        )
+
+
+def test_release_builder_rejects_external_identity_not_matching_frozen_receipt(
+    tmp_path,
+):
+    repo, base = _release_repo(tmp_path)
+    runtime = _runtime_snapshot(tmp_path)["identity"]
+    external_selector = tmp_path / "control" / "selector.py"
+    interpreter = Path(runtime["interpreter_path"])
+    _write(external_selector, "# expected selector\n")
+    _chmod(external_selector, 0o755)
+    frozen_selector = _identity_receipt(external_selector)
+    _write(external_selector, "# tampered before build\n")
+    _chmod(external_selector, 0o755)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="frozen identity"):
+        cutover.build_immutable_release(
+            repo,
+            "HEAD",
+            release_root=tmp_path / "installed-releases",
+            build_id="candidate",
+            base_ref=base,
+            expected_base_commit=base,
+            expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+            allowed_changed_paths={"app.py"},
+            selector_path=external_selector,
+            interpreter_path=interpreter,
+            expected_selector_identity=frozen_selector,
+            expected_interpreter_identity=_identity_receipt(interpreter),
+            runtime_identity=runtime,
+            agent_source_identity=_agent_source_snapshot(tmp_path)["identity"],
+            metadata=_release_metadata({"app.py"}),
+        )
+
+
+def test_release_builder_ignores_repository_shaping_git_environment(
+    monkeypatch, tmp_path
+):
+    repo_a, base_a = _release_repo(tmp_path, "repo-a")
+    repo_b, _base_b = _release_repo(tmp_path, "repo-b")
+    _write(repo_b / "app.py", "VALUE = 999\n")
+    _git(repo_b, "add", "app.py")
+    _git(repo_b, "commit", "-q", "-m", "poison")
+    runtime = _runtime_snapshot(tmp_path)["identity"]
+    external_selector = tmp_path / "control" / "selector.py"
+    interpreter = Path(runtime["interpreter_path"])
+    _write(external_selector, "# selector\n")
+    _chmod(external_selector, 0o755)
+    expected_commit = _git(repo_a, "rev-parse", "HEAD")
+    monkeypatch.setenv("GIT_DIR", str(repo_b / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(repo_b))
+
+    built = cutover.build_immutable_release(
+        repo_a,
+        "HEAD",
+        release_root=tmp_path / "installed-releases",
+        build_id="candidate",
+        base_ref=base_a,
+        expected_base_commit=base_a,
+        expected_origin_url="git@github.com:nesquena/hermes-webui.git",
+        allowed_changed_paths={"app.py"},
+        selector_path=external_selector,
+        interpreter_path=interpreter,
+        expected_selector_identity=_identity_receipt(external_selector),
+        expected_interpreter_identity=_identity_receipt(interpreter),
+        runtime_identity=runtime,
+        agent_source_identity=_agent_source_snapshot(tmp_path)["identity"],
+        metadata=_release_metadata({"app.py"}),
+    )
+
+    assert built["commit"] == expected_commit
+    assert (Path(built["release_path"]) / "app.py").read_text() == "VALUE = 2\n"
+
+
+def _pre_managed_control_plan(tmp_path: Path) -> dict:
+    control = tmp_path / "control"
+    control.mkdir(mode=0o700)
+    return {
+        "transaction_id": "pre-managed-rollback-transaction-0001",
+        "transaction_journal": str(control / "transaction.json"),
+        "selector_state": str(control / "selector-state.json"),
+        "selector_lock": str(control / "selector-state.lock"),
+        "managed_plist": str(control / "managed.plist"),
+    }
+
+
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_pre_managed_control_restore_is_exact_for_present_and_absent_state(
+    tmp_path,
+    preexisting,
+):
+    plan = _pre_managed_control_plan(tmp_path)
+    original = {
+        "selector_state": b'{"before":"selector"}\n',
+        "selector_lock": b"before-lock\n",
+        "managed_plist": b"before-plist\n",
+    }
+    if preexisting:
+        for key, payload in original.items():
+            path = Path(plan[key])
+            path.write_bytes(payload)
+            path.chmod(0o600)
+
+    captured = cutover._capture_pre_managed_control_state(plan)
+    for key in original:
+        path = Path(plan[key])
+        path.write_bytes(f"owned-{key}\n".encode())
+        path.chmod(0o600)
+    staged = cutover._pre_managed_control_stage_receipt(plan)
+
+    restored = cutover._restore_pre_managed_control_state(
+        plan,
+        captured,
+        staged,
+    )
+
+    assert restored["status"] == "restored"
+    for key, payload in original.items():
+        path = Path(plan[key])
+        if preexisting:
+            assert path.read_bytes() == payload
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        else:
+            assert not path.exists()
+
+
+def test_pre_managed_control_restore_refuses_non_owned_mutation(tmp_path):
+    plan = _pre_managed_control_plan(tmp_path)
+    captured = cutover._capture_pre_managed_control_state(plan)
+    for key in ("selector_state", "selector_lock", "managed_plist"):
+        path = Path(plan[key])
+        path.write_bytes(f"owned-{key}\n".encode())
+        path.chmod(0o600)
+    staged = cutover._pre_managed_control_stage_receipt(plan)
+    Path(plan["selector_state"]).write_bytes(b"foreign-mutation\n")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="selector_state changed before restore",
+    ):
+        cutover._restore_pre_managed_control_state(plan, captured, staged)
+
+    assert Path(plan["selector_state"]).read_bytes() == b"foreign-mutation\n"
+
+
+def _process_checkpoint_plan(tmp_path: Path) -> tuple[dict, Path]:
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir(mode=0o700)
+    process_store = hermes_home / "process_notifications.json"
+    process_store.write_text("{}\n", encoding="utf-8")
+    process_store.chmod(0o600)
+    cron = hermes_home / "cron"
+    cron.mkdir(mode=0o700)
+    tick_lock = cron / ".tick.lock"
+    tick_lock.write_bytes(b"")
+    tick_lock.chmod(0o600)
+    return (
+        {
+            "synthetic_process_notifications_path": str(process_store),
+            "gateway_listener_port": 8642,
+            "timeout_seconds": 0.2,
+            "interval_seconds": 0.001,
+        },
+        hermes_home / "processes.json",
+    )
+
+
+def test_gateway_process_checkpoint_requires_exact_private_empty_list(tmp_path):
+    plan, checkpoint = _process_checkpoint_plan(tmp_path)
+    checkpoint.write_text("[]\n", encoding="utf-8")
+    checkpoint.chmod(0o600)
+
+    receipt = cutover._legacy_process_checkpoint_receipt(plan)
+
+    assert receipt["status"] == "verified"
+    assert receipt["path"] == str(checkpoint)
+    assert receipt["active_records"] == 0
+    assert receipt["mode"] == 0o600
+    assert receipt["nlink"] == 1
+    assert receipt["sha256"] == hashlib.sha256(b"[]\n").hexdigest()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "absent",
+        "symlink",
+        "hardlink",
+        "permissive",
+        "non-list",
+        "nonempty",
+    ],
+)
+def test_gateway_process_checkpoint_unsafe_or_nonempty_never_authorizes_stop(
+    tmp_path,
+    mutation,
+):
+    plan, checkpoint = _process_checkpoint_plan(tmp_path)
+    if mutation == "symlink":
+        target = checkpoint.with_name("processes-target.json")
+        target.write_text("[]\n", encoding="utf-8")
+        target.chmod(0o600)
+        checkpoint.symlink_to(target)
+    elif mutation == "hardlink":
+        target = checkpoint.with_name("processes-target.json")
+        target.write_text("[]\n", encoding="utf-8")
+        target.chmod(0o600)
+        os.link(target, checkpoint)
+    elif mutation != "absent":
+        checkpoint.write_text(
+            '{"not":"a-list"}\n' if mutation == "non-list" else (
+                '[{"pid":321}]\n' if mutation == "nonempty" else "[]\n"
+            ),
+            encoding="utf-8",
+        )
+        checkpoint.chmod(0o644 if mutation == "permissive" else 0o600)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="process checkpoint"):
+        cutover._legacy_process_checkpoint_receipt(plan)
+
+
+def test_gateway_process_checkpoint_same_inode_mutation_is_rejected(
+    tmp_path,
+    monkeypatch,
+):
+    plan, checkpoint = _process_checkpoint_plan(tmp_path)
+    checkpoint.write_text("[]\n", encoding="utf-8")
+    checkpoint.chmod(0o600)
+    original_read = cutover.os.read
+    mutated = False
+
+    def racing_read(descriptor, size):
+        nonlocal mutated
+        chunk = original_read(descriptor, size)
+        if chunk and not mutated:
+            mutated = True
+            checkpoint.chmod(0o640)
+        return chunk
+
+    monkeypatch.setattr(cutover.os, "read", racing_read)
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="process checkpoint changed",
+    ):
+        cutover._legacy_process_checkpoint_receipt(plan)
+
+
+def test_gateway_process_checkpoint_waits_naturally_without_signalling_workers(
+    tmp_path,
+    monkeypatch,
+):
+    plan, _checkpoint = _process_checkpoint_plan(tmp_path)
+    prepared = {"gateway": {"pid": 41, "pid_start_token": "gateway-start"}}
+    receipts = iter(
+        [
+            cutover.ReleaseBuildError(
+                "gateway process checkpoint still has worker activity"
+            ),
+            {
+                "status": "verified",
+                "path": "processes.json",
+                "active_records": 0,
+            },
+        ]
+    )
+    signals = []
+
+    def checkpoint_receipt(_plan):
+        value = next(receipts)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_process_checkpoint_receipt",
+        checkpoint_receipt,
+    )
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: 41 if gateway else None,
+    )
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+    monkeypatch.setattr(cutover.os, "kill", lambda *args: signals.append(args))
+
+    receipt = cutover._wait_for_legacy_process_checkpoint_empty(plan, prepared)
+
+    assert receipt["active_records"] == 0
+    assert signals == []
+
+
+def test_process_retirement_barrier_releases_authority_during_gateway_exit(
+    tmp_path,
+    monkeypatch,
+):
+    plan, checkpoint = _process_checkpoint_plan(tmp_path)
+    checkpoint.write_text("[]\n", encoding="utf-8")
+    checkpoint.chmod(0o600)
+    events = []
+    admissions = iter(
+        [
+            {
+                "kind": "admission",
+                "handle": object(),
+                "receipt": {"path": "admission.lock"},
+            }
+        ]
+    )
+    authorities = iter(
+        [
+            {
+                "kind": "authority",
+                "handle": object(),
+                "receipt": {"path": "authority.lock", "epoch": 1},
+            },
+            {
+                "kind": "authority",
+                "handle": object(),
+                "receipt": {"path": "authority.lock", "epoch": 2},
+            },
+        ]
+    )
+
+    def acquire(_plan, *, kind):
+        events.append(f"acquire-{kind}")
+        return next(admissions if kind == "admission" else authorities)
+
+    def release(_plan, held):
+        events.append(f"release-{held['kind']}")
+        return {"status": "released", "kind": held["kind"]}
+
+    monkeypatch.setattr(cutover, "_acquire_process_registry_lock", acquire)
+    monkeypatch.setattr(cutover, "_release_process_registry_lock", release)
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_process_checkpoint_receipt",
+        lambda _plan: events.append("checkpoint")
+        or {
+            "status": "verified",
+            "path": str(checkpoint),
+            "active_records": 0,
+            "sha256": hashlib.sha256(b"[]\n").hexdigest(),
+        },
+    )
+
+    receipt = cutover._run_process_registry_retirement_barrier(
+        plan,
+        stop_gateway=lambda: events.append("stop-and-wait")
+        or {"status": "stopped"},
+    )
+
+    assert events == [
+        "acquire-admission",
+        "acquire-authority",
+        "checkpoint",
+        "release-authority",
+        "stop-and-wait",
+        "acquire-authority",
+        "checkpoint",
+        "release-authority",
+        "release-admission",
+    ]
+    assert receipt["status"] == "retired-at-zero"
+    assert receipt["pre_stop_checkpoint"]["active_records"] == 0
+    assert receipt["post_exit_checkpoint"]["active_records"] == 0
+
+
+def test_process_retirement_barrier_never_stops_on_nonzero_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    plan, _checkpoint = _process_checkpoint_plan(tmp_path)
+    events = []
+
+    def acquire(_plan, *, kind):
+        events.append(f"acquire-{kind}")
+        return {"kind": kind, "handle": object(), "receipt": {"kind": kind}}
+
+    def release(_plan, held):
+        events.append(f"release-{held['kind']}")
+        return {"status": "released", "kind": held["kind"]}
+
+    monkeypatch.setattr(cutover, "_acquire_process_registry_lock", acquire)
+    monkeypatch.setattr(cutover, "_release_process_registry_lock", release)
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_process_checkpoint_receipt",
+        lambda _plan: (_ for _ in ()).throw(
+            cutover.ReleaseBuildError(
+                "gateway process checkpoint still has worker activity"
+            )
+        ),
+    )
+
+    with pytest.raises(cutover.ReleaseBuildError, match="worker activity"):
+        cutover._run_process_registry_retirement_barrier(
+            plan,
+            stop_gateway=lambda: events.append("unsafe-stop"),
+        )
+
+    assert events == [
+        "acquire-admission",
+        "acquire-authority",
+        "release-authority",
+        "release-admission",
+    ]
+
+
+def test_gateway_stop_rechecks_checkpoint_before_bootout(tmp_path, monkeypatch):
+    plan, _checkpoint = _process_checkpoint_plan(tmp_path)
+    plan["transaction_id"] = "checkpoint-stop-transaction-000001"
+    prepared = {"gateway": {"pid": 41, "pid_start_token": "gateway-start"}}
+    intent = {
+        "planned_stop": {
+            "path": str(cutover._legacy_gateway_planned_stop_path(plan)),
+            "payload": {"release_transaction_id": plan["transaction_id"]},
+        }
+    }
+    bootouts = []
+    marker_writes = []
+    checkpoint_reads = iter(
+        [
+            {
+                "status": "verified",
+                "path": "processes.json",
+                "active_records": 0,
+            },
+            cutover.ReleaseBuildError(
+                "gateway process checkpoint still has worker activity"
+            ),
+        ]
+    )
+
+    def checkpoint_receipt(_plan):
+        value = next(checkpoint_reads)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_process_checkpoint_receipt",
+        checkpoint_receipt,
+    )
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _identity: True)
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: 41 if gateway else None,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_write_exact_private_json",
+        lambda *args, **kwargs: marker_writes.append((args, kwargs)) or {},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *args, **kwargs: bootouts.append((args, kwargs)),
+    )
+
+    with pytest.raises(cutover.ReleaseBuildError, match="process checkpoint"):
+        cutover._gracefully_stop_legacy_gateway(plan, prepared, intent)
+    cutover._release_legacy_cron_tick_lock(plan)
+
+    assert bootouts == []
+    assert len(marker_writes) == 1
+
+
+def test_gateway_stop_rechecks_exact_owner_after_second_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    plan, _checkpoint = _process_checkpoint_plan(tmp_path)
+    plan["transaction_id"] = "checkpoint-owner-race-transaction-000001"
+    prepared = {"gateway": {"pid": 41, "pid_start_token": "gateway-start"}}
+    intent = {
+        "planned_stop": {
+            "path": str(cutover._legacy_gateway_planned_stop_path(plan)),
+            "payload": {"release_transaction_id": plan["transaction_id"]},
+        }
+    }
+    bootouts = []
+    job_pids = iter([41, 99])
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_process_checkpoint_receipt",
+        lambda _plan: {
+            "status": "verified",
+            "path": "processes.json",
+            "active_records": 0,
+        },
+    )
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _identity: True)
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: next(job_pids) if gateway else None,
+    )
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+    monkeypatch.setattr(
+        cutover,
+        "_write_exact_private_json",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *args, **kwargs: bootouts.append((args, kwargs)),
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="changed immediately before graceful stop",
+    ):
+        cutover._gracefully_stop_legacy_gateway(plan, prepared, intent)
+    cutover._release_legacy_cron_tick_lock(plan)
+
+    assert bootouts == []
+
+
+def _canonical_gateway_health_fixture(
+    *,
+    pair_gate_active: bool,
+) -> tuple[dict, dict, dict]:
+    transaction_id = "gateway-health-transaction-00000001"
+    identity = {
+        "build_id": "candidate-webui",
+        "commit": "1" * 40,
+        "tree": "2" * 40,
+        "manifest_sha256": "3" * 64,
+        "agent_source_commit": "4" * 40,
+        "agent_source_tree": "5" * 40,
+        "agent_source_manifest_sha256": "6" * 64,
+        "runtime_manifest_sha256": "7" * 64,
+        "selector_generation": 7,
+    }
+    plan = {
+        "gateway_health_url": "http://127.0.0.1:8642/health",
+        "gateway_listener_port": 8642,
+        "gateway_launchd_label": "ai.hermes.gateway",
+        "transaction_id": transaction_id,
+        "timeout_seconds": 1,
+    }
+    release_pair_id = selector.release_pair_id(
+        identity,
+        selector_generation=7,
+        transaction_id=transaction_id,
+    )
+    release = {
+        "agent_commit": identity["agent_source_commit"],
+        "agent_tree": identity["agent_source_tree"],
+        "agent_manifest_sha256": identity["agent_source_manifest_sha256"],
+        "runtime_manifest_sha256": identity["runtime_manifest_sha256"],
+        "release_pair_id": release_pair_id,
+        "webui_build_id": identity["build_id"],
+        "webui_commit": identity["commit"],
+        "webui_tree": identity["tree"],
+        "webui_manifest_sha256": identity["manifest_sha256"],
+        "selector_generation": "7",
+        "release_transaction_id": transaction_id,
+        "gateway_launchd_label": plan["gateway_launchd_label"],
+    }
+    pair_gate_fixture_path = (
+        Path(__file__).parent
+        / "fixtures"
+        / "agent_pair_gate_receipts.v1.json"
+    )
+    pair_gate_fixture_bytes = pair_gate_fixture_path.read_bytes()
+    assert hashlib.sha256(pair_gate_fixture_bytes).hexdigest() == (
+        "1cfa3c6ee77874803bcc7871c1304387a448810038077647b2b807cb9819a1f5"
+    )
+    pair_gate_fixture = json.loads(pair_gate_fixture_bytes)
+    assert (
+        pair_gate_fixture["schema"]
+        == "hermes.agent_pair_gate_receipts.fixture.v1"
+    )
+    pair_gate = copy.deepcopy(
+        pair_gate_fixture["active" if pair_gate_active else "absent"]
+    )
+    if pair_gate_active:
+        assert pair_gate["transaction_id"] == transaction_id
+        assert pair_gate["agent"]["instance_epoch"] == release_pair_id
+    expected_admission = (
+        "rejecting_new_work"
+        if pair_gate_active
+        else "accepting_new_work"
+    )
+    work_fields = {
+        "active_http_requests",
+        "active_agent_turns",
+        "active_delegations",
+        "background_processes",
+        "process_completion_queue_depth",
+        "active_cron_jobs",
+        "api_background_tasks",
+        "running_kanban_workers",
+        "gateway_background_tasks",
+    }
+    health = {
+        "status": "ok",
+        "platform": "hermes-agent",
+        "version": "0.1.0",
+        "release_identity": {
+            "schema": "hermes.public_release_identity.v1",
+            "verified": True,
+            "release": release,
+            "process": {
+                "pid": 41,
+                "start_token": "gateway-start",
+                "start_token_status": "verified",
+            },
+        },
+        "drain": {
+            "schema": "hermes.gateway_drain.v1",
+            "admission": {
+                "state": expected_admission,
+                "verified": True,
+                "drain_requested": False,
+                "pair_open_gate_active": pair_gate_active,
+                "effective_rejection_requested": pair_gate_active,
+            },
+            "work": {name: 0 for name in work_fields},
+            "work_status": {name: "verified" for name in work_fields},
+            "quiescence": {
+                "verified": True,
+                "quiescent": pair_gate_active,
+                "blockers": (
+                    [] if pair_gate_active else ["admission_not_rejecting"]
+                ),
+            },
+            "pair_open_gate": pair_gate,
+        },
+    }
+    return plan, identity, health
+
+
+@pytest.mark.parametrize("pair_gate_active", [True, False])
+def test_gateway_health_accepts_canonical_agent_pair_gate_receipts(
+    monkeypatch,
+    pair_gate_active,
+):
+    plan, identity, health = _canonical_gateway_health_fixture(
+        pair_gate_active=pair_gate_active,
+    )
+    monkeypatch.setattr(cutover, "_http_json", lambda *args, **kwargs: health)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+
+    receipt = cutover._gateway_health_receipt(
+        plan,
+        expected_identity=identity,
+        expected_admission=(
+            "rejecting_new_work"
+            if pair_gate_active
+            else "accepting_new_work"
+        ),
+        expected_pair_gate=(
+            health["drain"]["pair_open_gate"]
+            if pair_gate_active
+            else "absent"
+        ),
+    )
+
+    assert receipt["drain"] == health["drain"]
+
+
+def test_gateway_health_rejects_incomplete_work_status_schema(monkeypatch):
+    plan, identity, health = _canonical_gateway_health_fixture(
+        pair_gate_active=True,
+    )
+    health["drain"]["work_status"].pop("running_kanban_workers")
+    monkeypatch.setattr(cutover, "_http_json", lambda *args, **kwargs: health)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="drain receipt is not quiescent",
+    ):
+        cutover._gateway_health_receipt(
+            plan,
+            expected_identity=identity,
+            expected_admission="rejecting_new_work",
+        )

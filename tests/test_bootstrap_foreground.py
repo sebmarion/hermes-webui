@@ -94,6 +94,14 @@ def clean_env(monkeypatch):
         "HERMES_WEBUI_AGENT_DIR",
         "HERMES_WEBUI_STATE_DIR",
         "HERMES_WEBUI_SERVER_CWD",
+        "HERMES_WEBUI_PYTHON",
+        "HERMES_WEBUI_RELEASE_ROOT",
+        "HERMES_WEBUI_RELEASE_PATH",
+        "HERMES_WEBUI_MANIFEST_SHA256",
+        "HERMES_WEBUI_SELECTOR_GENERATION",
+        "HERMES_WEBUI_SELECTOR_PATH",
+        "HERMES_WEBUI_INTERPRETER_PATH",
+        "HERMES_WEBUI_LAUNCH_MODE",
         "HERMES_HOME",
     ):
         monkeypatch.delenv(name, raising=False)
@@ -299,6 +307,52 @@ class TestMainForegroundRouting:
         # argv[0] is the program name (convention), argv[1] is the script
         assert argv[0] == python_exe
         assert argv[1].endswith("server.py")
+
+    def test_managed_selector_bootstrap_preserves_release_cwd_and_interpreter(
+        self, stub_main_dependencies, clean_env, monkeypatch
+    ):
+        bs = stub_main_dependencies
+        release_path = bs.REPO_ROOT.resolve()
+        interpreter = Path(sys.executable).absolute()
+        managed = {
+            "HERMES_WEBUI_RELEASE_ROOT": str(release_path.parent),
+            "HERMES_WEBUI_RELEASE_PATH": str(release_path),
+            "HERMES_WEBUI_MANIFEST_SHA256": "a" * 64,
+            "HERMES_WEBUI_SELECTOR_GENERATION": "2",
+            "HERMES_WEBUI_SELECTOR_PATH": str(release_path / "selector.py"),
+            "HERMES_WEBUI_INTERPRETER_PATH": str(interpreter),
+            "HERMES_WEBUI_LAUNCH_MODE": "selector",
+            "HERMES_WEBUI_PYTHON": str(interpreter),
+            "HERMES_WEBUI_SERVER_CWD": str(release_path),
+        }
+        for key, value in managed.items():
+            monkeypatch.setenv(key, value)
+        monkeypatch.setattr(sys, "argv", ["bootstrap.py", "--foreground"])
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(
+            bs, "_python_can_run_webui_and_agent", lambda *_args, **_kwargs: True
+        )
+        monkeypatch.setattr(
+            bs,
+            "discover_launcher_python",
+            lambda *_args: str(release_path / "wrong-python"),
+        )
+        chdirs = []
+        execs = []
+        monkeypatch.setattr(os, "chdir", lambda path: chdirs.append(Path(path)))
+
+        def fake_execv(path, argv):
+            execs.append((path, argv))
+            raise SystemExit(0)
+
+        monkeypatch.setattr(os, "execv", fake_execv)
+
+        with pytest.raises(SystemExit):
+            bs.main()
+
+        assert chdirs == [release_path]
+        assert execs[0][0] == str(interpreter)
+        assert execs[0][1] == [str(interpreter), str(release_path / "server.py")]
 
     @pytest.mark.parametrize("var", [
         "INVOCATION_ID",

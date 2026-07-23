@@ -1890,3 +1890,49 @@ an existing workspace. Strict: path must be under home, in the saved workspace l
 
 The distinction matters because add uses permissive validation to avoid the circular
 dependency: you cannot get a path into the saved list if you need the saved list to add it.
+
+## Immutable release FIRST-activation bridge
+
+The FIRST migration from the legacy launch layout to a managed release uses
+two separate activation boundaries in `scripts/webui_release_cutover.py`:
+
+- The candidate Hermes CLI is staged as an immutable private `0555` shell
+  shim. Before legacy drain starts, the canonical public `hermes` symlink is
+  CAS-switched from its captured legacy target to a transaction-owned `0555`
+  maintenance shim that imports no Python or Hermes modules and exits with a
+  temporary-failure status.
+- The managed gateway plist names the staged candidate shim directly. The
+  public CLI remains maintenance-gated while the WebUI and gateway start,
+  reconcile, and open behind the shared pair gate. Only a durable
+  `pair_opened` receipt authorizes a second CAS switch to the candidate shim.
+  Early abort and rollback restore the captured legacy link only when the live
+  target is the transaction-owned maintenance or candidate shim.
+- Legacy cron admission is excluded with an exclusive flock on
+  `~/.hermes/cron/.tick.lock`, not `.jobs.lock`. The canonical cron directory
+  must be private `0700`. A pre-existing same-uid, single-link regular lock may
+  be `0600` or legacy `0644`: the transaction first durably captures its exact
+  inode, bytes, and mode, then normalizes it through the same descriptor to
+  `0600`. An absent lock is durably captured before an exclusive `0600`
+  creation. Every lock open uses `O_NOFOLLOW` and `O_CLOEXEC`. The cutover
+  reacquires this kernel lock after process restart instead of treating a
+  journal phase as live ownership, and holds it from before drain through exact
+  legacy gateway exit and the all-services-stopped receipt. Pre-snapshot abort
+  restores the captured mode and bytes (or removes a transaction-created
+  lock); rollback permits an inode rebind only when the signed state-snapshot
+  restore receipt proves the transaction-owned replacement.
+- The same capture/CAS normalization applies to the two synthetic completion
+  stores. Candidate and quarantine JSON is always private `0600`, while an
+  exact legacy `0644` source mode is retained in the journal for abort or
+  rollback. Frozen inspection accepts only the plan-allowlisted terminal
+  process/delegation IDs and exact source SHA. Delivered and queued terminal
+  records are both classified; running, unknown-status, or non-allowlisted
+  records fail closed. Original bytes are moved into private transaction
+  quarantine and are never replayed. Rollback can restore the legacy live-file
+  mode, but the live payload remains the canonical empty store while the exact
+  terminal bytes remain sealed in quarantine.
+
+This is a bounded single-operator-host contract. Same-FD/path, inode, mode,
+ownership, link-count, and compare-before-replace checks fail closed for
+observed changes, but they do not claim to exclude a malicious concurrent
+process running under the same uid. That limitation is explicit in the durable
+receipts.

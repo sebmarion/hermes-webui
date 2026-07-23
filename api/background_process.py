@@ -76,6 +76,13 @@ _LAST_EMIT_TS: dict[str, float] = {}
 _PENDING_EMIT_PAYLOADS: dict[str, dict] = {}
 _PENDING_EMIT_TIMERS: dict[str, threading.Timer] = {}
 
+# Exact durable Agent completion events staged for the next process-wakeup
+# worker. The Agent outbox remains the durable authority; this process-local
+# handoff only bridges the synchronous route admission boundary to the worker
+# that will ACK (or requeue) after transcript writeback.
+_STAGED_PROCESS_COMPLETION_EVENTS: dict[str, list[dict]] = {}
+_STAGED_PROCESS_COMPLETION_EVENTS_LOCK = threading.Lock()
+
 
 # ── Persistent per-session SSE channel (Option X) ──────────────────────────
 # SESSION_CHANNELS maps WebUI session_id -> SessionChannel. Each channel owns
@@ -745,110 +752,82 @@ def _emit_bg_task_complete_events_coalesced(session_id: str, payload: dict) -> i
     return 0
 
 
-# ── Coupling contract: agent ProcessRegistry cross-A/B dedupe key ──────────
-# This WebUI drain (B) and the merged upstream PR #2279 next-turn drain (A)
-# dedupe a process_id against a SINGLE shared key inside the agent's
-# ``tools.process_registry.ProcessRegistry``:
-#
-#   * READ  side: the PUBLIC ``is_completion_consumed(process_id)`` method
-#     (used in ``_process_one`` above) — stable public API.
-#   * WRITE side: there is NO public ``mark_completion_consumed`` upstream, so
-#     B must reach into the registry's private ``_completion_consumed`` set
-#     (guarded by its private ``_lock``) to set the shared marker A reads.
-#
-# That private WRITE coupling is what Copilot review #2242 comment #4 flagged.
-# The long-term fix is an upstream PUBLIC ``mark_completion_consumed`` — see
-# the test ``test_registry_completion_consumed_contract`` which fails CI LOUD
-# the moment ``_completion_consumed`` / ``_lock`` / ``is_completion_consumed``
-# is renamed or retyped upstream, instead of a future rename silently
-# reintroducing the double-wakeup bug. ``_mark_registry_completion_consumed``
-# narrows the exception handling so a rename is logged at ERROR (visible in
-# errors.log + monitoring) rather than swallowed by a broad ``except`` at
-# DEBUG. ImportError stays best-effort (the registry is legitimately absent in
-# non-agent unit-test contexts; this module's own locked
-# ``BG_TASK_COMPLETE_EVENTS_SEEN`` gate still dedupes B's own duplicates there).
-_REGISTRY_CONSUMED_CONTRACT = ("_lock", "_completion_consumed", "is_completion_consumed")
-
-
-def _mark_registry_completion_consumed(process_id: str) -> None:
-    """Set the shared cross-A/B dedupe marker on the agent ProcessRegistry.
-
-    Couples to ``ProcessRegistry`` privates (``_lock`` /
-    ``_completion_consumed``) because no public ``mark_completion_consumed``
-    exists upstream (the read side uses the public
-    ``is_completion_consumed``). A future upstream rename must FAIL LOUD, not
-    silently reintroduce the double-wakeup: an ``AttributeError`` / ``TypeError``
-    from the private access is logged at ERROR with a contract-violation
-    message (and ``test_registry_completion_consumed_contract`` breaks CI at
-    test time). Only ``ImportError`` is treated as best-effort/expected (the
-    registry is absent in pure unit-test contexts).
-    """
-    try:
-        from tools.process_registry import process_registry as _pr
-    except ImportError:
-        # Agent registry not importable (e.g. isolated unit test) — B's own
-        # locked BG_TASK_COMPLETE_EVENTS_SEEN gate still prevents this module's
-        # duplicates; cross-A/B dedupe is moot when A isn't running either.
-        logger.debug(
-            "tools.process_registry not importable; skipping shared "
-            "completion-consumed marker (best-effort, expected off-agent)",
-            exc_info=True,
-        )
-        return
-    try:
-        lock = _pr._lock
-        consumed = _pr._completion_consumed
-    except AttributeError:
-        logger.error(
-            "ProcessRegistry coupling contract VIOLATED: expected private "
-            "attrs %s for cross-A/B wakeup dedupe are missing — an upstream "
-            "rename has broken the shared marker; process_complete wakeups may "
-            "now double-fire. A public mark_completion_consumed() upstream is "
-            "the durable fix (Copilot #2242 review #4).",
-            _REGISTRY_CONSUMED_CONTRACT,
-            exc_info=True,
-        )
-        return
-    try:
-        with lock:
-            consumed.add(process_id)
-    except (AttributeError, TypeError):
-        logger.error(
-            "ProcessRegistry coupling contract VIOLATED: _lock/"
-            "_completion_consumed changed shape (not a Lock / not a set) — "
-            "cross-A/B wakeup dedupe is broken; wakeups may double-fire. "
-            "Upstream public mark_completion_consumed() is the durable fix "
-            "(Copilot #2242 review #4).",
-            exc_info=True,
-        )
-
-
-def _ack_async_delegation_delivery(delegation_id: str) -> bool:
-    """ACK an async result only after its replacement turn was accepted.
-
-    Hermes Agent persists completed async delegations until a driver calls
-    ``mark_async_delegation_delivered``. WebUI previously consumed the queue
-    event and launched a server-side turn without making that call, so a restart
-    replayed an already-consumed result and could repeat continuation side
-    effects. Import/call failures deliberately leave the record replayable.
-    """
-    delegation_id = str(delegation_id or "").strip()
-    if not delegation_id:
+def _is_stable_process_completion_event(event: object) -> bool:
+    if not isinstance(event, dict):
         return False
-    try:
-        from tools.async_delegation import mark_async_delegation_delivered
+    if event.get("type") == "completion":
+        return bool(
+            str(event.get("event_id") or "").strip()
+            and str(event.get("session_id") or "").strip()
+            and str(event.get("session_key") or "").strip()
+        )
+    if event.get("type") == "async_delegation":
+        return bool(
+            str(event.get("delegation_id") or "").strip()
+            and str(event.get("session_key") or "").strip()
+        )
+    return False
 
-        mark_async_delegation_delivered(
-            {"type": "async_delegation", "delegation_id": delegation_id}
-        )
-    except Exception:
-        logger.warning(
-            "async delegation delivery ACK failed for %s; record remains replayable",
-            delegation_id,
-            exc_info=True,
-        )
+
+def stage_process_completion_event(session_id: str, event: dict) -> bool:
+    """Stage one exact durable event for a synchronously admitted wakeup."""
+    owner = str(session_id or "").strip()
+    if not owner or not _is_stable_process_completion_event(event):
         return False
+    event_id = str(event.get("event_id") or event.get("delegation_id"))
+    with _STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+        pending = _STAGED_PROCESS_COMPLETION_EVENTS.setdefault(owner, [])
+        if any(
+            str(item.get("event_id") or item.get("delegation_id") or "")
+            == event_id
+            for item in pending
+        ):
+            return True
+        pending.append(event)
     return True
+
+
+def claim_staged_process_completion_events(session_id: str) -> list[dict]:
+    """Atomically transfer exact staged events to one accepted worker."""
+    owner = str(session_id or "").strip()
+    if not owner:
+        return []
+    with _STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+        return _STAGED_PROCESS_COMPLETION_EVENTS.pop(owner, [])
+
+
+def has_staged_process_completion_events(session_id: str) -> bool:
+    owner = str(session_id or "").strip()
+    if not owner:
+        return False
+    with _STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+        return bool(_STAGED_PROCESS_COMPLETION_EVENTS.get(owner))
+
+
+def _unstage_process_completion_event(session_id: str, event: dict) -> bool:
+    """Remove one exact staged event when route admission did not claim it."""
+    owner = str(session_id or "").strip()
+    event_id = str(
+        (event or {}).get("event_id")
+        or (event or {}).get("delegation_id")
+        or ""
+    ).strip()
+    if not owner or not event_id:
+        return False
+    with _STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+        pending = _STAGED_PROCESS_COMPLETION_EVENTS.get(owner) or []
+        retained = [
+            item
+            for item in pending
+            if str(item.get("event_id") or item.get("delegation_id") or "")
+            != event_id
+        ]
+        removed = len(retained) != len(pending)
+        if retained:
+            _STAGED_PROCESS_COMPLETION_EVENTS[owner] = retained
+        else:
+            _STAGED_PROCESS_COMPLETION_EVENTS.pop(owner, None)
+        return removed
 
 
 # ── xsession wakeup misroute defense-in-depth (Option 3) ───────────────────
@@ -938,6 +917,12 @@ def _process_one(evt: dict) -> None:
 
     process_id = _event_process_id(evt)
     async_delegation_id = _async_delegation_id(evt)
+    delivery_id = str(
+        evt.get("event_id")
+        or evt.get("delegation_id")
+        or process_id
+        or ""
+    ).strip()
     session_key = str(evt.get("session_key") or "")
     # Root-cause fix (t_0f447014): the notify_on_complete completion event
     # enqueued by ProcessRegistry._move_to_finished() carries NO "session_key"
@@ -970,6 +955,19 @@ def _process_one(evt: dict) -> None:
         return
     with _cfg.PROCESS_SESSION_INDEX_LOCK:
         session_id = _cfg.PROCESS_SESSION_INDEX.get(session_key)
+    if not session_id:
+        # Startup replay runs before any new turn can rebuild the process-local
+        # index. A stable event's session_key is therefore allowed to route
+        # directly only when it resolves to an existing WebUI session.
+        try:
+            from api.models import get_session
+
+            replay_owner = get_session(session_key)
+            session_id = str(
+                getattr(replay_owner, "session_id", "") or ""
+            ).strip()
+        except Exception:
+            session_id = ""
     if not session_id:
         # No mapping — could be a cron/gateway process that uses the same
         # registry but a non-WebUI session_key. Ignore.
@@ -1022,22 +1020,13 @@ def _process_one(evt: dict) -> None:
     # occasionally enqueue twice despite the process_registry guard.
     with _cfg.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
         seen = _cfg.BG_TASK_COMPLETE_EVENTS_SEEN.setdefault(session_id, set())
-        if process_id and process_id in seen:
+        if delivery_id and delivery_id in seen:
             return
-        if process_id:
-            seen.add(process_id)
+        if delivery_id:
+            seen.add(delivery_id)
     payload = _build_payload(evt, session_id)
     _emit_bg_task_complete_events_coalesced(session_id, payload)
     _cfg.PENDING_BG_TASK_COMPLETIONS.add(session_id)
-    # Mark the event consumed in the agent's process registry so the REAL
-    # merged PR #2279's next-turn drain
-    # (api/streaming._drain_webui_process_notifications) treats this process_id
-    # as already-delivered and does not re-fire a wakeup (B-first order).
-    # This is the SHARED upstream dedupe key (see _mark_registry_completion_
-    # consumed for the coupling contract + why a future rename now fails loud).
-    if process_id:
-        _mark_registry_completion_consumed(process_id)
-
     # ── Option Z (PRIMARY): server-side wakeup, NO browser round-trip ──────
     # The SSE emit above is now demoted to a pure live-view layer (an open tab
     # streams the turn live via the per-session SSE channel). The ACTUAL agent
@@ -1087,6 +1076,11 @@ def _process_one(evt: dict) -> None:
                     process_id,
                     wakeup_prompt,
                     async_delegation_id=async_delegation_id,
+                    completion_event=(
+                        evt
+                        if evt.get("type") in {"completion", "async_delegation"}
+                        else None
+                    ),
                 )
                 logger.debug(
                     "server-side wakeup deferred: turn active for session %s "
@@ -1107,6 +1101,11 @@ def _process_one(evt: dict) -> None:
                     wakeup_prompt,
                     process_id=process_id,
                     async_delegation_id=async_delegation_id,
+                    completion_event=(
+                        evt
+                        if evt.get("type") in {"completion", "async_delegation"}
+                        else None
+                    ),
                 )
     except Exception:
         logger.warning(
@@ -1120,6 +1119,7 @@ def record_deferred_wakeup(
     wakeup_prompt: str,
     *,
     async_delegation_id: str = "",
+    completion_event: dict | None = None,
 ) -> None:
     """Persist a deferred process-completion wakeup for later redelivery.
 
@@ -1149,10 +1149,14 @@ def record_deferred_wakeup(
                 if existing is not None:
                     if async_delegation_id and not existing.get("async_delegation_id"):
                         existing["async_delegation_id"] = async_delegation_id
+                    if completion_event and not existing.get("completion_event"):
+                        existing["completion_event"] = completion_event
                     return
             entry = {"process_id": process_id, "wakeup_prompt": wakeup_prompt}
             if async_delegation_id:
                 entry["async_delegation_id"] = async_delegation_id
+            if completion_event:
+                entry["completion_event"] = completion_event
             entries.append(entry)
     except Exception:
         logger.debug(
@@ -1256,6 +1260,7 @@ def drain_deferred_wakeups_for_session(session_id: str) -> int:
                     async_delegation_id=str(
                         (entry or {}).get("async_delegation_id") or ""
                     ),
+                    completion_event=(entry or {}).get("completion_event"),
                 )
             _start_server_side_wakeup_turn(
                 session_id,
@@ -1264,6 +1269,7 @@ def drain_deferred_wakeups_for_session(session_id: str) -> int:
                 async_delegation_id=str(
                     (first or {}).get("async_delegation_id") or ""
                 ),
+                completion_event=(first or {}).get("completion_event"),
             )
             started = 1
         if started:
@@ -1316,6 +1322,7 @@ def _start_server_side_wakeup_turn(
     *,
     process_id: str = "",
     async_delegation_id: str = "",
+    completion_event: dict | None = None,
 ) -> None:
     """Start an agent turn server-side for a process_complete wakeup (Option Z).
 
@@ -1347,22 +1354,46 @@ def _start_server_side_wakeup_turn(
     """
 
     def _runner() -> None:
+        completion_staged = False
+
+        def _defer_unclaimed_completion() -> None:
+            if not completion_staged or not completion_event:
+                return
+            if not _unstage_process_completion_event(session_id, completion_event):
+                return
+            record_deferred_wakeup(
+                session_id,
+                process_id,
+                wakeup_prompt,
+                async_delegation_id=async_delegation_id,
+                completion_event=completion_event,
+            )
+
         try:
             from api.routes import start_session_turn
 
+            completion_staged = bool(
+                completion_event
+                and stage_process_completion_event(session_id, completion_event)
+            )
             resp = start_session_turn(
                 session_id, wakeup_prompt, source="process_wakeup"
             )
             status = int((resp or {}).get("_status", 200) or 200)
             if status == 409 and (resp or {}).get("error") == "process_wakeup_paused":
+                _defer_unclaimed_completion()
                 logger.info(
                     "server-side wakeup suppressed for session %s: provider credential state is paused",
                     session_id,
                 )
-            elif status == 409:
-                # Raced an active turn (e.g. a human /api/chat/start, or a
-                # sibling deferred-wakeup thread). Re-defer this prompt so it
-                # is delivered by the winning turn's teardown / next-turn drain
+            elif status == 409 or (
+                status == 503
+                and (resp or {}).get("code") == "maintenance_fence"
+            ):
+                # Raced an active turn (e.g. a human /api/chat/start or sibling
+                # deferred-wakeup thread), or reached the atomic release fence.
+                # Re-defer this prompt so it is delivered after the winning
+                # turn's teardown or after the replacement process starts,
                 # instead of being lost. The atomic claim in
                 # ``claim_deferred_wakeups`` still guarantees exactly-once
                 # delivery, and BG_TASK_COMPLETE_EVENTS_SEEN already deduped
@@ -1373,13 +1404,17 @@ def _start_server_side_wakeup_turn(
                         process_id,
                         wakeup_prompt,
                         async_delegation_id=async_delegation_id,
+                        completion_event=completion_event,
                     )
+                if completion_staged and completion_event:
+                    _unstage_process_completion_event(session_id, completion_event)
                 logger.debug(
-                    "server-side wakeup raced an active turn for session %s; "
+                    "server-side wakeup was deferred for session %s; "
                     "re-deferred for redelivery on next teardown/turn",
                     session_id,
                 )
             elif status >= 400:
+                _defer_unclaimed_completion()
                 logger.warning(
                     "server-side wakeup failed for session %s: status=%s err=%r",
                     session_id,
@@ -1387,17 +1422,32 @@ def _start_server_side_wakeup_turn(
                     (resp or {}).get("error"),
                 )
             else:
-                acked = False
-                if async_delegation_id:
-                    acked = _ack_async_delegation_delivery(async_delegation_id)
+                process_bound = True
+                if completion_staged and completion_event:
+                    process_bound = not _unstage_process_completion_event(
+                        session_id,
+                        completion_event,
+                    )
+                    if not process_bound:
+                        record_deferred_wakeup(
+                            session_id,
+                            process_id,
+                            wakeup_prompt,
+                            async_delegation_id=async_delegation_id,
+                            completion_event=completion_event,
+                        )
+                        logger.error(
+                            "accepted process wakeup did not bind its durable completion event"
+                        )
                 logger.info(
                     "server-side wakeup turn started for session %s "
-                    "(stream_id=%s, async_delivery_acked=%s)",
+                    "(stream_id=%s, durable_delivery_bound=%s)",
                     session_id,
                     (resp or {}).get("stream_id"),
-                    acked if async_delegation_id else "n/a",
+                    process_bound if completion_event else "n/a",
                 )
         except Exception:
+            _defer_unclaimed_completion()
             logger.warning(
                 "server-side wakeup turn raised for session %s",
                 session_id,

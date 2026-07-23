@@ -2,6 +2,7 @@ import io
 import json
 import socket
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
@@ -148,6 +149,46 @@ def test_oidc_callback_exchanges_code_and_sets_existing_session_cookie(monkeypat
     assert len(cookie_headers) == 1
     assert auth.COOKIE_NAME in cookie_headers[0]
     assert "session-token.signature" in cookie_headers[0]
+
+
+@pytest.mark.parametrize(
+    ("path", "query", "operation_name"),
+    [
+        ("/api/auth/oidc/start", "next=%2F", "build_authorization_redirect"),
+        (
+            "/api/auth/oidc/callback",
+            "state=state-token&code=code-token",
+            "complete_authorization_code_flow",
+        ),
+    ],
+)
+def test_oidc_mutating_gets_are_rejected_by_release_fence(
+    monkeypatch,
+    path,
+    query,
+    operation_name,
+):
+    import api.routes as routes
+
+    called = []
+
+    @contextmanager
+    def rejected_scope(**_kwargs):
+        raise routes.RunAdmissionClosed("release fence")
+        yield
+
+    monkeypatch.setattr(routes, "run_admission_scope", rejected_scope)
+    monkeypatch.setattr(
+        f"api.auth_oidc.{operation_name}",
+        lambda *_args, **_kwargs: called.append(True),
+    )
+
+    handler = RouteFakeHandler()
+    routes.handle_get(handler, SimpleNamespace(path=path, query=query))
+
+    assert handler.status == 503
+    assert handler.json_body()["code"] == "maintenance_fence"
+    assert called == []
 
 
 def test_oidc_callback_rejects_invalid_state_without_setting_session_cookie(monkeypatch):

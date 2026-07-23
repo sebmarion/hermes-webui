@@ -21,6 +21,7 @@ happen once.
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -31,6 +32,8 @@ import pytest
 # the _RenamedRegistry stub further down.
 from tests._wakeup_helpers import FakeProcessRegistry as _FakeProcessRegistry
 from tests._wakeup_helpers import install_fake_registry as _install_fake_registry
+from tests._wakeup_helpers import install_fake_start_session_turn
+from tests._wakeup_helpers import wait_for_wakeup
 
 
 def _reset_cfg_state():
@@ -59,6 +62,7 @@ def test_b_sse_first_then_a_drain_skips_same_process_id(monkeypatch):
     fake.register("p1", "sess-1")
     _install_fake_registry(monkeypatch, fake)
     _reset_cfg_state()
+    holder = install_fake_start_session_turn(monkeypatch)
 
     from api import background_process as bp
     from api import streaming as st
@@ -68,18 +72,29 @@ def test_b_sse_first_then_a_drain_skips_same_process_id(monkeypatch):
     bp.register_process_session("sess-1", "sess-1")
 
     evt = {
+        "event_id": "process:p1:completion",
         "type": "completion",
         "session_id": "p1",
         "session_key": "sess-1",
+        "platform": "webui",
         "command": "sleep 1",
         "exit_code": 0,
         "output": "done",
+        "created_at": time.time(),
     }
     # B path: process the event
     bp._process_one(evt)
+    assert wait_for_wakeup(holder)
 
-    # B must have marked the (session, process) seen and registry-consumed
-    assert "p1" in _cfg.BG_TASK_COMPLETE_EVENTS_SEEN["sess-1"]
+    # B owns only an in-memory claim at route acceptance. The exact Agent
+    # event is transferred to the worker and remains unacknowledged until that
+    # worker's transcript writeback commits.
+    assert "process:p1:completion" in _cfg.BG_TASK_COMPLETE_EVENTS_SEEN["sess-1"]
+    assert holder["calls"]
+    assert holder["calls"][0]["process_completion_events"] == [evt]
+    assert holder["calls"][0]["process_completion_events"][0] is evt
+    assert not fake.is_completion_consumed("p1")
+    assert fake.finish_notification_delivery(evt, True) is True
     assert fake.is_completion_consumed("p1")
 
     # Now simulate A's next-turn drain. Put a *new* event onto the queue for the
@@ -114,18 +129,31 @@ def test_a_drain_first_marks_seen_so_b_would_skip(monkeypatch):
     bp.register_process_session("sess-2", "sess-2")
 
     evt = {
+        "event_id": "process:p2:completion",
         "type": "completion",
         "session_id": "p2",
         "session_key": "sess-2",
+        "platform": "webui",
         "command": "echo hi",
         "exit_code": 0,
         "output": "hi",
+        "created_at": time.time(),
     }
     # A path: queue carried over from a closed-tab session, drain at next turn
     fake.completion_queue.put(evt)
-    notifications = st._drain_webui_process_notifications("sess-2")
+    claims = []
+    notifications = st._drain_webui_process_notifications(
+        "sess-2",
+        claimed_events=claims,
+    )
     assert len(notifications) == 1
     assert "Background process p2 completed" in notifications[0]
+    assert claims == [evt]
+    assert st._finalize_process_completion_claims(
+        fake,
+        claims,
+        committed=True,
+    ) is True
 
     # The REAL merged #2279 A-drain marks the SHARED upstream dedupe key
     # (registry consumed-marker) — NOT our private BG_TASK_COMPLETE_EVENTS_SEEN.
@@ -149,81 +177,57 @@ def test_a_drain_first_marks_seen_so_b_would_skip(monkeypatch):
 
 
 def test_registry_completion_consumed_contract():
-    """Copilot #2242 review #4 — fail CI LOUD if the agent ProcessRegistry
-    private cross-A/B dedupe surface is renamed/retyped upstream.
-
-    The WebUI B-drain has no public ``mark_completion_consumed`` to call, so
-    it reaches into ``ProcessRegistry._completion_consumed`` (under
-    ``._lock``) to set the shared marker that the public
-    ``is_completion_consumed`` reads. If a future upstream refactor renames
-    any of these, the double-wakeup bug would silently come back. This test
-    pins the contract so the rename breaks HERE (visibly) instead.
-    """
+    """The paired Agent exposes the atomic durable settlement contract."""
     pytest.importorskip("tools.process_registry", reason="hermes-agent not installed")
     from tools.process_registry import ProcessRegistry
-    from api import background_process as bp
-
     pr = ProcessRegistry()
-    for attr in bp._REGISTRY_CONSUMED_CONTRACT:
-        assert hasattr(pr, attr), (
-            f"ProcessRegistry.{attr} is gone — the WebUI cross-A/B wakeup "
-            f"dedupe coupling (Copilot #2242 #4) is broken. Either restore it "
-            f"or add a PUBLIC mark_completion_consumed() upstream and switch "
-            f"api/background_process._mark_registry_completion_consumed to it."
-        )
-    # Shape contract: the write target must be a set-like (supports .add) and
-    # the guard must be a usable context manager (supports `with`).
-    assert hasattr(pr._completion_consumed, "add"), (
-        "ProcessRegistry._completion_consumed is no longer a set-like "
-        "(.add gone) — cross-A/B wakeup dedupe write would fail."
-    )
-    assert hasattr(pr._lock, "__enter__") and hasattr(pr._lock, "__exit__"), (
-        "ProcessRegistry._lock is no longer a context manager — the guarded "
-        "marker write in _mark_registry_completion_consumed would fail."
-    )
     assert callable(pr.is_completion_consumed), (
         "ProcessRegistry.is_completion_consumed must stay a public method "
         "(the cross-A/B dedupe READ side depends on it)."
     )
 
-    # End-to-end: the public read sees what the guarded private write sets
-    # (the exact mechanism _mark_registry_completion_consumed relies on).
     pid = "proc_contract_test"
     assert pr.is_completion_consumed(pid) is False
-    with pr._lock:
-        pr._completion_consumed.add(pid)
-    assert pr.is_completion_consumed(pid) is True
+    if not hasattr(pr, "finish_notification_delivery"):
+        pytest.skip(
+            "installed Hermes Agent predates atomic delivery settlement; "
+            "managed release admission rejects it"
+        )
+    assert callable(pr.finish_notification_delivery)
 
 
-def test_mark_registry_completion_consumed_fails_loud_on_rename(monkeypatch, caplog):
-    """A renamed private attr must log ERROR (contract violation), NOT be
-    swallowed silently at DEBUG (the pre-Copilot-#4 behavior)."""
+def test_atomic_registry_settlement_failure_is_loud(monkeypatch, caplog):
+    """A settlement API failure is logged and leaves the event replayable."""
     import logging
 
-    class _RenamedRegistry:
-        # Simulates an upstream rename: _completion_consumed -> _consumed_v2.
-        def __init__(self):
-            self._lock = threading.Lock()
-            self._consumed_v2: set[str] = set()
+    class _FailingRegistry:
+        def finish_notification_delivery(self, event, committed):
+            raise OSError("outbox unavailable")
 
-        def is_completion_consumed(self, pid: str) -> bool:
-            return pid in self._consumed_v2
-
-    fake = _RenamedRegistry()
+    fake = _FailingRegistry()
     _install_fake_registry(monkeypatch, fake)
 
-    from api import background_process as bp
+    from api import streaming
 
-    with caplog.at_level(logging.ERROR, logger="api.background_process"):
-        bp._mark_registry_completion_consumed("p-renamed")
+    evt = {
+        "event_id": "process:p-failed:completion",
+        "type": "completion",
+        "session_id": "p-failed",
+        "session_key": "sess-failed",
+    }
+
+    with caplog.at_level(logging.WARNING, logger="api.streaming"):
+        assert streaming._finish_process_completion_delivery(
+            fake,
+            evt,
+            committed=True,
+        ) is False
 
     assert any(
-        "coupling contract VIOLATED" in r.message and r.levelno >= logging.ERROR
+        "Failed to finish durable process completion delivery" in r.message
+        and r.levelno >= logging.WARNING
         for r in caplog.records
-    ), "a renamed registry private attr must surface as an ERROR, not a silent DEBUG"
-    # The marker was NOT set (the bug it guards against), but it failed LOUD so
-    # CI / monitoring catches it instead of double-firing wakeups silently.
-    assert not fake.is_completion_consumed("p-renamed")
+    )
 
 
 def test_emit_uses_new_event_name_with_trimmed_payload_and_event_id(monkeypatch):
