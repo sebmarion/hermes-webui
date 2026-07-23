@@ -1141,10 +1141,26 @@ def test_gateway_bootout_freezes_before_marker_and_resumes_after_bootout(
             or {"status": "stopped"}
         ),
     )
+
+    def wait_for_exact_exit(
+        row,
+        timeout,
+        *,
+        allow_exact_signaled_zombie,
+    ):
+        events.append(
+            (
+                "wait-exit",
+                row,
+                timeout,
+                allow_exact_signaled_zombie,
+            )
+        )
+
     monkeypatch.setattr(
         cutover,
         "wait_for_exact_process_exit",
-        lambda row, timeout: events.append(("wait-exit", row, timeout)),
+        wait_for_exact_exit,
     )
 
     receipt = cutover._bootout_exact_frozen_legacy_gateway(
@@ -1160,7 +1176,7 @@ def test_gateway_bootout_freezes_before_marker_and_resumes_after_bootout(
         ("prepare-stop",),
         ("bootout", True, True),
         ("signal", signal.SIGCONT),
-        ("wait-exit", identity, 1.0),
+        ("wait-exit", identity, 1.0, True),
     ]
     assert receipt["status"] == "stopped"
     assert receipt["bootout"]["retirement"] == "pending-exact-frozen-root"

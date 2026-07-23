@@ -13828,6 +13828,7 @@ def _bootout_exact_frozen_legacy_gateway(
         wait_for_exact_process_exit(
             gateway_identity,
             float(plan["timeout_seconds"]),
+            allow_exact_signaled_zombie=True,
         )
     except Exception:
         if frozen and _exact_process_is_alive(gateway_identity):
