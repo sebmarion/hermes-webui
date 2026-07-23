@@ -1920,6 +1920,18 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   restores the captured mode and bytes (or removes a transaction-created
   lock); rollback permits an inode rebind only when the signed state-snapshot
   restore receipt proves the transaction-owned replacement.
+- Legacy gateway retirement does not rely on launchd's default SIGTERM exit
+  timeout. The durable stop intent first captures the exact launchd
+  `print-disabled` state and requires the service to be semantically enabled.
+  At the zero-work retirement boundary, the transaction disables the exact
+  label's KeepAlive restart, rechecks the PID/start token, listener, job, and
+  process checkpoint, sends an exact SIGINT, and waits for a fresh
+  clean-shutdown receipt before booting out the now-inactive job. The label is
+  re-enabled after either success or failure. Crash resume reuses the durable
+  restart-control intent; pre-snapshot abort re-enables it before adopting or
+  exactly restarting the attested legacy binding. Ambiguous listeners, PID
+  reuse, foreign runtime identity, and malformed launchd override output all
+  fail closed.
 - The same capture/CAS normalization applies to the two synthetic completion
   stores. Candidate and quarantine JSON is always private `0600`, while an
   exact legacy `0644` source mode is retained in the journal for abort or

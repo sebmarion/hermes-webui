@@ -8567,7 +8567,19 @@ def test_gateway_stop_rechecks_checkpoint_before_bootout(tmp_path, monkeypatch):
         "planned_stop": {
             "path": str(cutover._legacy_gateway_planned_stop_path(plan)),
             "payload": {"release_transaction_id": plan["transaction_id"]},
-        }
+        },
+        "launchd_restart_control": {
+            "status": "prepared",
+            "initial": {
+                "target": "gui/501/ai.hermes.gateway",
+                "disabled": False,
+            },
+            "restore_semantics": "enabled",
+        },
+        "clean_shutdown_baseline": {
+            "exists": False,
+            "mtime_ns": None,
+        },
     }
     bootouts = []
     marker_writes = []
@@ -8600,6 +8612,19 @@ def test_gateway_stop_rechecks_checkpoint_before_bootout(tmp_path, monkeypatch):
         cutover,
         "_job_pid",
         lambda _plan, *, gateway: 41 if gateway else None,
+    )
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(
+        cutover,
+        "_pid_start_token",
+        lambda _pid: "gateway-start",
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_set_launchd_service_disabled",
+        lambda *_args, disabled, **_kwargs: {
+            "status": "disabled" if disabled else "enabled"
+        },
     )
     monkeypatch.setattr(
         cutover,
@@ -8642,7 +8667,19 @@ def test_gateway_stop_rechecks_exact_owner_after_second_checkpoint(
         "planned_stop": {
             "path": str(cutover._legacy_gateway_planned_stop_path(plan)),
             "payload": {"release_transaction_id": plan["transaction_id"]},
-        }
+        },
+        "launchd_restart_control": {
+            "status": "prepared",
+            "initial": {
+                "target": "gui/501/ai.hermes.gateway",
+                "disabled": False,
+            },
+            "restore_semantics": "enabled",
+        },
+        "clean_shutdown_baseline": {
+            "exists": False,
+            "mtime_ns": None,
+        },
     }
     bootouts = []
     job_pids = iter([41, 99])
@@ -8660,6 +8697,13 @@ def test_gateway_stop_rechecks_exact_owner_after_second_checkpoint(
         cutover,
         "_job_pid",
         lambda _plan, *, gateway: next(job_pids) if gateway else None,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_set_launchd_service_disabled",
+        lambda *_args, disabled, **_kwargs: {
+            "status": "disabled" if disabled else "enabled"
+        },
     )
     monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
     monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")

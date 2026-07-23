@@ -1624,6 +1624,12 @@ completions. These tests model cooperating writers on a bounded
 single-operator host; they do not assert exclusion of a malicious same-uid
 actor.
 
+Gateway retirement coverage also proves exact launchd override parsing,
+KeepAlive disable-before-SIGINT ordering, PID/start/listener/job rechecks,
+fresh clean-shutdown enforcement, idempotent resume after process exit,
+re-enable-on-error, ambiguous-listener refusal, and pre-snapshot abort recovery
+for healthy replacement, clean absence, and foreign-owner cases.
+
 
 ---
 

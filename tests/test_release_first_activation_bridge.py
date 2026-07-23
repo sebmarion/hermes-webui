@@ -1109,6 +1109,799 @@ def test_graceful_gateway_stop_takes_tick_lock_before_process_admission(
     assert ".jobs.lock" not in str(cutover._legacy_cron_tick_lock_path(plan))
 
 
+def test_launchd_service_override_receipt_is_exact_label_scoped(monkeypatch):
+    plan = {
+        "gateway_launchd_domain": "gui/501",
+        "gateway_launchd_label": "ai.hermes.gateway",
+    }
+    output = """
+        disabled services = {
+            "ai.hermes.gateway.backup" => disabled
+            "ai.hermes.gateway" => enabled
+        }
+    """
+    monkeypatch.setattr(
+        cutover,
+        "_run_launchctl",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=output,
+            stderr="",
+        ),
+    )
+
+    receipt = cutover._launchd_service_override_receipt(
+        plan,
+        gateway=True,
+    )
+
+    assert receipt == {
+        "target": "gui/501/ai.hermes.gateway",
+        "domain": "gui/501",
+        "label": "ai.hermes.gateway",
+        "disabled": False,
+        "override": "enabled",
+    }
+
+
+def test_launchd_service_override_receipt_rejects_malformed_exact_row(
+    monkeypatch,
+):
+    plan = {
+        "gateway_launchd_domain": "gui/501",
+        "gateway_launchd_label": "ai.hermes.gateway",
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_run_launchctl",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                'disabled services = {\n'
+                '  "ai.hermes.gateway" => unknown\n'
+                '}\n'
+            ),
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="state is invalid",
+    ):
+        cutover._launchd_service_override_receipt(
+            plan,
+            gateway=True,
+        )
+
+
+def test_set_launchd_service_disabled_uses_exact_target_and_rechecks(
+    monkeypatch,
+):
+    plan = {
+        "gateway_launchd_domain": "gui/501",
+        "gateway_launchd_label": "ai.hermes.gateway",
+    }
+    control = {
+        "status": "prepared",
+        "initial": {
+            "target": "gui/501/ai.hermes.gateway",
+            "domain": "gui/501",
+            "label": "ai.hermes.gateway",
+            "disabled": False,
+            "override": "absent",
+        },
+        "restore_semantics": "enabled",
+    }
+    disabled = False
+    calls = []
+
+    def launchctl(*args, **_kwargs):
+        nonlocal disabled
+        calls.append(args)
+        if args == ("print-disabled", "gui/501"):
+            value = "disabled" if disabled else "enabled"
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    'disabled services = {\n'
+                    f'  "ai.hermes.gateway" => {value}\n'
+                    '}\n'
+                ),
+                stderr="",
+            )
+        if args == ("disable", "gui/501/ai.hermes.gateway"):
+            disabled = True
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected launchctl call: {args!r}")
+
+    monkeypatch.setattr(cutover, "_run_launchctl", launchctl)
+
+    receipt = cutover._set_launchd_service_disabled(
+        plan,
+        control,
+        disabled=True,
+    )
+
+    assert calls == [
+        ("print-disabled", "gui/501"),
+        ("disable", "gui/501/ai.hermes.gateway"),
+        ("print-disabled", "gui/501"),
+    ]
+    assert receipt["status"] == "disabled"
+    assert receipt["after"]["disabled"] is True
+
+
+def test_gateway_stop_intent_durably_captures_restart_control(
+    tmp_path,
+    monkeypatch,
+):
+    plan = {
+        "gateway_launchd_domain": "gui/501",
+        "gateway_launchd_label": "ai.hermes.gateway",
+        "gateway_listener_port": 8642,
+        "legacy_state_db": str(tmp_path / "state.db"),
+        "synthetic_process_notifications_path": str(
+            tmp_path / "process_notifications.json"
+        ),
+        "transaction_id": "restart-control-intent-transaction-000001",
+    }
+    prepared = {
+        "gateway": {
+            "pid": 41,
+            "pid_start_token": "gateway-start",
+        }
+    }
+    control = {
+        "target": "gui/501/ai.hermes.gateway",
+        "domain": "gui/501",
+        "label": "ai.hermes.gateway",
+        "disabled": False,
+        "override": "absent",
+    }
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_process_checkpoint_receipt",
+        lambda _plan: {"status": "verified", "active_records": 0},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_legacy_gateway_status",
+        lambda *_args, **_kwargs: (
+            {"start_time": 123},
+            {"sha256": "a" * 64, "mtime_ns": 100},
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_regular_file_baseline",
+        lambda *_args, **_kwargs: {
+            "exists": False,
+            "inode": None,
+            "mtime_ns": None,
+            "path": str(tmp_path / ".clean_shutdown"),
+            "sha256": None,
+            "size": 0,
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_gateway_log_baselines",
+        lambda _plan: [],
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_launchd_service_override_receipt",
+        lambda _plan, *, gateway: control,
+    )
+
+    intent = cutover._legacy_gateway_stop_intent_receipt(
+        plan,
+        prepared,
+        {"status": "verified"},
+    )
+
+    assert intent["launchd_restart_control"] == {
+        "status": "prepared",
+        "initial": control,
+        "restore_semantics": "enabled",
+    }
+
+
+def test_exact_gateway_retire_disables_restart_before_sigint_and_reenables(
+    tmp_path,
+    monkeypatch,
+):
+    plan = {
+        "gateway_launchd_domain": "gui/501",
+        "gateway_launchd_label": "ai.hermes.gateway",
+        "gateway_listener_port": 8642,
+        "interval_seconds": 0.01,
+        "synthetic_process_notifications_path": str(
+            tmp_path / "process_notifications.json"
+        ),
+        "timeout_seconds": 30,
+    }
+    identity = {"pid": 41, "pid_start_token": "gateway-start"}
+    initial = {
+        "target": "gui/501/ai.hermes.gateway",
+        "domain": "gui/501",
+        "label": "ai.hermes.gateway",
+        "disabled": False,
+        "override": "absent",
+    }
+    intent = {
+        "launchd_restart_control": {
+            "status": "prepared",
+            "initial": initial,
+            "restore_semantics": "enabled",
+        },
+        "clean_shutdown_baseline": {
+            "exists": False,
+            "mtime_ns": None,
+        },
+    }
+    state = {"alive": True, "job_loaded": True, "disabled": False}
+    events = []
+
+    def set_disabled(_plan, control, *, disabled):
+        assert control == intent["launchd_restart_control"]
+        state["disabled"] = disabled
+        events.append("disable" if disabled else "enable")
+        return {
+            "status": "disabled" if disabled else "enabled",
+            "target": initial["target"],
+        }
+
+    def signal_process(pid, sent_signal):
+        assert pid == 41
+        assert sent_signal == signal.SIGINT
+        assert state["disabled"] is True
+        events.append("sigint")
+
+    def wait_for_exit(row, timeout, *, allow_exact_signaled_zombie):
+        assert row == identity
+        assert timeout == 30
+        assert allow_exact_signaled_zombie is True
+        events.append("wait")
+        state["alive"] = False
+
+    def bootout(_plan, *, gateway, required):
+        assert gateway is True
+        assert required is False
+        assert state["alive"] is False
+        events.append("bootout")
+        state["job_loaded"] = False
+        return {
+            "status": "stopped",
+            "target": initial["target"],
+        }
+
+    monkeypatch.setattr(
+        cutover,
+        "_set_launchd_service_disabled",
+        set_disabled,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_exact_process_is_alive",
+        lambda _row: state["alive"],
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: (
+            41 if gateway and state["job_loaded"] and state["alive"] else None
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_listener_pid",
+        lambda _port: 41 if state["alive"] else None,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_pid_start_token",
+        lambda _pid: "gateway-start" if state["alive"] else None,
+    )
+    monkeypatch.setattr(cutover.os, "kill", signal_process)
+    monkeypatch.setattr(
+        cutover,
+        "wait_for_exact_process_exit",
+        wait_for_exit,
+    )
+    monkeypatch.setattr(cutover, "_bootout_job", bootout)
+    monkeypatch.setattr(
+        cutover,
+        "_regular_file_baseline",
+        lambda *_args, **_kwargs: {
+            "exists": True,
+            "mtime_ns": 200,
+            "sha256": "a" * 64,
+        },
+    )
+
+    receipt = cutover._retire_exact_legacy_gateway(
+        plan,
+        identity,
+        intent,
+        prepare_stop=lambda: events.append("prepare") or {
+            "status": "prepared"
+        },
+    )
+
+    assert events == [
+        "disable",
+        "prepare",
+        "sigint",
+        "wait",
+        "bootout",
+        "enable",
+    ]
+    assert receipt["status"] == "stopped"
+    assert receipt["signal"] == "SIGINT"
+    assert state == {"alive": False, "job_loaded": False, "disabled": False}
+
+
+def test_exact_gateway_retire_resumes_after_clean_process_exit(
+    tmp_path,
+    monkeypatch,
+):
+    plan = {
+        "gateway_launchd_domain": "gui/501",
+        "gateway_launchd_label": "ai.hermes.gateway",
+        "gateway_listener_port": 8642,
+        "interval_seconds": 0.01,
+        "synthetic_process_notifications_path": str(
+            tmp_path / "process_notifications.json"
+        ),
+        "timeout_seconds": 30,
+    }
+    identity = {"pid": 41, "pid_start_token": "gateway-start"}
+    control = {
+        "status": "prepared",
+        "initial": {
+            "target": "gui/501/ai.hermes.gateway",
+            "domain": "gui/501",
+            "label": "ai.hermes.gateway",
+            "disabled": False,
+            "override": "absent",
+        },
+        "restore_semantics": "enabled",
+    }
+    intent = {
+        "launchd_restart_control": control,
+        "clean_shutdown_baseline": {
+            "exists": False,
+            "mtime_ns": None,
+        },
+    }
+    events = []
+    monkeypatch.setattr(
+        cutover,
+        "_set_launchd_service_disabled",
+        lambda _plan, _control, *, disabled: (
+            events.append("disable" if disabled else "enable")
+            or {"status": "disabled" if disabled else "enabled"}
+        ),
+    )
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: False)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(
+        cutover.os,
+        "kill",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("clean resumed exit must not be signalled again")
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_regular_file_baseline",
+        lambda *_args, **_kwargs: {
+            "exists": True,
+            "mtime_ns": 200,
+            "sha256": "a" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *_args, **_kwargs: events.append("bootout")
+        or {"status": "stopped"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_listener_pid",
+        lambda _port: None,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: None,
+    )
+
+    receipt = cutover._retire_exact_legacy_gateway(
+        plan,
+        identity,
+        intent,
+        prepare_stop=lambda: (_ for _ in ()).throw(
+            AssertionError("already-clean exit must not prepare another signal")
+        ),
+    )
+
+    assert events == ["disable", "bootout", "enable"]
+    assert receipt["status"] == "stopped"
+    assert receipt["signal"] == "already-cleanly-exited"
+
+
+def test_exact_gateway_retire_rejects_unclean_prior_exit_and_reenables(
+    tmp_path,
+    monkeypatch,
+):
+    plan = {
+        "gateway_launchd_domain": "gui/501",
+        "gateway_launchd_label": "ai.hermes.gateway",
+        "gateway_listener_port": 8642,
+        "interval_seconds": 0.01,
+        "synthetic_process_notifications_path": str(
+            tmp_path / "process_notifications.json"
+        ),
+        "timeout_seconds": 30,
+    }
+    identity = {"pid": 41, "pid_start_token": "gateway-start"}
+    intent = {
+        "launchd_restart_control": {
+            "status": "prepared",
+            "initial": {
+                "target": "gui/501/ai.hermes.gateway",
+                "domain": "gui/501",
+                "label": "ai.hermes.gateway",
+                "disabled": False,
+                "override": "absent",
+            },
+            "restore_semantics": "enabled",
+        },
+        "clean_shutdown_baseline": {
+            "exists": False,
+            "mtime_ns": None,
+        },
+    }
+    events = []
+    monkeypatch.setattr(
+        cutover,
+        "_set_launchd_service_disabled",
+        lambda _plan, _control, *, disabled: (
+            events.append("disable" if disabled else "enable")
+            or {"status": "disabled" if disabled else "enabled"}
+        ),
+    )
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: False)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(
+        cutover,
+        "_regular_file_baseline",
+        lambda *_args, **_kwargs: {
+            "exists": False,
+            "mtime_ns": None,
+            "sha256": None,
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *_args, **_kwargs: events.append("unsafe-bootout"),
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="fresh clean-shutdown",
+    ):
+        cutover._retire_exact_legacy_gateway(
+            plan,
+            identity,
+            intent,
+            prepare_stop=lambda: {"status": "prepared"},
+        )
+
+    assert events == ["disable", "enable"]
+
+
+def test_exact_gateway_retire_rejects_ambiguous_listener_absence(
+    tmp_path,
+    monkeypatch,
+):
+    plan = {
+        "gateway_launchd_domain": "gui/501",
+        "gateway_launchd_label": "ai.hermes.gateway",
+        "gateway_listener_port": 8642,
+        "synthetic_process_notifications_path": str(
+            tmp_path / "process_notifications.json"
+        ),
+        "timeout_seconds": 30,
+    }
+    identity = {"pid": 41, "pid_start_token": "gateway-start"}
+    intent = {
+        "launchd_restart_control": {
+            "status": "prepared",
+            "initial": {
+                "target": "gui/501/ai.hermes.gateway",
+                "disabled": False,
+            },
+            "restore_semantics": "enabled",
+        },
+        "clean_shutdown_baseline": {
+            "exists": False,
+            "mtime_ns": None,
+        },
+    }
+    events = []
+    monkeypatch.setattr(
+        cutover,
+        "_set_launchd_service_disabled",
+        lambda _plan, _control, *, disabled: (
+            events.append("disable" if disabled else "enable")
+            or {"status": "disabled" if disabled else "enabled"}
+        ),
+    )
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: False)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(
+        cutover,
+        "_regular_file_baseline",
+        lambda *_args, **_kwargs: {
+            "exists": True,
+            "mtime_ns": 200,
+            "sha256": "a" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *_args, **_kwargs: events.append("bootout")
+        or {"status": "stopped"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_listener_pid",
+        lambda _port: (_ for _ in ()).throw(
+            cutover.DrainIdentityMismatch("ambiguous listener owners")
+        ),
+    )
+    monkeypatch.setattr(cutover, "_job_pid", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="ambiguous listener owners",
+    ):
+        cutover._retire_exact_legacy_gateway(
+            plan,
+            identity,
+            intent,
+            prepare_stop=lambda: {"status": "prepared"},
+        )
+
+    assert events == ["disable", "bootout", "enable"]
+
+
+def test_abort_restore_enables_restart_before_adopting_replacement(
+    monkeypatch,
+):
+    plan = {
+        "gateway_launchd_domain": "gui/501",
+        "gateway_launchd_label": "ai.hermes.gateway",
+    }
+    prepared = {
+        "gateway": {
+            "pid": 41,
+            "pid_start_token": "retired-start",
+        }
+    }
+    control = {
+        "status": "prepared",
+        "initial": {
+            "target": "gui/501/ai.hermes.gateway",
+            "disabled": False,
+        },
+        "restore_semantics": "enabled",
+    }
+    events = []
+    replacement = {
+        "status": "verified",
+        "pid": 52,
+        "pid_start_token": "replacement-start",
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_set_launchd_service_disabled",
+        lambda _plan, _control, *, disabled: (
+            events.append("enable")
+            or {"status": "enabled", "target": "gui/501/ai.hermes.gateway"}
+        )
+        if disabled is False
+        else (_ for _ in ()).throw(AssertionError("abort must enable")),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_restored_legacy_binding",
+        lambda _plan, *, prepared, gateway: (
+            events.append("attest") or replacement
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootstrap_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("healthy replacement must be adopted")
+        ),
+    )
+
+    receipt = cutover._restore_legacy_gateway_before_snapshot_abort(
+        plan,
+        prepared,
+        {"launchd_restart_control": control},
+    )
+
+    assert events == ["enable", "attest"]
+    assert receipt["gateway"] == replacement
+    assert receipt["recovery"]["status"] == "adopted-restored-binding"
+
+
+def test_abort_restore_restarts_when_exact_gateway_is_cleanly_absent(
+    monkeypatch,
+):
+    plan = {
+        "gateway_launchd_domain": "gui/501",
+        "gateway_launchd_label": "ai.hermes.gateway",
+        "gateway_listener_port": 8642,
+        "gateway_rollback_plist": "/tmp/legacy-gateway.plist",
+    }
+    prepared = {
+        "gateway": {
+            "pid": 41,
+            "pid_start_token": "retired-start",
+        }
+    }
+    control = {
+        "status": "prepared",
+        "initial": {
+            "target": "gui/501/ai.hermes.gateway",
+            "disabled": False,
+        },
+        "restore_semantics": "enabled",
+    }
+    events = []
+    restored = {
+        "status": "verified",
+        "pid": 53,
+        "pid_start_token": "restarted-start",
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_set_launchd_service_disabled",
+        lambda _plan, _control, *, disabled: (
+            events.append("enable")
+            or {"status": "enabled", "target": "gui/501/ai.hermes.gateway"}
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_restored_legacy_binding",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            cutover.ReleaseBuildError("listener absent")
+        ),
+    )
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: False)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: None)
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda _plan, *, gateway, required: (
+            events.append("bootout")
+            or {"status": "not-loaded", "target": "gui/501/ai.hermes.gateway"}
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootstrap_job",
+        lambda _plan, plist, *, gateway: (
+            events.append(("bootstrap", plist))
+            or {"status": "started", "target": "gui/501/ai.hermes.gateway"}
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_wait_for_legacy_binding",
+        lambda _plan, *, prepared, gateway: (
+            events.append("wait") or restored
+        ),
+    )
+
+    receipt = cutover._restore_legacy_gateway_before_snapshot_abort(
+        plan,
+        prepared,
+        {"launchd_restart_control": control},
+    )
+
+    assert events == [
+        "enable",
+        "bootout",
+        ("bootstrap", "/tmp/legacy-gateway.plist"),
+        "wait",
+    ]
+    assert receipt["gateway"]["pid"] == 53
+    assert receipt["gateway"]["restart"]["status"] == "started"
+    assert receipt["recovery"]["status"] == "restarted-cleanly-absent-binding"
+
+
+def test_abort_restore_rejects_foreign_gateway_owner(monkeypatch):
+    plan = {
+        "gateway_launchd_domain": "gui/501",
+        "gateway_launchd_label": "ai.hermes.gateway",
+        "gateway_listener_port": 8642,
+    }
+    prepared = {
+        "gateway": {
+            "pid": 41,
+            "pid_start_token": "retired-start",
+            "command": "expected command",
+        }
+    }
+    control = {
+        "status": "prepared",
+        "initial": {
+            "target": "gui/501/ai.hermes.gateway",
+            "disabled": False,
+        },
+        "restore_semantics": "enabled",
+    }
+    bootouts = []
+    monkeypatch.setattr(
+        cutover,
+        "_set_launchd_service_disabled",
+        lambda *_args, **_kwargs: {"status": "enabled"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_restored_legacy_binding",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            cutover.ReleaseBuildError("runtime changed")
+        ),
+    )
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: False)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 99)
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: 99,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_listener_process_receipt",
+        lambda *_args, **_kwargs: {"pid": 99, "command": "foreign command"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *_args, **_kwargs: bootouts.append(True),
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="unexpected gateway owner",
+    ):
+        cutover._restore_legacy_gateway_before_snapshot_abort(
+            plan,
+            prepared,
+            {"launchd_restart_control": control},
+        )
+
+    assert bootouts == []
+
+
 def test_gateway_bootout_freezes_before_marker_and_resumes_after_bootout(
     monkeypatch,
 ):

@@ -4525,6 +4525,98 @@ def _job_target(plan: dict, *, gateway: bool = False) -> str:
     return f"{plan[f'{prefix}launchd_domain']}/{plan[f'{prefix}launchd_label']}"
 
 
+def _launchd_service_override_receipt(
+    plan: dict,
+    *,
+    gateway: bool,
+) -> dict:
+    prefix = "gateway_" if gateway else ""
+    domain = str(plan[f"{prefix}launchd_domain"])
+    label = str(plan[f"{prefix}launchd_label"])
+    target = _job_target(plan, gateway=gateway)
+    if target != f"{domain}/{label}" or not label or any(
+        character in label for character in "\"\r\n"
+    ):
+        raise ReleaseBuildError("launchd service override target is invalid")
+    completed = _run_launchctl("print-disabled", domain)
+    matches = re.findall(
+        rf'(?m)^[ \t]*"{re.escape(label)}"[ \t]*=>[ \t]*'
+        r'([^\r\n]*?)[ \t]*$',
+        completed.stdout,
+    )
+    if len(matches) > 1:
+        raise DrainIdentityMismatch(
+            "launchd service override state is ambiguous"
+        )
+    if matches:
+        override = matches[0].strip()
+        if override not in {"enabled", "disabled"}:
+            raise DrainIdentityMismatch(
+                "launchd service override state is invalid"
+            )
+    else:
+        if re.search(
+            rf'(?m)^[ \t]*"{re.escape(label)}"(?:[ \t]|$)',
+            completed.stdout,
+        ):
+            raise DrainIdentityMismatch(
+                "launchd service override state is invalid"
+            )
+        override = "absent"
+    return {
+        "target": target,
+        "domain": domain,
+        "label": label,
+        "disabled": override == "disabled",
+        "override": override,
+    }
+
+
+def _set_launchd_service_disabled(
+    plan: dict,
+    control: dict,
+    *,
+    disabled: bool,
+) -> dict:
+    if not isinstance(control, dict):
+        raise ReleaseBuildError(
+            "legacy gateway launchd restart control is invalid"
+        )
+    initial = control.get("initial")
+    expected = _job_target(plan, gateway=True)
+    if (
+        control.get("status") != "prepared"
+        or control.get("restore_semantics") != "enabled"
+        or not isinstance(initial, dict)
+        or initial.get("target") != expected
+        or initial.get("disabled") is not False
+    ):
+        raise ReleaseBuildError(
+            "legacy gateway launchd restart control is invalid"
+        )
+    before = _launchd_service_override_receipt(plan, gateway=True)
+    if before["target"] != expected:
+        raise DrainIdentityMismatch(
+            "legacy gateway launchd restart target changed"
+        )
+    if before["disabled"] != disabled:
+        _run_launchctl(
+            "disable" if disabled else "enable",
+            expected,
+        )
+    after = _launchd_service_override_receipt(plan, gateway=True)
+    if after["target"] != expected or after["disabled"] != disabled:
+        raise DrainIdentityMismatch(
+            "legacy gateway launchd restart state did not change exactly"
+        )
+    return {
+        "status": "disabled" if disabled else "enabled",
+        "target": expected,
+        "before": before,
+        "after": after,
+    }
+
+
 def _job_pid(plan: dict, *, gateway: bool = False) -> int | None:
     completed = _run_launchctl("print", _job_target(plan, gateway=gateway), check=False)
     if completed.returncode != 0:
@@ -13248,6 +13340,14 @@ def _legacy_gateway_stop_intent_receipt(
         status_path,
         label="legacy gateway status",
     )
+    restart_control = _launchd_service_override_receipt(
+        plan,
+        gateway=True,
+    )
+    if restart_control["disabled"]:
+        raise ReleaseBuildError(
+            "legacy gateway launchd service is already disabled"
+        )
     payload = {
         "target_pid": int(gateway["pid"]),
         "target_start_time": status.get("start_time"),
@@ -13271,6 +13371,11 @@ def _legacy_gateway_stop_intent_receipt(
         "planned_stop": {
             "path": str(_legacy_gateway_planned_stop_path(plan)),
             "payload": payload,
+        },
+        "launchd_restart_control": {
+            "status": "prepared",
+            "initial": restart_control,
+            "restore_semantics": "enabled",
         },
         "clean_shutdown_baseline": _regular_file_baseline(
             _legacy_gateway_clean_shutdown_path(plan),
@@ -13851,6 +13956,148 @@ def _bootout_exact_frozen_legacy_gateway(
     }
 
 
+def _retire_exact_legacy_gateway(
+    plan: dict,
+    gateway_identity: dict,
+    intent: dict,
+    *,
+    prepare_stop: Callable[[], dict],
+) -> dict:
+    restart_control = (
+        intent.get("launchd_restart_control")
+        if isinstance(intent, dict)
+        else None
+    )
+    clean_baseline = (
+        intent.get("clean_shutdown_baseline")
+        if isinstance(intent, dict)
+        else None
+    )
+    if not isinstance(restart_control, dict) or not isinstance(
+        clean_baseline,
+        dict,
+    ):
+        raise ReleaseBuildError(
+            "legacy gateway restart-control intent is invalid"
+        )
+    disabled = _set_launchd_service_disabled(
+        plan,
+        restart_control,
+        disabled=True,
+    )
+    signal_status = "already-cleanly-exited"
+    prepared_stop: dict | None = None
+    bootout: dict | None = None
+    clean: dict | None = None
+    try:
+        pid = int(gateway_identity["pid"])
+        expected_start = str(gateway_identity["pid_start_token"])
+        if _exact_process_is_alive(gateway_identity):
+            if (
+                _job_pid(plan, gateway=True) != pid
+                or _listener_pid(int(plan["gateway_listener_port"])) != pid
+                or _pid_start_token(pid) != expected_start
+            ):
+                raise DrainIdentityMismatch(
+                    "gateway owner changed immediately before graceful stop"
+                )
+            prepared_stop = prepare_stop()
+            if (
+                not _exact_process_is_alive(gateway_identity)
+                or _job_pid(plan, gateway=True) != pid
+                or _listener_pid(int(plan["gateway_listener_port"])) != pid
+                or _pid_start_token(pid) != expected_start
+            ):
+                raise DrainIdentityMismatch(
+                    "gateway owner changed immediately before SIGINT"
+                )
+            try:
+                os.kill(pid, signal.SIGINT)
+            except OSError as exc:
+                raise DrainIdentityMismatch(
+                    "legacy gateway exact SIGINT failed"
+                ) from exc
+            signal_status = "SIGINT"
+            wait_for_exact_process_exit(
+                gateway_identity,
+                float(plan["timeout_seconds"]),
+                allow_exact_signaled_zombie=True,
+            )
+        elif _pid_start_token(pid) is not None:
+            raise DrainIdentityMismatch(
+                "retired legacy gateway PID was reused"
+            )
+
+        clean = _regular_file_baseline(
+            _legacy_gateway_clean_shutdown_path(plan),
+            label="legacy gateway clean-shutdown marker",
+        )
+        baseline_exists = bool(clean_baseline.get("exists"))
+        if (
+            not clean["exists"]
+            or (
+                baseline_exists
+                and int(clean.get("mtime_ns") or 0)
+                <= int(clean_baseline.get("mtime_ns") or 0)
+            )
+        ):
+            raise ReleaseBuildError(
+                "legacy gateway has no fresh clean-shutdown receipt"
+            )
+
+        bootout = _bootout_job(
+            plan,
+            gateway=True,
+            required=False,
+        )
+        listener_before = _listener_pid(
+            int(plan["gateway_listener_port"])
+        )
+        job_pid = _job_pid(plan, gateway=True)
+        listener_after = _listener_pid(
+            int(plan["gateway_listener_port"])
+        )
+        if (
+            listener_before is not None
+            or job_pid is not None
+            or listener_after is not None
+        ):
+            raise DrainIdentityMismatch(
+                "legacy gateway did not reach an absent graceful-stop boundary"
+            )
+    except BaseException as original:
+        try:
+            _set_launchd_service_disabled(
+                plan,
+                restart_control,
+                disabled=False,
+            )
+        except Exception as restore_error:
+            raise ReleaseBuildError(
+                "legacy gateway graceful stop failed and launchd "
+                "restart state could not be restored"
+            ) from restore_error
+        raise
+    enabled = _set_launchd_service_disabled(
+        plan,
+        restart_control,
+        disabled=False,
+    )
+    return {
+        "status": "stopped",
+        "gateway": copy.deepcopy(gateway_identity),
+        "signal": signal_status,
+        "prepare_stop": prepared_stop,
+        "clean_shutdown": clean,
+        "bootout": bootout,
+        "launchd_restart": {
+            "disabled": disabled,
+            "restored": enabled,
+        },
+        "exact_exit_confirmed": True,
+    }
+
+
 def _gracefully_stop_legacy_gateway(
     plan: dict,
     prepared: dict,
@@ -13872,14 +14119,17 @@ def _gracefully_stop_legacy_gateway(
 
     def stop_gateway() -> dict:
         gateway_alive = _exact_process_is_alive(gateway_identity)
-        gateway_job = _job_pid(plan, gateway=True)
-        frozen_stop: dict | None = None
-        if gateway_alive and gateway_job == int(gateway_identity["pid"]):
-            def prepare_frozen_stop() -> dict:
-                # With the exact gateway stopped, no marker watcher can race
-                # launchd's SIGTERM. Recheck durable work and ownership first,
-                # then expose the planned-stop marker immediately before
-                # bootout queues the sole shutdown signal.
+        gateway_job = (
+            _job_pid(plan, gateway=True)
+            if gateway_alive
+            else None
+        )
+        retired: dict | None = None
+        if (
+            gateway_alive
+            and gateway_job == int(gateway_identity["pid"])
+        ) or not gateway_alive:
+            def prepare_exact_stop() -> dict:
                 checkpoint = _legacy_process_checkpoint_receipt(plan)
                 if (
                     _listener_pid(int(plan["gateway_listener_port"]))
@@ -13892,19 +14142,15 @@ def _gracefully_stop_legacy_gateway(
                     raise DrainIdentityMismatch(
                         "gateway owner changed immediately before graceful stop"
                     )
-                marker = _write_exact_private_json(
-                    Path(planned["path"]),
-                    planned["payload"],
-                    label="legacy gateway planned-stop marker",
-                )
-                return {"checkpoint": checkpoint, "marker": marker}
+                return {"checkpoint": checkpoint}
 
-            frozen_stop = _bootout_exact_frozen_legacy_gateway(
+            retired = _retire_exact_legacy_gateway(
                 plan,
                 gateway_identity,
-                prepare_stop=prepare_frozen_stop,
+                intent,
+                prepare_stop=prepare_exact_stop,
             )
-            bootout = frozen_stop["bootout"]
+            bootout = retired["bootout"]
         elif gateway_alive and gateway_job is None:
             bootout = {"status": "externally-reconciled"}
             wait_for_exact_process_exit(
@@ -13935,8 +14181,8 @@ def _gracefully_stop_legacy_gateway(
             "bootout": bootout,
             "exact_exit_confirmed": True,
         }
-        if frozen_stop is not None:
-            receipt["frozen_stop"] = frozen_stop
+        if retired is not None:
+            receipt["retired"] = retired
         return receipt
 
     retirement = _run_process_registry_retirement_barrier(
@@ -14153,6 +14399,131 @@ def _restore_or_resume_frozen_legacy_webui(
     return {"writers": writers, "binding": binding}
 
 
+def _restore_legacy_gateway_before_snapshot_abort(
+    plan: dict,
+    prepared: dict,
+    stop_intent: dict | None,
+) -> dict:
+    gateway_identity = prepared.get("gateway")
+    if not isinstance(gateway_identity, dict):
+        raise ReleaseBuildError(
+            "prepared legacy gateway identity is invalid"
+        )
+    restart_control = (
+        stop_intent.get("launchd_restart_control")
+        if isinstance(stop_intent, dict)
+        else None
+    )
+    if isinstance(restart_control, dict):
+        launchd_restart = _set_launchd_service_disabled(
+            plan,
+            restart_control,
+            disabled=False,
+        )
+    else:
+        launchd_restart = {"status": "not-required"}
+
+    try:
+        gateway = _attest_restored_legacy_binding(
+            plan,
+            prepared=prepared,
+            gateway=True,
+        )
+    except (DrainIdentityMismatch, ReleaseBuildError) as attestation_error:
+        if _exact_process_is_alive(gateway_identity):
+            if _job_pid(plan, gateway=True) != int(gateway_identity["pid"]):
+                raise ReleaseBuildError(
+                    "legacy gateway graceful stop is incomplete; "
+                    "refusing duplicate restart"
+                ) from attestation_error
+            gateway = _wait_for_legacy_binding(
+                plan,
+                prepared=prepared,
+                gateway=True,
+            )
+            recovery = {
+                "status": "resumed-prepared-binding",
+                "pid": gateway["pid"],
+                "pid_start_token": gateway["pid_start_token"],
+            }
+        else:
+            retired_pid = int(gateway_identity["pid"])
+            if _pid_start_token(retired_pid) is not None:
+                raise DrainIdentityMismatch(
+                    "retired legacy gateway PID was reused before abort restore"
+                ) from attestation_error
+            try:
+                listener = _listener_pid(int(plan["gateway_listener_port"]))
+            except DrainIdentityMismatch as exc:
+                raise DrainIdentityMismatch(
+                    "ambiguous gateway listener blocks pre-snapshot abort"
+                ) from exc
+            if listener is not None:
+                job_pid = _job_pid(plan, gateway=True)
+                if job_pid != listener:
+                    raise DrainIdentityMismatch(
+                        "unexpected gateway owner blocks pre-snapshot abort"
+                    ) from attestation_error
+                runtime = _listener_process_receipt(
+                    plan,
+                    gateway=True,
+                    require_git_source=False,
+                )
+                if not _runtime_receipt_matches(
+                    runtime,
+                    gateway_identity,
+                ):
+                    raise DrainIdentityMismatch(
+                        "unexpected gateway owner blocks pre-snapshot abort"
+                    ) from attestation_error
+                gateway = _wait_for_legacy_binding(
+                    plan,
+                    prepared=prepared,
+                    gateway=True,
+                )
+                recovery = {
+                    "status": "adopted-starting-restored-binding",
+                    "pid": gateway["pid"],
+                    "pid_start_token": gateway["pid_start_token"],
+                }
+            else:
+                bootout = _bootout_job(
+                    plan,
+                    gateway=True,
+                    required=False,
+                )
+                started = _bootstrap_job(
+                    plan,
+                    plan["gateway_rollback_plist"],
+                    gateway=True,
+                )
+                gateway = {
+                    **_wait_for_legacy_binding(
+                        plan,
+                        prepared=prepared,
+                        gateway=True,
+                    ),
+                    "pre_restart_bootout": bootout,
+                    "restart": started,
+                }
+                recovery = {
+                    "status": "restarted-cleanly-absent-binding",
+                    "pid": gateway["pid"],
+                    "pid_start_token": gateway["pid_start_token"],
+                }
+    else:
+        recovery = {
+            "status": "adopted-restored-binding",
+            "pid": gateway["pid"],
+            "pid_start_token": gateway["pid_start_token"],
+        }
+    return {
+        "gateway": gateway,
+        "launchd_restart": launchd_restart,
+        "recovery": recovery,
+    }
+
+
 def _restore_legacy_before_snapshot_abort(
     plan: dict,
     prepared: dict,
@@ -14207,9 +14578,6 @@ def _restore_legacy_before_snapshot_abort(
                 planned["payload"],
                 label="legacy gateway planned-stop marker",
             )
-    gateway_identity = prepared["gateway"]
-    gateway_alive = _exact_process_is_alive(gateway_identity)
-    gateway_job = _job_pid(plan, gateway=True)
     dispatcher_lock: dict | None = None
     durable_dispatcher_lock = phases.get("legacy_dispatcher_lock_acquired")
     if isinstance(durable_dispatcher_lock, dict):
@@ -14247,40 +14615,12 @@ def _restore_legacy_before_snapshot_abort(
         )
     else:
         synthetic_store_modes = {"status": "not-required"}
-    if gateway_alive:
-        if gateway_job != int(gateway_identity["pid"]):
-            raise ReleaseBuildError(
-                "legacy gateway graceful stop is incomplete; refusing duplicate restart"
-            )
-        gateway = _wait_for_legacy_binding(
-            plan,
-            prepared=prepared,
-            gateway=True,
-        )
-    else:
-        try:
-            listener = _listener_pid(int(plan["gateway_listener_port"]))
-        except DrainIdentityMismatch:
-            listener = None
-        if listener is not None or gateway_job is not None:
-            raise DrainIdentityMismatch(
-                "unexpected gateway owner blocks pre-snapshot abort"
-            )
-        if dispatcher_lock is not None:
-            dispatcher_lock = _release_legacy_dispatcher_lock(plan)
-        started = _bootstrap_job(
-            plan,
-            plan["gateway_rollback_plist"],
-            gateway=True,
-        )
-        gateway = {
-            **_wait_for_legacy_binding(
-                plan,
-                prepared=prepared,
-                gateway=True,
-            ),
-            "restart": started,
-        }
+    gateway_restore = _restore_legacy_gateway_before_snapshot_abort(
+        plan,
+        prepared,
+        stop_intent if isinstance(stop_intent, dict) else None,
+    )
+    gateway = gateway_restore["gateway"]
     restored_webui = _restore_or_resume_frozen_legacy_webui(
         plan,
         prepared=prepared,
@@ -14294,6 +14634,8 @@ def _restore_legacy_before_snapshot_abort(
         "reason_sha256": hashlib.sha256(str(original).encode()).hexdigest(),
         "markers": marker_receipts,
         "gateway": gateway,
+        "gateway_launchd_restart": gateway_restore["launchd_restart"],
+        "gateway_recovery": gateway_restore["recovery"],
         "webui": webui,
         "cli": cli,
         "pre_managed_controls": controls,
