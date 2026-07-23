@@ -3580,6 +3580,13 @@ _CUTOVER_PLAN_PATH_KEYS = {
     "synthetic_async_delegations_path",
     "synthetic_quarantine_root",
 }
+_CUTOVER_MUTABLE_REFERENCE_PATH_KEYS = {
+    "watchdog_state_file",
+    "watchdog_scheduler_registry",
+    "legacy_state_db",
+    "synthetic_process_notifications_path",
+    "synthetic_async_delegations_path",
+}
 _VERIFIED_RELEASE_IDENTITY_KEYS = {
     "build_id",
     "commit",
@@ -3680,7 +3687,10 @@ def _load_cutover_plan(path: Path | str) -> dict:
                 raise ReleaseBuildError(
                     "cutover plan mutable state paths overlap"
                 )
-    for key in _CUTOVER_PLAN_PATH_KEYS.intersection(plan):
+    for key in (
+        _CUTOVER_PLAN_PATH_KEYS.intersection(plan)
+        - _CUTOVER_MUTABLE_REFERENCE_PATH_KEYS
+    ):
         artifact = Path(plan[key])
         for raw_mutable in normalized_mutable:
             mutable = Path(raw_mutable)

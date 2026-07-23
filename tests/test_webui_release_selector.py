@@ -2792,6 +2792,22 @@ def test_expected_old_interpreter_plan_path_allows_only_its_leaf_symlink(tmp_pat
         cutover._absolute_plan_path(configured, label="installed_plist")
 
 
+def test_cutover_mutable_references_are_not_classified_as_artifacts():
+    assert cutover._CUTOVER_MUTABLE_REFERENCE_PATH_KEYS == {
+        "watchdog_state_file",
+        "watchdog_scheduler_registry",
+        "legacy_state_db",
+        "synthetic_process_notifications_path",
+        "synthetic_async_delegations_path",
+    }
+    assert not {
+        "signing_key_file",
+        "selector_state",
+        "transaction_journal",
+        "installed_plist",
+    } & cutover._CUTOVER_MUTABLE_REFERENCE_PATH_KEYS
+
+
 def test_internal_watchdog_receipt_is_scoped_to_exact_job(tmp_path):
     plan, registry = _internal_watchdog_plan(tmp_path)
 
