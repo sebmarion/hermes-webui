@@ -6038,10 +6038,85 @@ def _reconcile_cutover_journal(
 
 
 def _inspect_cutover_plan(plan: dict) -> dict:
+    selector_state = release_selector.read_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+    )
+    candidate = plan["expected_candidate_identity"]
+    candidate_id = candidate["build_id"]
+    last_good_id = plan["last_good_identity"]["build_id"]
+    promoted = (
+        selector_state["current"] == candidate_id
+        and selector_state["last_good"] == candidate_id
+        and selector_state["candidate"] is None
+        and selector_state.get("pending_transaction_id") is None
+    )
+    if promoted:
+        startup_value = candidate.get("selector_generation")
+        if (
+            not isinstance(startup_value, int)
+            or isinstance(startup_value, bool)
+            or startup_value <= 0
+            or startup_value > selector_state["generation"]
+            or selector_state["releases"].get(candidate_id)
+            != _release_record_from_identity(candidate)
+        ):
+            raise ReleaseBuildError(
+                "promoted candidate selector generation changed"
+            )
+        startup_generation = {
+            "status": "already-promoted",
+            "staged_generation": startup_value - 1,
+            "startup_generation": startup_value,
+            "current_generation": selector_state["generation"],
+        }
+    elif (
+        selector_state["current"] == candidate_id
+        and selector_state["candidate"] == candidate_id
+        and selector_state.get("pending_transaction_id")
+        == plan["transaction_id"]
+    ):
+        if candidate.get("selector_generation") != selector_state["generation"]:
+            raise ReleaseBuildError(
+                "active candidate selector generation changed"
+            )
+        startup_generation = {
+            "staged_generation": selector_state["generation"] - 1,
+            "startup_generation": selector_state["generation"],
+        }
+    else:
+        staged_state = copy.deepcopy(selector_state)
+        if staged_state["candidate"] is None:
+            staged_state = release_selector.stage_candidate(
+                staged_state,
+                candidate_id,
+                _release_record_from_identity(candidate),
+                transaction_id=plan["transaction_id"],
+            )
+            staged_state["generation"] += 1
+        if staged_state["current"] != last_good_id:
+            raise ReleaseBuildError(
+                "candidate selector is not staged from last-good"
+            )
+        startup_generation = _attest_candidate_startup_generation(
+            plan,
+            staged_state,
+        )
     result: dict[str, object] = {
         "status": "verified",
         "transaction_id": plan["transaction_id"],
-        "selector": _selector_state_attestation(plan),
+        "selector": {
+            "status": "verified",
+            "transaction_id": plan["transaction_id"],
+            "generation": selector_state["generation"],
+            "current": selector_state["current"],
+            "candidate": selector_state["candidate"],
+            "pending_transaction_id": selector_state.get(
+                "pending_transaction_id"
+            ),
+            "last_good": selector_state["last_good"],
+        },
+        "candidate_startup_generation": startup_generation,
         "installed_plist": _installed_plist_attestation(plan),
         "snapshot_manifest_sha256": (
             sha256_file(Path(plan["snapshot_manifest"]))
@@ -7359,6 +7434,36 @@ def _prepare_bootstrap_selector(plan: dict) -> dict:
     return state
 
 
+def _attest_candidate_startup_generation(
+    plan: dict,
+    staged_state: dict,
+) -> dict:
+    candidate = plan.get("expected_candidate_identity")
+    last_good = plan.get("last_good_identity")
+    if not isinstance(candidate, dict) or not isinstance(last_good, dict):
+        raise ReleaseBuildError("candidate startup generation identity is missing")
+    selector_generation = candidate.get("selector_generation")
+    staged_generation = staged_state.get("generation")
+    if (
+        not isinstance(selector_generation, int)
+        or isinstance(selector_generation, bool)
+        or not isinstance(staged_generation, int)
+        or isinstance(staged_generation, bool)
+        or staged_state.get("current") != last_good.get("build_id")
+        or staged_state.get("candidate") != candidate.get("build_id")
+        or staged_state.get("pending_transaction_id") != plan.get("transaction_id")
+        or staged_state.get("last_good") != last_good.get("build_id")
+        or selector_generation != staged_generation + 1
+    ):
+        raise ReleaseBuildError(
+            "candidate selector generation is not the post-activation generation"
+        )
+    return {
+        "staged_generation": staged_generation,
+        "startup_generation": selector_generation,
+    }
+
+
 def _read_private_regular_bytes(
     path: Path,
     *,
@@ -7572,6 +7677,7 @@ def _pre_managed_control_stage_intent_receipt(
         or selector_state["last_good"] != plan["last_good_identity"]["build_id"]
     ):
         raise ReleaseBuildError("pre-managed selector stage intent changed")
+    _attest_candidate_startup_generation(plan, selector_state)
     selector_payload = (
         json.dumps(selector_state, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
@@ -7718,6 +7824,125 @@ def _adopt_or_restage_pre_managed_controls(
     return observed
 
 
+def _rollback_exact_owned_selector_activation(
+    plan: dict,
+    owned: dict,
+    current_receipt: dict,
+) -> dict | None:
+    candidate = plan.get("expected_candidate_identity")
+    last_good = plan.get("last_good_identity")
+    if not isinstance(candidate, dict) or not isinstance(last_good, dict):
+        return None
+    candidate_id = str(candidate.get("build_id") or "")
+    last_good_id = str(last_good.get("build_id") or "")
+    transaction_id = str(plan.get("transaction_id") or "")
+    if not candidate_id or not last_good_id or not transaction_id:
+        return None
+    if any(
+        current_receipt.get(field) != owned.get(field)
+        for field in ("mode", "uid")
+    ):
+        return None
+
+    def is_owned_transition(state: dict, generation_delta: int) -> bool:
+        try:
+            generation = int(state["generation"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if generation < generation_delta:
+            return False
+        staged_state = copy.deepcopy(state)
+        staged_state["generation"] = generation - generation_delta
+        staged_state["current"] = last_good_id
+        staged_state["candidate"] = candidate_id
+        staged_state["pending_transaction_id"] = transaction_id
+        encoded = (
+            json.dumps(staged_state, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        return (
+            len(encoded) == owned.get("size")
+            and hashlib.sha256(encoded).hexdigest() == owned.get("sha256")
+        )
+
+    state = release_selector.read_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+    )
+    activated = (
+        state["current"] == candidate_id
+        and state["candidate"] == candidate_id
+        and state.get("pending_transaction_id") == transaction_id
+        and state["last_good"] == last_good_id
+        and is_owned_transition(state, 1)
+    )
+    already_rolled_back = (
+        state["current"] == last_good_id
+        and state["candidate"] is None
+        and state.get("pending_transaction_id") is None
+        and state["last_good"] == last_good_id
+        and candidate_id in state["releases"]
+        and is_owned_transition(state, 2)
+    )
+    if already_rolled_back:
+        exact = _private_control_file_receipt(
+            Path(plan["selector_state"]),
+            label="rolled-back selector state",
+        )
+        if release_selector.read_selector_state(
+            plan["selector_state"],
+            lock_path=plan["selector_lock"],
+        ) != state:
+            raise DrainIdentityMismatch(
+                "rolled-back selector state changed during restore"
+            )
+        return {
+            "status": "already-rolled-back-owned-activation",
+            "selection": state,
+            "identity": exact,
+        }
+    if not activated:
+        return None
+
+    expected_generation = int(state["generation"])
+
+    def rollback_if_still_owned(current: dict) -> dict:
+        if (
+            current["current"] != candidate_id
+            or current["candidate"] != candidate_id
+            or current.get("pending_transaction_id") != transaction_id
+            or current["last_good"] != last_good_id
+            or not is_owned_transition(current, 1)
+        ):
+            raise DrainIdentityMismatch(
+                "owned selector activation changed before rollback"
+            )
+        return release_selector.rollback_to_last_good(current)
+
+    selected = release_selector.update_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+        expected_generation=expected_generation,
+        transition=rollback_if_still_owned,
+    )
+    if (
+        selected["generation"] != expected_generation + 1
+        or selected["current"] != last_good_id
+        or selected["last_good"] != last_good_id
+        or selected["candidate"] is not None
+        or selected.get("pending_transaction_id") is not None
+    ):
+        raise DrainIdentityMismatch("owned selector rollback receipt is invalid")
+    exact = _private_control_file_receipt(
+        Path(plan["selector_state"]),
+        label="rolled-back selector state",
+    )
+    return {
+        "status": "rolled-back-owned-activation",
+        "selection": selected,
+        "identity": exact,
+    }
+
+
 def _restore_pre_managed_control_state(
     plan: dict,
     captured: dict,
@@ -7758,6 +7983,15 @@ def _restore_pre_managed_control_state(
             current.get(field) != owned.get(field)
             for field in ("sha256", "size", "mode", "uid")
         ):
+            if key == "selector_state":
+                selector_rollback = _rollback_exact_owned_selector_activation(
+                    plan,
+                    owned,
+                    current,
+                )
+                if selector_rollback is not None:
+                    restored[key] = selector_rollback
+                    continue
             raise ReleaseBuildError(f"pre-managed {key} changed before restore")
         if before.get("status") == "absent":
             path.unlink()

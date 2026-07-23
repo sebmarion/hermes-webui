@@ -7731,6 +7731,105 @@ def test_pre_managed_control_restore_refuses_non_owned_mutation(tmp_path):
     assert Path(plan["selector_state"]).read_bytes() == b"foreign-mutation\n"
 
 
+def test_pre_managed_control_restore_rolls_back_exact_owned_selector_activation(
+    tmp_path,
+):
+    plan = _pre_managed_control_plan(tmp_path)
+    control_root = Path(plan["selector_state"]).parent
+    last_good = _managed_release(control_root, "last-good")
+    candidate = _managed_release(control_root, "candidate")
+    plan.update(
+        {
+            "expected_candidate_identity": {"build_id": "candidate"},
+            "last_good_identity": {"build_id": "last-good"},
+        }
+    )
+    selector.initialize_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+        release_root=last_good["release_root"],
+        bootstrap_build_id="last-good",
+        bootstrap_record=last_good["record"],
+    )
+    staged_state = selector.update_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+        expected_generation=0,
+        transition=lambda current: selector.stage_candidate(
+            current,
+            "candidate",
+            candidate["record"],
+            transaction_id=plan["transaction_id"],
+        ),
+    )
+    Path(plan["managed_plist"]).write_bytes(b"before-plist\n")
+    Path(plan["managed_plist"]).chmod(0o600)
+    captured = cutover._capture_pre_managed_control_state(plan)
+    staged = cutover._pre_managed_control_stage_receipt(plan)
+    activated_state = selector.update_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+        expected_generation=staged_state["generation"],
+        transition=selector.activate_candidate,
+    )
+
+    restored = cutover._restore_pre_managed_control_state(
+        plan,
+        captured,
+        staged,
+    )
+
+    current = selector.read_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+    )
+    assert restored["controls"]["selector_state"]["status"] == (
+        "rolled-back-owned-activation"
+    )
+    assert current["generation"] == activated_state["generation"] + 1
+    assert current["current"] == current["last_good"] == "last-good"
+    assert current["candidate"] is None
+    assert current["pending_transaction_id"] is None
+    assert current["releases"]["candidate"] == candidate["record"]
+    resumed = cutover._restore_pre_managed_control_state(
+        plan,
+        captured,
+        staged,
+    )
+    assert resumed["controls"]["selector_state"]["status"] == (
+        "already-rolled-back-owned-activation"
+    )
+
+
+def test_candidate_startup_generation_requires_the_post_activation_generation():
+    plan = {
+        "transaction_id": "startup-generation-transaction-0001",
+        "expected_candidate_identity": {
+            "build_id": "candidate",
+            "selector_generation": 8,
+        },
+        "last_good_identity": {"build_id": "last-good"},
+    }
+    staged = {
+        "generation": 7,
+        "current": "last-good",
+        "candidate": "candidate",
+        "pending_transaction_id": plan["transaction_id"],
+        "last_good": "last-good",
+    }
+
+    assert cutover._attest_candidate_startup_generation(plan, staged) == {
+        "staged_generation": 7,
+        "startup_generation": 8,
+    }
+    plan["expected_candidate_identity"]["selector_generation"] = 7
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="candidate selector generation is not the post-activation generation",
+    ):
+        cutover._attest_candidate_startup_generation(plan, staged)
+
+
 def test_pre_managed_control_resume_restages_only_rollback_owned_absence(
     monkeypatch,
     tmp_path,
