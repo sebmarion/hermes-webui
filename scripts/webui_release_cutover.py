@@ -13,6 +13,7 @@ import hmac
 import io
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import plistlib
@@ -39,6 +40,7 @@ if __package__ in {None, ""}:
 
 from scripts import webui_release_selector as release_selector
 from api.process_identity import process_start_token
+from api.state_sync import SESSION_ACTIVITY_TTL_SECONDS
 
 
 _ALLOWED_INHERITED_LAUNCH_ENV_KEYS = {
@@ -10449,7 +10451,37 @@ def _legacy_durable_activity_receipt(plan: dict) -> dict:
         raise ReleaseBuildError(
             "legacy activity lease proof is unavailable"
         ) from exc
-    if rows:
+
+    try:
+        activity_ttl_seconds = float(SESSION_ACTIVITY_TTL_SECONDS)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseBuildError(
+            "legacy activity lease TTL is invalid"
+        ) from exc
+    if (
+        not math.isfinite(activity_ttl_seconds)
+        or activity_ttl_seconds <= 0.0
+    ):
+        raise ReleaseBuildError("legacy activity lease TTL is invalid")
+    cutoff = float(time.time()) - activity_ttl_seconds
+    active_rows = []
+    expired_rows = []
+    for row in rows:
+        try:
+            heartbeat_at = float(row[4])
+        except (TypeError, ValueError) as exc:
+            raise ReleaseBuildError(
+                "legacy activity lease heartbeat is invalid"
+            ) from exc
+        if not math.isfinite(heartbeat_at):
+            raise ReleaseBuildError(
+                "legacy activity lease heartbeat is invalid"
+            )
+        if heartbeat_at >= cutoff:
+            active_rows.append(row)
+        else:
+            expired_rows.append(row)
+    if active_rows:
         raise ReleaseBuildError(
             "legacy WebUI still has durable active-run leases"
         )
@@ -10459,6 +10491,8 @@ def _legacy_durable_activity_receipt(plan: dict) -> dict:
         "status": "verified",
         "state_db": str(state_db),
         "webui_active_run_leases": 0,
+        "expired_webui_activity_rows": len(expired_rows),
+        "activity_ttl_seconds": activity_ttl_seconds,
         "gateway_process_checkpoint": checkpoint,
     }
 

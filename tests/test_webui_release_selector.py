@@ -10,6 +10,7 @@ from pathlib import Path
 import plistlib
 import re
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -5476,6 +5477,204 @@ def test_frozen_boundary_accepts_exact_idle_descendant_tree(monkeypatch):
         "pid_start_token": "root-start",
         "children": 1,
     }
+
+
+def test_legacy_durable_activity_ignores_expired_webui_rows(
+    tmp_path, monkeypatch
+):
+    state_db = tmp_path / "state.db"
+    with sqlite3.connect(state_db) as connection:
+        connection.execute(
+            """
+            CREATE TABLE session_activity (
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                heartbeat_at REAL NOT NULL,
+                PRIMARY KEY (session_id, run_id)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO session_activity VALUES (?, ?, ?, ?, ?, ?)",
+            ("sid", "run-stale", "webui", "running", 900.0, 979.0),
+        )
+    monkeypatch.setattr(cutover.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_process_checkpoint_receipt",
+        lambda _plan: {"status": "verified"},
+    )
+
+    receipt = cutover._legacy_durable_activity_receipt(
+        {"legacy_state_db": str(state_db)}
+    )
+
+    assert receipt["status"] == "verified"
+    assert receipt["webui_active_run_leases"] == 0
+    assert receipt["expired_webui_activity_rows"] == 1
+    assert receipt["activity_ttl_seconds"] == 20.0
+
+
+def test_legacy_durable_activity_rejects_fresh_webui_row(
+    tmp_path, monkeypatch
+):
+    state_db = tmp_path / "state.db"
+    with sqlite3.connect(state_db) as connection:
+        connection.execute(
+            """
+            CREATE TABLE session_activity (
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                heartbeat_at REAL NOT NULL,
+                PRIMARY KEY (session_id, run_id)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO session_activity VALUES (?, ?, ?, ?, ?, ?)",
+            ("sid", "run-fresh", "webui-native", "tool", 990.0, 980.0),
+        )
+    monkeypatch.setattr(cutover.time, "time", lambda: 1000.0)
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="legacy WebUI still has durable active-run leases",
+    ):
+        cutover._legacy_durable_activity_receipt(
+            {"legacy_state_db": str(state_db)}
+        )
+
+
+def test_legacy_durable_activity_rejects_invalid_heartbeat(
+    tmp_path, monkeypatch
+):
+    state_db = tmp_path / "state.db"
+    with sqlite3.connect(state_db) as connection:
+        connection.execute(
+            """
+            CREATE TABLE session_activity (
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                heartbeat_at REAL NOT NULL,
+                PRIMARY KEY (session_id, run_id)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO session_activity VALUES (?, ?, ?, ?, ?, ?)",
+            ("sid", "run-invalid", "webui", "running", 900.0, "invalid"),
+        )
+    monkeypatch.setattr(cutover.time, "time", lambda: 1000.0)
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="legacy activity lease heartbeat is invalid",
+    ):
+        cutover._legacy_durable_activity_receipt(
+            {"legacy_state_db": str(state_db)}
+        )
+
+
+def test_legacy_durable_activity_rejects_invalid_ttl(tmp_path, monkeypatch):
+    state_db = tmp_path / "state.db"
+    with sqlite3.connect(state_db) as connection:
+        connection.execute(
+            """
+            CREATE TABLE session_activity (
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                heartbeat_at REAL NOT NULL,
+                PRIMARY KEY (session_id, run_id)
+            )
+            """
+        )
+    monkeypatch.setattr(
+        cutover, "SESSION_ACTIVITY_TTL_SECONDS", float("nan")
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="legacy activity lease TTL is invalid",
+    ):
+        cutover._legacy_durable_activity_receipt(
+            {"legacy_state_db": str(state_db)}
+        )
+
+
+def test_legacy_durable_activity_accepts_empty_table(tmp_path, monkeypatch):
+    state_db = tmp_path / "state.db"
+    with sqlite3.connect(state_db) as connection:
+        connection.execute(
+            """
+            CREATE TABLE session_activity (
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                heartbeat_at REAL NOT NULL,
+                PRIMARY KEY (session_id, run_id)
+            )
+            """
+        )
+    monkeypatch.setattr(cutover.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_process_checkpoint_receipt",
+        lambda _plan: {"status": "verified"},
+    )
+
+    receipt = cutover._legacy_durable_activity_receipt(
+        {"legacy_state_db": str(state_db)}
+    )
+
+    assert receipt["webui_active_run_leases"] == 0
+    assert receipt["expired_webui_activity_rows"] == 0
+
+
+def test_legacy_durable_activity_rejects_future_heartbeat(
+    tmp_path, monkeypatch
+):
+    state_db = tmp_path / "state.db"
+    with sqlite3.connect(state_db) as connection:
+        connection.execute(
+            """
+            CREATE TABLE session_activity (
+                session_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                source TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                heartbeat_at REAL NOT NULL,
+                PRIMARY KEY (session_id, run_id)
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO session_activity VALUES (?, ?, ?, ?, ?, ?)",
+            ("sid", "run-future", "webui", "running", 990.0, 2000.0),
+        )
+    monkeypatch.setattr(cutover.time, "time", lambda: 1000.0)
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="legacy WebUI still has durable active-run leases",
+    ):
+        cutover._legacy_durable_activity_receipt(
+            {"legacy_state_db": str(state_db)}
+        )
 
 
 def test_frozen_writer_verification_rejects_recorded_non_descendant(monkeypatch):
