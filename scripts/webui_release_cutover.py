@@ -3517,6 +3517,7 @@ _BOOTSTRAP_WATCHDOG_PLAN_KEYS = {
 }
 _BOOTSTRAP_WATCHDOG_SCHEDULER_PLAN_KEYS = {
     "watchdog_scheduler_backend",
+    "watchdog_scheduler_registry",
     "watchdog_scheduler_job_id",
 }
 _BOOTSTRAP_INGRESS_GATE_PLAN_KEYS = {

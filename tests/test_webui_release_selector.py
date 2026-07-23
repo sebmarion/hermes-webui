@@ -2769,6 +2769,11 @@ def _internal_watchdog_plan(tmp_path: Path) -> tuple[dict, Path]:
     }, registry
 
 
+def test_internal_watchdog_registry_is_an_admitted_cutover_plan_path():
+    assert "watchdog_scheduler_registry" in cutover._CUTOVER_PLAN_OPTIONAL
+    assert "watchdog_scheduler_registry" in cutover._CUTOVER_PLAN_PATH_KEYS
+
+
 def test_internal_watchdog_receipt_is_scoped_to_exact_job(tmp_path):
     plan, registry = _internal_watchdog_plan(tmp_path)
 
