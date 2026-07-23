@@ -1420,6 +1420,63 @@ def test_mutable_writer_barrier_rejects_handle_set_change(
         cutover._prove_no_mutable_writers(plan, expected=receipt)
 
 
+def test_process_tree_freeze_ignores_tokenless_zombie_descendant(monkeypatch):
+    root = {"pid": 41, "pid_start_token": "root-start"}
+    signals = []
+    monkeypatch.setattr(
+        cutover,
+        "_process_parent_table",
+        lambda: {41: 1, 42: 41},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_pid_start_token",
+        lambda pid: "root-start" if pid == 41 else None,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_exact_process_is_alive",
+        lambda receipt: (
+            receipt.get("pid") == 41
+            and receipt.get("pid_start_token") == "root-start"
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_ps_value",
+        lambda pid, _field: "T" if pid == 41 else "Z",
+    )
+    monkeypatch.setattr(
+        cutover.os,
+        "kill",
+        lambda pid, sent_signal: signals.append((pid, sent_signal)),
+    )
+
+    frozen = cutover._freeze_exact_process_tree(root, role="webui")
+
+    assert frozen == {
+        "role": "webui",
+        "status": "frozen",
+        "tree": [
+            {
+                "pid": 41,
+                "ppid": None,
+                "pid_start_token": "root-start",
+                "state": "T",
+            }
+        ],
+    }
+    assert signals == [(41, signal.SIGSTOP)]
+    assert (
+        cutover._verify_frozen_prepared_writers(
+            {"listener_port": 8787},
+            {"legacy": root},
+            {"status": "frozen", "writers": [frozen]},
+        )
+        == {"status": "frozen", "writers": [frozen]}
+    )
+
+
 def test_legacy_shutdown_parser_accepts_natural_nonzero_to_zero_drain():
     receipt = cutover._parse_legacy_gateway_shutdown_log(
         "Shutdown phase: drain done "

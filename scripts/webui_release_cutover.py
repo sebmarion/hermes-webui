@@ -9435,6 +9435,35 @@ def _descendant_pids(table: dict[int, int], root_pid: int) -> set[int]:
     return descendants
 
 
+def _live_descendant_pids(
+    table: dict[int, int],
+    root_pid: int,
+    *,
+    role: str,
+    known_receipts: dict[int, dict] | None = None,
+) -> set[int]:
+    live: set[int] = set()
+    for pid in _descendant_pids(table, root_pid):
+        known = (known_receipts or {}).get(pid)
+        if known is not None and _exact_process_is_alive(known):
+            live.add(pid)
+            continue
+        if _pid_start_token(pid) is not None:
+            live.add(pid)
+            continue
+        try:
+            state = _ps_value(pid, "state").upper().strip()
+        except DrainIdentityMismatch:
+            if _pid_start_token(pid) is None:
+                continue
+            raise
+        if not state.startswith("Z"):
+            raise DrainIdentityMismatch(
+                f"{role} descendant identity is unavailable for PID {pid}"
+            )
+    return live
+
+
 def _freeze_exact_process_tree(root_receipt: dict, *, role: str) -> dict:
     root_pid = int(root_receipt["pid"])
     if not _exact_process_is_alive(root_receipt):
@@ -9449,7 +9478,7 @@ def _freeze_exact_process_tree(root_receipt: dict, *, role: str) -> dict:
         if _pid_start_token(pid) != receipt["pid_start_token"]:
             raise DrainIdentityMismatch(f"{role} process identity changed after freeze")
         state = _ps_value(pid, "state")
-        if "T" not in state.upper():
+        if not state.upper().strip().startswith("T"):
             raise DrainIdentityMismatch(f"{role} process did not enter STOP barrier")
         frozen[pid] = {
             "pid": pid,
@@ -9462,11 +9491,19 @@ def _freeze_exact_process_tree(root_receipt: dict, *, role: str) -> dict:
         freeze(root_receipt, ppid=None)
         for _attempt in range(32):
             table = _process_parent_table()
-            descendants = _descendant_pids(table, root_pid)
+            descendants = _live_descendant_pids(
+                table,
+                root_pid,
+                role=role,
+            )
             unfrozen = sorted(descendants - set(frozen))
             if not unfrozen:
                 final_table = _process_parent_table()
-                final_descendants = _descendant_pids(final_table, root_pid)
+                final_descendants = _live_descendant_pids(
+                    final_table,
+                    root_pid,
+                    role=role,
+                )
                 if final_descendants.issubset(frozen):
                     break
                 continue
@@ -9567,11 +9604,18 @@ def _verify_frozen_prepared_writers(
         for process in tree:
             if not isinstance(process, dict) or not _exact_process_is_alive(process):
                 raise DrainIdentityMismatch("frozen process tree identity changed")
-            if "T" not in _ps_value(int(process["pid"]), "state").upper():
+            if not _ps_value(
+                int(process["pid"]),
+                "state",
+            ).upper().strip().startswith("T"):
                 raise DrainIdentityMismatch("frozen process resumed unexpectedly")
-        current_descendants = _descendant_pids(
+        current_descendants = _live_descendant_pids(
             _process_parent_table(),
             int(original["pid"]),
+            role=role,
+            known_receipts={
+                int(process["pid"]): process for process in tree
+            },
         )
         recorded = {int(process["pid"]) for process in tree}
         expected_recorded = current_descendants | {int(original["pid"])}
