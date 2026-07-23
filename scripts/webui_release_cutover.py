@@ -12886,7 +12886,9 @@ def _wait_for_legacy_kanban_quiescence(plan: dict) -> dict:
 def _parse_legacy_gateway_shutdown_log(combined: str) -> dict:
     match = re.search(
         r"Shutdown phase: drain done "
-        r"\(timed_out=(True|False), "
+        r"(?:\(|at \+[0-9]+(?:\.[0-9]+)?s "
+        r"\(drain took [0-9]+(?:\.[0-9]+)?s, )"
+        r"timed_out=(True|False), "
         r"active_at_start=([0-9]+), active_now=([0-9]+), "
         r"cron_at_start=([0-9]+), cron_now=([0-9]+)\)",
         combined,

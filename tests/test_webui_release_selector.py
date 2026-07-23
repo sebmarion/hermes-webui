@@ -6962,6 +6962,122 @@ def test_gateway_stop_rechecks_exact_owner_after_second_checkpoint(
     assert bootouts == []
 
 
+@pytest.mark.parametrize(
+    "drain_line",
+    [
+        (
+            "Shutdown phase: drain done "
+            "(timed_out=False, active_at_start=0, active_now=0, "
+            "cron_at_start=0, cron_now=0)"
+        ),
+        (
+            "Shutdown phase: drain done at +0.01s "
+            "(drain took 0.00s, timed_out=False, active_at_start=3, "
+            "active_now=0, cron_at_start=7, cron_now=0)"
+        ),
+    ],
+)
+def test_legacy_gateway_shutdown_log_accepts_strict_clean_formats(drain_line):
+    combined = "\n".join(
+        [
+            drain_line,
+            "[Api_Server] API server stopped",
+            "Gateway stopped (total teardown 0.30s)",
+        ]
+    )
+
+    receipt = cutover._parse_legacy_gateway_shutdown_log(combined)
+
+    assert receipt["timed_out"] is False
+    assert receipt["active_now"] == 0
+    assert receipt["cron_now"] == 0
+    assert receipt["active_at_start"] in {0, 3}
+    assert receipt["cron_at_start"] in {0, 7}
+
+
+@pytest.mark.parametrize(
+    "drain_fields",
+    [
+        "timed_out=True, active_at_start=0, active_now=0, "
+        "cron_at_start=0, cron_now=0",
+        "timed_out=False, active_at_start=0, active_now=1, "
+        "cron_at_start=0, cron_now=0",
+        "timed_out=False, active_at_start=0, active_now=0, "
+        "cron_at_start=0, cron_now=1",
+    ],
+)
+def test_legacy_gateway_shutdown_log_rejects_timeout_or_remaining_work(
+    drain_fields,
+):
+    combined = "\n".join(
+        [
+            f"Shutdown phase: drain done at +0.01s "
+            f"(drain took 0.00s, {drain_fields})",
+            "[Api_Server] API server stopped",
+            "Gateway stopped (total teardown 0.30s)",
+        ]
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="zero-work clean stop",
+    ):
+        cutover._parse_legacy_gateway_shutdown_log(combined)
+
+
+def test_legacy_gateway_shutdown_log_preserves_natural_drain_counts():
+    combined = "\n".join(
+        [
+            "Shutdown phase: drain done at +12s "
+            "(drain took 11.5s, timed_out=False, active_at_start=3, "
+            "active_now=0, cron_at_start=7, cron_now=0)",
+            "[Api_Server] API server stopped",
+            "Gateway stopped (total teardown 12.1s)",
+        ]
+    )
+
+    assert cutover._parse_legacy_gateway_shutdown_log(combined) == {
+        "timed_out": False,
+        "active_at_start": 3,
+        "active_now": 0,
+        "cron_at_start": 7,
+        "cron_now": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "terminal_line",
+    [
+        "",
+        "[Api_Server] API server stopped",
+        "Gateway stopped (total teardown 0.30s)",
+        "Gateway drain timed out\n"
+        "[Api_Server] API server stopped\n"
+        "Gateway stopped (total teardown 0.30s)",
+        "Skipping .clean_shutdown marker\n"
+        "[Api_Server] API server stopped\n"
+        "Gateway stopped (total teardown 0.30s)",
+    ],
+)
+def test_legacy_gateway_shutdown_log_requires_unambiguous_clean_terminal_receipts(
+    terminal_line,
+):
+    combined = "\n".join(
+        [
+            "Shutdown phase: drain done "
+            "(timed_out=False, active_at_start=0, active_now=0, "
+            "cron_at_start=0, cron_now=0)",
+            terminal_line,
+        ]
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="zero-work clean stop",
+    ):
+        cutover._parse_legacy_gateway_shutdown_log(combined)
+
+
 @pytest.mark.parametrize("mode", [0o600, 0o644])
 def test_legacy_gateway_status_reader_accepts_exact_owned_regular_file(
     tmp_path,
