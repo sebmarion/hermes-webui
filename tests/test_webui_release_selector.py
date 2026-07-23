@@ -5402,6 +5402,129 @@ def test_writer_barrier_freezes_root_and_complete_descendant_tree(monkeypatch):
     assert all(sent_signal == cutover.signal.SIGSTOP for _pid, sent_signal in signals)
 
 
+def test_frozen_boundary_accepts_exact_idle_descendant_tree(monkeypatch):
+    plan = {"gateway_listener_port": 8642}
+    prepared = {
+        "legacy": {"pid": 10, "pid_start_token": "root-start"},
+        "gateway": {"pid": 20, "pid_start_token": "gateway-start"},
+    }
+    frozen = {
+        "writers": [
+            {
+                "role": "webui",
+                "status": "frozen",
+                "tree": [
+                    {
+                        "pid": 9,
+                        "ppid": 10,
+                        "pid_start_token": "child-start",
+                        "state": "T",
+                    },
+                    {
+                        "pid": 10,
+                        "ppid": None,
+                        "pid_start_token": "root-start",
+                        "state": "T",
+                    },
+                ],
+            }
+        ]
+    }
+
+    monkeypatch.setattr(
+        cutover,
+        "_verify_frozen_prepared_writers",
+        lambda *_args: frozen,
+    )
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: None)
+    monkeypatch.setattr(cutover, "_job_pid", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cutover,
+        "_verify_legacy_dispatcher_lock",
+        lambda _plan, receipt: receipt,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_wait_for_legacy_kanban_quiescence",
+        lambda _plan: {"status": "verified"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_established_socket_boundary_receipt",
+        lambda *_args, **_kwargs: {"status": "verified"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_durable_activity_receipt",
+        lambda _plan: {"status": "verified"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_inspect_synthetic_completion_stores",
+        lambda _plan: {"status": "verified"},
+    )
+
+    observed = cutover._prove_frozen_legacy_boundary(
+        plan,
+        prepared,
+        frozen,
+        {"status": "held"},
+    )
+
+    assert observed["processes"]["webui"] == {
+        "pid": 10,
+        "pid_start_token": "root-start",
+        "children": 1,
+    }
+
+
+def test_frozen_writer_verification_rejects_recorded_non_descendant(monkeypatch):
+    prepared = {
+        "legacy": {"pid": 10, "pid_start_token": "root-start"},
+    }
+    frozen = {
+        "writers": [
+            {
+                "role": "webui",
+                "status": "frozen",
+                "tree": [
+                    {
+                        "pid": 10,
+                        "ppid": None,
+                        "pid_start_token": "root-start",
+                        "state": "T",
+                    },
+                    {
+                        "pid": 11,
+                        "ppid": 10,
+                        "pid_start_token": "child-start",
+                        "state": "T",
+                    },
+                    {
+                        "pid": 99,
+                        "ppid": 1,
+                        "pid_start_token": "foreign-start",
+                        "state": "T",
+                    },
+                ],
+            }
+        ]
+    }
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: True)
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "T")
+    monkeypatch.setattr(
+        cutover,
+        "_process_parent_table",
+        lambda: {10: 1, 11: 10, 99: 1},
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="membership changed",
+    ):
+        cutover._verify_frozen_prepared_writers({}, prepared, frozen)
+
+
 def test_cutover_controller_starts_adopts_and_exactly_stops_ingress_gate(tmp_path):
     gate_script = Path(cutover.__file__).resolve().parents[2] / "evidence" / "ingress_gate.py"
     assert gate_script.is_file()

@@ -9231,8 +9231,11 @@ def _verify_frozen_prepared_writers(
             int(original["pid"]),
         )
         recorded = {int(process["pid"]) for process in tree}
-        if not current_descendants.issubset(recorded):
-            raise DrainIdentityMismatch("unfrozen descendant appeared after barrier")
+        expected_recorded = current_descendants | {int(original["pid"])}
+        if recorded != expected_recorded:
+            raise DrainIdentityMismatch(
+                "frozen process tree membership changed after barrier"
+            )
     return frozen
 
 
@@ -13332,9 +13335,25 @@ def _prove_frozen_legacy_boundary(
         if isinstance(row, dict)
     }
     tree = trees.get("webui")
-    if not isinstance(tree, list) or len(tree) != 1:
-        raise ReleaseBuildError(
-            "frozen WebUI still has child or worker processes"
+    if not isinstance(tree, list) or not tree:
+        raise ReleaseBuildError("frozen WebUI process tree is unavailable")
+    expected_root = prepared["legacy"]
+    root = next(
+        (
+            process
+            for process in tree
+            if (
+                isinstance(process, dict)
+                and int(process.get("pid", -1)) == int(expected_root["pid"])
+                and process.get("pid_start_token")
+                == expected_root["pid_start_token"]
+            )
+        ),
+        None,
+    )
+    if root is None:
+        raise DrainIdentityMismatch(
+            "frozen WebUI root identity changed at boundary"
         )
     try:
         gateway_listener = _listener_pid(int(plan["gateway_listener_port"]))
@@ -13353,9 +13372,9 @@ def _prove_frozen_legacy_boundary(
         "status": "verified",
         "processes": {
             "webui": {
-                "pid": int(tree[0]["pid"]),
-                "pid_start_token": str(tree[0]["pid_start_token"]),
-                "children": 0,
+                "pid": int(root["pid"]),
+                "pid_start_token": str(root["pid_start_token"]),
+                "children": len(tree) - 1,
             },
             "gateway": {
                 "pid": int(prepared["gateway"]["pid"]),
