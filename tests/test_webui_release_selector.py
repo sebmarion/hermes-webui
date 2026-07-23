@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import socket
 import stat
 import subprocess
@@ -2736,6 +2737,7 @@ def _internal_watchdog_plan(tmp_path: Path) -> tuple[dict, Path]:
         "state": "scheduled",
         "deliver": "local",
         "no_agent": True,
+        "repeat": {"completed": 5, "times": None},
         "next_run_at": "2026-07-23T12:00:00+00:00",
     }
     registry.write_text(
@@ -2899,7 +2901,7 @@ def test_prepare_release_watchdog_barrier_captures_internal_gateway_intent(
     }
 
 
-def test_internal_watchdog_barrier_uses_gateway_drain_without_duplicate_cron(
+def test_internal_watchdog_barrier_pauses_registry_without_gateway_drain(
     tmp_path,
     monkeypatch,
 ):
@@ -2920,40 +2922,74 @@ def test_internal_watchdog_barrier_uses_gateway_drain_without_duplicate_cron(
             }
         },
     }
-    gateway_drain = {"status": "verified", "work": {"active_cron_jobs": 0}}
-    calls = []
     monkeypatch.setattr(
         cutover,
         "_wait_for_legacy_gateway_drain",
-        lambda actual_plan, actual_prepared, actual_intent: calls.append(
-            (actual_plan, actual_prepared, actual_intent)
-        )
-        or gateway_drain,
+        lambda *_args: pytest.fail("legacy gateway drain must not be required"),
     )
     monkeypatch.setattr(
         cutover,
         "_attest_internal_watchdog_drain_marker",
-        lambda actual_plan, actual_prepared: {
-            "status": "verified",
-            "marker_sha256": "a" * 64,
-        },
+        lambda *_args: pytest.fail("legacy gateway marker must not be required"),
     )
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["jobs"][0]["last_run_at"] = "2026-07-23T12:00:05+00:00"
+    payload["jobs"][0]["next_run_at"] = "2026-07-23T12:03:05+00:00"
+    payload["jobs"][0]["repeat"] = {"completed": 7, "times": None}
+    unrelated_before = copy.deepcopy(payload["jobs"][1])
+    registry.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    registry.chmod(0o600)
 
     disabled = cutover._disable_watchdog_cron(
         plan,
         {"watchdog_cron": prepared, "gateway": {"pid": 99}},
     )
 
-    assert disabled == {
-        "status": "disabled",
-        "backend": "hermes_internal",
-        "crontab_sha256": prepared["crontab_sha256"],
-        "marker_sha256": "a" * 64,
-    }
-    assert len(calls) == 1
-    assert json.loads(registry.read_text(encoding="utf-8"))["jobs"][0][
-        "enabled"
-    ] is True
+    assert disabled["status"] == "disabled"
+    assert disabled["backend"] == "hermes_internal"
+    assert disabled["job_id"] == "watchdog-job"
+    assert re.fullmatch(r"[0-9a-f]{64}", disabled["crontab_sha256"])
+    assert re.fullmatch(r"[0-9a-f]{64}", disabled["marker_sha256"])
+    paused_payload = json.loads(registry.read_text(encoding="utf-8"))
+    paused = paused_payload["jobs"][0]
+    assert paused["enabled"] is False
+    assert paused["state"] == "paused"
+    assert paused["paused_reason"] == (
+        "release-cutover:internal-watchdog-transaction-000001"
+    )
+    assert paused["last_run_at"] == "2026-07-23T12:00:05+00:00"
+    assert paused["next_run_at"] == "2026-07-23T12:03:05+00:00"
+    assert paused["repeat"] == {"completed": 7, "times": None}
+    assert paused_payload["jobs"][1] == unrelated_before
+    assert cutover._disable_watchdog_cron(
+        plan,
+        {"watchdog_cron": prepared, "gateway": {"pid": 99}},
+    ) == disabled
+    assert cutover._attest_disabled_watchdog_cron(
+        plan,
+        {"watchdog_cron": prepared},
+    ) == disabled
+
+    restored = cutover._restore_watchdog_cron(
+        plan,
+        {"watchdog_cron": prepared},
+    )
+
+    active_payload = json.loads(registry.read_text(encoding="utf-8"))
+    active = active_payload["jobs"][0]
+    assert active["enabled"] is True
+    assert active["state"] == "scheduled"
+    assert active.get("paused_at") is None
+    assert active.get("paused_reason") is None
+    assert active["last_run_at"] == "2026-07-23T12:00:05+00:00"
+    assert active["next_run_at"] == "2026-07-23T12:03:05+00:00"
+    assert active["repeat"] == {"completed": 7, "times": None}
+    assert active_payload["jobs"][1] == unrelated_before
+    assert restored["backend"] == "hermes_internal"
+    assert cutover._restore_watchdog_cron(
+        plan,
+        {"watchdog_cron": prepared},
+    )["stable_job_sha256"] == restored["stable_job_sha256"]
     assert os_cron_reads
 
 
@@ -2992,11 +3028,11 @@ def test_internal_watchdog_attestation_rejects_job_identity_change(
         )
 
 
-def test_internal_watchdog_failed_drain_releases_owned_marker(
+def test_internal_watchdog_active_claim_refuses_pause_without_mutation(
     tmp_path,
     monkeypatch,
 ):
-    plan, _registry = _internal_watchdog_plan(tmp_path)
+    plan, registry = _internal_watchdog_plan(tmp_path)
     intent = {
         "marker": {
             "path": str(tmp_path / ".drain_request.json"),
@@ -3011,27 +3047,30 @@ def test_internal_watchdog_failed_drain_releases_owned_marker(
         },
         "gateway": {"pid": 99},
     }
-    released = []
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["jobs"][0]["state"] = "running"
+    payload["jobs"][0]["run_claim"] = {
+        "owner": "legacy-scheduler",
+        "claimed_at": "2026-07-23T12:00:00+00:00",
+    }
+    registry.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    registry.chmod(0o600)
+    before = registry.read_bytes()
     monkeypatch.setattr(
         cutover,
         "_wait_for_legacy_gateway_drain",
-        lambda *_args: (_ for _ in ()).throw(
-            cutover.DrainTimeout("active watchdog")
-        ),
+        lambda *_args: pytest.fail("legacy gateway drain must not be required"),
     )
     monkeypatch.setattr(
         cutover,
         "_clear_legacy_gateway_drain_marker",
-        lambda actual_plan, actual_intent: released.append(
-            (actual_plan, actual_intent)
-        )
-        or {"status": "cleared"},
+        lambda *_args: pytest.fail("no gateway marker should be written"),
     )
 
-    with pytest.raises(cutover.DrainTimeout, match="active watchdog"):
+    with pytest.raises(cutover.DrainTimeout, match="watchdog job is active"):
         cutover._disable_watchdog_cron(plan, prepared)
 
-    assert released == [(plan, intent)]
+    assert registry.read_bytes() == before
 
 
 def test_begin_release_watchdog_barrier_prepares_internal_backend(

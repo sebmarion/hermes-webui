@@ -7845,64 +7845,182 @@ def _acquire_internal_watchdog_jobs_lock(plan: dict):
             ) from exc
 
 
-def _internal_watchdog_job_receipt(plan: dict) -> dict:
+_INTERNAL_WATCHDOG_RUNTIME_FIELDS = {
+    "failure_class",
+    "fire_claim",
+    "last_delivery_error",
+    "last_error",
+    "last_run_at",
+    "last_status",
+    "manual_action_required",
+    "next_retry_at",
+    "next_run_at",
+    "recovery_claim",
+    "recovery_state",
+    "run_claim",
+}
+_INTERNAL_WATCHDOG_CONTROL_FIELDS = {
+    "enabled",
+    "state",
+    "paused_at",
+    "paused_reason",
+}
+
+
+def _canonical_internal_watchdog_job(job: dict) -> bytes:
+    return (
+        json.dumps(
+            job,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _internal_watchdog_stable_job(job: dict) -> dict:
+    stable = copy.deepcopy(job)
+    for field in (
+        _INTERNAL_WATCHDOG_RUNTIME_FIELDS
+        | _INTERNAL_WATCHDOG_CONTROL_FIELDS
+    ):
+        stable.pop(field, None)
+    repeat = stable.get("repeat")
+    if isinstance(repeat, dict):
+        repeat = copy.deepcopy(repeat)
+        repeat.pop("completed", None)
+        stable["repeat"] = repeat
+    return stable
+
+
+def _internal_watchdog_stable_sha256(job: dict) -> str:
+    return hashlib.sha256(
+        _canonical_internal_watchdog_job(
+            _internal_watchdog_stable_job(job)
+        )
+    ).hexdigest()
+
+
+def _read_internal_watchdog_registry(
+    plan: dict,
+) -> tuple[Path, dict, list, int, dict]:
+    registry = Path(plan["watchdog_scheduler_registry"])
+    try:
+        payload = json.loads(registry.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseBuildError(
+            "internal watchdog registry is invalid"
+        ) from exc
+    jobs = payload.get("jobs") if isinstance(payload, dict) else None
+    if not isinstance(jobs, list):
+        raise ReleaseBuildError("internal watchdog registry has no jobs")
+    job_id = str(plan.get("watchdog_scheduler_job_id") or "")
+    script_name = Path(str(plan["watchdog_installed_script"])).name
+    by_id = [
+        (index, job)
+        for index, job in enumerate(jobs)
+        if isinstance(job, dict) and str(job.get("id") or "") == job_id
+    ]
+    by_script = [
+        (index, job)
+        for index, job in enumerate(jobs)
+        if isinstance(job, dict)
+        and str(job.get("script") or "") == script_name
+    ]
+    if (
+        len(by_id) != 1
+        or len(by_script) != 1
+        or by_id[0][0] != by_script[0][0]
+    ):
+        raise ReleaseBuildError(
+            "internal watchdog job is missing or ambiguous"
+        )
+    index, job = by_id[0]
+    return registry, payload, jobs, index, copy.deepcopy(job)
+
+
+def _write_internal_watchdog_registry(plan: dict, payload: dict) -> None:
+    registry = Path(plan["watchdog_scheduler_registry"])
+    encoded = (
+        json.dumps(
+            payload,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{registry.name}.",
+        dir=registry.parent,
+    )
+    replaced = False
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, registry)
+        replaced = True
+        _fsync_directory(registry.parent)
+    finally:
+        if not replaced:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+    opened = registry.lstat()
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.getuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or registry.read_bytes() != encoded
+    ):
+        raise ReleaseBuildError(
+            "internal watchdog registry write did not persist"
+        )
+
+
+def _internal_watchdog_job_receipt(
+    plan: dict,
+    *,
+    require_active: bool = True,
+) -> dict:
     handle = _acquire_internal_watchdog_jobs_lock(plan)
     try:
-        registry = Path(plan["watchdog_scheduler_registry"])
-        try:
-            payload = json.loads(registry.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ReleaseBuildError(
-                "internal watchdog registry is invalid"
-            ) from exc
-        jobs = payload.get("jobs") if isinstance(payload, dict) else None
-        if not isinstance(jobs, list):
-            raise ReleaseBuildError("internal watchdog registry has no jobs")
-        job_id = str(plan.get("watchdog_scheduler_job_id") or "")
-        script_name = Path(str(plan["watchdog_installed_script"])).name
-        by_id = [
-            job
-            for job in jobs
-            if isinstance(job, dict) and str(job.get("id") or "") == job_id
-        ]
-        by_script = [
-            job
-            for job in jobs
-            if isinstance(job, dict)
-            and str(job.get("script") or "") == script_name
-        ]
+        registry, _payload, _jobs, _index, job = (
+            _read_internal_watchdog_registry(plan)
+        )
         if (
-            len(by_id) != 1
-            or len(by_script) != 1
-            or by_id[0] is not by_script[0]
-        ):
-            raise ReleaseBuildError(
-                "internal watchdog job is missing or ambiguous"
-            )
-        job = copy.deepcopy(by_id[0])
-        if (
-            job.get("enabled") is not True
-            or job.get("state") != "scheduled"
-            or job.get("no_agent") is not True
+            job.get("no_agent") is not True
             or job.get("deliver") != "local"
         ):
-            raise ReleaseBuildError("internal watchdog job is not active")
-        canonical = (
-            json.dumps(
-                job,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-                allow_nan=False,
+            raise ReleaseBuildError(
+                "internal watchdog job identity changed"
             )
-            + "\n"
-        ).encode("utf-8")
+        if require_active and (
+            job.get("enabled") is not True
+            or job.get("state") != "scheduled"
+        ):
+            raise ReleaseBuildError(
+                "internal watchdog job is not active"
+            )
+        canonical = _canonical_internal_watchdog_job(job)
         job_sha256 = hashlib.sha256(canonical).hexdigest()
+        job_id = str(plan["watchdog_scheduler_job_id"])
+        script_name = Path(str(plan["watchdog_installed_script"])).name
         return {
             "backend": "hermes_internal",
             "registry_path": str(registry),
             "job_id": job_id,
             "job_sha256": job_sha256,
+            "stable_job_sha256": _internal_watchdog_stable_sha256(job),
+            "job_enabled": job.get("enabled"),
+            "job_state": job.get("state"),
             "crontab_sha256": job_sha256,
             "watchdog_command": f"hermes-internal:{job_id}:{script_name}",
             "canonical_job": canonical,
@@ -8125,51 +8243,127 @@ def _attest_internal_watchdog_drain_marker(
     }
 
 
+def _internal_watchdog_pause_fields(
+    plan: dict,
+    prepared: dict,
+) -> dict:
+    cron = prepared.get("watchdog_cron") if isinstance(prepared, dict) else None
+    intent = cron.get("drain_intent") if isinstance(cron, dict) else None
+    marker = intent.get("marker") if isinstance(intent, dict) else None
+    marker_payload = (
+        marker.get("payload") if isinstance(marker, dict) else None
+    )
+    transaction_id = str(plan.get("transaction_id") or "")
+    if (
+        not isinstance(marker_payload, dict)
+        or marker_payload.get("release_transaction_id") != transaction_id
+    ):
+        raise ReleaseBuildError(
+            "internal watchdog pause intent is missing"
+        )
+    reason = f"release-cutover:{transaction_id}"
+    paused_at = str(
+        marker_payload.get("requested_at")
+        or f"transaction:{transaction_id}"
+    )
+    return {
+        "enabled": False,
+        "state": "paused",
+        "paused_at": paused_at,
+        "paused_reason": reason,
+    }
+
+
+def _internal_watchdog_disabled_receipt(
+    plan: dict,
+    prepared: dict,
+    job: dict,
+) -> dict:
+    cron = prepared.get("watchdog_cron") if isinstance(prepared, dict) else None
+    pause = _internal_watchdog_pause_fields(plan, prepared)
+    stable_sha256 = _internal_watchdog_stable_sha256(job)
+    if (
+        not isinstance(cron, dict)
+        or stable_sha256 != cron.get("stable_job_sha256")
+        or any(job.get(key) != value for key, value in pause.items())
+    ):
+        raise DrainIdentityMismatch(
+            "internal watchdog job changed from its transaction-owned pause"
+        )
+    marker_sha256 = hashlib.sha256(
+        json.dumps(
+            {
+                "job_id": plan["watchdog_scheduler_job_id"],
+                "pause": pause,
+                "stable_job_sha256": stable_sha256,
+                "transaction_id": plan["transaction_id"],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return {
+        "status": "disabled",
+        "backend": "hermes_internal",
+        "job_id": str(plan["watchdog_scheduler_job_id"]),
+        "stable_job_sha256": stable_sha256,
+        "crontab_sha256": stable_sha256,
+        "marker_sha256": marker_sha256,
+    }
+
+
 def _disable_watchdog_cron(plan: dict, prepared: dict) -> dict:
     if _watchdog_scheduler_backend(plan) == "hermes_internal":
-        cron = (
-            prepared.get("watchdog_cron")
-            if isinstance(prepared, dict)
-            else None
-        )
-        intent = cron.get("drain_intent") if isinstance(cron, dict) else None
-        if not isinstance(intent, dict):
+        _assert_no_os_watchdog_duplicate(plan)
+        cron = prepared.get("watchdog_cron") if isinstance(prepared, dict) else None
+        pause = _internal_watchdog_pause_fields(plan, prepared)
+        if not isinstance(cron, dict):
             raise ReleaseBuildError(
-                "internal watchdog drain intent is missing"
+                "internal watchdog preparation is missing"
             )
+        handle = _acquire_internal_watchdog_jobs_lock(plan)
         try:
-            drained = _wait_for_legacy_gateway_drain(
+            _registry, payload, jobs, index, job = (
+                _read_internal_watchdog_registry(plan)
+            )
+            if (
+                _internal_watchdog_stable_sha256(job)
+                != cron.get("stable_job_sha256")
+            ):
+                raise DrainIdentityMismatch(
+                    "internal watchdog job configuration changed"
+                )
+            if all(job.get(key) == value for key, value in pause.items()):
+                disabled_job = job
+            else:
+                active_claims = any(
+                    job.get(field) is not None
+                    for field in (
+                        "run_claim",
+                        "fire_claim",
+                        "recovery_claim",
+                    )
+                )
+                if (
+                    job.get("enabled") is not True
+                    or job.get("state") != "scheduled"
+                    or active_claims
+                ):
+                    raise DrainTimeout(
+                        "internal watchdog job is active or not schedulable"
+                    )
+                disabled_job = {**job, **pause}
+                jobs[index] = disabled_job
+                payload["jobs"] = jobs
+                _write_internal_watchdog_registry(plan, payload)
+            disabled_receipt = _internal_watchdog_disabled_receipt(
                 plan,
                 prepared,
-                intent,
+                disabled_job,
             )
-            if drained.get("status") != "verified":
-                raise ReleaseBuildError(
-                    "internal watchdog gateway did not drain"
-                )
-            marker = _attest_internal_watchdog_drain_marker(plan, prepared)
-            try:
-                current = _cron_watchdog_receipt(plan)
-            except ReleaseBuildError as exc:
-                raise DrainIdentityMismatch(
-                    "internal watchdog job changed"
-                ) from exc
-            if not _cron_receipt_matches_prepared(current, prepared):
-                raise DrainIdentityMismatch("internal watchdog job changed")
-        except Exception as barrier_error:
-            try:
-                _clear_legacy_gateway_drain_marker(plan, intent)
-            except Exception as cleanup_error:
-                raise ReleaseBuildError(
-                    "internal watchdog failed barrier could not reopen admission"
-                ) from cleanup_error
-            raise
-        return {
-            "status": "disabled",
-            "backend": "hermes_internal",
-            "crontab_sha256": current["crontab_sha256"],
-            "marker_sha256": marker["marker_sha256"],
-        }
+        finally:
+            handle.close()
+        return disabled_receipt
     original_path = Path(plan["watchdog_crontab_rollback"])
     if sha256_file(original_path) != prepared["watchdog_cron"]["backup_sha256"]:
         raise ReleaseBuildError("watchdog crontab backup identity changed")
@@ -8212,19 +8406,19 @@ def _disable_watchdog_cron(plan: dict, prepared: dict) -> dict:
 
 def _attest_disabled_watchdog_cron(plan: dict, prepared: dict) -> dict:
     if _watchdog_scheduler_backend(plan) == "hermes_internal":
-        marker = _attest_internal_watchdog_drain_marker(plan, prepared)
+        handle = _acquire_internal_watchdog_jobs_lock(plan)
         try:
-            current = _cron_watchdog_receipt(plan)
-        except ReleaseBuildError as exc:
-            raise DrainIdentityMismatch("internal watchdog job changed") from exc
-        if not _cron_receipt_matches_prepared(current, prepared):
-            raise DrainIdentityMismatch("internal watchdog job changed")
-        return {
-            "status": "disabled",
-            "backend": "hermes_internal",
-            "crontab_sha256": current["crontab_sha256"],
-            "marker_sha256": marker["marker_sha256"],
-        }
+            _registry, _payload, _jobs, _index, job = (
+                _read_internal_watchdog_registry(plan)
+            )
+            disabled_receipt = _internal_watchdog_disabled_receipt(
+                plan,
+                prepared,
+                job,
+            )
+        finally:
+            handle.close()
+        return disabled_receipt
     current = _read_crontab()
     command = prepared["watchdog_cron"]["watchdog_command"]
     marker = f"# HERMES_CUTOVER_DISABLED {plan['transaction_id']} " + command
@@ -8257,9 +8451,53 @@ def _restore_watchdog_cron(plan: dict, prepared: dict) -> dict:
             raise ReleaseBuildError(
                 "internal watchdog rollback identity changed"
             )
-        current = _cron_watchdog_receipt(plan)
-        if not _cron_receipt_matches_prepared(current, prepared):
-            raise DrainIdentityMismatch("internal watchdog job changed")
+        try:
+            original = json.loads(backup.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReleaseBuildError(
+                "internal watchdog rollback job is invalid"
+            ) from exc
+        if (
+            not isinstance(original, dict)
+            or _internal_watchdog_stable_sha256(original)
+            != cron.get("stable_job_sha256")
+        ):
+            raise ReleaseBuildError(
+                "internal watchdog rollback configuration changed"
+            )
+        pause = _internal_watchdog_pause_fields(plan, prepared)
+        original_controls = {
+            key: original.get(key)
+            for key in _INTERNAL_WATCHDOG_CONTROL_FIELDS
+        }
+        handle = _acquire_internal_watchdog_jobs_lock(plan)
+        try:
+            _registry, payload, jobs, index, job = (
+                _read_internal_watchdog_registry(plan)
+            )
+            if (
+                _internal_watchdog_stable_sha256(job)
+                != cron.get("stable_job_sha256")
+            ):
+                raise DrainIdentityMismatch(
+                    "internal watchdog job configuration changed"
+                )
+            if all(
+                job.get(key) == value
+                for key, value in original_controls.items()
+            ):
+                pass
+            elif all(job.get(key) == value for key, value in pause.items()):
+                restored_job = {**job, **original_controls}
+                jobs[index] = restored_job
+                payload["jobs"] = jobs
+                _write_internal_watchdog_registry(plan, payload)
+            else:
+                raise DrainIdentityMismatch(
+                    "internal watchdog job has another pause owner"
+                )
+        finally:
+            handle.close()
         intent = cron.get("drain_intent")
         if not isinstance(intent, dict):
             raise ReleaseBuildError(
@@ -8277,6 +8515,9 @@ def _restore_watchdog_cron(plan: dict, prepared: dict) -> dict:
             )
         if marker_path.exists() or marker_path.is_symlink():
             _clear_legacy_gateway_drain_marker(plan, intent)
+        current = _cron_watchdog_receipt(plan)
+        if not _cron_receipt_matches_prepared(current, prepared):
+            raise DrainIdentityMismatch("internal watchdog job changed")
         return current
     backup = Path(plan["watchdog_crontab_rollback"])
     if sha256_file(backup) != prepared["watchdog_cron"]["backup_sha256"]:
@@ -8305,6 +8546,17 @@ def _restore_watchdog_cron(plan: dict, prepared: dict) -> dict:
 
 def _cron_receipt_matches_prepared(receipt: dict, prepared: dict) -> bool:
     expected = prepared["watchdog_cron"]
+    if expected.get("backend") == "hermes_internal":
+        return (
+            receipt.get("backend") == "hermes_internal"
+            and receipt.get("job_id") == expected.get("job_id")
+            and receipt.get("stable_job_sha256")
+            == expected.get("stable_job_sha256")
+            and receipt.get("watchdog_command")
+            == expected.get("watchdog_command")
+            and receipt.get("job_enabled") is True
+            and receipt.get("job_state") == "scheduled"
+        )
     return all(
         receipt.get(key) == expected.get(key)
         for key in ("crontab_sha256", "watchdog_command")
