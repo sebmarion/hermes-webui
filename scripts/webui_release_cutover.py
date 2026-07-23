@@ -9389,6 +9389,78 @@ def _read_private_json_value(path: Path, *, label: str) -> object:
         raise ReleaseBuildError(f"{label} JSON is invalid") from exc
 
 
+_LEGACY_GATEWAY_STATUS_MAX_BYTES = 1024 * 1024
+_LEGACY_GATEWAY_STATUS_MODES = {0o600, 0o644}
+
+
+def _read_legacy_gateway_status(
+    path: Path,
+    *,
+    label: str,
+) -> tuple[dict, dict]:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ReleaseBuildError(f"{label} no-follow reads are unavailable")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as handle:
+            before = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_uid != os.getuid()
+                or stat.S_IMODE(before.st_mode)
+                not in _LEGACY_GATEWAY_STATUS_MODES
+            ):
+                raise ReleaseBuildError(f"{label} is unsafe")
+            payload = handle.read(_LEGACY_GATEWAY_STATUS_MAX_BYTES + 1)
+            after = os.fstat(handle.fileno())
+            current = path.lstat()
+    except ReleaseBuildError:
+        raise
+    except OSError as exc:
+        raise ReleaseBuildError(f"{label} is unreadable") from exc
+    if len(payload) > _LEGACY_GATEWAY_STATUS_MAX_BYTES:
+        raise ReleaseBuildError(f"{label} is too large")
+    stable_fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_uid",
+        "st_nlink",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    if (
+        any(
+            getattr(before, field) != getattr(after, field)
+            or getattr(after, field) != getattr(current, field)
+            for field in stable_fields
+        )
+        or after.st_size != len(payload)
+    ):
+        raise ReleaseBuildError(f"{label} identity changed during read")
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseBuildError(f"{label} JSON is invalid") from exc
+    if not isinstance(value, dict):
+        raise ReleaseBuildError(f"{label} must contain a JSON object")
+    return value, {
+        "path": str(path),
+        "exists": True,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "device": after.st_dev,
+        "inode": after.st_ino,
+        "uid": after.st_uid,
+        "mode": stat.S_IMODE(after.st_mode),
+        "nlink": after.st_nlink,
+        "size": after.st_size,
+        "mtime_ns": after.st_mtime_ns,
+        "ctime_ns": after.st_ctime_ns,
+    }
+
+
 _SYNTHETIC_STORE_MAX_BYTES = 16 * 1024 * 1024
 _SYNTHETIC_STORE_STABLE_FIELDS = (
     "path",
@@ -12112,6 +12184,10 @@ def _legacy_gateway_drain_intent_receipt(plan: dict, prepared: dict) -> dict:
             "legacy gateway changed before durable drain intent"
         )
     status_path = _legacy_gateway_home(plan) / "gateway_state.json"
+    _status, status_baseline = _read_legacy_gateway_status(
+        status_path,
+        label="legacy gateway status",
+    )
     marker_payload = {
         "action": "drain",
         "requested_at": datetime.now(timezone.utc).isoformat(),
@@ -12134,10 +12210,7 @@ def _legacy_gateway_drain_intent_receipt(plan: dict, prepared: dict) -> dict:
             "pid": int(gateway["pid"]),
             "pid_start_token": str(gateway["pid_start_token"]),
         },
-        "status_baseline": _regular_file_baseline(
-            status_path,
-            label="legacy gateway status",
-        ),
+        "status_baseline": status_baseline,
         "marker": {
             "path": str(_legacy_gateway_drain_marker_path(plan)),
             "payload": marker_payload,
@@ -12236,28 +12309,20 @@ def _wait_for_legacy_gateway_drain(
                 raise DrainIdentityMismatch(
                     "legacy gateway changed while acknowledging drain"
                 )
-            status_receipt = _regular_file_baseline(
+            status, status_receipt = _read_legacy_gateway_status(
                 status_path,
                 label="legacy gateway status",
             )
             baseline_mtime = status_baseline.get("mtime_ns")
             if (
-                not status_receipt["exists"]
-                or (
-                    baseline_mtime is not None
-                    and int(status_receipt["mtime_ns"]) <= int(baseline_mtime)
-                )
+                baseline_mtime is not None
+                and int(status_receipt["mtime_ns"]) <= int(baseline_mtime)
             ):
                 raise ReleaseBuildError(
                     "legacy gateway has not written a post-marker status"
                 )
-            status = _read_private_json_value(
-                status_path,
-                label="legacy gateway status",
-            )
             if (
-                not isinstance(status, dict)
-                or status.get("kind") != "hermes-gateway"
+                status.get("kind") != "hermes-gateway"
                 or int(status.get("pid", -1)) != expected_pid
                 or status.get("gateway_state") != "draining"
                 or int(status.get("active_agents", -1)) != 0
@@ -12414,7 +12479,7 @@ def _legacy_gateway_stop_intent_receipt(
         )
     checkpoint = _legacy_process_checkpoint_receipt(plan)
     status_path = _legacy_gateway_home(plan) / "gateway_state.json"
-    status = _read_private_json_value(
+    status, status_receipt = _read_legacy_gateway_status(
         status_path,
         label="legacy gateway status",
     )
@@ -12446,10 +12511,7 @@ def _legacy_gateway_stop_intent_receipt(
             _legacy_gateway_clean_shutdown_path(plan),
             label="legacy gateway clean-shutdown marker",
         ),
-        "status_baseline": _regular_file_baseline(
-            status_path,
-            label="legacy gateway status",
-        ),
+        "status_baseline": status_receipt,
         "logs": _legacy_gateway_log_baselines(plan),
         "process_checkpoint": checkpoint,
     }
@@ -12957,20 +13019,15 @@ def _gracefully_stop_legacy_gateway(
             "legacy gateway has no fresh clean-shutdown receipt"
         )
     status_path = _legacy_gateway_home(plan) / "gateway_state.json"
-    status_receipt = _regular_file_baseline(
+    status, status_receipt = _read_legacy_gateway_status(
         status_path,
         label="legacy gateway terminal status",
     )
     status_baseline = intent.get("status_baseline")
-    status = _read_private_json_value(
-        status_path,
-        label="legacy gateway terminal status",
-    )
     if (
         not isinstance(status_baseline, dict)
         or int(status_receipt.get("mtime_ns") or 0)
         <= int(status_baseline.get("mtime_ns") or 0)
-        or not isinstance(status, dict)
         or status.get("kind") != "hermes-gateway"
         or int(status.get("pid", -1)) != int(gateway_identity["pid"])
         or status.get("gateway_state") != "stopped"

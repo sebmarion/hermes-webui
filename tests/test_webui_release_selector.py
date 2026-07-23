@@ -6962,6 +6962,130 @@ def test_gateway_stop_rechecks_exact_owner_after_second_checkpoint(
     assert bootouts == []
 
 
+@pytest.mark.parametrize("mode", [0o600, 0o644])
+def test_legacy_gateway_status_reader_accepts_exact_owned_regular_file(
+    tmp_path,
+    mode,
+):
+    status_path = tmp_path / "gateway_state.json"
+    payload = {
+        "kind": "hermes-gateway",
+        "pid": 41,
+        "gateway_state": "draining",
+        "active_agents": 0,
+    }
+    status_path.write_text(json.dumps(payload), encoding="utf-8")
+    status_path.chmod(mode)
+
+    status, receipt = cutover._read_legacy_gateway_status(
+        status_path,
+        label="legacy gateway status",
+    )
+
+    assert status == payload
+    assert receipt["path"] == str(status_path)
+    assert receipt["mode"] == mode
+    assert receipt["uid"] == os.getuid()
+    assert receipt["nlink"] == 1
+    assert receipt["size"] == status_path.stat().st_size
+    assert receipt["sha256"] == _sha(status_path)
+
+
+@pytest.mark.parametrize("unsafe_mode", [0o640, 0o666])
+def test_legacy_gateway_status_reader_rejects_unsafe_mode(
+    tmp_path,
+    unsafe_mode,
+):
+    status_path = tmp_path / "gateway_state.json"
+    status_path.write_text("{}", encoding="utf-8")
+    status_path.chmod(unsafe_mode)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="unsafe"):
+        cutover._read_legacy_gateway_status(
+            status_path,
+            label="legacy gateway status",
+        )
+
+
+def test_legacy_gateway_status_reader_rejects_symlink(tmp_path):
+    target = tmp_path / "real-gateway-state.json"
+    target.write_text("{}", encoding="utf-8")
+    target.chmod(0o644)
+    status_path = tmp_path / "gateway_state.json"
+    status_path.symlink_to(target)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="unreadable|unsafe"):
+        cutover._read_legacy_gateway_status(
+            status_path,
+            label="legacy gateway status",
+        )
+
+
+def test_legacy_gateway_status_reader_rejects_hardlink(tmp_path):
+    status_path = tmp_path / "gateway_state.json"
+    status_path.write_text("{}", encoding="utf-8")
+    status_path.chmod(0o644)
+    os.link(status_path, tmp_path / "gateway_state-copy.json")
+
+    with pytest.raises(cutover.ReleaseBuildError, match="unsafe"):
+        cutover._read_legacy_gateway_status(
+            status_path,
+            label="legacy gateway status",
+        )
+
+
+def test_legacy_gateway_status_reader_rejects_path_swap(tmp_path, monkeypatch):
+    status_path = tmp_path / "gateway_state.json"
+    replacement = tmp_path / "replacement.json"
+    status_path.write_text('{"gateway_state":"draining"}', encoding="utf-8")
+    replacement.write_text('{"gateway_state":"stopped"}', encoding="utf-8")
+    status_path.chmod(0o644)
+    replacement.chmod(0o644)
+    original_fstat = os.fstat
+    calls = 0
+
+    def swap_after_read(descriptor):
+        nonlocal calls
+        result = original_fstat(descriptor)
+        calls += 1
+        if calls == 2:
+            replacement.replace(status_path)
+        return result
+
+    monkeypatch.setattr(cutover.os, "fstat", swap_after_read)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="identity changed"):
+        cutover._read_legacy_gateway_status(
+            status_path,
+            label="legacy gateway status",
+        )
+
+
+def test_legacy_gateway_status_reader_rejects_non_object_json(tmp_path):
+    status_path = tmp_path / "gateway_state.json"
+    status_path.write_text("[]", encoding="utf-8")
+    status_path.chmod(0o644)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="JSON object"):
+        cutover._read_legacy_gateway_status(
+            status_path,
+            label="legacy gateway status",
+        )
+
+
+def test_legacy_gateway_status_reader_requires_nofollow(tmp_path, monkeypatch):
+    status_path = tmp_path / "gateway_state.json"
+    status_path.write_text("{}", encoding="utf-8")
+    status_path.chmod(0o644)
+    monkeypatch.delattr(cutover.os, "O_NOFOLLOW")
+
+    with pytest.raises(cutover.ReleaseBuildError, match="no-follow"):
+        cutover._read_legacy_gateway_status(
+            status_path,
+            label="legacy gateway status",
+        )
+
+
 def test_legacy_gateway_drain_accepts_exact_old_status_and_empty_checkpoint(
     tmp_path,
     monkeypatch,
@@ -6989,6 +7113,19 @@ def test_legacy_gateway_drain_accepts_exact_old_status_and_empty_checkpoint(
     prepared = {
         "gateway": {"pid": 41, "pid_start_token": "gateway-start"}
     }
+    status_path = tmp_path / "hermes-home" / "gateway_state.json"
+    status_path.write_text(
+        json.dumps(
+            {
+                "kind": "hermes-gateway",
+                "pid": 41,
+                "gateway_state": "draining",
+                "active_agents": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    status_path.chmod(0o644)
     monkeypatch.setattr(
         cutover,
         "_write_legacy_gateway_drain_marker",
@@ -7007,16 +7144,6 @@ def test_legacy_gateway_drain_accepts_exact_old_status_and_empty_checkpoint(
             "exists": True,
             "mtime_ns": 11,
             "sha256": "b" * 64,
-        },
-    )
-    monkeypatch.setattr(
-        cutover,
-        "_read_private_json_value",
-        lambda *_args, **_kwargs: {
-            "kind": "hermes-gateway",
-            "pid": 41,
-            "gateway_state": "draining",
-            "active_agents": 0,
         },
     )
     monkeypatch.setattr(
