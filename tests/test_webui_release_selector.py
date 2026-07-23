@@ -2725,6 +2725,7 @@ def _watchdog_barrier_transaction(tmp_path: Path) -> tuple[dict, dict]:
         "transaction_id": transaction_id,
         "transaction_journal": str(journal_path),
         "watchdog_crontab_rollback": str(tmp_path / "crontab.backup"),
+        "watchdog_candidate_script": str(tmp_path / "candidate-watchdog.py"),
     }, candidate
 
 
@@ -3195,7 +3196,7 @@ def test_begin_release_watchdog_barrier_prepares_internal_backend(
     monkeypatch.setattr(
         cutover,
         "_watchdog_reconcile_receipt",
-        lambda *_args: {
+        lambda *_args, **_kwargs: {
             "status": "no_reconcilable_slot",
             "state_before": expected_state,
             "state_after": expected_state,
@@ -3224,6 +3225,137 @@ def test_begin_release_watchdog_barrier_prepares_internal_backend(
     assert prepared_calls == [plan]
     assert barrier["prepared"] == prepared
     assert barrier["lock"] is lock
+
+
+def test_watchdog_reconcile_retries_only_transient_empty_receipt_and_uses_candidate(
+    tmp_path,
+    monkeypatch,
+):
+    candidate = tmp_path / "candidate-watchdog.py"
+    candidate.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    candidate.chmod(0o700)
+    plan = {
+        "watchdog_state_file": str(tmp_path / "recovery" / "state.json"),
+        "watchdog_installed_script": str(tmp_path / "installed-watchdog.py"),
+        "watchdog_candidate_script": str(candidate),
+        "watchdog_expected_sha256": "a" * 64,
+        "signing_key_file": str(tmp_path / "webui" / ".signing_key"),
+        "base_url": "http://127.0.0.1:8787",
+        "listener_port": 8787,
+        "timeout_seconds": 300,
+        "interval_seconds": 0.25,
+    }
+    state_before = {"claim_revision": 7}
+    state_after = {"claim_revision": 8}
+    state_receipts = iter((state_before, state_after))
+    invocations = []
+    results = iter(
+        (
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "RECOVERY_SLOT_RECONCILE_ONLY "
+                    "status=no_reconcilable_slot\n"
+                ),
+                stderr="",
+            ),
+        )
+    )
+    monotonic = iter((100.0, 100.1))
+    sleeps = []
+    monkeypatch.setattr(
+        cutover,
+        "_watchdog_state_receipt",
+        lambda _plan: next(state_receipts),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_file_identity_receipt",
+        lambda path: {
+            "resolved_path": str(Path(path).resolve()),
+            "sha256": "a" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_disabled_watchdog_cron",
+        lambda _plan, prepared: {"prepared": prepared},
+    )
+    monkeypatch.setattr(
+        cutover.subprocess,
+        "run",
+        lambda argv, **_kwargs: invocations.append(argv) or next(results),
+    )
+    monkeypatch.setattr(cutover.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(
+        cutover.time,
+        "sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+
+    receipt = cutover._watchdog_reconcile_receipt(
+        plan,
+        {"status": "prepared"},
+        script_path=candidate,
+    )
+
+    assert invocations == [[str(candidate)], [str(candidate)]]
+    assert sleeps == [0.25]
+    assert receipt["status"] == "no_reconcilable_slot"
+    assert receipt["transient_empty_attempts"] == 1
+    assert receipt["installed_script"]["sha256"] == "a" * 64
+    assert receipt["state_before"] == state_before
+    assert receipt["state_after"] == state_after
+
+
+def test_watchdog_reconcile_rejects_stderr_without_retry(tmp_path, monkeypatch):
+    candidate = tmp_path / "candidate-watchdog.py"
+    candidate.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    candidate.chmod(0o700)
+    plan = {
+        "watchdog_state_file": str(tmp_path / "recovery" / "state.json"),
+        "watchdog_installed_script": str(tmp_path / "installed-watchdog.py"),
+        "watchdog_candidate_script": str(candidate),
+        "watchdog_expected_sha256": "b" * 64,
+        "signing_key_file": str(tmp_path / "webui" / ".signing_key"),
+        "base_url": "http://127.0.0.1:8787",
+        "listener_port": 8787,
+        "timeout_seconds": 300,
+        "interval_seconds": 0.25,
+    }
+    invocations = []
+    monkeypatch.setattr(
+        cutover,
+        "_watchdog_state_receipt",
+        lambda _plan: {"claim_revision": 7},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_file_identity_receipt",
+        lambda path: {
+            "resolved_path": str(Path(path).resolve()),
+            "sha256": "b" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        cutover.subprocess,
+        "run",
+        lambda argv, **_kwargs: invocations.append(argv)
+        or SimpleNamespace(returncode=0, stdout="", stderr="warning\n"),
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="watchdog reconcile-only receipt is invalid",
+    ):
+        cutover._watchdog_reconcile_receipt(
+            plan,
+            {"status": "prepared"},
+            script_path=candidate,
+        )
+
+    assert invocations == [[str(candidate)]]
 
 
 def test_release_watchdog_barrier_disables_reconciles_and_holds_exact_lock(
@@ -3257,7 +3389,9 @@ def test_release_watchdog_barrier_disables_reconciles_and_holds_exact_lock(
     monkeypatch.setattr(
         cutover,
         "_watchdog_reconcile_receipt",
-        lambda _plan, _prepared: events.append("reconcile")
+        lambda _plan, _prepared, **kwargs: events.append(
+            ("reconcile", kwargs.get("script_path"))
+        )
         or {
             "status": "no_reconcilable_slot",
             "state_before": {**expected_state, "claim_revision": 6},
@@ -3291,7 +3425,13 @@ def test_release_watchdog_barrier_disables_reconciles_and_holds_exact_lock(
     assert barrier["lock"] is lock
     assert barrier["prepared"] == prepared
     assert barrier["state"] == expected_state
-    assert events == ["disable", "reconcile", "acquire", "verify-lock", "state"]
+    assert events == [
+        "disable",
+        ("reconcile", plan["watchdog_candidate_script"]),
+        "acquire",
+        "verify-lock",
+        "state",
+    ]
     phases = cutover.read_transaction_journal(
         plan["transaction_journal"],
         transaction_id=plan["transaction_id"],
@@ -3332,7 +3472,7 @@ def test_release_watchdog_barrier_rejects_state_change_and_leaves_cron_disabled(
     monkeypatch.setattr(
         cutover,
         "_watchdog_reconcile_receipt",
-        lambda *_args: {
+        lambda *_args, **_kwargs: {
             "status": "no_reconcilable_slot",
             "state_before": expected_state,
             "state_after": expected_state,

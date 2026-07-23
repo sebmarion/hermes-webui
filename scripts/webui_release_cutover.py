@@ -15232,9 +15232,22 @@ def _watchdog_state_receipt(plan: dict) -> dict:
     }
 
 
-def _watchdog_reconcile_receipt(plan: dict, prepared: dict) -> dict:
+def _watchdog_reconcile_receipt(
+    plan: dict,
+    prepared: dict,
+    *,
+    script_path: Path | str | None = None,
+) -> dict:
     state_path = Path(plan["watchdog_state_file"])
     hermes_home = state_path.parent.parent
+    installed_script = Path(plan["watchdog_installed_script"])
+    candidate_script = Path(plan["watchdog_candidate_script"])
+    reconcile_script = Path(script_path) if script_path is not None else installed_script
+    if reconcile_script not in {installed_script, candidate_script}:
+        raise ReleaseBuildError("watchdog reconcile script path is invalid")
+    script_receipt = _file_identity_receipt(reconcile_script)
+    if script_receipt.get("sha256") != plan["watchdog_expected_sha256"]:
+        raise DrainIdentityMismatch("watchdog reconcile script identity changed")
     before = _watchdog_state_receipt(plan)
     environment = {
         key: value
@@ -15259,37 +15272,56 @@ def _watchdog_reconcile_receipt(plan: dict, prepared: dict) -> dict:
             "HERMES_SESSION_WATCHDOG_RECONCILE_ONLY": "1",
         }
     )
-    try:
-        completed = subprocess.run(
-            [str(plan["watchdog_installed_script"])],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=max(30.0, float(plan["timeout_seconds"])),
-            env=environment,
+    retry_window = min(30.0, float(plan["timeout_seconds"]))
+    invocation_timeout = max(1.0, retry_window)
+    deadline = time.monotonic() + retry_window
+    transient_empty_attempts = 0
+    while True:
+        try:
+            completed = subprocess.run(
+                [str(reconcile_script)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=invocation_timeout,
+                env=environment,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ReleaseBuildError(
+                "watchdog reconcile-only invocation failed"
+            ) from exc
+        stdout = completed.stdout.strip()
+        stderr = completed.stderr.strip()
+        match = re.fullmatch(
+            r"RECOVERY_SLOT_RECONCILE_ONLY status="
+            r"(no_reconcilable_slot|superseded_turn_after_abandoned_dispatch)",
+            stdout,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ReleaseBuildError("watchdog reconcile-only invocation failed") from exc
-    stdout = completed.stdout.strip()
-    match = re.fullmatch(
-        r"RECOVERY_SLOT_RECONCILE_ONLY status="
-        r"(no_reconcilable_slot|superseded_turn_after_abandoned_dispatch)",
-        stdout,
-    )
-    if completed.returncode != 0 or completed.stderr.strip() or match is None:
+        if completed.returncode == 0 and not stderr and match is not None:
+            break
+        if completed.returncode == 0 and not stdout and not stderr:
+            transient_empty_attempts += 1
+            now = time.monotonic()
+            if now < deadline:
+                time.sleep(
+                    min(float(plan["interval_seconds"]), deadline - now)
+                )
+                continue
         raise ReleaseBuildError("watchdog reconcile-only receipt is invalid")
     after = _watchdog_state_receipt(plan)
     if after["claim_revision"] < before["claim_revision"]:
         raise ReleaseBuildError("watchdog claim revision moved backwards")
     return {
         "status": match.group(1),
+        "transient_empty_attempts": transient_empty_attempts,
         "stdout_sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
         "state_path": str(state_path),
         "state_before": before,
         "state_after": after,
-        "installed_script": _file_identity_receipt(
-            plan["watchdog_installed_script"]
+        "installed_script": script_receipt,
+        "script_role": (
+            "installed" if reconcile_script == installed_script else "candidate"
         ),
         "cron": _attest_disabled_watchdog_cron(plan, prepared),
     }
@@ -15648,7 +15680,11 @@ def _begin_release_watchdog_barrier(
             plan["transaction_journal"],
             transaction_id=plan["transaction_id"],
             phase="watchdog_state_reconciled",
-            receipt=_watchdog_reconcile_receipt(plan, durable_prepared),
+            receipt=_watchdog_reconcile_receipt(
+                plan,
+                durable_prepared,
+                script_path=plan["watchdog_candidate_script"],
+            ),
         )
         phases = journal["phases"]
     reconciled = phases["watchdog_state_reconciled"]
@@ -17526,14 +17562,14 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                 journal = _record_bootstrap_phase(
                     plan,
                     "watchdog_reconciled_once",
-                    _watchdog_reconcile_receipt(plan),
+                    _watchdog_reconcile_receipt(plan, prepared),
                 )
                 phases = journal["phases"]
             if "watchdog_reconciled_twice" not in phases:
                 journal = _record_bootstrap_phase(
                     plan,
                     "watchdog_reconciled_twice",
-                    _watchdog_reconcile_receipt(plan),
+                    _watchdog_reconcile_receipt(plan, prepared),
                 )
                 phases = journal["phases"]
             cron = _attest_disabled_watchdog_cron(plan, prepared)
