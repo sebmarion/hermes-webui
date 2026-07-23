@@ -107,6 +107,14 @@ class ReleaseBuildError(RuntimeError):
     """The committed source cannot be materialized as an immutable release."""
 
 
+class ListenerAbsent(DrainIdentityMismatch):
+    """No process currently owns the probed listener."""
+
+
+class ListenerProbeAmbiguous(ReleaseBuildError):
+    """The listener owner could not be determined unambiguously."""
+
+
 class InjectedCutoverCrash(RuntimeError):
     """Deterministic durable-transaction crash point used by tests."""
 
@@ -4510,14 +4518,38 @@ def _listener_pid(port: int) -> int:
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise DrainIdentityMismatch("listener PID probe failed") from exc
-    pids = {int(row) for row in completed.stdout.split() if row.isdigit()}
-    if completed.returncode != 0 or len(pids) != 1:
-        raise DrainIdentityMismatch("listener PID is unavailable or ambiguous")
+        raise ListenerProbeAmbiguous("listener PID probe failed") from exc
+    rows = [row.strip() for row in completed.stdout.splitlines() if row.strip()]
+    if (
+        completed.returncode == 1
+        and not rows
+        and not completed.stderr.strip()
+    ):
+        raise ListenerAbsent(f"no listener owns TCP port {int(port)}")
+    if (
+        completed.returncode != 0
+        or completed.stderr.strip()
+        or any(not row.isdigit() for row in rows)
+    ):
+        detail = completed.stderr.strip()
+        suffix = f": {detail}" if detail else ""
+        raise ListenerProbeAmbiguous(f"listener PID probe failed{suffix}")
+    pids = {int(row) for row in rows}
+    if len(pids) != 1:
+        raise ListenerProbeAmbiguous(
+            "listener PID is unavailable or ambiguous"
+        )
     pid = next(iter(pids))
     if pid <= 1:
-        raise DrainIdentityMismatch("listener PID is invalid")
+        raise ListenerProbeAmbiguous("listener PID is invalid")
     return pid
+
+
+def _listener_pid_or_none(port: int) -> int | None:
+    try:
+        return _listener_pid(port)
+    except ListenerAbsent:
+        return None
 
 
 def _job_target(plan: dict, *, gateway: bool = False) -> str:
@@ -14050,11 +14082,11 @@ def _retire_exact_legacy_gateway(
             gateway=True,
             required=False,
         )
-        listener_before = _listener_pid(
+        listener_before = _listener_pid_or_none(
             int(plan["gateway_listener_port"])
         )
         job_pid = _job_pid(plan, gateway=True)
-        listener_after = _listener_pid(
+        listener_after = _listener_pid_or_none(
             int(plan["gateway_listener_port"])
         )
         if (
@@ -14357,12 +14389,7 @@ def _restore_or_resume_frozen_legacy_webui(
             gateway=False,
         )
     except (DrainIdentityMismatch, ReleaseBuildError) as attestation_error:
-        try:
-            listener = _listener_pid(int(plan["listener_port"]))
-        except DrainIdentityMismatch as exc:
-            raise DrainIdentityMismatch(
-                "ambiguous WebUI listener blocks pre-snapshot abort restore"
-            ) from exc
+        listener = _listener_pid_or_none(int(plan["listener_port"]))
         job_pid = _job_pid(plan, gateway=False)
         if listener is not None or job_pid is not None:
             raise DrainIdentityMismatch(
@@ -14452,12 +14479,9 @@ def _restore_legacy_gateway_before_snapshot_abort(
                 raise DrainIdentityMismatch(
                     "retired legacy gateway PID was reused before abort restore"
                 ) from attestation_error
-            try:
-                listener = _listener_pid(int(plan["gateway_listener_port"]))
-            except DrainIdentityMismatch as exc:
-                raise DrainIdentityMismatch(
-                    "ambiguous gateway listener blocks pre-snapshot abort"
-                ) from exc
+            listener = _listener_pid_or_none(
+                int(plan["gateway_listener_port"])
+            )
             if listener is not None:
                 job_pid = _job_pid(plan, gateway=True)
                 if job_pid != listener:
@@ -14589,14 +14613,53 @@ def _restore_legacy_before_snapshot_abort(
     if dispatcher_lock is not None and dispatcher_lock.get("status") == "held":
         dispatcher_lock = _release_legacy_dispatcher_lock(plan)
     tick_intent = phases.get("legacy_cron_tick_lock_normalize_intent")
+    cron_tick_reacquire: dict
     try:
         if isinstance(tick_intent, dict):
+            original_tick_lock = tick_intent.get("original")
+            if not isinstance(original_tick_lock, dict):
+                raise ReleaseBuildError(
+                    "legacy cron tick lock normalization intent is invalid"
+                )
+            original_status = original_tick_lock.get("status")
+            if original_status == "present":
+                original_mode = original_tick_lock.get("mode")
+                if original_mode not in {0o600, 0o644}:
+                    raise ReleaseBuildError(
+                        "legacy cron tick lock normalization intent is invalid"
+                    )
+                cron_tick_reacquire = (
+                    _acquire_legacy_cron_tick_lock_modes(
+                        plan,
+                        allowed_modes={0o600, int(original_mode)},
+                    )
+                )
+            elif original_status == "absent":
+                current_tick_lock = _read_legacy_cron_tick_file_receipt(
+                    plan,
+                    allowed_modes={0o600},
+                    allow_absent=True,
+                )
+                if current_tick_lock.get("status") == "present":
+                    cron_tick_reacquire = (
+                        _acquire_legacy_cron_tick_lock_modes(
+                            plan,
+                            allowed_modes={0o600},
+                        )
+                    )
+                else:
+                    cron_tick_reacquire = {"status": "already-absent"}
+            else:
+                raise ReleaseBuildError(
+                    "legacy cron tick lock normalization intent is invalid"
+                )
             cron_tick_restore = _restore_legacy_cron_tick_lock(
                 plan,
                 tick_intent,
                 phases.get("legacy_cron_tick_lock_normalized"),
             )
         else:
+            cron_tick_reacquire = {"status": "not-required"}
             cron_tick_restore = {"status": "not-required"}
     finally:
         cron_tick_release = _release_legacy_cron_tick_lock(
@@ -14641,6 +14704,7 @@ def _restore_legacy_before_snapshot_abort(
         "pre_managed_controls": controls,
         "dispatcher_lock": dispatcher_lock or {"status": "not-acquired"},
         "cron_tick_lock": {
+            "reacquire": cron_tick_reacquire,
             "release": cron_tick_release,
             "restore": cron_tick_restore,
         },

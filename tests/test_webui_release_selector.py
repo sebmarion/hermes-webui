@@ -6385,6 +6385,53 @@ def test_frozen_boundary_accepts_exact_idle_descendant_tree(monkeypatch):
     }
 
 
+def test_frozen_boundary_rejects_ambiguous_gateway_listener(monkeypatch):
+    plan = {"gateway_listener_port": 8642}
+    prepared = {
+        "legacy": {"pid": 10, "pid_start_token": "root-start"},
+        "gateway": {"pid": 20, "pid_start_token": "gateway-start"},
+    }
+    frozen = {
+        "writers": [
+            {
+                "role": "webui",
+                "status": "frozen",
+                "tree": [
+                    {
+                        "pid": 10,
+                        "ppid": None,
+                        "pid_start_token": "root-start",
+                        "state": "T",
+                    }
+                ],
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_verify_frozen_prepared_writers",
+        lambda *_args: frozen,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_listener_pid",
+        lambda _port: (_ for _ in ()).throw(
+            cutover.ListenerProbeAmbiguous("ambiguous listener owners")
+        ),
+    )
+
+    with pytest.raises(
+        cutover.ListenerProbeAmbiguous,
+        match="ambiguous listener owners",
+    ):
+        cutover._prove_frozen_legacy_boundary(
+            plan,
+            prepared,
+            frozen,
+            {"status": "held"},
+        )
+
+
 def test_legacy_durable_activity_ignores_expired_webui_rows(
     tmp_path, monkeypatch
 ):

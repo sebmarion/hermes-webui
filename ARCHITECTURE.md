@@ -1917,9 +1917,12 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   reacquires this kernel lock after process restart instead of treating a
   journal phase as live ownership, and holds it from before drain through exact
   legacy gateway exit and the all-services-stopped receipt. Pre-snapshot abort
+  reacquires the exact inode in either normalized or captured mode before it
   restores the captured mode and bytes (or removes a transaction-created
-  lock); rollback permits an inode rebind only when the signed state-snapshot
-  restore receipt proves the transaction-owned replacement.
+  lock). This makes abort recovery idempotent after a crash between the restore
+  and its durable receipt. Rollback permits an inode rebind only when the
+  signed state-snapshot restore receipt proves the transaction-owned
+  replacement.
 - Legacy gateway retirement does not rely on launchd's default SIGTERM exit
   timeout. The durable stop intent first captures the exact launchd
   `print-disabled` state and requires the service to be semantically enabled.
@@ -1929,9 +1932,11 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   clean-shutdown receipt before booting out the now-inactive job. The label is
   re-enabled after either success or failure. Crash resume reuses the durable
   restart-control intent; pre-snapshot abort re-enables it before adopting or
-  exactly restarting the attested legacy binding. Ambiguous listeners, PID
-  reuse, foreign runtime identity, and malformed launchd override output all
-  fail closed.
+  exactly restarting the attested legacy binding. Listener probing
+  distinguishes a clean `lsof` no-owner result from multiple owners, malformed
+  output, stderr, and probe failure. Only clean absence authorizes a restart;
+  ambiguity, PID reuse, foreign runtime identity, and malformed launchd
+  override output all fail closed.
 - The same capture/CAS normalization applies to the two synthetic completion
   stores. Candidate and quarantine JSON is always private `0600`, while an
   exact legacy `0644` source mode is retained in the journal for abort or

@@ -1627,8 +1627,10 @@ actor.
 Gateway retirement coverage also proves exact launchd override parsing,
 KeepAlive disable-before-SIGINT ordering, PID/start/listener/job rechecks,
 fresh clean-shutdown enforcement, idempotent resume after process exit,
-re-enable-on-error, ambiguous-listener refusal, and pre-snapshot abort recovery
-for healthy replacement, clean absence, and foreign-owner cases.
+re-enable-on-error, clean-absence versus ambiguous/probe-error listener
+classification, and pre-snapshot abort recovery for healthy replacement, clean
+absence, foreign-owner cases, and a crash after the cron tick lock was already
+restored but before the abort receipt was durable.
 
 
 ---

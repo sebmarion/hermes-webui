@@ -338,6 +338,27 @@ def test_legacy_cron_tick_lock_normalization_is_durable_and_reversible(
     assert restored["status"] in {"already-restored", "restored"}
 
 
+def test_legacy_cron_tick_lock_restore_adopts_exact_prior_restore(tmp_path):
+    plan, path = _cron_plan(tmp_path, lock_mode=0o644)
+    intent, normalized = _normalize_tick_lock(plan)
+
+    first = cutover._restore_legacy_cron_tick_lock(
+        plan,
+        intent,
+        normalized,
+    )
+    second = cutover._restore_legacy_cron_tick_lock(
+        plan,
+        intent,
+        normalized,
+    )
+
+    assert first["status"] == "restored"
+    assert second["status"] == "already-restored"
+    assert second["restored"]["mode"] == 0o644
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
 def test_first_tick_lock_normalization_accepts_empty_mtime_churn_under_lock(
     tmp_path,
 ):
@@ -1445,6 +1466,38 @@ def test_exact_gateway_retire_disables_restart_before_sigint_and_reenables(
     assert state == {"alive": False, "job_loaded": False, "disabled": False}
 
 
+def test_listener_probe_distinguishes_clean_absence_from_ambiguity(monkeypatch):
+    results = iter(
+        [
+            SimpleNamespace(returncode=1, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="41\n42\n", stderr=""),
+            SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="lsof: probe failed\n",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        cutover.subprocess,
+        "run",
+        lambda *_args, **_kwargs: next(results),
+    )
+
+    with pytest.raises(cutover.ListenerAbsent, match="no listener"):
+        cutover._listener_pid(8642)
+    with pytest.raises(
+        cutover.ListenerProbeAmbiguous,
+        match="unavailable or ambiguous",
+    ):
+        cutover._listener_pid(8642)
+    with pytest.raises(
+        cutover.ListenerProbeAmbiguous,
+        match="probe failed",
+    ):
+        cutover._listener_pid(8642)
+
+
 def test_exact_gateway_retire_resumes_after_clean_process_exit(
     tmp_path,
     monkeypatch,
@@ -1666,13 +1719,13 @@ def test_exact_gateway_retire_rejects_ambiguous_listener_absence(
         cutover,
         "_listener_pid",
         lambda _port: (_ for _ in ()).throw(
-            cutover.DrainIdentityMismatch("ambiguous listener owners")
+            cutover.ListenerProbeAmbiguous("ambiguous listener owners")
         ),
     )
     monkeypatch.setattr(cutover, "_job_pid", lambda *_args, **_kwargs: None)
 
     with pytest.raises(
-        cutover.DrainIdentityMismatch,
+        cutover.ListenerProbeAmbiguous,
         match="ambiguous listener owners",
     ):
         cutover._retire_exact_legacy_gateway(
@@ -1794,7 +1847,13 @@ def test_abort_restore_restarts_when_exact_gateway_is_cleanly_absent(
     )
     monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: False)
     monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
-    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: None)
+    monkeypatch.setattr(
+        cutover,
+        "_listener_pid",
+        lambda _port: (_ for _ in ()).throw(
+            cutover.ListenerAbsent("no listener owns TCP port 8642")
+        ),
+    )
     monkeypatch.setattr(
         cutover,
         "_bootout_job",
@@ -1900,6 +1959,101 @@ def test_abort_restore_rejects_foreign_gateway_owner(monkeypatch):
         )
 
     assert bootouts == []
+
+
+def test_abort_restore_reacquires_tick_lock_after_crash(monkeypatch):
+    plan = {"transaction_id": "abort-recovery-transaction-000001"}
+    prepared = {"pre_managed_controls": {}}
+    frozen = {"writers": []}
+    tick_intent = {
+        "original": {
+            "status": "present",
+            "mode": 0o644,
+        }
+    }
+    phases = {
+        "legacy_cron_tick_lock_normalize_intent": tick_intent,
+        "legacy_cron_tick_lock_normalized": {"status": "normalized"},
+    }
+    events = []
+    monkeypatch.setattr(
+        cutover,
+        "_restore_pre_managed_control_state",
+        lambda *_args, **_kwargs: {"status": "restored"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_bootstrap_cli_link",
+        lambda *_args, **_kwargs: {"status": "restored"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_acquire_legacy_cron_tick_lock_modes",
+        lambda _plan, *, allowed_modes: (
+            events.append(("acquire", allowed_modes))
+            or {"status": "held"}
+        ),
+    )
+
+    def restore_tick(_plan, intent, normalization):
+        assert intent is tick_intent
+        assert normalization == {"status": "normalized"}
+        assert events == [("acquire", {0o600, 0o644})]
+        events.append("restore")
+        return {"status": "already-restored"}
+
+    monkeypatch.setattr(
+        cutover,
+        "_restore_legacy_cron_tick_lock",
+        restore_tick,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_release_legacy_cron_tick_lock",
+        lambda *_args, **_kwargs: (
+            events.append("release") or {"status": "released"}
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_legacy_gateway_before_snapshot_abort",
+        lambda *_args, **_kwargs: {
+            "gateway": {"status": "verified"},
+            "launchd_restart": {"status": "enabled"},
+            "recovery": {"status": "restored"},
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_or_resume_frozen_legacy_webui",
+        lambda *_args, **_kwargs: {
+            "binding": {"status": "verified"},
+            "writers": {"status": "resumed"},
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_watchdog_cron",
+        lambda *_args, **_kwargs: {"status": "restored"},
+    )
+
+    receipt = cutover._restore_legacy_before_snapshot_abort(
+        plan,
+        prepared,
+        frozen,
+        phases,
+        cutover.ReleaseBuildError("resume boundary failed"),
+    )
+
+    assert events == [
+        ("acquire", {0o600, 0o644}),
+        "restore",
+        "release",
+    ]
+    assert receipt["status"] == "aborted"
+    assert receipt["cron_tick_lock"]["restore"]["status"] == (
+        "already-restored"
+    )
 
 
 def test_gateway_bootout_freezes_before_marker_and_resumes_after_bootout(
