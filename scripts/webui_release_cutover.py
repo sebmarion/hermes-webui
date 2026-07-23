@@ -10647,6 +10647,76 @@ def _legacy_cron_tick_receipts_match_stable(
     )
 
 
+def _legacy_cron_tick_receipts_match_locked_mtime_churn(
+    plan: dict,
+    actual: dict,
+    expected: dict,
+) -> bool:
+    if _legacy_cron_tick_receipts_match_stable(actual, expected):
+        return True
+    transaction_id = str(plan.get("transaction_id") or "")
+    handle = _LEGACY_CRON_TICK_LOCKS.get(transaction_id)
+    if handle is None or getattr(handle, "closed", True):
+        return False
+    try:
+        held_receipt = _legacy_cron_tick_lock_receipt(
+            _legacy_cron_tick_lock_path(plan),
+            os.fstat(handle.fileno()),
+        )
+        _verify_legacy_cron_tick_lock(plan, held_receipt)
+    except (OSError, ReleaseBuildError):
+        return False
+    return _legacy_cron_tick_receipts_differ_only_empty_mtime(
+        actual,
+        expected,
+    )
+
+
+def _legacy_cron_tick_receipts_differ_only_empty_mtime(
+    actual: dict,
+    expected: dict,
+) -> bool:
+    stable_without_mtime = tuple(
+        field
+        for field in _LEGACY_CRON_TICK_LOCK_STABLE_FIELDS
+        if field != "mtime_ns"
+    )
+    empty_sha256 = hashlib.sha256(b"").hexdigest()
+    return (
+        all(
+            actual.get(field) == expected.get(field)
+            for field in stable_without_mtime
+        )
+        and actual.get("size") == expected.get("size") == 0
+        and actual.get("sha256")
+        == expected.get("sha256")
+        == empty_sha256
+    )
+
+
+def _legacy_cron_tick_normalizations_match(
+    plan: dict,
+    actual: dict,
+    expected: dict,
+) -> bool:
+    return (
+        isinstance(actual, dict)
+        and isinstance(expected, dict)
+        and actual.get("status") == expected.get("status") == "normalized"
+        and actual.get("transaction_id") == expected.get("transaction_id")
+        and actual.get("original") == expected.get("original")
+        and actual.get("bounded_host_assumption")
+        == expected.get("bounded_host_assumption")
+        and isinstance(actual.get("normalized"), dict)
+        and isinstance(expected.get("normalized"), dict)
+        and _legacy_cron_tick_receipts_match_locked_mtime_churn(
+            plan,
+            actual["normalized"],
+            expected["normalized"],
+        )
+    )
+
+
 def _normalize_legacy_cron_tick_lock(plan: dict, intent: dict) -> dict:
     if (
         not isinstance(intent, dict)
@@ -10729,7 +10799,11 @@ def _normalize_legacy_cron_tick_lock(plan: dict, intent: dict) -> dict:
             allowed_modes={0o600, int(original_mode)},
             allow_absent=False,
         )
-        if not _legacy_cron_tick_receipts_match_stable(current, original):
+        if not _legacy_cron_tick_receipts_match_locked_mtime_churn(
+            plan,
+            current,
+            original,
+        ):
             raise DrainIdentityMismatch(
                 "legacy cron tick lock changed before normalization"
             )
@@ -10771,7 +10845,8 @@ def _normalize_legacy_cron_tick_lock(plan: dict, intent: dict) -> dict:
             finally:
                 os.close(descriptor)
             _fsync_directory(parent)
-        if not _legacy_cron_tick_receipts_match_stable(
+        if not _legacy_cron_tick_receipts_match_locked_mtime_churn(
+            plan,
             normalized,
             original,
         ):
@@ -10907,12 +10982,14 @@ def _restore_legacy_cron_tick_lock(
         allowed_modes={0o600, int(original["mode"])},
         allow_absent=False,
     )
-    matches_original = _legacy_cron_tick_receipts_match_stable(
+    matches_original = _legacy_cron_tick_receipts_match_locked_mtime_churn(
+        plan,
         current,
         original,
     )
     matches_normalized = normalized is None or (
-        _legacy_cron_tick_receipts_match_stable(
+        _legacy_cron_tick_receipts_match_locked_mtime_churn(
+            plan,
             current,
             normalized,
         )
@@ -10968,7 +11045,11 @@ def _restore_legacy_cron_tick_lock(
             descriptor,
             allowed_modes={0o600},
         )
-        if not _legacy_cron_tick_receipts_match_stable(opened, current):
+        if not _legacy_cron_tick_receipts_match_locked_mtime_churn(
+            plan,
+            opened,
+            current,
+        ):
             raise DrainIdentityMismatch(
                 "legacy cron tick lock changed before restore"
             )
@@ -10982,9 +11063,12 @@ def _restore_legacy_cron_tick_lock(
     finally:
         os.close(descriptor)
     _fsync_directory(path.parent)
-    if not _legacy_cron_tick_receipts_match_stable(
-        restored,
-        original,
+    if not (
+        _legacy_cron_tick_receipts_match_stable(restored, original)
+        or _legacy_cron_tick_receipts_differ_only_empty_mtime(
+            restored,
+            original,
+        )
     ) and not (
         snapshot_rebound
         and restored.get("path") == original.get("path")
@@ -11134,7 +11218,11 @@ def _acquire_legacy_cron_tick_lock(plan: dict) -> dict:
         raise
 
 
-def _release_legacy_cron_tick_lock(plan: dict) -> dict:
+def _release_legacy_cron_tick_lock(
+    plan: dict,
+    *,
+    allow_restored_mode: bool = False,
+) -> dict:
     transaction_id = str(plan.get("transaction_id") or "")
     handle = _LEGACY_CRON_TICK_LOCKS.get(transaction_id)
     if handle is None or getattr(handle, "closed", True):
@@ -11150,7 +11238,30 @@ def _release_legacy_cron_tick_lock(plan: dict) -> dict:
         _legacy_cron_tick_lock_path(plan),
         opened,
     )
-    _verify_legacy_cron_tick_lock(plan, held)
+    if allow_restored_mode:
+        path = _legacy_cron_tick_lock_path(plan)
+        current = path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) not in {0o600, 0o644}
+            or any(
+                getattr(current, field) != getattr(opened, field)
+                for field in (
+                    "st_dev",
+                    "st_ino",
+                    "st_mode",
+                    "st_uid",
+                    "st_nlink",
+                )
+            )
+        ):
+            raise DrainIdentityMismatch(
+                "legacy cron tick lock identity changed before release"
+            )
+    else:
+        _verify_legacy_cron_tick_lock(plan, held)
     _LEGACY_CRON_TICK_LOCKS.pop(transaction_id, None)
     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     handle.close()
@@ -11993,6 +12104,8 @@ def _legacy_gateway_health_with_drain(plan: dict) -> dict:
         if isinstance(environment, dict)
         else ""
     )
+    if not api_key:
+        return public
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     return _http_json(
         Request(detailed_url, headers=headers, method="GET"),
@@ -12055,6 +12168,7 @@ def _wait_for_legacy_gateway_drain(
             health = _legacy_gateway_health_with_drain(plan)
             drain = health.get("drain")
             if isinstance(drain, dict):
+                health_mode = "structured-drain"
                 admission = drain.get("admission")
                 work = drain.get("work")
                 work_status = drain.get("work_status")
@@ -12111,23 +12225,36 @@ def _wait_for_legacy_gateway_drain(
                     if isinstance(queues, dict)
                     else None
                 )
-                if (
-                    health.get("gateway_state") != "draining"
-                    or int(health.get("active_agents", -1)) != 0
-                    or not isinstance(readiness, dict)
-                    or readiness.get("status") not in {"ok", "degraded"}
-                    or not isinstance(queues, dict)
-                    or queues.get("status") != "ok"
-                    or not isinstance(work, dict)
-                    or any(
-                        isinstance(value, bool)
-                        or not isinstance(value, int)
-                        or value != 0
-                        for value in work.values()
-                    )
+                if isinstance(readiness, dict):
+                    health_mode = "detailed-readiness"
+                    if (
+                        health.get("gateway_state") != "draining"
+                        or int(health.get("active_agents", -1)) != 0
+                        or readiness.get("status") not in {"ok", "degraded"}
+                        or not isinstance(queues, dict)
+                        or queues.get("status") != "ok"
+                        or not isinstance(work, dict)
+                        or any(
+                            isinstance(value, bool)
+                            or not isinstance(value, int)
+                            or value != 0
+                            for value in work.values()
+                        )
+                    ):
+                        raise ReleaseBuildError(
+                            "legacy gateway detailed readiness is not zero-work"
+                        )
+                elif (
+                    health.get("status") == "ok"
+                    and health.get("platform") == "hermes-agent"
+                    and isinstance(health.get("version"), str)
+                    and health.get("version")
                 ):
+                    health_mode = "legacy-status-file"
+                    work = {"active_agents": 0}
+                else:
                     raise ReleaseBuildError(
-                        "legacy gateway detailed readiness is not zero-work"
+                        "legacy gateway public health is not usable"
                     )
             health_pid = health.get("pid")
             release = health.get("release_identity")
@@ -12162,6 +12289,7 @@ def _wait_for_legacy_gateway_drain(
                         separators=(",", ":"),
                     ).encode()
                 ).hexdigest(),
+                "health_mode": health_mode,
                 "work": copy.deepcopy(work),
                 "process_checkpoint": checkpoint,
             }
@@ -12896,16 +13024,21 @@ def _restore_legacy_before_snapshot_abort(
         _wait_for_legacy_kanban_quiescence(plan)
     if dispatcher_lock is not None and dispatcher_lock.get("status") == "held":
         dispatcher_lock = _release_legacy_dispatcher_lock(plan)
-    cron_tick_release = _release_legacy_cron_tick_lock(plan)
     tick_intent = phases.get("legacy_cron_tick_lock_normalize_intent")
-    if isinstance(tick_intent, dict):
-        cron_tick_restore = _restore_legacy_cron_tick_lock(
+    try:
+        if isinstance(tick_intent, dict):
+            cron_tick_restore = _restore_legacy_cron_tick_lock(
+                plan,
+                tick_intent,
+                phases.get("legacy_cron_tick_lock_normalized"),
+            )
+        else:
+            cron_tick_restore = {"status": "not-required"}
+    finally:
+        cron_tick_release = _release_legacy_cron_tick_lock(
             plan,
-            tick_intent,
-            phases.get("legacy_cron_tick_lock_normalized"),
+            allow_restored_mode=True,
         )
-    else:
-        cron_tick_restore = {"status": "not-required"}
     store_intent = phases.get("synthetic_store_mode_normalize_intent")
     store_normalization = phases.get("synthetic_store_modes_normalized")
     if isinstance(store_intent, dict):
@@ -15241,6 +15374,15 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                                 ),
                             )
                             phases = journal["phases"]
+                        cron_tick_lock = None
+                        if "legacy_cron_tick_lock_normalized" in phases:
+                            # A durable normalization may be resumed after a
+                            # cooperating legacy scheduler touched only the
+                            # empty lock file's mtime. Reacquire the kernel
+                            # lock before accepting that bounded drift.
+                            cron_tick_lock = _acquire_legacy_cron_tick_lock(
+                                plan
+                            )
                         observed_tick_normalization = (
                             _normalize_legacy_cron_tick_lock(
                                 plan,
@@ -15257,8 +15399,11 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                             )
                             phases = journal["phases"]
                         elif (
-                            phases["legacy_cron_tick_lock_normalized"]
-                            != observed_tick_normalization
+                            not _legacy_cron_tick_normalizations_match(
+                                plan,
+                                observed_tick_normalization,
+                                phases["legacy_cron_tick_lock_normalized"],
+                            )
                         ):
                             raise DrainIdentityMismatch(
                                 "durable legacy cron tick lock normalization changed"
@@ -15266,7 +15411,10 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                         # Always reacquire the kernel lock on resume. A durable
                         # phase proves ordering, not continued lock ownership
                         # across process death.
-                        cron_tick_lock = _acquire_legacy_cron_tick_lock(plan)
+                        if cron_tick_lock is None:
+                            cron_tick_lock = _acquire_legacy_cron_tick_lock(
+                                plan
+                            )
                         if "legacy_cron_tick_lock_acquired" not in phases:
                             journal = _record_bootstrap_phase(
                                 plan,

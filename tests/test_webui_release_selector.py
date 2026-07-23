@@ -6962,6 +6962,168 @@ def test_gateway_stop_rechecks_exact_owner_after_second_checkpoint(
     assert bootouts == []
 
 
+def test_legacy_gateway_drain_accepts_exact_old_status_and_empty_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    plan, _checkpoint = _process_checkpoint_plan(tmp_path)
+    plan.update(
+        {
+            "transaction_id": "legacy-drain-transaction-000000001",
+            "gateway_listener_port": 8642,
+            "interval_seconds": 0.001,
+            "timeout_seconds": 0.1,
+        }
+    )
+    marker = tmp_path / "hermes-home" / ".drain_request.json"
+    intent = {
+        "status_baseline": {"mtime_ns": 10},
+        "marker": {
+            "path": str(marker),
+            "payload": {
+                "release_transaction_id": plan["transaction_id"],
+            },
+            "sha256": "a" * 64,
+        },
+    }
+    prepared = {
+        "gateway": {"pid": 41, "pid_start_token": "gateway-start"}
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_write_legacy_gateway_drain_marker",
+        lambda *_args: {"path": str(marker), "sha256": "a" * 64},
+    )
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(
+        cutover,
+        "_pid_start_token",
+        lambda _pid: "gateway-start",
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_regular_file_baseline",
+        lambda *_args, **_kwargs: {
+            "exists": True,
+            "mtime_ns": 11,
+            "sha256": "b" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_private_json_value",
+        lambda *_args, **_kwargs: {
+            "kind": "hermes-gateway",
+            "pid": 41,
+            "gateway_state": "draining",
+            "active_agents": 0,
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_gateway_health_with_drain",
+        lambda _plan: {
+            "status": "ok",
+            "platform": "hermes-agent",
+            "version": "0.18.2",
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_wait_for_legacy_process_checkpoint_empty",
+        lambda *_args: {
+            "status": "verified",
+            "active_records": 0,
+        },
+    )
+
+    receipt = cutover._wait_for_legacy_gateway_drain(
+        plan,
+        prepared,
+        intent,
+    )
+
+    assert receipt["status"] == "verified"
+    assert receipt["work"] == {"active_agents": 0}
+    assert receipt["health_mode"] == "legacy-status-file"
+
+
+def test_legacy_gateway_health_without_api_key_uses_public_receipt(
+    tmp_path,
+    monkeypatch,
+):
+    plist = tmp_path / "gateway.plist"
+    plist.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": "ai.hermes.gateway",
+                "EnvironmentVariables": {"HERMES_HOME": str(tmp_path)},
+            }
+        )
+    )
+    plan = {
+        "gateway_health_url": "http://127.0.0.1:8642/health",
+        "gateway_rollback_plist": str(plist),
+        "timeout_seconds": 0.1,
+    }
+    public = {
+        "status": "ok",
+        "platform": "hermes-agent",
+        "version": "0.18.2",
+    }
+    calls = []
+    monkeypatch.setattr(
+        cutover,
+        "_http_json",
+        lambda request, **_kwargs: calls.append(request) or public,
+    )
+
+    assert cutover._legacy_gateway_health_with_drain(plan) == public
+    assert calls == [plan["gateway_health_url"]]
+
+
+def test_legacy_tick_lock_mtime_churn_is_recoverable_under_kernel_lock(
+    tmp_path,
+):
+    plan, _checkpoint = _process_checkpoint_plan(tmp_path)
+    tick_lock = (
+        Path(plan["synthetic_process_notifications_path"]).parent
+        / "cron"
+        / ".tick.lock"
+    )
+    plan.update(
+        {
+            "transaction_id": "tick-lock-recovery-transaction-000001",
+            "timeout_seconds": 0.1,
+            "interval_seconds": 0.001,
+        }
+    )
+    tick_lock.chmod(0o644)
+    intent = cutover._legacy_cron_tick_lock_normalize_intent_receipt(plan)
+    normalized = cutover._normalize_legacy_cron_tick_lock(plan, intent)
+    held = cutover._acquire_legacy_cron_tick_lock(plan)
+    before = tick_lock.stat()
+    os.utime(
+        tick_lock,
+        ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000),
+    )
+    try:
+        restored = cutover._restore_legacy_cron_tick_lock(
+            plan,
+            intent,
+            normalized,
+        )
+    finally:
+        cutover._release_legacy_cron_tick_lock(
+            plan,
+            allow_restored_mode=True,
+        )
+
+    assert held["status"] == "held"
+    assert restored["status"] == "restored"
+    assert stat.S_IMODE(tick_lock.stat().st_mode) == 0o644
+
+
 def _canonical_gateway_health_fixture(
     *,
     pair_gate_active: bool,
