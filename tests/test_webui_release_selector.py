@@ -5779,6 +5779,158 @@ def test_cutover_controller_starts_adopts_and_exactly_stops_ingress_gate(tmp_pat
         rebound.close()
 
 
+def test_ingress_gate_token_receipt_creates_private_control_directory(
+    tmp_path,
+):
+    token_path = tmp_path / "missing-control" / "controller.token"
+
+    receipt = cutover._ingress_gate_token_receipt(
+        {"ingress_gate_token_file": str(token_path)}
+    )
+
+    assert receipt["path"] == str(token_path)
+    assert stat.S_IMODE(token_path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+    assert token_path.read_text(encoding="ascii").strip() == receipt["token"]
+
+
+def test_ingress_gate_token_receipt_rejects_existing_public_directory(
+    tmp_path,
+):
+    control = tmp_path / "public-control"
+    control.mkdir(mode=0o755)
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="ingress gate control directory is not private",
+    ):
+        cutover._ingress_gate_token_receipt(
+            {"ingress_gate_token_file": str(control / "controller.token")}
+        )
+
+
+def test_ingress_gate_token_receipt_rejects_parent_replacement_during_create(
+    tmp_path,
+    monkeypatch,
+):
+    control = tmp_path / "control"
+    diverted = tmp_path / "diverted-control"
+    token_path = control / "controller.token"
+    real_open = cutover.os.open
+    swapped = False
+
+    def swapping_open(target, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if (
+            flags & os.O_CREAT
+            and not swapped
+            and (
+                Path(target) == token_path
+                or str(target) == token_path.name
+            )
+        ):
+            control.rename(diverted)
+            control.mkdir(mode=0o700)
+            swapped = True
+        return real_open(target, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(cutover.os, "open", swapping_open)
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="ingress gate control directory changed during token receipt",
+    ):
+        cutover._ingress_gate_token_receipt(
+            {"ingress_gate_token_file": str(token_path)}
+        )
+
+    assert swapped is True
+    assert not token_path.exists()
+    assert (diverted / token_path.name).is_file()
+
+
+def test_ingress_gate_token_receipt_closes_created_descriptor_if_fdopen_fails(
+    tmp_path,
+    monkeypatch,
+):
+    token_path = tmp_path / "control" / "controller.token"
+    created_descriptor = None
+
+    def failing_fdopen(descriptor, *_args, **_kwargs):
+        nonlocal created_descriptor
+        created_descriptor = descriptor
+        raise OSError("injected fdopen failure")
+
+    monkeypatch.setattr(cutover.os, "fdopen", failing_fdopen)
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="ingress gate controller token cannot be written",
+    ):
+        cutover._ingress_gate_token_receipt(
+            {"ingress_gate_token_file": str(token_path)}
+        )
+
+    assert created_descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(created_descriptor)
+
+
+def test_bootstrap_abort_boundary_remains_recoverable_after_job_bootout():
+    assert cutover._can_restore_legacy_before_snapshot_abort(
+        {"legacy_jobs_booted_out": {"status": "verified-absent"}}
+    )
+    assert not cutover._can_restore_legacy_before_snapshot_abort(
+        {
+            "legacy_jobs_booted_out": {"status": "verified-absent"},
+            "services_stopped": {"status": "stopped"},
+        }
+    )
+    assert not cutover._can_restore_legacy_before_snapshot_abort(
+        {
+            "legacy_jobs_booted_out": {"status": "verified-absent"},
+            "rollback_started": {"error_type": "ReleaseBuildError"},
+        }
+    )
+
+
+def test_bootstrap_journal_allows_exact_abort_after_job_bootout():
+    phase_names = (
+        "prepared",
+        "pre_managed_controls_stage_intent",
+        "pre_managed_controls_staged",
+        "watchdog_cron_disabled",
+        "writers_frozen",
+        "cli_maintenance_gate_stage_intent",
+        "cli_maintenance_gate_installed",
+        "legacy_cron_tick_lock_normalize_intent",
+        "legacy_cron_tick_lock_normalized",
+        "legacy_cron_tick_lock_acquired",
+        "legacy_gateway_drain_intent",
+        "legacy_gateway_drain_acknowledged",
+        "legacy_gateway_stop_intent",
+        "legacy_gateway_gracefully_stopped",
+        "synthetic_store_mode_normalize_intent",
+        "synthetic_store_modes_normalized",
+        "legacy_dispatcher_lock_acquired",
+        "frozen_boundary_proved",
+        "legacy_jobs_booted_out",
+        "aborted_before_cutover",
+    )
+    transaction_id = "post-bootout-abort-transaction-000001"
+    raw = {
+        "version": 1,
+        "transaction_id": transaction_id,
+        "phases": {name: {} for name in phase_names},
+    }
+
+    validated = cutover._validated_bootstrap_journal(raw, transaction_id)
+
+    assert "legacy_jobs_booted_out" in validated["phases"]
+    assert "aborted_before_cutover" in validated["phases"]
+    assert "rollback_started" not in validated["phases"]
+
+
 class _Clock:
     def __init__(self):
         self.now = 0.0

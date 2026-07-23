@@ -7174,7 +7174,6 @@ def _validated_bootstrap_journal(raw: object, transaction_id: str) -> dict:
     if "aborted_before_cutover" in phases and any(
         phase in phases
         for phase in (
-            "legacy_jobs_booted_out",
             "services_stopped",
             "ingress_gate_started",
             "rollback_started",
@@ -7187,6 +7186,19 @@ def _validated_bootstrap_journal(raw: object, transaction_id: str) -> dict:
         "transaction_id": transaction_id,
         "phases": phases,
     }
+
+
+def _can_restore_legacy_before_snapshot_abort(phases: object) -> bool:
+    return isinstance(phases, dict) and not any(
+        phase in phases
+        for phase in (
+            "services_stopped",
+            "ingress_gate_started",
+            "snapshot_created",
+            "rollback_started",
+            "complete",
+        )
+    )
 
 
 def _read_bootstrap_journal(plan: dict) -> dict:
@@ -8793,38 +8805,234 @@ _LEGACY_CRON_TICK_LOCKS: dict[str, object] = {}
 def _ingress_gate_token_receipt(plan: dict) -> dict:
     path = Path(plan["ingress_gate_token_file"])
     parent = path.parent
-    if (
-        not parent.is_dir()
-        or parent.is_symlink()
-        or parent.resolve(strict=True) != parent
-        or parent.stat().st_uid != os.getuid()
-        or stat.S_IMODE(parent.stat().st_mode) & 0o077
-    ):
-        raise ReleaseBuildError("ingress gate control directory is not private")
-    if not path.exists():
-        token = secrets.token_urlsafe(48).encode("ascii") + b"\n"
-        descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(token)
-            handle.flush()
-            os.fchmod(handle.fileno(), 0o600)
-            os.fsync(handle.fileno())
-        _fsync_directory(parent)
-    opened = path.lstat()
-    if (
-        path.is_symlink()
-        or not stat.S_ISREG(opened.st_mode)
-        or opened.st_uid != os.getuid()
-        or opened.st_nlink != 1
-        or stat.S_IMODE(opened.st_mode) != 0o600
-        or not 32 <= opened.st_size <= 257
-    ):
-        raise ReleaseBuildError("ingress gate controller token file is unsafe")
-    raw = path.read_bytes()
+    ancestor = parent.parent
+    if path.name in {"", ".", ".."} or parent.name in {"", ".", ".."}:
+        raise ReleaseBuildError("ingress gate controller token path is invalid")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        if ancestor.resolve(strict=True) != ancestor:
+            raise ReleaseBuildError(
+                "ingress gate control ancestor is not canonical"
+            )
+        ancestor_descriptor = os.open(ancestor, directory_flags)
+    except ReleaseBuildError:
+        raise
+    except OSError as exc:
+        raise ReleaseBuildError(
+            "ingress gate control ancestor cannot be opened"
+        ) from exc
+    try:
+        ancestor_opened = os.fstat(ancestor_descriptor)
+        ancestor_entry = os.stat(ancestor, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(ancestor_opened.st_mode)
+            or not stat.S_ISDIR(ancestor_entry.st_mode)
+            or ancestor_opened.st_uid != os.getuid()
+            or stat.S_IMODE(ancestor_opened.st_mode) & 0o077
+            or (ancestor_opened.st_dev, ancestor_opened.st_ino)
+            != (ancestor_entry.st_dev, ancestor_entry.st_ino)
+        ):
+            raise ReleaseBuildError(
+                "ingress gate control ancestor is not private"
+            )
+        try:
+            os.mkdir(parent.name, mode=0o700, dir_fd=ancestor_descriptor)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise ReleaseBuildError(
+                "ingress gate control directory cannot be created"
+            ) from exc
+        else:
+            os.fsync(ancestor_descriptor)
+        try:
+            parent_descriptor = os.open(
+                parent.name,
+                directory_flags,
+                dir_fd=ancestor_descriptor,
+            )
+        except OSError as exc:
+            raise ReleaseBuildError(
+                "ingress gate control directory is not private"
+            ) from exc
+        try:
+            parent_opened = os.fstat(parent_descriptor)
+            parent_entry = os.stat(
+                parent.name,
+                dir_fd=ancestor_descriptor,
+                follow_symlinks=False,
+            )
+            try:
+                parent_canonical = parent.resolve(strict=True)
+            except OSError as exc:
+                raise ReleaseBuildError(
+                    "ingress gate control directory is not private"
+                ) from exc
+            if (
+                not stat.S_ISDIR(parent_opened.st_mode)
+                or not stat.S_ISDIR(parent_entry.st_mode)
+                or parent_canonical != parent
+                or parent_opened.st_uid != os.getuid()
+                or stat.S_IMODE(parent_opened.st_mode) & 0o077
+                or (parent_opened.st_dev, parent_opened.st_ino)
+                != (parent_entry.st_dev, parent_entry.st_ino)
+            ):
+                raise ReleaseBuildError(
+                    "ingress gate control directory is not private"
+                )
+            read_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                token_descriptor = os.open(
+                    path.name,
+                    read_flags,
+                    dir_fd=parent_descriptor,
+                )
+            except FileNotFoundError:
+                token = secrets.token_urlsafe(48).encode("ascii") + b"\n"
+                try:
+                    created_descriptor = os.open(
+                        path.name,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o600,
+                        dir_fd=parent_descriptor,
+                    )
+                except FileExistsError:
+                    token_descriptor = os.open(
+                        path.name,
+                        read_flags,
+                        dir_fd=parent_descriptor,
+                    )
+                except OSError as exc:
+                    raise ReleaseBuildError(
+                        "ingress gate controller token file is unsafe"
+                    ) from exc
+                else:
+                    try:
+                        created_handle = os.fdopen(created_descriptor, "wb")
+                    except OSError as exc:
+                        try:
+                            os.close(created_descriptor)
+                        except OSError:
+                            pass
+                        raise ReleaseBuildError(
+                            "ingress gate controller token cannot be written"
+                        ) from exc
+                    try:
+                        with created_handle as handle:
+                            handle.write(token)
+                            handle.flush()
+                            os.fchmod(handle.fileno(), 0o600)
+                            os.fsync(handle.fileno())
+                    except OSError as exc:
+                        raise ReleaseBuildError(
+                            "ingress gate controller token cannot be written"
+                        ) from exc
+                    os.fsync(parent_descriptor)
+                    token_descriptor = os.open(
+                        path.name,
+                        read_flags,
+                        dir_fd=parent_descriptor,
+                    )
+            except OSError as exc:
+                raise ReleaseBuildError(
+                    "ingress gate controller token file is unsafe"
+                ) from exc
+            try:
+                token_opened = os.fstat(token_descriptor)
+                if (
+                    not stat.S_ISREG(token_opened.st_mode)
+                    or token_opened.st_uid != os.getuid()
+                    or token_opened.st_nlink != 1
+                    or stat.S_IMODE(token_opened.st_mode) != 0o600
+                    or not 32 <= token_opened.st_size <= 257
+                ):
+                    raise ReleaseBuildError(
+                        "ingress gate controller token file is unsafe"
+                    )
+                raw = os.read(token_descriptor, 258)
+                token_after_read = os.fstat(token_descriptor)
+            finally:
+                os.close(token_descriptor)
+            try:
+                token_entry = os.stat(
+                    path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                parent_after = os.stat(
+                    parent.name,
+                    dir_fd=ancestor_descriptor,
+                    follow_symlinks=False,
+                )
+                ancestor_after = os.stat(ancestor, follow_symlinks=False)
+                parent_canonical_after = parent.resolve(strict=True)
+            except OSError as exc:
+                raise ReleaseBuildError(
+                    "ingress gate control directory changed during token receipt"
+                ) from exc
+            token_identity = (
+                token_opened.st_dev,
+                token_opened.st_ino,
+                token_opened.st_mode,
+                token_opened.st_uid,
+                token_opened.st_nlink,
+                token_opened.st_size,
+                token_opened.st_mtime_ns,
+                token_opened.st_ctime_ns,
+            )
+            if token_identity != (
+                token_after_read.st_dev,
+                token_after_read.st_ino,
+                token_after_read.st_mode,
+                token_after_read.st_uid,
+                token_after_read.st_nlink,
+                token_after_read.st_size,
+                token_after_read.st_mtime_ns,
+                token_after_read.st_ctime_ns,
+            ) or token_identity != (
+                token_entry.st_dev,
+                token_entry.st_ino,
+                token_entry.st_mode,
+                token_entry.st_uid,
+                token_entry.st_nlink,
+                token_entry.st_size,
+                token_entry.st_mtime_ns,
+                token_entry.st_ctime_ns,
+            ):
+                raise ReleaseBuildError(
+                    "ingress gate controller token changed during receipt"
+                )
+            if len(raw) != token_opened.st_size:
+                raise ReleaseBuildError(
+                    "ingress gate controller token changed during receipt"
+                )
+            if (
+                parent_canonical_after != parent
+                or (parent_opened.st_dev, parent_opened.st_ino)
+                != (parent_after.st_dev, parent_after.st_ino)
+                or (ancestor_opened.st_dev, ancestor_opened.st_ino)
+                != (ancestor_after.st_dev, ancestor_after.st_ino)
+            ):
+                raise ReleaseBuildError(
+                    "ingress gate control directory changed during token receipt"
+                )
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        os.close(ancestor_descriptor)
     try:
         token = raw.rstrip(b"\r\n").decode("ascii")
     except UnicodeDecodeError as exc:
@@ -15793,9 +16001,8 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                             phases["legacy_dispatcher_lock_acquired"],
                         )
                     except Exception as boundary_error:
-                        if (
-                            "legacy_jobs_booted_out" in phases
-                            or "snapshot_created" in phases
+                        if not _can_restore_legacy_before_snapshot_abort(
+                            phases
                         ):
                             raise
                         abort_receipt = _restore_legacy_before_snapshot_abort(
@@ -16556,7 +16763,7 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                 "snapshot rollback is forbidden and the same transaction "
                 "must be rerun to roll forward"
             ) from original
-        if "legacy_jobs_booted_out" not in bootstrap_phases:
+        if _can_restore_legacy_before_snapshot_abort(bootstrap_phases):
             try:
                 abort_receipt = _restore_legacy_before_snapshot_abort(
                     plan,
