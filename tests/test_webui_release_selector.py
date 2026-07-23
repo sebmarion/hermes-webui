@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -6176,6 +6177,76 @@ def test_cutover_controller_starts_adopts_and_exactly_stops_ingress_gate(tmp_pat
         rebound.close()
 
 
+def test_cutover_controller_retries_transient_ingress_gate_address_hold(
+    tmp_path,
+    monkeypatch,
+):
+    gate_script = tmp_path / "ingress_gate.py"
+    gate_script.write_text("# retry probe\n", encoding="utf-8")
+    control = tmp_path / "gate-control"
+    control.mkdir(mode=0o700)
+    plan = {
+        "base_url": "http://127.0.0.1:18787",
+        "listener_port": 18787,
+        "timeout_seconds": 1,
+        "interval_seconds": 0.001,
+        "managed_interpreter": sys.executable,
+        "ingress_gate_script": str(gate_script),
+        "ingress_gate_expected_sha256": _sha(gate_script),
+        "ingress_gate_token_file": str(control / "controller.token"),
+        "ingress_gate_ready_receipt": str(control / "ready.json"),
+    }
+    processes = [
+        SimpleNamespace(
+            pid=101,
+            stderr=io.BytesIO(
+                b"ingress gate startup failed: [Errno 48] Address already in use\n"
+            ),
+            poll=lambda: 1,
+            wait=lambda timeout: 1,
+        ),
+        SimpleNamespace(
+            pid=102,
+            stderr=io.BytesIO(),
+            poll=lambda: None,
+            wait=lambda timeout: 0,
+        ),
+    ]
+    spawned = []
+
+    def popen(*_args, **kwargs):
+        spawned.append(kwargs)
+        return processes[len(spawned) - 1]
+
+    attestations = 0
+
+    def attest(_plan):
+        nonlocal attestations
+        attestations += 1
+        if attestations == 1:
+            raise cutover.ReleaseBuildError("no gate yet")
+        return {
+            "status": "verified",
+            "pid": 102,
+            "pid_start_token": "gate-start",
+        }
+
+    monkeypatch.setattr(cutover.subprocess, "Popen", popen)
+    monkeypatch.setattr(cutover, "_attest_ingress_gate", attest)
+    monkeypatch.setattr(
+        cutover,
+        "_ingress_gate_listener_pid_or_none",
+        lambda _port: None,
+    )
+
+    receipt = cutover._start_or_adopt_ingress_gate(plan)
+
+    assert receipt["status"] == "started"
+    assert receipt["binding"]["pid"] == 102
+    assert len(spawned) == 2
+    assert all(row["stderr"] == subprocess.PIPE for row in spawned)
+
+
 def test_ingress_gate_token_receipt_creates_private_control_directory(
     tmp_path,
 ):
@@ -8401,4 +8472,87 @@ def test_gateway_health_rejects_incomplete_work_status_schema(monkeypatch):
             plan,
             expected_identity=identity,
             expected_admission="rejecting_new_work",
+        )
+
+
+def test_restart_or_adopt_restored_legacy_pair_adopts_exact_running_pair(
+    monkeypatch,
+):
+    bindings = {
+        True: {
+            "status": "verified",
+            "pid": 41,
+            "pid_start_token": "gateway-start",
+        },
+        False: {
+            "status": "verified",
+            "pid": 42,
+            "pid_start_token": "webui-start",
+        },
+    }
+    attestations = []
+
+    def attest(_plan, *, prepared, gateway):
+        assert prepared == {"captured": "legacy-pair"}
+        attestations.append(gateway)
+        return bindings[gateway]
+
+    monkeypatch.setattr(cutover, "_attest_restored_legacy_binding", attest)
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exact restored pair must not be booted out")
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootstrap_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exact restored pair must not be restarted")
+        ),
+    )
+
+    receipt = cutover._restart_or_adopt_restored_legacy_pair(
+        {},
+        prepared={"captured": "legacy-pair"},
+    )
+
+    assert attestations == [True, False]
+    assert receipt["gateway_binding"] == bindings[True]
+    assert receipt["webui_binding"] == bindings[False]
+    assert receipt["gateway_start"] == {
+        "status": "adopted-exact-restored-binding",
+        "pid": 41,
+        "pid_start_token": "gateway-start",
+    }
+    assert receipt["webui_start"] == {
+        "status": "adopted-exact-restored-binding",
+        "pid": 42,
+        "pid_start_token": "webui-start",
+    }
+
+
+def test_restart_or_adopt_restored_legacy_pair_does_not_restart_on_bug(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        cutover,
+        "_attest_restored_legacy_binding",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("injected programming error")
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unexpected bug must not trigger a restart")
+        ),
+    )
+
+    with pytest.raises(AssertionError, match="injected programming error"):
+        cutover._restart_or_adopt_restored_legacy_pair(
+            {},
+            prepared={"captured": "legacy-pair"},
         )

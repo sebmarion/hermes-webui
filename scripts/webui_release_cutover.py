@@ -9146,14 +9146,84 @@ def _attest_ingress_gate(plan: dict) -> dict:
     }
 
 
+def _ingress_gate_listener_pid_or_none(port: int) -> int | None:
+    try:
+        completed = subprocess.run(
+            [
+                "lsof",
+                "-nP",
+                f"-iTCP:{int(port)}",
+                "-sTCP:LISTEN",
+                "-t",
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DrainIdentityMismatch("ingress gate listener probe failed") from exc
+    rows = completed.stdout.split()
+    if completed.returncode == 1 and not rows and not completed.stderr.strip():
+        return None
+    pids = {int(row) for row in rows if row.isdigit()}
+    if (
+        completed.returncode != 0
+        or len(pids) != 1
+        or len(rows) != 1
+    ):
+        raise DrainIdentityMismatch(
+            "ingress gate listener PID is unavailable or ambiguous"
+        )
+    pid = next(iter(pids))
+    if pid <= 1:
+        raise DrainIdentityMismatch("ingress gate listener PID is invalid")
+    return pid
+
+
+def _ingress_gate_exit_receipt(process: subprocess.Popen) -> dict:
+    exit_code = process.poll()
+    if exit_code is None:
+        raise ReleaseBuildError("ingress gate exit receipt requested while running")
+    stderr_stream = process.stderr
+    raw = b""
+    if stderr_stream is not None:
+        try:
+            raw = stderr_stream.read(4096)
+        finally:
+            stderr_stream.close()
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8", errors="replace")
+    raw = bytes(raw)
+    lowered = raw.lower()
+    retryable_bind_hold = (
+        b"address already in use" in lowered
+        and any(
+            marker in lowered
+            for marker in (b"errno 48", b"errno 98", b"errno 10048")
+        )
+    )
+    return {
+        "exit_code": int(exit_code),
+        "stderr_sha256": hashlib.sha256(raw).hexdigest(),
+        "stderr_size": len(raw),
+        "category": (
+            "transient-address-hold"
+            if retryable_bind_hold
+            else "non-retryable-startup-exit"
+        ),
+        "retryable": retryable_bind_hold,
+    }
+
+
 def _start_or_adopt_ingress_gate(plan: dict) -> dict:
     try:
         return {"status": "adopted", "binding": _attest_ingress_gate(plan)}
     except Exception as adoption_error:
-        try:
-            listener = _listener_pid(int(plan["listener_port"]))
-        except DrainIdentityMismatch:
-            listener = None
+        listener = _ingress_gate_listener_pid_or_none(
+            int(plan["listener_port"])
+        )
         if listener is not None:
             raise DrainIdentityMismatch(
                 "unexpected process owns WebUI port before ingress gate"
@@ -9165,52 +9235,88 @@ def _start_or_adopt_ingress_gate(plan: dict) -> dict:
     receipt_path = Path(plan["ingress_gate_ready_receipt"])
     if receipt_path.parent != Path(token["path"]).parent:
         raise ReleaseBuildError("ingress gate receipt is outside private control dir")
-    process = subprocess.Popen(
-        [
-            str(plan["managed_interpreter"]),
-            "-I",
-            str(script),
-            "--host",
-            str(urlsplit(str(plan["base_url"])).hostname),
-            "--port",
-            str(plan["listener_port"]),
-            "--controller-token-file",
-            token["path"],
-            "--ready-receipt",
-            str(receipt_path),
-        ],
-        cwd=script.parent,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        start_new_session=True,
-        env={
-            key: value
-            for key in ("HOME", "LANG", "LC_ALL", "TMPDIR", "TZ")
-            if (value := os.environ.get(key)) is not None
-        },
-    )
     deadline = time.monotonic() + float(plan["timeout_seconds"])
     last_error: Exception | None = None
+    transient_failures: list[dict] = []
+    process: subprocess.Popen | None = None
     while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise ReleaseBuildError("ingress gate exited before readiness")
-        try:
-            binding = _attest_ingress_gate(plan)
-            if binding["pid"] != process.pid:
-                raise DrainIdentityMismatch("ingress gate spawned PID changed")
-            _INGRESS_GATE_CHILDREN[process.pid] = process
-            return {"status": "started", "binding": binding}
-        except Exception as exc:
-            last_error = exc
-            time.sleep(float(plan["interval_seconds"]))
-    if _pid_start_token(process.pid) is not None:
+        process = subprocess.Popen(
+            [
+                str(plan["managed_interpreter"]),
+                "-I",
+                str(script),
+                "--host",
+                str(urlsplit(str(plan["base_url"])).hostname),
+                "--port",
+                str(plan["listener_port"]),
+                "--controller-token-file",
+                token["path"],
+                "--ready-receipt",
+                str(receipt_path),
+            ],
+            cwd=script.parent,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=True,
+            env={
+                key: value
+                for key in ("HOME", "LANG", "LC_ALL", "TMPDIR", "TZ")
+                if (value := os.environ.get(key)) is not None
+            },
+        )
+        retry_spawn = False
+        while time.monotonic() < deadline:
+            exit_code = process.poll()
+            if exit_code is not None:
+                failure = _ingress_gate_exit_receipt(process)
+                if not failure["retryable"]:
+                    raise ReleaseBuildError(
+                        "ingress gate exited before readiness: "
+                        f"category={failure['category']} "
+                        f"exit_code={failure['exit_code']} "
+                        f"stderr_sha256={failure['stderr_sha256']}"
+                    )
+                listener = _ingress_gate_listener_pid_or_none(
+                    int(plan["listener_port"])
+                )
+                if listener is not None:
+                    raise DrainIdentityMismatch(
+                        "WebUI port was reacquired during ingress gate retry"
+                    )
+                transient_failures.append(failure)
+                last_error = ReleaseBuildError(
+                    "ingress gate address remained transiently unavailable"
+                )
+                time.sleep(float(plan["interval_seconds"]))
+                retry_spawn = True
+                break
+            try:
+                binding = _attest_ingress_gate(plan)
+                if binding["pid"] != process.pid:
+                    raise DrainIdentityMismatch("ingress gate spawned PID changed")
+                _INGRESS_GATE_CHILDREN[process.pid] = process
+                return {
+                    "status": "started",
+                    "binding": binding,
+                    "start_attempts": len(transient_failures) + 1,
+                    "transient_failures": transient_failures,
+                }
+            except Exception as exc:
+                last_error = exc
+                time.sleep(float(plan["interval_seconds"]))
+        if not retry_spawn:
+            break
+    if process is not None and _pid_start_token(process.pid) is not None:
         os.kill(process.pid, signal.SIGKILL)
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired as exc:
-        raise ReleaseBuildError("failed ingress gate child could not be reaped") from exc
+    if process is not None:
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            raise ReleaseBuildError(
+                "failed ingress gate child could not be reaped"
+            ) from exc
     raise DrainTimeout(f"ingress gate readiness timed out: {last_error}")
 
 
@@ -15351,6 +15457,48 @@ def _runtime_receipt_matches(actual: dict, expected: dict) -> bool:
     return all(actual.get(key) == expected.get(key) for key in keys)
 
 
+def _attest_restored_legacy_binding(
+    plan: dict,
+    *,
+    prepared: dict,
+    gateway: bool,
+) -> dict:
+    expected = prepared["gateway" if gateway else "legacy"]
+    actual = _listener_process_receipt(
+        plan,
+        gateway=gateway,
+        require_git_source=not gateway,
+    )
+    if not _runtime_receipt_matches(actual, expected):
+        raise ReleaseBuildError("restored legacy runtime identity changed")
+    if gateway:
+        health = _gateway_health_receipt(plan)
+    else:
+        health_body = _http_json(
+            f"{str(plan['base_url']).rstrip('/')}/health",
+            timeout_seconds=max(30.0, float(plan["timeout_seconds"])),
+        )
+        if health_body.get("status") != "ok":
+            raise ReleaseBuildError("restored legacy WebUI is unhealthy")
+        health = {
+            "status": "ok",
+            "body_sha256": hashlib.sha256(
+                json.dumps(
+                    health_body,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
+        }
+    return {
+        "status": "verified",
+        "pid": actual["pid"],
+        "pid_start_token": actual["pid_start_token"],
+        "runtime": actual,
+        "health": health,
+    }
+
+
 def _wait_for_legacy_binding(
     plan: dict,
     *,
@@ -15359,46 +15507,76 @@ def _wait_for_legacy_binding(
 ) -> dict:
     deadline = time.monotonic() + float(plan["timeout_seconds"])
     last_error: Exception | None = None
-    expected = prepared["gateway" if gateway else "legacy"]
     while time.monotonic() < deadline:
         try:
-            actual = _listener_process_receipt(
+            return _attest_restored_legacy_binding(
                 plan,
+                prepared=prepared,
                 gateway=gateway,
-                require_git_source=not gateway,
             )
-            if not _runtime_receipt_matches(actual, expected):
-                raise ReleaseBuildError("restored legacy runtime identity changed")
-            if gateway:
-                health = _gateway_health_receipt(plan)
-            else:
-                health_body = _http_json(
-                    f"{str(plan['base_url']).rstrip('/')}/health",
-                    timeout_seconds=max(30.0, float(plan["timeout_seconds"])),
-                )
-                if health_body.get("status") != "ok":
-                    raise ReleaseBuildError("restored legacy WebUI is unhealthy")
-                health = {
-                    "status": "ok",
-                    "body_sha256": hashlib.sha256(
-                        json.dumps(
-                            health_body,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode()
-                    ).hexdigest(),
-                }
-            return {
-                "status": "verified",
-                "pid": actual["pid"],
-                "pid_start_token": actual["pid_start_token"],
-                "runtime": actual,
-                "health": health,
-            }
         except Exception as exc:
             last_error = exc
             time.sleep(float(plan["interval_seconds"]))
     raise DrainTimeout(f"restored legacy binding timed out: {last_error}")
+
+
+def _restart_or_adopt_restored_legacy_pair(
+    plan: dict,
+    *,
+    prepared: dict,
+) -> dict:
+    try:
+        gateway_binding = _attest_restored_legacy_binding(
+            plan,
+            prepared=prepared,
+            gateway=True,
+        )
+        webui_binding = _attest_restored_legacy_binding(
+            plan,
+            prepared=prepared,
+            gateway=False,
+        )
+    except (DrainIdentityMismatch, ReleaseBuildError):
+        _bootout_job(plan, gateway=True, required=False)
+        gateway_started = _bootstrap_job(
+            plan,
+            plan["gateway_installed_plist"],
+            gateway=True,
+        )
+        _wait_for_legacy_binding(plan, prepared=prepared, gateway=True)
+        _bootout_job(plan, gateway=False, required=False)
+        webui_started = _bootstrap_job(
+            plan,
+            plan["installed_plist"],
+            gateway=False,
+        )
+        gateway_binding = _wait_for_legacy_binding(
+            plan,
+            prepared=prepared,
+            gateway=True,
+        )
+        webui_binding = _wait_for_legacy_binding(
+            plan,
+            prepared=prepared,
+            gateway=False,
+        )
+    else:
+        gateway_started = {
+            "status": "adopted-exact-restored-binding",
+            "pid": gateway_binding["pid"],
+            "pid_start_token": gateway_binding["pid_start_token"],
+        }
+        webui_started = {
+            "status": "adopted-exact-restored-binding",
+            "pid": webui_binding["pid"],
+            "pid_start_token": webui_binding["pid_start_token"],
+        }
+    return {
+        "gateway_start": gateway_started,
+        "webui_start": webui_started,
+        "gateway_binding": gateway_binding,
+        "webui_binding": webui_binding,
+    }
 
 
 def _rollback_gateway_stop_intent(plan: dict) -> dict:
@@ -15714,38 +15892,13 @@ def _resume_bootstrap_rollback(plan: dict, journal: dict) -> dict:
         )
         phases = journal["phases"]
     if "rollback_services_restarted" not in phases:
-        _bootout_job(plan, gateway=True, required=False)
-        gateway_started = _bootstrap_job(
-            plan,
-            plan["gateway_installed_plist"],
-            gateway=True,
-        )
-        _wait_for_legacy_binding(plan, prepared=prepared, gateway=True)
-        _bootout_job(plan, gateway=False, required=False)
-        webui_started = _bootstrap_job(
-            plan,
-            plan["installed_plist"],
-            gateway=False,
-        )
-        gateway_binding = _wait_for_legacy_binding(
-            plan,
-            prepared=prepared,
-            gateway=True,
-        )
-        webui_binding = _wait_for_legacy_binding(
-            plan,
-            prepared=prepared,
-            gateway=False,
-        )
         journal = _record_bootstrap_phase(
             plan,
             "rollback_services_restarted",
-            {
-                "gateway_start": gateway_started,
-                "webui_start": webui_started,
-                "gateway_binding": gateway_binding,
-                "webui_binding": webui_binding,
-            },
+            _restart_or_adopt_restored_legacy_pair(
+                plan,
+                prepared=prepared,
+            ),
         )
         phases = journal["phases"]
     if "rollback_cron_restored" not in phases:
