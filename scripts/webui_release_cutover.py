@@ -7602,6 +7602,81 @@ def _pre_managed_control_stage_receipt(plan: dict) -> dict:
     }
 
 
+def _stage_pre_managed_controls(plan: dict, prepared: dict) -> dict:
+    _prepare_bootstrap_selector(plan)
+    transformed = transform_launchd_target(
+        _read_plist(plan["bootstrap_rollback_plist"]),
+        plan["selector_path"],
+        expected_label=plan["launchd_label"],
+        expected_old_interpreter=prepared["legacy"]["program_arguments"][0],
+        managed_interpreter=plan["managed_interpreter"],
+        expected_old_target=prepared["legacy"]["program_arguments"][1],
+        selector_state_path=plan["selector_state"],
+        selector_lock_path=plan["selector_lock"],
+        managed_routing_environment=prepared["legacy"][
+            "routing_environment"
+        ],
+    )
+    _write_plist_atomic(plan["managed_plist"], transformed)
+    return _pre_managed_control_stage_receipt(plan)
+
+
+def _adopt_or_restage_pre_managed_controls(
+    plan: dict,
+    prepared: dict,
+    expected: dict,
+) -> dict:
+    captured = prepared.get("pre_managed_controls")
+    if (
+        not isinstance(captured, dict)
+        or captured.get("status") != "captured"
+        or not isinstance(expected, dict)
+        or expected.get("status") != "staged"
+    ):
+        raise ReleaseBuildError(
+            "pre-managed control resume receipt is invalid"
+        )
+    missing_owned_creation = False
+    for key in ("selector_state", "selector_lock", "managed_plist"):
+        path = Path(str(plan.get(key) or ""))
+        before = captured.get(key)
+        intended = expected.get(key)
+        if (
+            not isinstance(before, dict)
+            or before.get("path") != str(path)
+            or not isinstance(intended, dict)
+            or intended.get("path") != str(path)
+        ):
+            raise ReleaseBuildError(
+                f"pre-managed {key} resume identity is invalid"
+            )
+        if not path.exists() and not path.is_symlink():
+            if before.get("status") != "absent":
+                raise DrainIdentityMismatch(
+                    f"pre-managed {key} disappeared after rollback"
+                )
+            missing_owned_creation = True
+            continue
+        current = _private_control_file_receipt(
+            path,
+            label=f"staged {key}",
+        )
+        if current != intended:
+            raise DrainIdentityMismatch(
+                f"pre-managed {key} changed on bootstrap resume"
+            )
+    observed = (
+        _stage_pre_managed_controls(plan, prepared)
+        if missing_owned_creation
+        else _pre_managed_control_stage_receipt(plan)
+    )
+    if observed != expected:
+        raise DrainIdentityMismatch(
+            "pre-managed control restage changed before commit"
+        )
+    return observed
+
+
 def _restore_pre_managed_control_state(
     plan: dict,
     captured: dict,
@@ -7908,8 +7983,15 @@ def _read_internal_watchdog_registry(
 ) -> tuple[Path, dict, list, int, dict]:
     registry = Path(plan["watchdog_scheduler_registry"])
     try:
-        payload = json.loads(registry.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        encoded, _opened = _read_private_regular_bytes(
+            registry,
+            label="internal watchdog registry",
+            max_bytes=16 * 1024 * 1024,
+        )
+        payload = json.loads(encoded)
+    except ReleaseBuildError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ReleaseBuildError(
             "internal watchdog registry is invalid"
         ) from exc
@@ -7957,12 +8039,15 @@ def _write_internal_watchdog_registry(plan: dict, payload: dict) -> None:
         dir=registry.parent,
     )
     replaced = False
+    written_identity: tuple[int, int] | None = None
     try:
         with os.fdopen(descriptor, "wb") as handle:
             os.fchmod(handle.fileno(), 0o600)
             handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
+            written = os.fstat(handle.fileno())
+            written_identity = (written.st_dev, written.st_ino)
         os.replace(temporary, registry)
         replaced = True
         _fsync_directory(registry.parent)
@@ -7972,13 +8057,19 @@ def _write_internal_watchdog_registry(plan: dict, payload: dict) -> None:
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
-    opened = registry.lstat()
+    observed, opened = _read_private_regular_bytes(
+        registry,
+        label="internal watchdog registry",
+        max_bytes=16 * 1024 * 1024,
+    )
     if (
-        not stat.S_ISREG(opened.st_mode)
+        written_identity is None
+        or (opened.st_dev, opened.st_ino) != written_identity
+        or not stat.S_ISREG(opened.st_mode)
         or opened.st_uid != os.getuid()
         or opened.st_nlink != 1
         or stat.S_IMODE(opened.st_mode) != 0o600
-        or registry.read_bytes() != encoded
+        or observed != encoded
     ):
         raise ReleaseBuildError(
             "internal watchdog registry write did not persist"
@@ -8169,6 +8260,59 @@ def _backup_crontab(plan: dict) -> dict:
         "backup_path": str(backup),
         "backup_sha256": hashlib.sha256(content).hexdigest(),
     }
+
+
+def _read_internal_watchdog_rollback_job(
+    plan: dict,
+    cron: dict,
+) -> dict:
+    if not isinstance(cron, dict):
+        raise ReleaseBuildError(
+            "internal watchdog preparation is missing"
+        )
+    backup = Path(plan["watchdog_crontab_rollback"])
+    payload, _opened = _read_private_regular_bytes(
+        backup,
+        label="internal watchdog rollback job",
+    )
+    if hashlib.sha256(payload).hexdigest() != cron.get("backup_sha256"):
+        raise ReleaseBuildError(
+            "internal watchdog rollback identity changed"
+        )
+    try:
+        original = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseBuildError(
+            "internal watchdog rollback job is invalid"
+        ) from exc
+    if not isinstance(original, dict):
+        raise ReleaseBuildError(
+            "internal watchdog rollback job is invalid"
+        )
+    return original
+
+
+def _upgrade_internal_watchdog_prepared_receipt(
+    plan: dict,
+    prepared: dict,
+) -> dict:
+    upgraded = copy.deepcopy(prepared)
+    if _watchdog_scheduler_backend(plan) != "hermes_internal":
+        return upgraded
+    cron = (
+        upgraded.get("watchdog_cron")
+        if isinstance(upgraded, dict)
+        else None
+    )
+    original = _read_internal_watchdog_rollback_job(plan, cron)
+    stable_sha256 = _internal_watchdog_stable_sha256(original)
+    declared = cron.get("stable_job_sha256")
+    if declared is not None and declared != stable_sha256:
+        raise ReleaseBuildError(
+            "internal watchdog stable rollback identity changed"
+        )
+    cron["stable_job_sha256"] = stable_sha256
+    return upgraded
 
 
 def _install_crontab_file(path: Path) -> None:
@@ -8443,23 +8587,9 @@ def _restore_watchdog_cron(plan: dict, prepared: dict) -> dict:
             if isinstance(prepared, dict)
             else None
         )
-        backup = Path(plan["watchdog_crontab_rollback"])
+        original = _read_internal_watchdog_rollback_job(plan, cron)
         if (
-            not isinstance(cron, dict)
-            or sha256_file(backup) != cron.get("backup_sha256")
-        ):
-            raise ReleaseBuildError(
-                "internal watchdog rollback identity changed"
-            )
-        try:
-            original = json.loads(backup.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ReleaseBuildError(
-                "internal watchdog rollback job is invalid"
-            ) from exc
-        if (
-            not isinstance(original, dict)
-            or _internal_watchdog_stable_sha256(original)
+            _internal_watchdog_stable_sha256(original)
             != cron.get("stable_job_sha256")
         ):
             raise ReleaseBuildError(
@@ -14612,7 +14742,10 @@ def _stop_bootstrap_pair_for_rollback(
 
 def _resume_bootstrap_rollback(plan: dict, journal: dict) -> dict:
     phases = journal["phases"]
-    prepared = phases["prepared"]
+    prepared = _upgrade_internal_watchdog_prepared_receipt(
+        plan,
+        phases["prepared"],
+    )
     try:
         cutover = read_transaction_journal(
             plan["transaction_journal"],
@@ -14972,7 +15105,10 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
             "bootstrap_journal": str(journal_path),
             "receipt": phases["aborted_before_cutover"],
         }
-    prepared = phases["prepared"]
+    prepared = _upgrade_internal_watchdog_prepared_receipt(
+        plan,
+        phases["prepared"],
+    )
     try:
         if "pre_managed_controls_stage_intent" not in phases:
             journal = _record_bootstrap_phase(
@@ -14987,22 +15123,10 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
         if not isinstance(stage_intent, dict):
             raise ReleaseBuildError("pre-managed control stage intent is invalid")
         if "pre_managed_controls_staged" not in phases:
-            _prepare_bootstrap_selector(plan)
-            transformed = transform_launchd_target(
-                _read_plist(plan["bootstrap_rollback_plist"]),
-                plan["selector_path"],
-                expected_label=plan["launchd_label"],
-                expected_old_interpreter=prepared["legacy"]["program_arguments"][0],
-                managed_interpreter=plan["managed_interpreter"],
-                expected_old_target=prepared["legacy"]["program_arguments"][1],
-                selector_state_path=plan["selector_state"],
-                selector_lock_path=plan["selector_lock"],
-                managed_routing_environment=prepared["legacy"][
-                    "routing_environment"
-                ],
+            staged_controls = _stage_pre_managed_controls(
+                plan,
+                prepared,
             )
-            _write_plist_atomic(plan["managed_plist"], transformed)
-            staged_controls = _pre_managed_control_stage_receipt(plan)
             if staged_controls != stage_intent:
                 raise DrainIdentityMismatch(
                     "pre-managed control stage changed before commit"
@@ -15013,13 +15137,15 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                 staged_controls,
             )
             phases = journal["phases"]
-        elif (
-            _pre_managed_control_stage_receipt(plan)
-            != phases["pre_managed_controls_staged"]
-            or phases["pre_managed_controls_staged"] != stage_intent
-        ):
-            raise DrainIdentityMismatch(
-                "pre-managed control state changed on bootstrap resume"
+        else:
+            if phases["pre_managed_controls_staged"] != stage_intent:
+                raise DrainIdentityMismatch(
+                    "pre-managed control state changed on bootstrap resume"
+                )
+            _adopt_or_restage_pre_managed_controls(
+                plan,
+                prepared,
+                stage_intent,
             )
         if "watchdog_cron_disabled" not in phases:
             journal = _record_bootstrap_phase(
@@ -16017,7 +16143,7 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
             try:
                 abort_receipt = _restore_legacy_before_snapshot_abort(
                     plan,
-                    bootstrap_phases["prepared"],
+                    prepared,
                     bootstrap_phases.get("writers_frozen", {"writers": []}),
                     bootstrap_phases,
                     original,

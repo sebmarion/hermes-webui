@@ -2993,6 +2993,84 @@ def test_internal_watchdog_barrier_pauses_registry_without_gateway_drain(
     assert os_cron_reads
 
 
+def test_internal_watchdog_legacy_prepared_receipt_is_upgraded_from_backup(
+    tmp_path,
+):
+    plan, registry = _internal_watchdog_plan(tmp_path)
+    watchdog_cron = cutover._backup_crontab(plan)
+    expected_stable = watchdog_cron.pop("stable_job_sha256")
+    watchdog_cron["drain_intent"] = {
+        "marker": {
+            "path": str(tmp_path / ".drain_request.json"),
+            "payload": {"release_transaction_id": plan["transaction_id"]},
+            "sha256": "d" * 64,
+        }
+    }
+    legacy = {
+        "watchdog_cron": watchdog_cron,
+        "gateway": {"pid": 99},
+    }
+
+    upgraded = cutover._upgrade_internal_watchdog_prepared_receipt(
+        plan,
+        legacy,
+    )
+
+    assert "stable_job_sha256" not in legacy["watchdog_cron"]
+    assert upgraded["watchdog_cron"]["stable_job_sha256"] == expected_stable
+    disabled = cutover._disable_watchdog_cron(plan, upgraded)
+    assert disabled["stable_job_sha256"] == expected_stable
+    restored = cutover._restore_watchdog_cron(plan, upgraded)
+    assert restored["stable_job_sha256"] == expected_stable
+    assert json.loads(registry.read_text(encoding="utf-8"))["jobs"][0][
+        "enabled"
+    ] is True
+
+
+def test_internal_watchdog_registry_symlink_is_rejected(tmp_path):
+    plan, registry = _internal_watchdog_plan(tmp_path)
+    foreign = tmp_path / "foreign-jobs.json"
+    foreign.write_bytes(registry.read_bytes())
+    foreign.chmod(0o600)
+    registry.unlink()
+    registry.symlink_to(foreign)
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="internal watchdog registry is unreadable",
+    ):
+        cutover._read_internal_watchdog_registry(plan)
+
+
+def test_internal_watchdog_restore_rejects_symlinked_backup(tmp_path):
+    plan, _registry = _internal_watchdog_plan(tmp_path)
+    watchdog_cron = cutover._backup_crontab(plan)
+    watchdog_cron["drain_intent"] = {
+        "marker": {
+            "path": str(tmp_path / ".drain_request.json"),
+            "payload": {"release_transaction_id": plan["transaction_id"]},
+            "sha256": "e" * 64,
+        }
+    }
+    prepared = {
+        "watchdog_cron": watchdog_cron,
+        "gateway": {"pid": 99},
+    }
+    cutover._disable_watchdog_cron(plan, prepared)
+    backup = Path(plan["watchdog_crontab_rollback"])
+    foreign = tmp_path / "foreign-watchdog-backup.json"
+    foreign.write_bytes(backup.read_bytes())
+    foreign.chmod(0o600)
+    backup.unlink()
+    backup.symlink_to(foreign)
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="internal watchdog rollback job is unreadable",
+    ):
+        cutover._restore_watchdog_cron(plan, prepared)
+
+
 def test_internal_watchdog_attestation_rejects_job_identity_change(
     tmp_path,
     monkeypatch,
@@ -6410,6 +6488,98 @@ def test_pre_managed_control_restore_refuses_non_owned_mutation(tmp_path):
         cutover._restore_pre_managed_control_state(plan, captured, staged)
 
     assert Path(plan["selector_state"]).read_bytes() == b"foreign-mutation\n"
+
+
+def test_pre_managed_control_resume_restages_only_rollback_owned_absence(
+    monkeypatch,
+    tmp_path,
+):
+    plan = _pre_managed_control_plan(tmp_path)
+    plan.update(
+        {
+            "selector_path": str(tmp_path / "control" / "selector.py"),
+            "bootstrap_rollback_plist": str(
+                tmp_path / "rollback" / "webui.plist"
+            ),
+            "launchd_label": "com.example.hermes-webui",
+            "managed_interpreter": str(tmp_path / "runtime" / "python"),
+        }
+    )
+    captured = cutover._capture_pre_managed_control_state(plan)
+    prepared = {
+        "pre_managed_controls": captured,
+        "legacy": {
+            "program_arguments": [
+                str(tmp_path / "legacy" / "python"),
+                str(tmp_path / "legacy" / "bootstrap.py"),
+            ],
+            "routing_environment": {},
+        },
+    }
+    selector_payload = b'{"candidate":"owned"}\n'
+    lock_payload = b"owned-lock\n"
+    transformed = {
+        "Label": "com.example.hermes-webui",
+        "ProgramArguments": [str(tmp_path / "runtime" / "python")],
+    }
+
+    def prepare_selector(_plan):
+        for key, payload in (
+            ("selector_state", selector_payload),
+            ("selector_lock", lock_payload),
+        ):
+            path = Path(plan[key])
+            path.write_bytes(payload)
+            path.chmod(0o600)
+        return {"candidate": "owned"}
+
+    monkeypatch.setattr(
+        cutover,
+        "_prepare_bootstrap_selector",
+        prepare_selector,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_plist",
+        lambda _path: {"Label": "legacy"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "transform_launchd_target",
+        lambda *_args, **_kwargs: transformed,
+    )
+    expected = cutover._stage_pre_managed_controls(plan, prepared)
+    expected_plist = plistlib.dumps(
+        transformed,
+        fmt=plistlib.FMT_XML,
+        sort_keys=True,
+    )
+    for key in ("selector_state", "selector_lock", "managed_plist"):
+        Path(plan[key]).unlink()
+
+    observed = cutover._adopt_or_restage_pre_managed_controls(
+        plan,
+        prepared,
+        expected,
+    )
+
+    assert observed == expected
+    assert Path(plan["selector_state"]).read_bytes() == selector_payload
+    assert Path(plan["selector_lock"]).read_bytes() == lock_payload
+    assert Path(plan["managed_plist"]).read_bytes() == expected_plist
+
+    Path(plan["managed_plist"]).unlink()
+    Path(plan["selector_state"]).write_bytes(b"foreign-selector\n")
+    Path(plan["selector_state"]).chmod(0o600)
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="pre-managed selector_state changed",
+    ):
+        cutover._adopt_or_restage_pre_managed_controls(
+            plan,
+            prepared,
+            expected,
+        )
 
 
 def _process_checkpoint_plan(tmp_path: Path) -> tuple[dict, Path]:
