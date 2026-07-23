@@ -14702,6 +14702,11 @@ def _gateway_health_receipt(
         if isinstance(drain, dict)
         else None
     )
+    cron_admission = (
+        drain.get("cron_admission")
+        if isinstance(drain, dict)
+        else None
+    )
     expected_work = {
         "active_http_requests",
         "active_agent_turns",
@@ -14727,6 +14732,7 @@ def _gateway_health_receipt(
         "rejecting_new_work",
     }:
         raise ValueError("expected gateway admission state is invalid")
+    expected_cron_accepting = expected_admission == "accepting_new_work"
     if expected_admission == "accepting_new_work":
         expected_drain_requested = False
         expected_gate_active = False
@@ -14756,6 +14762,7 @@ def _gateway_health_receipt(
             "work_status",
             "quiescence",
             "pair_open_gate",
+            "cron_admission",
         }
         or drain.get("schema") != "hermes.gateway_drain.v1"
         or not isinstance(admission, dict)
@@ -14785,6 +14792,26 @@ def _gateway_health_receipt(
         or not isinstance(quiescence, dict)
         or set(quiescence) != {"verified", "quiescent", "blockers"}
         or quiescence.get("verified") is not True
+        or not isinstance(cron_admission, dict)
+        or set(cron_admission) != {
+            "schema",
+            "verified",
+            "accepting",
+            "gate_epoch",
+            "active_count",
+            "active_job_ids",
+            "active_leases",
+        }
+        or cron_admission.get("schema") != "hermes.cron_admission.v1"
+        or cron_admission.get("verified") is not True
+        or cron_admission.get("accepting") is not expected_cron_accepting
+        or isinstance(cron_admission.get("gate_epoch"), bool)
+        or not isinstance(cron_admission.get("gate_epoch"), int)
+        or cron_admission["gate_epoch"] < 1
+        or isinstance(cron_admission.get("active_count"), bool)
+        or cron_admission.get("active_count") != 0
+        or cron_admission.get("active_job_ids") != []
+        or cron_admission.get("active_leases") != []
     ):
         raise ReleaseBuildError("gateway public drain receipt is not quiescent")
     if expected_admission == "rejecting_new_work":
@@ -15076,7 +15103,7 @@ def _probe_startup_fenced_webui_binding(
         candidate_identity=signed_identity,
         expected_candidate_identity=identity,
         admission_state="startup-fenced",
-        require_full_health=True,
+        require_full_health=False,
     )
 
 
@@ -15933,7 +15960,11 @@ def _stop_current_service(
     bootout = _bootout_job(plan, gateway=gateway, required=False)
     if identity is not None and _exact_process_is_alive(identity):
         os.kill(int(identity["pid"]), signal.SIGKILL)
-        wait_for_exact_process_exit(identity, float(plan["timeout_seconds"]))
+        wait_for_exact_process_exit(
+            identity,
+            float(plan["timeout_seconds"]),
+            allow_exact_signaled_zombie=True,
+        )
     try:
         replacement = _listener_pid(int(plan[port_key]))
     except DrainIdentityMismatch:
@@ -16000,6 +16031,59 @@ def _authorized_cutover_runtimes(plan: dict, *, gateway: bool) -> list[dict]:
             .get("runtime"),
         ]
     return [value for value in candidates if isinstance(value, dict)]
+
+
+def _incomplete_managed_webui_stop_authorization(
+    plan: dict,
+    journal: dict,
+) -> dict | None:
+    """Reconstruct an exact stop receipt after start but before its journal phase."""
+    phases = journal.get("phases", {}) if isinstance(journal, dict) else {}
+    if "managed_pair_started" in phases:
+        return None
+    intent = phases.get("managed_pair_start_intent")
+    if not isinstance(intent, dict):
+        return None
+    candidate = plan.get("expected_candidate_identity")
+    last_good = plan.get("last_good_identity")
+    selection = intent.get("selection")
+    install = intent.get("webui_install")
+    if (
+        not isinstance(candidate, dict)
+        or not isinstance(last_good, dict)
+        or not isinstance(selection, dict)
+        or not isinstance(install, dict)
+        or intent.get("build_id") != candidate.get("build_id")
+        or selection.get("generation") != candidate.get("selector_generation")
+        or selection.get("current") != candidate.get("build_id")
+        or selection.get("candidate") != candidate.get("build_id")
+        or selection.get("pending_transaction_id") != plan.get("transaction_id")
+        or selection.get("last_good") != last_good.get("build_id")
+    ):
+        raise ReleaseBuildError(
+            "incomplete managed WebUI start intent is invalid"
+        )
+    current_selection = release_selector.read_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+    )
+    if current_selection != selection:
+        raise DrainIdentityMismatch(
+            "incomplete managed WebUI selector state changed"
+        )
+    if sha256_file(Path(plan["installed_plist"])) != install.get("sha256"):
+        raise DrainIdentityMismatch(
+            "incomplete managed WebUI install identity changed"
+        )
+    binding = _probe_startup_fenced_webui_binding(plan, candidate)
+    if binding is None:
+        return None
+    runtime = binding.get("runtime")
+    if not isinstance(runtime, dict):
+        raise DrainIdentityMismatch(
+            "incomplete managed WebUI runtime identity is missing"
+        )
+    return runtime
 
 
 def _stop_current_pair(plan: dict, journal: dict | None = None) -> dict:
@@ -16264,6 +16348,12 @@ def _stop_bootstrap_pair_for_rollback(
 
     authorized = _authorized_bootstrap_runtimes(journal, gateway=False)
     authorized.extend(_authorized_cutover_runtimes(plan, gateway=False))
+    incomplete_runtime = _incomplete_managed_webui_stop_authorization(
+        plan,
+        journal,
+    )
+    if incomplete_runtime is not None:
+        authorized.append(incomplete_runtime)
     webui = _stop_current_service(
         plan,
         gateway=False,

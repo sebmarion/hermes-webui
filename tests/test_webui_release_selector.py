@@ -5415,6 +5415,75 @@ def test_wait_for_exact_process_exit_rejects_unauthorized_zombie(monkeypatch):
         )
 
 
+def test_stop_current_service_allows_exact_signaled_terminal_zombie(monkeypatch):
+    plan = {
+        "listener_port": 8787,
+        "timeout_seconds": 1,
+    }
+    runtime = {
+        "pid": 41,
+        "pid_start_token": "candidate-start",
+        "program_identity": {"sha256": "a" * 64},
+    }
+    listener_probes = iter((41, None))
+    job_probes = iter((41, None))
+    signals = []
+
+    def listener(_port):
+        value = next(listener_probes)
+        if value is None:
+            raise cutover.DrainIdentityMismatch("listener absent")
+        return value
+
+    monkeypatch.setattr(cutover, "_listener_pid", listener)
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: next(job_probes),
+    )
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "candidate-start")
+    monkeypatch.setattr(
+        cutover,
+        "_listener_process_receipt",
+        lambda *_args, **_kwargs: runtime,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_runtime_receipt_matches",
+        lambda actual, expected: actual == expected,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *_args, **_kwargs: {"status": "stopped"},
+    )
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: True)
+    monkeypatch.setattr(
+        cutover.os,
+        "kill",
+        lambda pid, sent_signal: signals.append((pid, sent_signal)),
+    )
+
+    def wait(identity, timeout_seconds, *, allow_exact_signaled_zombie):
+        assert identity == {
+            "pid": 41,
+            "pid_start_token": "candidate-start",
+        }
+        assert timeout_seconds == 1
+        assert allow_exact_signaled_zombie is True
+
+    monkeypatch.setattr(cutover, "wait_for_exact_process_exit", wait)
+
+    receipt = cutover._stop_current_service(
+        plan,
+        gateway=False,
+        authorized_receipts=[runtime],
+    )
+
+    assert receipt["status"] == "stopped"
+    assert signals == [(41, signal.SIGKILL)]
+
+
 def test_wait_for_exact_process_exit_accepts_reap_during_zombie_probe(
     monkeypatch,
 ):
@@ -6659,6 +6728,168 @@ def test_bootstrap_abort_boundary_remains_recoverable_after_job_bootout():
             "rollback_started": {"error_type": "ReleaseBuildError"},
         }
     )
+
+
+def test_incomplete_managed_webui_start_reconstructs_exact_stop_authorization(
+    monkeypatch,
+):
+    selection = {
+        "version": 2,
+        "generation": 61,
+        "current": "candidate-r24",
+        "candidate": "candidate-r24",
+        "pending_transaction_id": "bootstrap-transaction-000001",
+        "last_good": "last-good",
+        "bootstrap_fallback": "last-good",
+        "release_root": "/tmp/releases",
+        "releases": {},
+    }
+    runtime = {
+        "pid": 41,
+        "pid_start_token": "candidate-start",
+        "program_identity": {"sha256": "a" * 64},
+    }
+    plan = {
+        "transaction_id": "bootstrap-transaction-000001",
+        "expected_candidate_identity": {
+            "build_id": "candidate-r24",
+            "selector_generation": 61,
+        },
+        "last_good_identity": {"build_id": "last-good"},
+        "selector_state": "/tmp/selector.json",
+        "selector_lock": "/tmp/selector.lock",
+        "installed_plist": "/tmp/managed.plist",
+    }
+    journal = {
+        "phases": {
+            "managed_pair_start_intent": {
+                "build_id": "candidate-r24",
+                "selection": selection,
+                "webui_install": {"sha256": "b" * 64},
+            }
+        }
+    }
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: copy.deepcopy(selection),
+    )
+    monkeypatch.setattr(cutover, "sha256_file", lambda _path: "b" * 64)
+    monkeypatch.setattr(
+        cutover,
+        "_probe_startup_fenced_webui_binding",
+        lambda _plan, _identity: {"runtime": runtime},
+    )
+
+    assert (
+        cutover._incomplete_managed_webui_stop_authorization(plan, journal)
+        == runtime
+    )
+
+
+def test_incomplete_managed_webui_start_rejects_selector_drift(monkeypatch):
+    selection = {
+        "generation": 61,
+        "current": "candidate-r24",
+        "candidate": "candidate-r24",
+        "pending_transaction_id": "bootstrap-transaction-000001",
+        "last_good": "last-good",
+    }
+    plan = {
+        "transaction_id": "bootstrap-transaction-000001",
+        "expected_candidate_identity": {
+            "build_id": "candidate-r24",
+            "selector_generation": 61,
+        },
+        "last_good_identity": {"build_id": "last-good"},
+        "selector_state": "/tmp/selector.json",
+        "selector_lock": "/tmp/selector.lock",
+        "installed_plist": "/tmp/managed.plist",
+    }
+    journal = {
+        "phases": {
+            "managed_pair_start_intent": {
+                "build_id": "candidate-r24",
+                "selection": selection,
+                "webui_install": {"sha256": "b" * 64},
+            }
+        }
+    }
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: {**selection, "generation": 62},
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="selector state changed",
+    ):
+        cutover._incomplete_managed_webui_stop_authorization(plan, journal)
+
+
+def test_probe_startup_fenced_webui_does_not_require_mutating_deep_checks(
+    monkeypatch,
+):
+    identity = {
+        "build_id": "candidate-r24",
+        "selector_generation": 61,
+    }
+    plan = {
+        "listener_port": 8787,
+        "base_url": "http://127.0.0.1:8787",
+        "signing_key_file": "/tmp/release-control.key",
+        "transaction_id": "bootstrap-transaction-000001",
+        "timeout_seconds": 1,
+    }
+    binding = {
+        "status": "verified",
+        "signed_identity": identity,
+        "deep_health": {
+            "status": "ok",
+            "checks": {
+                "sessions": {"status": "deferred"},
+                "projects": {"status": "deferred"},
+                "state_db": {"status": "deferred"},
+            },
+        },
+    }
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_job_pid", lambda _plan, *, gateway: 41)
+    monkeypatch.setattr(cutover, "_read_release_control_key", lambda _path: b"key")
+    monkeypatch.setattr(
+        cutover,
+        "_release_control_client",
+        lambda *_args, **_kwargs: (
+            lambda: {},
+            lambda *_args, **_kwargs: {},
+            plan["transaction_id"],
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_collect_process_binding",
+        lambda _plan, *, inspect_control: binding,
+    )
+
+    def require_candidate(
+        evidence,
+        *,
+        candidate_identity,
+        expected_candidate_identity,
+        admission_state,
+        require_full_health,
+    ):
+        assert evidence is binding
+        assert candidate_identity is identity
+        assert expected_candidate_identity is identity
+        assert admission_state == "startup-fenced"
+        assert require_full_health is False
+        return evidence
+
+    monkeypatch.setattr(cutover, "_require_candidate_binding", require_candidate)
+
+    assert cutover._probe_startup_fenced_webui_binding(plan, identity) is binding
 
 
 def test_bootstrap_journal_allows_exact_abort_after_job_bootout():
@@ -8840,6 +9071,15 @@ def _canonical_gateway_health_fixture(
                 ),
             },
             "pair_open_gate": pair_gate,
+            "cron_admission": {
+                "schema": "hermes.cron_admission.v1",
+                "verified": True,
+                "accepting": not pair_gate_active,
+                "gate_epoch": 7,
+                "active_count": 0,
+                "active_job_ids": [],
+                "active_leases": [],
+            },
         },
     }
     return plan, identity, health
@@ -8892,6 +9132,74 @@ def test_gateway_health_rejects_incomplete_work_status_schema(monkeypatch):
             plan,
             expected_identity=identity,
             expected_admission="rejecting_new_work",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("verified", False),
+        ("accepting", True),
+        ("gate_epoch", True),
+        ("active_count", 1),
+        ("active_job_ids", ["job-1"]),
+        (
+            "active_leases",
+            [
+                {
+                    "job_id": "job-1",
+                    "source": "cron",
+                    "pid": 42,
+                    "gate_epoch": 7,
+                    "admitted_at": "2026-07-23T00:00:00+00:00",
+                }
+            ],
+        ),
+    ],
+)
+def test_gateway_health_rejects_invalid_cron_admission_receipt(
+    monkeypatch,
+    field,
+    value,
+):
+    plan, identity, health = _canonical_gateway_health_fixture(
+        pair_gate_active=True,
+    )
+    health["drain"]["cron_admission"][field] = value
+    monkeypatch.setattr(cutover, "_http_json", lambda *args, **kwargs: health)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="drain receipt is not quiescent",
+    ):
+        cutover._gateway_health_receipt(
+            plan,
+            expected_identity=identity,
+            expected_admission="rejecting_new_work",
+            expected_pair_gate=health["drain"]["pair_open_gate"],
+        )
+
+
+def test_gateway_health_rejects_incomplete_cron_admission_schema(monkeypatch):
+    plan, identity, health = _canonical_gateway_health_fixture(
+        pair_gate_active=True,
+    )
+    health["drain"]["cron_admission"].pop("active_leases")
+    monkeypatch.setattr(cutover, "_http_json", lambda *args, **kwargs: health)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="drain receipt is not quiescent",
+    ):
+        cutover._gateway_health_receipt(
+            plan,
+            expected_identity=identity,
+            expected_admission="rejecting_new_work",
+            expected_pair_gate=health["drain"]["pair_open_gate"],
         )
 
 
