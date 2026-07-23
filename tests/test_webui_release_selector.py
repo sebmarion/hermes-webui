@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import signal
 import socket
 import sqlite3
 import stat
@@ -5341,12 +5342,371 @@ def test_atomic_copy_streams_without_path_read_bytes(tmp_path, monkeypatch):
 def test_wait_for_exact_process_exit_does_not_treat_ps_failure_as_exit(monkeypatch):
     monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
     monkeypatch.setattr(cutover.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "S")
 
     with pytest.raises(cutover.DrainIdentityMismatch, match="probe failed"):
         cutover.wait_for_exact_process_exit(
             {"pid": 123, "pid_start_token": "same-live-process"},
             0.2,
         )
+
+
+def test_wait_for_exact_process_exit_accepts_authorized_terminal_zombie(
+    monkeypatch,
+):
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(cutover.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "Z")
+
+    cutover.wait_for_exact_process_exit(
+        {"pid": 123, "pid_start_token": "same-signaled-process"},
+        0.2,
+        allow_exact_signaled_zombie=True,
+    )
+
+
+def test_wait_for_exact_process_exit_rejects_unauthorized_zombie(monkeypatch):
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(cutover.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "Z")
+
+    with pytest.raises(cutover.DrainIdentityMismatch, match="probe failed"):
+        cutover.wait_for_exact_process_exit(
+            {"pid": 123, "pid_start_token": "unproved-process"},
+            0.2,
+        )
+
+
+def test_wait_for_exact_process_exit_accepts_reap_during_zombie_probe(
+    monkeypatch,
+):
+    probes = iter(("present", "absent"))
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+
+    def fake_kill(_pid, sent_signal):
+        assert sent_signal == 0
+        if next(probes) == "absent":
+            raise ProcessLookupError
+
+    monkeypatch.setattr(cutover.os, "kill", fake_kill)
+    monkeypatch.setattr(
+        cutover,
+        "_ps_value",
+        lambda _pid, _field: (_ for _ in ()).throw(
+            cutover.DrainIdentityMismatch("process identity probe failed")
+        ),
+    )
+
+    cutover.wait_for_exact_process_exit(
+        {"pid": 123, "pid_start_token": "same-signaled-process"},
+        0.2,
+        allow_exact_signaled_zombie=True,
+    )
+
+
+def test_resume_frozen_writers_tolerates_already_terminal_leaf(monkeypatch):
+    frozen = {
+        "writers": [
+            {
+                "role": "webui",
+                "status": "frozen",
+                "tree": [
+                    {
+                        "pid": 123,
+                        "pid_start_token": "terminal-leaf",
+                        "ppid": 122,
+                        "state": "T",
+                    },
+                    {
+                        "pid": 122,
+                        "pid_start_token": "exact-root",
+                        "ppid": None,
+                        "state": "Ts",
+                    },
+                ],
+            }
+        ]
+    }
+    continued = []
+
+    monkeypatch.setattr(
+        cutover,
+        "_exact_process_is_alive",
+        lambda process: process["pid"] == 122,
+    )
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "S")
+
+    def fake_kill(pid, sent_signal):
+        if pid == 123 and sent_signal == 0:
+            raise ProcessLookupError
+        continued.append((pid, sent_signal))
+
+    monkeypatch.setattr(cutover.os, "kill", fake_kill)
+
+    receipt = cutover._resume_frozen_prepared_writers(frozen)
+
+    assert receipt["status"] == "resumed-with-terminal-children"
+    assert receipt["processes"] == [
+        {"pid": 122, "pid_start_token": "exact-root"}
+    ]
+    assert receipt["terminal_processes"] == [
+        {
+            "pid": 123,
+            "pid_start_token": "terminal-leaf",
+            "status": "absent",
+        }
+    ]
+    assert continued == [(122, signal.SIGCONT)]
+
+
+def test_resume_frozen_writers_tolerates_terminal_zombie_leaf(monkeypatch):
+    frozen = {
+        "writers": [
+            {
+                "role": "webui",
+                "status": "frozen",
+                "tree": [
+                    {
+                        "pid": 123,
+                        "pid_start_token": "terminal-leaf",
+                        "ppid": 122,
+                        "state": "T",
+                    },
+                    {
+                        "pid": 122,
+                        "pid_start_token": "exact-root",
+                        "ppid": None,
+                        "state": "Ts",
+                    },
+                ],
+            }
+        ]
+    }
+    continued = []
+    monkeypatch.setattr(
+        cutover,
+        "_exact_process_is_alive",
+        lambda process: process["pid"] == 122,
+    )
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(
+        cutover,
+        "_ps_value",
+        lambda pid, _field: "Z" if pid == 123 else "S",
+    )
+    monkeypatch.setattr(
+        cutover.os,
+        "kill",
+        lambda pid, sent_signal: continued.append((pid, sent_signal))
+        if sent_signal == signal.SIGCONT
+        else None,
+    )
+
+    receipt = cutover._resume_frozen_prepared_writers(frozen)
+
+    assert receipt["status"] == "resumed-with-terminal-children"
+    assert receipt["terminal_processes"] == [
+        {
+            "pid": 123,
+            "pid_start_token": "terminal-leaf",
+            "status": "zombie",
+        }
+    ]
+    assert continued == [(122, signal.SIGCONT)]
+
+
+def test_resume_frozen_writers_tolerates_leaf_reaped_during_state_probe(
+    monkeypatch,
+):
+    frozen = {
+        "writers": [
+            {
+                "role": "webui",
+                "status": "frozen",
+                "tree": [
+                    {
+                        "pid": 123,
+                        "pid_start_token": "terminal-leaf",
+                        "ppid": 122,
+                        "state": "T",
+                    },
+                    {
+                        "pid": 122,
+                        "pid_start_token": "exact-root",
+                        "ppid": None,
+                        "state": "Ts",
+                    },
+                ],
+            }
+        ]
+    }
+    leaf_probes = iter(("present", "absent"))
+    monkeypatch.setattr(
+        cutover,
+        "_exact_process_is_alive",
+        lambda process: process["pid"] == 122,
+    )
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+
+    def fake_kill(pid, sent_signal):
+        if pid == 123 and sent_signal == 0:
+            if next(leaf_probes) == "absent":
+                raise ProcessLookupError
+
+    monkeypatch.setattr(cutover.os, "kill", fake_kill)
+    monkeypatch.setattr(
+        cutover,
+        "_ps_value",
+        lambda pid, _field: (_ for _ in ()).throw(
+            cutover.DrainIdentityMismatch("process identity probe failed")
+        )
+        if pid == 123
+        else "S",
+    )
+
+    receipt = cutover._resume_frozen_prepared_writers(frozen)
+
+    assert receipt["terminal_processes"] == [
+        {
+            "pid": 123,
+            "pid_start_token": "terminal-leaf",
+            "status": "absent",
+        }
+    ]
+
+
+def test_resume_frozen_writers_rejects_reused_leaf_pid(monkeypatch):
+    frozen = {
+        "writers": [
+            {
+                "role": "webui",
+                "status": "frozen",
+                "tree": [
+                    {
+                        "pid": 123,
+                        "pid_start_token": "terminal-leaf",
+                        "ppid": 122,
+                        "state": "T",
+                    },
+                    {
+                        "pid": 122,
+                        "pid_start_token": "exact-root",
+                        "ppid": None,
+                        "state": "Ts",
+                    },
+                ],
+            }
+        ]
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_exact_process_is_alive",
+        lambda process: process["pid"] == 122,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_pid_start_token",
+        lambda pid: "reused-leaf" if pid == 123 else None,
+    )
+    monkeypatch.setattr(
+        cutover.os,
+        "kill",
+        lambda _pid, _signal: (_ for _ in ()).throw(
+            AssertionError("no process may be resumed before validation completes")
+        ),
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="frozen child PID was reused before SIGCONT",
+    ):
+        cutover._resume_frozen_prepared_writers(frozen)
+
+
+def test_resume_frozen_writers_resumes_parent_before_lower_pid_child(monkeypatch):
+    frozen = {
+        "writers": [
+            {
+                "role": "webui",
+                "status": "frozen",
+                "tree": [
+                    {
+                        "pid": 100,
+                        "pid_start_token": "child",
+                        "ppid": 300,
+                        "state": "T",
+                    },
+                    {
+                        "pid": 300,
+                        "pid_start_token": "root",
+                        "ppid": None,
+                        "state": "Ts",
+                    },
+                ],
+            }
+        ]
+    }
+    continued = []
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _process: True)
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "S")
+    monkeypatch.setattr(
+        cutover.os,
+        "kill",
+        lambda pid, sent_signal: continued.append((pid, sent_signal)),
+    )
+
+    receipt = cutover._resume_frozen_prepared_writers(frozen)
+
+    assert receipt["status"] == "resumed"
+    assert continued == [
+        (300, signal.SIGCONT),
+        (100, signal.SIGCONT),
+    ]
+
+
+def test_stop_prepared_service_kills_children_before_parent(monkeypatch):
+    tree = [
+        {
+            "pid": 100,
+            "pid_start_token": "child",
+            "ppid": 300,
+            "state": "T",
+        },
+        {
+            "pid": 300,
+            "pid_start_token": "root",
+            "ppid": None,
+            "state": "Ts",
+        },
+    ]
+    signaled = []
+    monkeypatch.setattr(cutover, "_job_pid", lambda _plan, gateway: None)
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _process: True)
+    monkeypatch.setattr(
+        cutover.os,
+        "kill",
+        lambda pid, sent_signal: signaled.append((pid, sent_signal)),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "wait_for_exact_process_exit",
+        lambda _process, _timeout, **_kwargs: None,
+    )
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: None)
+
+    cutover._stop_prepared_service(
+        {"timeout_seconds": 1.0, "listener_port": 8787},
+        {"pid": 300, "pid_start_token": "root"},
+        gateway=False,
+        frozen_tree={"tree": tree},
+        bootout_receipt={"status": "stopped"},
+    )
+
+    assert signaled == [
+        (100, signal.SIGKILL),
+        (300, signal.SIGKILL),
+    ]
 
 
 def test_darwin_pid_start_token_distinguishes_same_second_pid_reuse(monkeypatch):

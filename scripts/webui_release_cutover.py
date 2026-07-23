@@ -2081,7 +2081,12 @@ def signal_exact_release_process(identity: dict) -> None:
         raise DrainIdentityMismatch("release signal failed") from exc
 
 
-def wait_for_exact_process_exit(identity: dict, timeout_seconds: float) -> None:
+def wait_for_exact_process_exit(
+    identity: dict,
+    timeout_seconds: float,
+    *,
+    allow_exact_signaled_zombie: bool = False,
+) -> None:
     pid = int(identity.get("pid"))
     expected_start = str(identity.get("pid_start_token") or "").strip()
     deadline = time.monotonic() + max(0.1, float(timeout_seconds))
@@ -2096,6 +2101,23 @@ def wait_for_exact_process_exit(identity: dict, timeout_seconds: float) -> None:
                 raise DrainIdentityMismatch(
                     "release process existence probe failed"
                 ) from exc
+            if allow_exact_signaled_zombie:
+                try:
+                    state = _ps_value(pid, "state")
+                except DrainIdentityMismatch:
+                    if _pid_start_token(pid) is not None:
+                        raise
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        return
+                    except OSError as exc:
+                        raise DrainIdentityMismatch(
+                            "release process existence re-probe failed"
+                        ) from exc
+                    raise
+                if state.upper().startswith("Z"):
+                    return
             raise DrainIdentityMismatch(
                 "release process start-token probe failed while PID is alive"
             )
@@ -9449,30 +9471,140 @@ def _verify_frozen_prepared_writers(
     return frozen
 
 
+def _validated_parent_first_frozen_tree(tree: list) -> list[dict]:
+    by_pid: dict[int, dict] = {}
+    roots: list[int] = []
+    for process in tree:
+        if not isinstance(process, dict):
+            raise ReleaseBuildError("frozen process tree receipt is invalid")
+        try:
+            pid = int(process["pid"])
+            raw_ppid = process.get("ppid")
+            ppid = None if raw_ppid is None else int(raw_ppid)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReleaseBuildError("frozen process tree receipt is invalid") from exc
+        if pid <= 1 or pid in by_pid or (ppid is not None and ppid <= 1):
+            raise ReleaseBuildError("frozen process tree receipt is invalid")
+        by_pid[pid] = process
+        if ppid is None:
+            roots.append(pid)
+    if tree and len(roots) != 1:
+        raise ReleaseBuildError("frozen process tree root is ambiguous")
+    for pid, process in by_pid.items():
+        raw_ppid = process.get("ppid")
+        if raw_ppid is not None and int(raw_ppid) not in by_pid:
+            raise ReleaseBuildError(
+                f"frozen process tree parent is missing for PID {pid}"
+            )
+
+    depths: dict[int, int] = {}
+
+    def depth(pid: int, visiting: set[int]) -> int:
+        if pid in depths:
+            return depths[pid]
+        if pid in visiting:
+            raise ReleaseBuildError("frozen process tree contains a cycle")
+        visiting.add(pid)
+        raw_ppid = by_pid[pid].get("ppid")
+        value = 0 if raw_ppid is None else depth(int(raw_ppid), visiting) + 1
+        visiting.remove(pid)
+        depths[pid] = value
+        return value
+
+    for pid in by_pid:
+        depth(pid, set())
+    return sorted(
+        by_pid.values(),
+        key=lambda process: (depth(int(process["pid"]), set()), int(process["pid"])),
+    )
+
+
 def _resume_frozen_prepared_writers(frozen: dict) -> dict:
     rows = frozen.get("writers") if isinstance(frozen, dict) else None
     if not isinstance(rows, list):
         raise ReleaseBuildError("frozen writer receipt is invalid")
     resumed: list[dict] = []
+    terminal: list[dict] = []
     for row in rows:
         if not isinstance(row, dict):
             raise ReleaseBuildError("frozen writer receipt is invalid")
         tree = row.get("tree", [])
         if not isinstance(tree, list):
             raise ReleaseBuildError("frozen process tree receipt is invalid")
+        tree = _validated_parent_first_frozen_tree(tree)
+        root_pid = int(tree[0]["pid"]) if tree else None
+        survivors: list[dict] = []
         for process in tree:
-            if not isinstance(process, dict) or not _exact_process_is_alive(process):
+            pid = int(process["pid"])
+            if _exact_process_is_alive(process):
+                survivors.append(process)
+                continue
+            if pid == root_pid:
+                raise DrainIdentityMismatch(
+                    "frozen root process identity changed before SIGCONT"
+                )
+            current_start = _pid_start_token(pid)
+            if current_start is not None:
+                raise DrainIdentityMismatch(
+                    "frozen child PID was reused before SIGCONT"
+                )
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                terminal_status = "absent"
+            except OSError as exc:
+                raise DrainIdentityMismatch(
+                    "frozen child existence probe failed before SIGCONT"
+                ) from exc
+            else:
+                try:
+                    state = _ps_value(pid, "state")
+                except DrainIdentityMismatch:
+                    if _pid_start_token(pid) is not None:
+                        raise DrainIdentityMismatch(
+                            "frozen child PID was reused before SIGCONT"
+                        )
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        terminal_status = "absent"
+                    except OSError as exc:
+                        raise DrainIdentityMismatch(
+                            "frozen child existence re-probe failed before SIGCONT"
+                        ) from exc
+                    else:
+                        raise
+                else:
+                    if not state.upper().startswith("Z"):
+                        raise DrainIdentityMismatch(
+                            "frozen child start-token probe failed before SIGCONT"
+                        )
+                    terminal_status = "zombie"
+                if terminal_status not in {"absent", "zombie"}:
+                    raise DrainIdentityMismatch(
+                        "frozen child start-token probe failed before SIGCONT"
+                    )
+            terminal.append(
+                {
+                    "pid": pid,
+                    "pid_start_token": str(process["pid_start_token"]),
+                    "status": terminal_status,
+                }
+            )
+        for process in survivors:
+            pid = int(process["pid"])
+            if not _exact_process_is_alive(process):
                 raise DrainIdentityMismatch(
                     "frozen process identity changed before SIGCONT"
                 )
-            os.kill(int(process["pid"]), signal.SIGCONT)
+            os.kill(pid, signal.SIGCONT)
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
                 if not _exact_process_is_alive(process):
                     raise DrainIdentityMismatch(
                         "frozen process exited during SIGCONT"
                     )
-                state = _ps_value(int(process["pid"]), "state")
+                state = _ps_value(pid, "state")
                 if "T" not in state.upper():
                     break
                 time.sleep(0.02)
@@ -9482,10 +9614,16 @@ def _resume_frozen_prepared_writers(frozen: dict) -> dict:
                 )
             resumed.append(
                 {
-                    "pid": int(process["pid"]),
+                    "pid": pid,
                     "pid_start_token": str(process["pid_start_token"]),
                 }
             )
+    if terminal:
+        return {
+            "status": "resumed-with-terminal-children",
+            "processes": resumed,
+            "terminal_processes": terminal,
+        }
     return {"status": "resumed", "processes": resumed}
 
 
@@ -13669,12 +13807,14 @@ def _stop_prepared_service(
     tree = frozen_tree.get("tree") if isinstance(frozen_tree, dict) else None
     if not isinstance(tree, list):
         raise ReleaseBuildError("frozen process tree receipt is missing")
-    for process in reversed(tree):
-        if not isinstance(process, dict):
-            raise ReleaseBuildError("frozen process tree receipt is invalid")
+    for process in reversed(_validated_parent_first_frozen_tree(tree)):
         if _exact_process_is_alive(process):
             os.kill(int(process["pid"]), signal.SIGKILL)
-            wait_for_exact_process_exit(process, float(plan["timeout_seconds"]))
+            wait_for_exact_process_exit(
+                process,
+                float(plan["timeout_seconds"]),
+                allow_exact_signaled_zombie=True,
+            )
     port_key = "gateway_listener_port" if gateway else "listener_port"
     try:
         replacement = _listener_pid(int(plan[port_key]))
