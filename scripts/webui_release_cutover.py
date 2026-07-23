@@ -3515,6 +3515,10 @@ _BOOTSTRAP_WATCHDOG_PLAN_KEYS = {
     "watchdog_crontab_rollback",
     "watchdog_expected_sha256",
 }
+_BOOTSTRAP_WATCHDOG_SCHEDULER_PLAN_KEYS = {
+    "watchdog_scheduler_backend",
+    "watchdog_scheduler_job_id",
+}
 _BOOTSTRAP_INGRESS_GATE_PLAN_KEYS = {
     "ingress_gate_script",
     "ingress_gate_expected_sha256",
@@ -3536,6 +3540,7 @@ _CUTOVER_PLAN_OPTIONAL = {
     "interval_seconds",
     *_BOOTSTRAP_GATEWAY_PLAN_KEYS,
     *_BOOTSTRAP_WATCHDOG_PLAN_KEYS,
+    *_BOOTSTRAP_WATCHDOG_SCHEDULER_PLAN_KEYS,
     *_BOOTSTRAP_INGRESS_GATE_PLAN_KEYS,
     *_BOOTSTRAP_LEGACY_BOUNDARY_PLAN_KEYS,
 }
@@ -3565,6 +3570,7 @@ _CUTOVER_PLAN_PATH_KEYS = {
     "watchdog_rollback_script",
     "watchdog_crontab_rollback",
     "watchdog_state_file",
+    "watchdog_scheduler_registry",
     "ingress_gate_script",
     "ingress_gate_token_file",
     "ingress_gate_ready_receipt",
@@ -3758,6 +3764,37 @@ def _load_cutover_plan(path: Path | str) -> dict:
         r"[0-9a-f]{64}", str(plan.get("watchdog_expected_sha256") or "")
     ):
         raise ReleaseBuildError("cutover plan watchdog identity is invalid")
+    configured_watchdog_scheduler = (
+        _BOOTSTRAP_WATCHDOG_SCHEDULER_PLAN_KEYS.intersection(plan)
+    )
+    if configured_watchdog_scheduler and (
+        configured_watchdog_scheduler
+        != _BOOTSTRAP_WATCHDOG_SCHEDULER_PLAN_KEYS
+        or configured_watchdog != _BOOTSTRAP_WATCHDOG_PLAN_KEYS
+        or plan.get("watchdog_scheduler_backend") != "hermes_internal"
+        or re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{2,255}",
+            str(plan.get("watchdog_scheduler_job_id") or ""),
+        )
+        is None
+    ):
+        raise ReleaseBuildError(
+            "cutover plan watchdog scheduler identity is invalid"
+        )
+    if configured_watchdog_scheduler:
+        watchdog_registry = _absolute_plan_path(
+            plan["watchdog_scheduler_registry"],
+            label="watchdog_scheduler_registry",
+        )
+        if not any(
+            watchdog_registry == Path(mutable)
+            or Path(mutable) in watchdog_registry.parents
+            for mutable in normalized_mutable
+        ):
+            raise ReleaseBuildError(
+                "watchdog scheduler registry is not covered by the mutable snapshot"
+            )
+        plan["watchdog_scheduler_registry"] = str(watchdog_registry)
     configured_ingress = _BOOTSTRAP_INGRESS_GATE_PLAN_KEYS.intersection(plan)
     if (
         configured_ingress
@@ -6707,7 +6744,7 @@ def _run_release_commit_plan(
     except BaseException as original:
         try:
             _finish_release_watchdog_barrier(plan, barrier)
-        except Exception as barrier_error:
+        except Exception:
             raise ReleaseBuildError(
                 f"paired release failed: {original}; watchdog barrier finish failed: "
                 f"{barrier_error}"
@@ -7713,7 +7750,210 @@ def _read_crontab() -> str:
     return completed.stdout
 
 
+def _watchdog_scheduler_backend(plan: dict) -> str:
+    backend = str(plan.get("watchdog_scheduler_backend") or "crontab")
+    if backend not in {"crontab", "hermes_internal"}:
+        raise ReleaseBuildError("watchdog scheduler backend is unsupported")
+    return backend
+
+
+def _acquire_internal_watchdog_jobs_lock(plan: dict):
+    registry = Path(str(plan.get("watchdog_scheduler_registry") or ""))
+    if (
+        not registry.is_absolute()
+        or Path(os.path.abspath(registry)) != registry
+        or registry.is_symlink()
+        or not registry.exists()
+    ):
+        raise ReleaseBuildError("internal watchdog registry path is invalid")
+    parent = registry.parent
+    try:
+        parent_info = parent.lstat()
+        registry_info = registry.lstat()
+    except OSError as exc:
+        raise ReleaseBuildError("internal watchdog registry is unavailable") from exc
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_ISLNK(parent_info.st_mode)
+        or parent.resolve(strict=True) != parent
+        or parent_info.st_uid != os.getuid()
+        or stat.S_IMODE(parent_info.st_mode) & 0o022
+        or not stat.S_ISREG(registry_info.st_mode)
+        or stat.S_ISLNK(registry_info.st_mode)
+        or registry_info.st_uid != os.getuid()
+        or registry_info.st_nlink != 1
+        or stat.S_IMODE(registry_info.st_mode) & 0o077
+        or not 2 <= registry_info.st_size <= 16 * 1024 * 1024
+    ):
+        raise ReleaseBuildError("internal watchdog registry is unsafe")
+    lock_path = parent / ".jobs.lock"
+    if lock_path.is_symlink():
+        raise ReleaseBuildError("internal watchdog jobs lock is unsafe")
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as exc:
+        raise ReleaseBuildError("internal watchdog jobs lock is unavailable") from exc
+    os.set_inheritable(descriptor, False)
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_uid != os.getuid()
+        or opened.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) & 0o022
+    ):
+        os.close(descriptor)
+        raise ReleaseBuildError("internal watchdog jobs lock is unsafe")
+    handle = os.fdopen(descriptor, "r+b", buffering=0)
+    deadline = time.monotonic() + min(
+        30.0,
+        max(1.0, float(plan.get("timeout_seconds", 30.0))),
+    )
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return handle
+        except BlockingIOError as exc:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise ReleaseBuildError(
+                    "internal watchdog jobs lock timed out"
+                ) from exc
+            time.sleep(min(0.05, float(plan.get("interval_seconds", 0.05))))
+        except OSError as exc:
+            handle.close()
+            raise ReleaseBuildError(
+                "internal watchdog jobs lock failed"
+            ) from exc
+
+
+def _internal_watchdog_job_receipt(plan: dict) -> dict:
+    handle = _acquire_internal_watchdog_jobs_lock(plan)
+    try:
+        registry = Path(plan["watchdog_scheduler_registry"])
+        try:
+            payload = json.loads(registry.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReleaseBuildError(
+                "internal watchdog registry is invalid"
+            ) from exc
+        jobs = payload.get("jobs") if isinstance(payload, dict) else None
+        if not isinstance(jobs, list):
+            raise ReleaseBuildError("internal watchdog registry has no jobs")
+        job_id = str(plan.get("watchdog_scheduler_job_id") or "")
+        script_name = Path(str(plan["watchdog_installed_script"])).name
+        by_id = [
+            job
+            for job in jobs
+            if isinstance(job, dict) and str(job.get("id") or "") == job_id
+        ]
+        by_script = [
+            job
+            for job in jobs
+            if isinstance(job, dict)
+            and str(job.get("script") or "") == script_name
+        ]
+        if (
+            len(by_id) != 1
+            or len(by_script) != 1
+            or by_id[0] is not by_script[0]
+        ):
+            raise ReleaseBuildError(
+                "internal watchdog job is missing or ambiguous"
+            )
+        job = copy.deepcopy(by_id[0])
+        if (
+            job.get("enabled") is not True
+            or job.get("state") != "scheduled"
+            or job.get("no_agent") is not True
+            or job.get("deliver") != "local"
+        ):
+            raise ReleaseBuildError("internal watchdog job is not active")
+        canonical = (
+            json.dumps(
+                job,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("utf-8")
+        job_sha256 = hashlib.sha256(canonical).hexdigest()
+        return {
+            "backend": "hermes_internal",
+            "registry_path": str(registry),
+            "job_id": job_id,
+            "job_sha256": job_sha256,
+            "crontab_sha256": job_sha256,
+            "watchdog_command": f"hermes-internal:{job_id}:{script_name}",
+            "canonical_job": canonical,
+        }
+    finally:
+        handle.close()
+
+
+def _assert_no_os_watchdog_duplicate(plan: dict) -> None:
+    installed = str(plan["watchdog_installed_script"])
+    script_name = Path(installed).name
+    duplicates = []
+    for line in _read_crontab().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = stripped.split(None, 1 if stripped.startswith("@") else 5)
+        expected_fields = 2 if stripped.startswith("@") else 6
+        if len(fields) != expected_fields:
+            if installed in stripped or script_name in stripped:
+                raise ReleaseBuildError(
+                    "internal watchdog OS cron command is not parseable"
+                )
+            continue
+        command = fields[-1]
+        try:
+            tokens = shlex.split(command, comments=True, posix=True)
+        except ValueError as exc:
+            if installed in command or script_name in command:
+                raise ReleaseBuildError(
+                    "internal watchdog OS cron command is not parseable"
+                ) from exc
+            continue
+        pending = list(tokens)
+        seen: set[str] = set()
+        matched = False
+        while pending:
+            token = pending.pop(0)
+            if token in seen:
+                continue
+            seen.add(token)
+            if token == installed or Path(token).name == script_name:
+                matched = True
+                break
+            if any(character.isspace() for character in token):
+                try:
+                    pending.extend(shlex.split(token, comments=True, posix=True))
+                except ValueError:
+                    if installed in token or script_name in token:
+                        raise ReleaseBuildError(
+                            "internal watchdog nested OS cron command is not parseable"
+                        )
+        if matched:
+            duplicates.append(line)
+    if duplicates:
+        raise ReleaseBuildError(
+            "internal watchdog has an active duplicate OS cron command"
+        )
+
+
 def _cron_watchdog_receipt(plan: dict) -> dict:
+    if _watchdog_scheduler_backend(plan) == "hermes_internal":
+        _assert_no_os_watchdog_duplicate(plan)
+        receipt = _internal_watchdog_job_receipt(plan)
+        receipt.pop("canonical_job")
+        return receipt
     crontab = _read_crontab()
     installed = str(plan["watchdog_installed_script"])
     lines = [
@@ -7730,6 +7970,43 @@ def _cron_watchdog_receipt(plan: dict) -> dict:
 
 
 def _backup_crontab(plan: dict) -> dict:
+    if _watchdog_scheduler_backend(plan) == "hermes_internal":
+        _assert_no_os_watchdog_duplicate(plan)
+        receipt = _internal_watchdog_job_receipt(plan)
+        content = receipt.pop("canonical_job")
+        backup = Path(plan["watchdog_crontab_rollback"])
+        if backup.exists():
+            if backup.is_symlink() or backup.read_bytes() != content:
+                raise ReleaseBuildError(
+                    "internal watchdog backup conflicts with live job"
+                )
+        else:
+            parent = _prepare_release_root(backup.parent)
+            descriptor, temp_name = tempfile.mkstemp(
+                prefix=f".{backup.name}.",
+                dir=parent,
+            )
+            replaced = False
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(content)
+                    handle.flush()
+                    os.fchmod(handle.fileno(), 0o600)
+                    os.fsync(handle.fileno())
+                os.replace(temp_name, backup)
+                replaced = True
+                _fsync_directory(parent)
+            finally:
+                if not replaced:
+                    try:
+                        os.unlink(temp_name)
+                    except FileNotFoundError:
+                        pass
+        return {
+            **receipt,
+            "backup_path": str(backup),
+            "backup_sha256": hashlib.sha256(content).hexdigest(),
+        }
     content = _read_crontab().encode()
     backup = Path(plan["watchdog_crontab_rollback"])
     if backup.exists():
@@ -7775,7 +8052,109 @@ def _install_crontab_file(path: Path) -> None:
         raise ReleaseBuildError("watchdog crontab update failed") from exc
 
 
+def _attest_internal_watchdog_drain_marker(
+    plan: dict,
+    prepared: dict,
+) -> dict:
+    cron = prepared.get("watchdog_cron") if isinstance(prepared, dict) else None
+    intent = cron.get("drain_intent") if isinstance(cron, dict) else None
+    marker = intent.get("marker") if isinstance(intent, dict) else None
+    path = Path(str(marker.get("path") or "")) if isinstance(marker, dict) else None
+    if (
+        not isinstance(marker, dict)
+        or path != _legacy_gateway_drain_marker_path(plan)
+        or not isinstance(marker.get("payload"), dict)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(marker.get("sha256") or ""))
+        or not path.exists()
+        or path.is_symlink()
+        or _read_private_json_value(
+            path,
+            label="legacy gateway drain marker",
+        )
+        != marker["payload"]
+        or sha256_file(path) != marker["sha256"]
+    ):
+        raise ReleaseBuildError(
+            "internal watchdog gateway drain marker is not exact"
+        )
+    health = _legacy_gateway_health_with_drain(plan)
+    drain = health.get("drain") if isinstance(health, dict) else None
+    admission = drain.get("admission") if isinstance(drain, dict) else None
+    cron_admission = (
+        drain.get("cron_admission") if isinstance(drain, dict) else None
+    )
+    work = drain.get("work") if isinstance(drain, dict) else None
+    quiescence = drain.get("quiescence") if isinstance(drain, dict) else None
+    if (
+        not isinstance(admission, dict)
+        or admission.get("state") != "rejecting_new_work"
+        or admission.get("verified") is not True
+        or admission.get("drain_requested") is not True
+        or not isinstance(cron_admission, dict)
+        or cron_admission.get("verified") is not True
+        or cron_admission.get("accepting") is not False
+        or cron_admission.get("active_count") != 0
+        or not isinstance(work, dict)
+        or work.get("active_cron_jobs") != 0
+        or not isinstance(quiescence, dict)
+        or quiescence.get("verified") is not True
+        or quiescence.get("quiescent") is not True
+        or quiescence.get("blockers") != []
+    ):
+        raise ReleaseBuildError(
+            "internal watchdog gateway drain is not quiescent"
+        )
+    return {
+        "status": "verified",
+        "marker_sha256": marker["sha256"],
+    }
+
+
 def _disable_watchdog_cron(plan: dict, prepared: dict) -> dict:
+    if _watchdog_scheduler_backend(plan) == "hermes_internal":
+        cron = (
+            prepared.get("watchdog_cron")
+            if isinstance(prepared, dict)
+            else None
+        )
+        intent = cron.get("drain_intent") if isinstance(cron, dict) else None
+        if not isinstance(intent, dict):
+            raise ReleaseBuildError(
+                "internal watchdog drain intent is missing"
+            )
+        try:
+            drained = _wait_for_legacy_gateway_drain(
+                plan,
+                prepared,
+                intent,
+            )
+            if drained.get("status") != "verified":
+                raise ReleaseBuildError(
+                    "internal watchdog gateway did not drain"
+                )
+            marker = _attest_internal_watchdog_drain_marker(plan, prepared)
+            try:
+                current = _cron_watchdog_receipt(plan)
+            except ReleaseBuildError as exc:
+                raise DrainIdentityMismatch(
+                    "internal watchdog job changed"
+                ) from exc
+            if not _cron_receipt_matches_prepared(current, prepared):
+                raise DrainIdentityMismatch("internal watchdog job changed")
+        except Exception as barrier_error:
+            try:
+                _clear_legacy_gateway_drain_marker(plan, intent)
+            except Exception as cleanup_error:
+                raise ReleaseBuildError(
+                    "internal watchdog failed barrier could not reopen admission"
+                ) from cleanup_error
+            raise
+        return {
+            "status": "disabled",
+            "backend": "hermes_internal",
+            "crontab_sha256": current["crontab_sha256"],
+            "marker_sha256": marker["marker_sha256"],
+        }
     original_path = Path(plan["watchdog_crontab_rollback"])
     if sha256_file(original_path) != prepared["watchdog_cron"]["backup_sha256"]:
         raise ReleaseBuildError("watchdog crontab backup identity changed")
@@ -7817,6 +8196,20 @@ def _disable_watchdog_cron(plan: dict, prepared: dict) -> dict:
 
 
 def _attest_disabled_watchdog_cron(plan: dict, prepared: dict) -> dict:
+    if _watchdog_scheduler_backend(plan) == "hermes_internal":
+        marker = _attest_internal_watchdog_drain_marker(plan, prepared)
+        try:
+            current = _cron_watchdog_receipt(plan)
+        except ReleaseBuildError as exc:
+            raise DrainIdentityMismatch("internal watchdog job changed") from exc
+        if not _cron_receipt_matches_prepared(current, prepared):
+            raise DrainIdentityMismatch("internal watchdog job changed")
+        return {
+            "status": "disabled",
+            "backend": "hermes_internal",
+            "crontab_sha256": current["crontab_sha256"],
+            "marker_sha256": marker["marker_sha256"],
+        }
     current = _read_crontab()
     command = prepared["watchdog_cron"]["watchdog_command"]
     marker = f"# HERMES_CUTOVER_DISABLED {plan['transaction_id']} " + command
@@ -7835,6 +8228,41 @@ def _attest_disabled_watchdog_cron(plan: dict, prepared: dict) -> dict:
 
 
 def _restore_watchdog_cron(plan: dict, prepared: dict) -> dict:
+    if _watchdog_scheduler_backend(plan) == "hermes_internal":
+        cron = (
+            prepared.get("watchdog_cron")
+            if isinstance(prepared, dict)
+            else None
+        )
+        backup = Path(plan["watchdog_crontab_rollback"])
+        if (
+            not isinstance(cron, dict)
+            or sha256_file(backup) != cron.get("backup_sha256")
+        ):
+            raise ReleaseBuildError(
+                "internal watchdog rollback identity changed"
+            )
+        current = _cron_watchdog_receipt(plan)
+        if not _cron_receipt_matches_prepared(current, prepared):
+            raise DrainIdentityMismatch("internal watchdog job changed")
+        intent = cron.get("drain_intent")
+        if not isinstance(intent, dict):
+            raise ReleaseBuildError(
+                "internal watchdog drain intent is missing"
+            )
+        marker = intent.get("marker")
+        marker_path = (
+            Path(str(marker.get("path") or ""))
+            if isinstance(marker, dict)
+            else None
+        )
+        if marker_path is None:
+            raise ReleaseBuildError(
+                "internal watchdog drain marker identity is missing"
+            )
+        if marker_path.exists() or marker_path.is_symlink():
+            _clear_legacy_gateway_drain_marker(plan, intent)
+        return current
     backup = Path(plan["watchdog_crontab_rollback"])
     if sha256_file(backup) != prepared["watchdog_cron"]["backup_sha256"]:
         raise ReleaseBuildError("watchdog crontab rollback identity changed")
@@ -7939,7 +8367,7 @@ def _prepared_bootstrap_receipt(plan: dict) -> dict:
         Path(plan["watchdog_installed_script"]),
         Path(plan["watchdog_rollback_script"]),
     )
-    return {
+    prepared = {
         "legacy_idle": legacy_health,
         "legacy": legacy,
         "gateway": gateway,
@@ -7950,6 +8378,11 @@ def _prepared_bootstrap_receipt(plan: dict) -> dict:
         "watchdog_cron": _backup_crontab(plan),
         "pre_managed_controls": _capture_pre_managed_control_state(plan),
     }
+    if _watchdog_scheduler_backend(plan) == "hermes_internal":
+        prepared["watchdog_cron"]["drain_intent"] = (
+            _legacy_gateway_drain_intent_receipt(plan, prepared)
+        )
+    return prepared
 
 
 _INGRESS_GATE_READY_PATH = "/__hermes_first_cutover_gate__/ready"
@@ -11105,6 +11538,30 @@ def _legacy_gateway_drain_intent_receipt(plan: dict, prepared: dict) -> dict:
     }
 
 
+def _prepared_legacy_gateway_drain_intent(
+    plan: dict,
+    prepared: dict,
+) -> dict:
+    if _watchdog_scheduler_backend(plan) != "hermes_internal":
+        return _legacy_gateway_drain_intent_receipt(plan, prepared)
+    cron = prepared.get("watchdog_cron") if isinstance(prepared, dict) else None
+    intent = cron.get("drain_intent") if isinstance(cron, dict) else None
+    marker = intent.get("marker") if isinstance(intent, dict) else None
+    if (
+        not isinstance(intent, dict)
+        or not isinstance(marker, dict)
+        or marker.get("path") != str(_legacy_gateway_drain_marker_path(plan))
+        or not isinstance(marker.get("payload"), dict)
+        or marker["payload"].get("release_transaction_id")
+        != plan["transaction_id"]
+        or not re.fullmatch(r"[0-9a-f]{64}", str(marker.get("sha256") or ""))
+    ):
+        raise ReleaseBuildError(
+            "prepared internal watchdog gateway drain intent is invalid"
+        )
+    return copy.deepcopy(intent)
+
+
 def _write_legacy_gateway_drain_marker(plan: dict, intent: dict) -> dict:
     marker = intent.get("marker") if isinstance(intent, dict) else None
     if (
@@ -13279,6 +13736,20 @@ def _validated_watchdog_prepared(plan: dict, prepared: object) -> dict:
     return copy.deepcopy(prepared)
 
 
+def _prepare_release_watchdog_barrier(plan: dict) -> dict:
+    prepared = {"watchdog_cron": _backup_crontab(plan)}
+    if _watchdog_scheduler_backend(plan) == "hermes_internal":
+        prepared["gateway"] = _listener_process_receipt(
+            plan,
+            gateway=True,
+            require_git_source=False,
+        )
+        prepared["watchdog_cron"]["drain_intent"] = (
+            _legacy_gateway_drain_intent_receipt(plan, prepared)
+        )
+    return prepared
+
+
 def _begin_release_watchdog_barrier(
     plan: dict,
     *,
@@ -13295,7 +13766,7 @@ def _begin_release_watchdog_barrier(
             plan,
             prepared
             if prepared is not None
-            else {"watchdog_cron": _backup_crontab(plan)},
+            else _prepare_release_watchdog_barrier(plan),
         )
         journal = record_transaction_phase(
             plan["transaction_journal"],
@@ -14418,7 +14889,7 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                             journal = _record_bootstrap_phase(
                                 plan,
                                 "legacy_gateway_drain_intent",
-                                _legacy_gateway_drain_intent_receipt(
+                                _prepared_legacy_gateway_drain_intent(
                                     plan,
                                     prepared,
                                 ),
