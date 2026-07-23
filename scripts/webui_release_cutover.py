@@ -2118,6 +2118,8 @@ def wait_for_exact_process_exit(
                     raise
                 if state.upper().startswith("Z"):
                     return
+                time.sleep(0.1)
+                continue
             raise DrainIdentityMismatch(
                 "release process start-token probe failed while PID is alive"
             )

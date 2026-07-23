@@ -5365,6 +5365,43 @@ def test_wait_for_exact_process_exit_accepts_authorized_terminal_zombie(
     )
 
 
+def test_wait_for_exact_process_exit_accepts_transient_post_sigkill_state(
+    monkeypatch,
+):
+    states = iter(("T", "Z"))
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(cutover.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: next(states))
+    monkeypatch.setattr(cutover.time, "sleep", lambda _seconds: None)
+
+    cutover.wait_for_exact_process_exit(
+        {"pid": 123, "pid_start_token": "same-signaled-process"},
+        0.2,
+        allow_exact_signaled_zombie=True,
+    )
+
+
+def test_wait_for_exact_process_exit_bounds_transient_post_sigkill_state(
+    monkeypatch,
+):
+    clock = iter((0.0, 0.0, 0.2))
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
+    monkeypatch.setattr(cutover.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(cutover, "_ps_value", lambda _pid, _field: "S")
+    monkeypatch.setattr(cutover.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cutover.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(
+        cutover.DrainTimeout,
+        match="committed release process did not exit",
+    ):
+        cutover.wait_for_exact_process_exit(
+            {"pid": 123, "pid_start_token": "same-signaled-process"},
+            0.1,
+            allow_exact_signaled_zombie=True,
+        )
+
+
 def test_wait_for_exact_process_exit_rejects_unauthorized_zombie(monkeypatch):
     monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: None)
     monkeypatch.setattr(cutover.os, "kill", lambda _pid, _signal: None)
