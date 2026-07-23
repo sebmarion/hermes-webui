@@ -1125,6 +1125,85 @@ def test_legacy_shutdown_parser_accepts_natural_nonzero_to_zero_drain():
     }
 
 
+def _terminal_gateway_status_fixture(state: str) -> tuple[dict, dict, dict]:
+    return (
+        {
+            "kind": "hermes-gateway",
+            "pid": 41,
+            "gateway_state": state,
+            "active_agents": 0,
+        },
+        {"sha256": "a" * 64, "mtime_ns": 200},
+        {"mtime_ns": 100},
+    )
+
+
+def test_legacy_terminal_status_accepts_planned_double_signal_run_intent():
+    status, receipt, baseline = _terminal_gateway_status_fixture("running")
+
+    observed = cutover._legacy_gateway_terminal_status_receipt(
+        status,
+        receipt,
+        status_baseline=baseline,
+        gateway_pid=41,
+        shutdown_log=(
+            "Received UNKNOWN as a planned gateway stop — exiting cleanly\n"
+            "Received SIGTERM — initiating shutdown\n"
+            "Gateway stopped by an unexpected signal — persisting "
+            "gateway_state=running so container_boot auto-starts\n"
+        ),
+    )
+
+    assert observed["gateway_state"] == "running"
+    assert observed["compatibility"] == (
+        "planned-stop-double-signal-run-intent"
+    )
+
+
+@pytest.mark.parametrize(
+    "shutdown_log",
+    [
+        "Gateway stopped by an unexpected signal — persisting "
+        "gateway_state=running so container_boot auto-starts\n",
+        "Received UNKNOWN as a planned gateway stop — exiting cleanly\n",
+    ],
+)
+def test_legacy_terminal_status_rejects_unproved_running_state(shutdown_log):
+    status, receipt, baseline = _terminal_gateway_status_fixture("running")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="not a fresh clean stop",
+    ):
+        cutover._legacy_gateway_terminal_status_receipt(
+            status,
+            receipt,
+            status_baseline=baseline,
+            gateway_pid=41,
+            shutdown_log=shutdown_log,
+        )
+
+
+def test_legacy_terminal_status_rejects_reversed_double_signal_receipt():
+    status, receipt, baseline = _terminal_gateway_status_fixture("running")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="not a fresh clean stop",
+    ):
+        cutover._legacy_gateway_terminal_status_receipt(
+            status,
+            receipt,
+            status_baseline=baseline,
+            gateway_pid=41,
+            shutdown_log=(
+                "Gateway stopped by an unexpected signal — persisting "
+                "gateway_state=running so container_boot auto-starts\n"
+                "Received UNKNOWN as a planned gateway stop — exiting cleanly\n"
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     "line",
     [

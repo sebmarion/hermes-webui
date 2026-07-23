@@ -12914,6 +12914,71 @@ def _parse_legacy_gateway_shutdown_log(combined: str) -> dict:
     return receipt
 
 
+def _legacy_gateway_terminal_status_receipt(
+    status: dict,
+    status_receipt: dict,
+    *,
+    status_baseline: dict,
+    gateway_pid: int,
+    shutdown_log: str,
+) -> dict:
+    try:
+        fresh = (
+            int(status_receipt.get("mtime_ns") or 0)
+            > int(status_baseline.get("mtime_ns") or 0)
+        )
+        observed_pid = int(status.get("pid", -1))
+        active_agents = int(status.get("active_agents", -1))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ReleaseBuildError(
+            "legacy gateway terminal status is not a fresh clean stop"
+        ) from exc
+    gateway_state = status.get("gateway_state")
+    compatibility = "terminal-stopped"
+    if gateway_state == "running":
+        planned_stop_seen = re.search(
+            r"Received (?:UNKNOWN|SIGTERM|SIGINT) as a planned gateway stop "
+            r"— exiting cleanly",
+            shutdown_log,
+        )
+        run_intent_offset = shutdown_log.find(
+            "Gateway stopped by an unexpected signal — persisting "
+            "gateway_state=running"
+        )
+        if (
+            planned_stop_seen is None
+            or run_intent_offset < 0
+            or planned_stop_seen.start() >= run_intent_offset
+        ):
+            raise ReleaseBuildError(
+                "legacy gateway terminal status is not a fresh clean stop"
+            )
+        compatibility = "planned-stop-double-signal-run-intent"
+    elif gateway_state != "stopped":
+        raise ReleaseBuildError(
+            "legacy gateway terminal status is not a fresh clean stop"
+        )
+    if (
+        not isinstance(status, dict)
+        or not isinstance(status_receipt, dict)
+        or not isinstance(status_baseline, dict)
+        or not fresh
+        or status.get("kind") != "hermes-gateway"
+        or observed_pid != int(gateway_pid)
+        or active_agents != 0
+    ):
+        raise ReleaseBuildError(
+            "legacy gateway terminal status is not a fresh clean stop"
+        )
+    return {
+        "sha256": status_receipt["sha256"],
+        "mtime_ns": status_receipt["mtime_ns"],
+        "gateway_state": gateway_state,
+        "active_agents": 0,
+        "compatibility": compatibility,
+    }
+
+
 def _gracefully_stop_legacy_gateway(
     plan: dict,
     prepared: dict,
@@ -13019,18 +13084,6 @@ def _gracefully_stop_legacy_gateway(
         label="legacy gateway terminal status",
     )
     status_baseline = intent.get("status_baseline")
-    if (
-        not isinstance(status_baseline, dict)
-        or int(status_receipt.get("mtime_ns") or 0)
-        <= int(status_baseline.get("mtime_ns") or 0)
-        or status.get("kind") != "hermes-gateway"
-        or int(status.get("pid", -1)) != int(gateway_identity["pid"])
-        or status.get("gateway_state") != "stopped"
-        or int(status.get("active_agents", -1)) != 0
-    ):
-        raise ReleaseBuildError(
-            "legacy gateway terminal status is not a fresh clean stop"
-        )
     log_texts: list[str] = []
     log_receipts: list[dict] = []
     for baseline in intent.get("logs", []):
@@ -13039,6 +13092,13 @@ def _gracefully_stop_legacy_gateway(
         log_receipts.append(receipt)
     combined = "\n".join(log_texts)
     shutdown_drain = _parse_legacy_gateway_shutdown_log(combined)
+    terminal_status = _legacy_gateway_terminal_status_receipt(
+        status,
+        status_receipt,
+        status_baseline=status_baseline,
+        gateway_pid=int(gateway_identity["pid"]),
+        shutdown_log=combined,
+    )
     planned_path = Path(planned["path"])
     if planned_path.exists():
         if _read_private_json_value(
@@ -13058,12 +13118,7 @@ def _gracefully_stop_legacy_gateway(
         "process_retirement": retirement,
         "cron_tick_lock": cron_tick_lock,
         "clean_shutdown": clean,
-        "terminal_status": {
-            "sha256": status_receipt["sha256"],
-            "mtime_ns": status_receipt["mtime_ns"],
-            "gateway_state": "stopped",
-            "active_agents": 0,
-        },
+        "terminal_status": terminal_status,
         "logs": log_receipts,
         "shutdown_drain": shutdown_drain,
     }
