@@ -8027,6 +8027,141 @@ def _stage_pre_managed_controls(plan: dict, prepared: dict) -> dict:
     return _pre_managed_control_stage_receipt(plan)
 
 
+def _owned_forward_selector_transition(
+    plan: dict,
+    intended: dict,
+    current_receipt: dict,
+) -> dict | None:
+    candidate = plan.get("expected_candidate_identity")
+    last_good = plan.get("last_good_identity")
+    if not isinstance(candidate, dict) or not isinstance(last_good, dict):
+        return None
+    candidate_id = str(candidate.get("build_id") or "")
+    last_good_id = str(last_good.get("build_id") or "")
+    transaction_id = str(plan.get("transaction_id") or "")
+    try:
+        startup_generation = int(candidate.get("selector_generation"))
+    except (TypeError, ValueError):
+        return None
+    if (
+        not candidate_id
+        or not last_good_id
+        or not _TRANSACTION_ID.fullmatch(transaction_id)
+        or startup_generation <= 0
+        or any(
+            current_receipt.get(field) != intended.get(field)
+            for field in ("mode", "uid")
+        )
+    ):
+        return None
+    try:
+        journal = read_transaction_journal(
+            plan["transaction_journal"],
+            transaction_id=transaction_id,
+        )
+    except ReleaseBuildError:
+        return None
+    if journal.get("expected_candidate_identity") != candidate:
+        return None
+    phases = journal["phases"]
+    path = Path(plan["selector_state"])
+    payload, opened = _read_private_regular_bytes(
+        path,
+        label="forward selector state",
+    )
+    stable_receipt = {
+        "path": str(path),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size": len(payload),
+        "mode": stat.S_IMODE(opened.st_mode),
+        "uid": opened.st_uid,
+    }
+    if stable_receipt != current_receipt:
+        raise DrainIdentityMismatch(
+            "pre-managed selector_state changed during forward adoption"
+        )
+    try:
+        state = release_selector._validate_state(json.loads(payload))
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        release_selector.SelectorError,
+    ):
+        return None
+
+    transition: str
+    durable_selection: object
+    generation_delta: int
+    promoted = phases.get("promoted")
+    activated = phases.get("selection_activated")
+    if isinstance(promoted, dict):
+        durable_selection = (
+            promoted.get("promotion", {})
+            .get("selector_and_cli", {})
+            .get("selector")
+        )
+        transition = "promoted"
+        generation_delta = 2
+        if "pair_commit_intent" not in phases:
+            return None
+    elif isinstance(activated, dict):
+        durable_selection = activated.get("selection")
+        transition = "activated"
+        generation_delta = 1
+    else:
+        return None
+    if state != durable_selection:
+        return None
+
+    staged_state = copy.deepcopy(state)
+    try:
+        staged_state["generation"] = int(staged_state["generation"]) - (
+            generation_delta
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if transition == "promoted":
+        if (
+            state.get("generation") != startup_generation + 1
+            or state.get("current") != candidate_id
+            or state.get("last_good") != candidate_id
+            or state.get("candidate") is not None
+            or state.get("pending_transaction_id") is not None
+        ):
+            return None
+        staged_state["last_good"] = last_good_id
+        staged_state["candidate"] = candidate_id
+        staged_state["pending_transaction_id"] = transaction_id
+    else:
+        if (
+            state.get("generation") != startup_generation
+            or state.get("current") != candidate_id
+            or state.get("last_good") != last_good_id
+            or state.get("candidate") != candidate_id
+            or state.get("pending_transaction_id") != transaction_id
+        ):
+            return None
+    staged_state["current"] = last_good_id
+    try:
+        staged_state = release_selector._validate_state(staged_state)
+    except release_selector.SelectorError:
+        return None
+    encoded = (
+        json.dumps(staged_state, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if (
+        len(encoded) != intended.get("size")
+        or hashlib.sha256(encoded).hexdigest() != intended.get("sha256")
+    ):
+        return None
+    return {
+        "status": "verified",
+        "transition": transition,
+        "selection": state,
+        "identity": stable_receipt,
+    }
+
+
 def _adopt_or_restage_pre_managed_controls(
     plan: dict,
     prepared: dict,
@@ -8043,6 +8178,7 @@ def _adopt_or_restage_pre_managed_controls(
             "pre-managed control resume receipt is invalid"
         )
     missing_owned_creation = False
+    selector_transition: dict | None = None
     for key in ("selector_state", "selector_lock", "managed_plist"):
         path = Path(str(plan.get(key) or ""))
         before = captured.get(key)
@@ -8068,14 +8204,41 @@ def _adopt_or_restage_pre_managed_controls(
             label=f"staged {key}",
         )
         if current != intended:
+            if key == "selector_state":
+                selector_transition = _owned_forward_selector_transition(
+                    plan,
+                    intended,
+                    current,
+                )
+                if selector_transition is not None:
+                    continue
             raise DrainIdentityMismatch(
                 f"pre-managed {key} changed on bootstrap resume"
             )
+    if missing_owned_creation and selector_transition is not None:
+        raise DrainIdentityMismatch(
+            "pre-managed controls disappeared after owned selector transition"
+        )
     observed = (
         _stage_pre_managed_controls(plan, prepared)
         if missing_owned_creation
         else _pre_managed_control_stage_receipt(plan)
     )
+    if selector_transition is not None:
+        if (
+            observed.get("selector_lock") != expected.get("selector_lock")
+            or observed.get("managed_plist") != expected.get("managed_plist")
+            or observed.get("selector_state")
+            != selector_transition.get("identity")
+        ):
+            raise DrainIdentityMismatch(
+                "pre-managed forward selector adoption changed"
+            )
+        return {
+            **observed,
+            "status": "adopted-owned-forward-transition",
+            "selector_transition": selector_transition,
+        }
     if observed != expected:
         raise DrainIdentityMismatch(
             "pre-managed control restage changed before commit"

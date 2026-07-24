@@ -8698,6 +8698,156 @@ def test_pre_managed_control_resume_restages_only_rollback_owned_absence(
         )
 
 
+def test_pre_managed_control_resume_adopts_durably_promoted_selector(
+    tmp_path,
+):
+    plan = _pre_managed_control_plan(tmp_path)
+    control_root = Path(plan["selector_state"]).parent
+    last_good = _managed_release(control_root, "last-good")
+    candidate = _managed_release(control_root, "candidate")
+    plan.update(
+        {
+            "expected_candidate_identity": {
+                "build_id": "candidate",
+                "selector_generation": 2,
+            },
+            "last_good_identity": {"build_id": "last-good"},
+        }
+    )
+    selector.initialize_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+        release_root=last_good["release_root"],
+        bootstrap_build_id="last-good",
+        bootstrap_record=last_good["record"],
+    )
+    Path(plan["managed_plist"]).write_bytes(b"managed-plist\n")
+    Path(plan["managed_plist"]).chmod(0o600)
+    captured = cutover._capture_pre_managed_control_state(plan)
+    staged_state = selector.update_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+        expected_generation=0,
+        transition=lambda current: selector.stage_candidate(
+            current,
+            "candidate",
+            candidate["record"],
+            transaction_id=plan["transaction_id"],
+        ),
+    )
+    expected = cutover._pre_managed_control_stage_receipt(plan)
+    cutover.initialize_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+        expected_candidate_identity=plan["expected_candidate_identity"],
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "a" * 64,
+            "state_snapshot_id": "pre-managed-selector-snapshot",
+            "state_snapshot_sha256": "b" * 64,
+        },
+    )
+    for phase in (
+        "staged",
+        "plist_installed",
+        "old_fenced",
+        "old_committed",
+    ):
+        cutover.record_transaction_phase(
+            plan["transaction_journal"],
+            transaction_id=plan["transaction_id"],
+            phase=phase,
+            receipt={"status": "recorded"},
+        )
+    activated_state = selector.update_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+        expected_generation=staged_state["generation"],
+        transition=selector.activate_candidate,
+    )
+    cutover.record_transaction_phase(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+        phase="selection_activated",
+        receipt={"selection": activated_state},
+    )
+    prepared = {"pre_managed_controls": captured}
+
+    activated = cutover._adopt_or_restage_pre_managed_controls(
+        plan,
+        prepared,
+        expected,
+    )
+
+    assert activated["status"] == "adopted-owned-forward-transition"
+    assert activated["selector_transition"]["transition"] == "activated"
+    assert activated["selector_transition"]["selection"] == activated_state
+    assert selector.read_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+    ) == activated_state
+
+    promoted_state = selector.update_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+        expected_generation=activated_state["generation"],
+        transition=selector.promote_candidate,
+    )
+    for phase in (
+        "old_stopped",
+        "replacement_proved",
+        "candidate_fenced_health_proved",
+        "pair_ready",
+        "pair_commit_intent",
+        "promoted",
+    ):
+        cutover.record_transaction_phase(
+            plan["transaction_journal"],
+            transaction_id=plan["transaction_id"],
+            phase=phase,
+            receipt=(
+                {
+                    "promotion": {
+                        "selector_and_cli": {"selector": promoted_state},
+                    }
+                }
+                if phase == "promoted"
+                else {"status": "recorded"}
+            ),
+        )
+
+    observed = cutover._adopt_or_restage_pre_managed_controls(
+        plan,
+        prepared,
+        expected,
+    )
+
+    assert observed["status"] == "adopted-owned-forward-transition"
+    assert observed["selector_transition"]["transition"] == "promoted"
+    assert observed["selector_transition"]["selection"] == promoted_state
+    assert selector.read_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+    ) == promoted_state
+
+    foreign_state = copy.deepcopy(promoted_state)
+    foreign_state["generation"] += 1
+    Path(plan["selector_state"]).write_text(
+        json.dumps(foreign_state, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    Path(plan["selector_state"]).chmod(0o600)
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="pre-managed selector_state changed on bootstrap resume",
+    ):
+        cutover._adopt_or_restage_pre_managed_controls(
+            plan,
+            prepared,
+            expected,
+        )
+
+
 def _process_checkpoint_plan(tmp_path: Path) -> tuple[dict, Path]:
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir(mode=0o700)

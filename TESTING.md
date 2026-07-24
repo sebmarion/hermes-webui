@@ -1647,7 +1647,10 @@ and that barrier cleanup adopts state drift only after an exact signed
 snapshot rollback has been reverified live. Restored-gateway tests also prove
 that a legacy process may return to its launchd working directory without
 losing rollback authority, while any command, executable, or argv drift still
-fails closed.
+fails closed. Resume tests prove that the same transaction may adopt its
+durably activated or promoted selector only when inverse reconstruction
+matches the exact staged selector receipt; foreign mutation and incomplete
+control sets remain rejected.
 
 
 ---

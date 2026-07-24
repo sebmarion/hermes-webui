@@ -1978,6 +1978,14 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   and argv, but not to the live process cwd because the legacy gateway may
   chdir to a selected workspace after launch. Legacy WebUI rollback remains
   bound to cwd plus the exact captured git-source and routing receipts.
+- Crash resume after selector activation does not mistake the transaction's
+  own forward progress for foreign pre-managed-control drift. It may adopt only
+  an activated or promoted selector that exactly equals the same transaction's
+  durable journal receipt and whose inverse generation transition reproduces
+  the original staged selector bytes, mode, and owner. A promoted adoption also
+  requires the durable pair-commit intent. Missing controls, another
+  transaction, a changed journal identity, or any selector bytes that cannot
+  reconstruct the staged hash still fail closed.
 
 This is a bounded single-operator-host contract. Same-FD/path, inode, mode,
 ownership, link-count, and compare-before-replace checks fail closed for
