@@ -2005,6 +2005,12 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   probes. After acceptance, those probes run even while the pair-open gate
   still rejects ordinary work, allowing the controller to prove sessions,
   projects, and `state.db` before it atomically opens the pair.
+- A controller resuming an older already-accepted candidate may bridge its
+  mutation-free deferred state receipt only when the process reports an exact
+  validated pair gate. The same PID must then pass full state-backed health
+  after the durable gate release and before `pair_opened` is recorded. If a
+  crash occurs after unlinking the gate, the durable release owner is adopted
+  and the post-open identity and full-health proof still run.
 
 This is a bounded single-operator-host contract. Same-FD/path, inode, mode,
 ownership, link-count, and compare-before-replace checks fail closed for

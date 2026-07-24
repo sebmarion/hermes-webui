@@ -7437,6 +7437,67 @@ def test_candidate_binding_rejects_deferred_checks_after_admission_opens():
         )
 
 
+def test_candidate_binding_accepts_deferred_checks_only_behind_pair_gate():
+    expected = {
+        "build_id": "candidate-r32",
+        "manifest_sha256": "a" * 64,
+        "agent_manifest_sha256": "b" * 64,
+        "runtime_manifest_sha256": "c" * 64,
+        "selector_generation": 82,
+    }
+    identity = {
+        "pid": 41,
+        "pid_start_token": "candidate-start",
+    }
+    evidence = {
+        "status": "verified",
+        "launchd_pid": 41,
+        "listener_pid": 41,
+        "signed_health_pid": 41,
+        "pid_start_token": "candidate-start",
+        "deep_health": {
+            "status": "ok",
+            "build": {
+                "status": "managed",
+                "valid": True,
+                **expected,
+            },
+            "admission": {
+                "state": "open",
+                "effective_state": "pair-gated",
+                "pair_gate": {
+                    "status": "active",
+                    "transaction_id": "pair-gate-transaction-000000000001",
+                    "epoch": 82,
+                    "owner_hash": "d" * 64,
+                    "payload_sha256": "e" * 64,
+                    "agent": {"build_id": "agent"},
+                    "webui": {"build_id": expected["build_id"]},
+                },
+            },
+            "checks": {
+                "streams_lock": {"status": "ok"},
+                "stream_runtime": {"status": "ok"},
+                "startup_fence": {
+                    "status": "fenced",
+                    "mutation_free": True,
+                },
+                "sessions": {"status": "deferred"},
+                "projects": {"status": "deferred"},
+                "state_db": {"status": "deferred"},
+            },
+        },
+    }
+
+    assert cutover._require_candidate_binding(
+        evidence,
+        candidate_identity=identity,
+        expected_candidate_identity=expected,
+        admission_state="open",
+        require_full_health=True,
+    ) is evidence
+
+
 def test_bootstrap_journal_allows_exact_abort_after_job_bootout():
     phase_names = (
         "prepared",
@@ -10421,8 +10482,10 @@ def test_release_commit_prepares_bootstrap_watchdog_before_state_lock(
     ]
 
 
+@pytest.mark.parametrize("gate_release_state", ("active", "released"))
 def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
     monkeypatch,
+    gate_release_state,
 ):
     transaction_id = "sealed-gateway-attestation-transaction-0001"
     sealed_identity = {
@@ -10485,6 +10548,7 @@ def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
         },
     }
     gateway_identities = []
+    candidate_health_proofs = []
     monkeypatch.setattr(
         cutover,
         "_reconcile_cutover_journal",
@@ -10548,11 +10612,11 @@ def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
         "_collect_process_binding",
         lambda *_args, **_kwargs: {"status": "verified"},
     )
-    monkeypatch.setattr(
-        cutover,
-        "_require_candidate_binding",
-        lambda binding, **_kwargs: binding,
-    )
+    def require_candidate(binding, **kwargs):
+        candidate_health_proofs.append((binding, kwargs))
+        return binding
+
+    monkeypatch.setattr(cutover, "_require_candidate_binding", require_candidate)
     monkeypatch.setattr(
         cutover,
         "_require_webui_pair_gate_state",
@@ -10560,8 +10624,19 @@ def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
     )
     monkeypatch.setattr(
         cutover,
+        "_pair_open_gate_release_state",
+        lambda *_args, **_kwargs: gate_release_state,
+    )
+    monkeypatch.setattr(
+        cutover,
         "_release_owned_pair_open_gate",
-        lambda *_args, **_kwargs: {"status": "released"},
+        lambda *_args, **_kwargs: {
+            "status": (
+                "released"
+                if gate_release_state == "active"
+                else "already-released"
+            )
+        },
     )
     monkeypatch.setattr(
         cutover,
@@ -10583,7 +10658,16 @@ def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
         plan,
         bootstrap_open_pair=lambda _identity: {"status": "ready"},
     ) == {"status": "accepted"}
-    assert gateway_identities == [sealed_identity] * 3
+    expected_proof_count = 2 if gate_release_state == "active" else 1
+    assert gateway_identities == [sealed_identity] * (
+        3 if gate_release_state == "active" else 2
+    )
+    assert len(candidate_health_proofs) == expected_proof_count
+    assert all(
+        proof[1]["admission_state"] == "open"
+        and proof[1]["require_full_health"] is True
+        for proof in candidate_health_proofs
+    )
 
 
 def test_gateway_binding_wait_does_not_retry_programming_errors(monkeypatch):

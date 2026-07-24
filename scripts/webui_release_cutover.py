@@ -2367,12 +2367,40 @@ def _require_candidate_binding(
         ):
             raise ReleaseBuildError("accepted candidate full deep health is incomplete")
         state_checks = {"sessions", "projects", "state_db"}
+        pair_gate = admission.get("pair_gate")
+        deferred_pair_health = (
+            admission_state == "open"
+            and admission.get("effective_state") == "pair-gated"
+            and isinstance(pair_gate, dict)
+            and pair_gate.get("status") == "active"
+            and isinstance(pair_gate.get("transaction_id"), str)
+            and bool(
+                re.fullmatch(
+                    r"[A-Za-z0-9_-]{32,128}",
+                    pair_gate["transaction_id"],
+                )
+            )
+            and isinstance(pair_gate.get("epoch"), int)
+            and not isinstance(pair_gate.get("epoch"), bool)
+            and pair_gate["epoch"] > 0
+            and isinstance(pair_gate.get("owner_hash"), str)
+            and bool(re.fullmatch(r"[0-9a-f]{64}", pair_gate["owner_hash"]))
+            and isinstance(pair_gate.get("payload_sha256"), str)
+            and bool(
+                re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    pair_gate["payload_sha256"],
+                )
+            )
+            and isinstance(pair_gate.get("agent"), dict)
+            and isinstance(pair_gate.get("webui"), dict)
+        )
         expected_state_statuses = (
             {"deferred"}
-            if admission_state == "startup-fenced"
+            if admission_state == "startup-fenced" or deferred_pair_health
             else {"ok", "missing"}
         )
-        if admission_state == "startup-fenced":
+        if admission_state == "startup-fenced" or deferred_pair_health:
             startup_fence = checks.get("startup_fence")
             if (
                 not isinstance(startup_fence, dict)
@@ -7038,32 +7066,58 @@ def _run_release_commit_plan_core(
             != gate_installed.get("payload_sha256")
         ):
             raise ReleaseBuildError("pair-open release intent is invalid")
-        gateway_gated = _attest_managed_gateway_binding(
+        release_state = _pair_open_gate_release_state(
             plan,
-            plan["expected_candidate_identity"],
-            expected_admission="rejecting_new_work",
-            expected_pair_gate=_expected_agent_pair_gate_receipt(
+            gate_intent,
+            gate_installed,
+        )
+        if release_state == "active":
+            gateway_gated = _attest_managed_gateway_binding(
+                plan,
+                plan["expected_candidate_identity"],
+                expected_admission="rejecting_new_work",
+                expected_pair_gate=_expected_agent_pair_gate_receipt(
+                    gate_intent,
+                    active=True,
+                ),
+            )
+            gateway_gate = gateway_gated["health"]["drain"]["pair_open_gate"]
+            webui_gated = _require_candidate_binding(
+                _collect_process_binding(
+                    plan,
+                    inspect_control=inspect_control,
+                ),
+                candidate_identity=candidate_identity,
+                expected_candidate_identity=plan["expected_candidate_identity"],
+                admission_state="open",
+                require_full_health=True,
+            )
+            webui_gate = _require_webui_pair_gate_state(
+                webui_gated,
                 gate_intent,
                 active=True,
-            ),
-        )
-        webui_gated = _require_candidate_binding(
-            _collect_process_binding(plan, inspect_control=inspect_control),
-            candidate_identity=candidate_identity,
-            expected_candidate_identity=plan["expected_candidate_identity"],
-            admission_state="open",
-            require_full_health=True,
-        )
-        webui_gate = _require_webui_pair_gate_state(
-            webui_gated,
-            gate_intent,
-            active=True,
-        )
+            )
+        else:
+            gateway_gate = {
+                "status": "adopted-durable-release-intent",
+                "active": True,
+            }
+            webui_gate = {
+                "status": "adopted-durable-release-intent",
+                "active": True,
+            }
         released = _release_owned_pair_open_gate(
             plan,
             gate_intent,
             gate_installed,
         )
+        expected_release_status = (
+            "released" if release_state == "active" else "already-released"
+        )
+        if released.get("status") != expected_release_status:
+            raise DrainIdentityMismatch(
+                "pair-open gate release state changed during commit"
+            )
         gateway_open = _attest_managed_gateway_binding(
             plan,
             plan["expected_candidate_identity"],
@@ -7073,12 +7127,18 @@ def _run_release_commit_plan_core(
                 active=False,
             ),
         )
-        webui_open = _wait_for_expected_binding(
-            plan,
-            inspect_control=inspect_control,
-            expected_identity=plan["expected_candidate_identity"],
+        webui_open = _require_candidate_binding(
+            _wait_for_expected_binding(
+                plan,
+                inspect_control=inspect_control,
+                expected_identity=plan["expected_candidate_identity"],
+                admission_state="open",
+                require_startup_markers_cleared=False,
+            ),
+            candidate_identity=candidate_identity,
+            expected_candidate_identity=plan["expected_candidate_identity"],
             admission_state="open",
-            require_startup_markers_cleared=False,
+            require_full_health=True,
         )
         webui_released = _require_webui_pair_gate_state(
             webui_open,
@@ -7093,9 +7153,7 @@ def _run_release_commit_plan_core(
                 "payload_sha256": gate_installed["payload_sha256"],
                 "webui_gated": webui_gate,
                 "webui_open": webui_released,
-                "gateway_gated": gateway_gated["health"]["drain"][
-                    "pair_open_gate"
-                ],
+                "gateway_gated": gateway_gate,
                 "gateway_open": gateway_open["health"]["drain"][
                     "pair_open_gate"
                 ],
@@ -13364,6 +13422,32 @@ def _release_owned_pair_open_gate(
         "owner_hash": payload["owner_hash"],
         "payload_sha256": intent["payload_sha256"],
     }
+
+
+def _pair_open_gate_release_state(
+    plan: dict,
+    intent: dict,
+    installed: dict,
+) -> str:
+    """Return active or released for the exact durable release owner."""
+    path = _pair_open_gate_path(plan)
+    payload = intent.get("payload") if isinstance(intent, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or intent.get("path") != str(path)
+        or installed.get("owner_hash") != payload.get("owner_hash")
+        or installed.get("payload_sha256") != intent.get("payload_sha256")
+    ):
+        raise ReleaseBuildError("pair-open gate release ownership is invalid")
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with _with_transaction_journal_lock(lock_path):
+        if not path.exists() and not path.is_symlink():
+            return "released"
+        if _read_private_json_value(path, label="pair-open gate") != payload:
+            raise ReleaseBuildError("pair-open gate has another owner")
+        if sha256_file(path) != intent.get("payload_sha256"):
+            raise ReleaseBuildError("pair-open gate owner bytes changed")
+    return "active"
 
 
 def _require_webui_pair_gate_state(

@@ -1659,6 +1659,10 @@ that unexpected programming errors are not retried until the binding timeout.
 Startup-fence health tests also prove an accepted WebUI performs its state-backed
 deep probes behind the still-active pair gate, while a not-yet-accepted WebUI
 continues to report mutation-free deferred checks.
+Forward-resume tests cover older accepted candidates that still report deferred
+state checks behind an exact pair gate: unrelated open-admission deferrals stay
+rejected, full deep health is mandatory after gate release, and an already
+released exact owner resumes without repeating the gated preflight.
 
 
 ---
