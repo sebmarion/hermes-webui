@@ -9906,7 +9906,23 @@ def test_release_commit_prepares_bootstrap_watchdog_before_state_lock(
         assert actual_plan is plan
         events.append("run-cutover")
         assert bootstrap_prepare_pair is not None
-        assert bootstrap_prepare_pair(expected_identity) == readiness
+        signed_process_identity = {
+            **expected_identity,
+            "pid": 41,
+            "pid_start_token": "candidate-start",
+            "instance_id": "candidate-instance",
+        }
+        assert bootstrap_prepare_pair(signed_process_identity) == readiness
+        with pytest.raises(
+            cutover.DrainIdentityMismatch,
+            match="bootstrap paired readiness candidate changed",
+        ):
+            bootstrap_prepare_pair(
+                {
+                    **signed_process_identity,
+                    "build_id": "different-candidate",
+                }
+            )
         events.append("use-cached-readiness")
         return {"status": "accepted"}
 
@@ -10169,6 +10185,62 @@ def test_restart_or_adopt_restored_legacy_pair_adopts_exact_running_pair(
         "pid": 42,
         "pid_start_token": "webui-start",
     }
+
+
+def test_restored_legacy_gateway_allows_runtime_cwd_drift_only(monkeypatch):
+    expected = {
+        "command": "/legacy/python -m hermes_cli.main gateway run --replace",
+        "comm": "/legacy/python",
+        "cwd": "/runtime/selected-workspace",
+        "program_arguments": [
+            "/legacy/python",
+            "-m",
+            "hermes_cli.main",
+            "gateway",
+            "run",
+            "--replace",
+        ],
+        "program_identity": {
+            "path": "/legacy/python",
+            "sha256": "a" * 64,
+        },
+    }
+    actual = {
+        **expected,
+        "cwd": "/launchd/working-directory",
+        "pid": 51,
+        "pid_start_token": "restored-gateway-start",
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_listener_process_receipt",
+        lambda *_args, **_kwargs: actual,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_gateway_health_receipt",
+        lambda _plan: {"status": "ok"},
+    )
+
+    receipt = cutover._attest_restored_legacy_binding(
+        {},
+        prepared={"gateway": expected},
+        gateway=True,
+    )
+
+    assert receipt["status"] == "verified"
+    assert receipt["pid"] == 51
+
+    actual["command"] = "/unexpected/python -m hermes_cli.main gateway run"
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="restored legacy runtime identity changed",
+    ):
+        cutover._attest_restored_legacy_binding(
+            {},
+            prepared={"gateway": expected},
+            gateway=True,
+        )
 
 
 def test_restart_or_adopt_restored_legacy_pair_does_not_restart_on_bug(

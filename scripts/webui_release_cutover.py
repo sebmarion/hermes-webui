@@ -7096,7 +7096,10 @@ def _run_release_commit_plan(
             )
 
         def use_prepared_bootstrap_pair(candidate_identity: dict) -> dict:
-            if candidate_identity != expected_identity:
+            if not _candidate_identity_matches(
+                candidate_identity,
+                expected_identity,
+            ):
                 raise DrainIdentityMismatch(
                     "bootstrap paired readiness candidate changed"
                 )
@@ -16767,14 +16770,20 @@ def _restore_exact_backup(backup: Path, destination: Path, receipt: dict) -> dic
     return copied
 
 
-def _runtime_receipt_matches(actual: dict, expected: dict) -> bool:
+def _runtime_receipt_matches(
+    actual: dict,
+    expected: dict,
+    *,
+    require_cwd: bool = True,
+) -> bool:
     keys = {
         "command",
         "comm",
-        "cwd",
         "program_arguments",
         "program_identity",
     }
+    if require_cwd:
+        keys.add("cwd")
     if "source" in expected:
         keys.update({"source", "routing_environment"})
     return all(actual.get(key) == expected.get(key) for key in keys)
@@ -16792,7 +16801,14 @@ def _attest_restored_legacy_binding(
         gateway=gateway,
         require_git_source=not gateway,
     )
-    if not _runtime_receipt_matches(actual, expected):
+    if not _runtime_receipt_matches(
+        actual,
+        expected,
+        # The legacy gateway may chdir to a selected workspace after launch.
+        # Its command, executable and argv are stable rollback authority; its
+        # live cwd is not. WebUI keeps cwd plus the exact git-source receipt.
+        require_cwd=not gateway,
+    ):
         raise ReleaseBuildError("restored legacy runtime identity changed")
     if gateway:
         health = _gateway_health_receipt(plan)

@@ -1641,8 +1641,13 @@ restore the captured legacy pair from the bootstrap handoff receipt. Watchdog
 ordering tests prove that both installed-script reconcile-only calls finish
 while scheduling is disabled and before the state lock is acquired, that the
 locked commit reuses the durable readiness receipt instead of recursively
-contending on the lock, and that barrier cleanup adopts state drift only after
-an exact signed snapshot rollback has been reverified live.
+contending on the lock, that the cached receipt accepts the matching signed
+process projection with runtime-only fields while rejecting a changed build,
+and that barrier cleanup adopts state drift only after an exact signed
+snapshot rollback has been reverified live. Restored-gateway tests also prove
+that a legacy process may return to its launchd working directory without
+losing rollback authority, while any command, executable, or argv drift still
+fails closed.
 
 
 ---

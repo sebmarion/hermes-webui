@@ -1917,11 +1917,15 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   pre-open reconcile-only proofs while watchdog scheduling is durably disabled
   and before the release transaction acquires the watchdog state lock. The
   resulting readiness receipt is reused inside the locked pair commit; no
-  watchdog subprocess is launched while its own state lock is held. A final
-  candidate-script reconciliation immediately precedes lock acquisition, and
-  the cron schedule is restored only after `pair_opened`. Barrier cleanup
-  accepts a changed watchdog state only when the same transaction has durably
-  restored and reverified its exact signed state snapshot.
+  watchdog subprocess is launched while its own state lock is held. Reuse
+  binds the full sealed release identity to the signed process-identity
+  projection; runtime-only fields such as PID, start token, and instance ID
+  may be present without making an otherwise exact candidate appear changed.
+  A final candidate-script reconciliation immediately precedes lock
+  acquisition, and the cron schedule is restored only after `pair_opened`.
+  Barrier cleanup accepts a changed watchdog state only when the same
+  transaction has durably restored and reverified its exact signed state
+  snapshot.
 - Legacy cron admission is excluded with an exclusive flock on
   `~/.hermes/cron/.tick.lock`, not `.jobs.lock`. The canonical cron directory
   must be private `0700`. A pre-existing same-uid, single-link regular lock may
@@ -1969,7 +1973,11 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   If the outer bootstrap rollback observes that already-restored legacy
   gateway, it classifies it by the restored plist and runtime receipts,
   re-drains it under the existing transaction intent, and completes state
-  restoration without entering a managed-gateway attestation wait.
+  restoration without entering a managed-gateway attestation wait. Gateway
+  rollback authority is bound to the captured command, executable identity,
+  and argv, but not to the live process cwd because the legacy gateway may
+  chdir to a selected workspace after launch. Legacy WebUI rollback remains
+  bound to cwd plus the exact captured git-source and routing receipts.
 
 This is a bounded single-operator-host contract. Same-FD/path, inode, mode,
 ownership, link-count, and compare-before-replace checks fail closed for
