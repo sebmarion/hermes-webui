@@ -610,6 +610,33 @@ def test_release_control_rejects_missing_transaction_identity(isolated_admission
         )
 
 
+def test_process_completion_activity_accepts_verified_checkpoint_metadata():
+    from api import release_control
+
+    snapshot = {
+        "running_processes": 0,
+        "finalizing_processes": 0,
+        "durable_undelivered_completions": 0,
+        "process_completion_activity_available": True,
+        "process_checkpoint_available": True,
+        "process_checkpoint_reason": "verified",
+    }
+
+    assert release_control._process_completion_activity_snapshot(
+        lambda: snapshot
+    ) == snapshot
+    assert release_control._process_completion_activity_snapshot(
+        lambda: {
+            **snapshot,
+            "process_checkpoint_reason": "invalid",
+        }
+    ) == {
+        "process_completion_activity_available": False,
+        "process_checkpoint_available": False,
+        "process_checkpoint_reason": "unavailable",
+    }
+
+
 def test_release_control_commit_checks_streams_and_delegations(
     monkeypatch, isolated_admission
 ):
@@ -633,6 +660,8 @@ def test_release_control_commit_checks_streams_and_delegations(
         "finalizing_processes": 0,
         "durable_undelivered_completions": 0,
         "process_completion_activity_available": True,
+        "process_checkpoint_available": True,
+        "process_checkpoint_reason": "verified",
     }
 
     monkeypatch.setattr(

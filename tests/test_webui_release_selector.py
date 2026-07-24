@@ -4203,7 +4203,11 @@ def test_release_watchdog_barrier_adopts_exact_snapshot_rollback_state(
     ]
 
 
-def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
+@pytest.mark.parametrize("external_drain", [False, True])
+def test_release_control_driver_commits_pair_before_sequential_open(
+    tmp_path,
+    external_drain,
+):
     transaction_id = "release-transaction-00000000000001"
     old_identity = {
         "pid": 123,
@@ -4277,6 +4281,18 @@ def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
             "process_completion_activity_available": True,
         },
     }
+    if external_drain:
+        drained["activity"] = {
+            key: value
+            for key, value in drained["activity"].items()
+            if key
+            not in {
+                "running_processes",
+                "finalizing_processes",
+                "durable_undelivered_completions",
+            }
+        }
+        drained["activity"]["process_completion_activity_available"] = False
     inspection_rows = iter(
         [
             {
@@ -4305,6 +4321,15 @@ def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
         ]
     )
     actions = []
+    external_drain_calls = []
+
+    def attest_external_drain(exact, inspection):
+        external_drain_calls.append((exact, inspection))
+        return {
+            "status": "verified",
+            "identity": exact,
+            "proof": "exact-external-process-barrier",
+        }
 
     def send_control(action, expected, fence_token=None):
         actions.append((action, expected, fence_token))
@@ -4316,6 +4341,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
                 "identity": old_identity,
             }
         if action == "commit":
+            assert external_drain is False
             assert fence_token == "old-secret-token"
             return {
                 "status": "committing",
@@ -4472,6 +4498,9 @@ def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
         open_pair_after_promotion=lambda _identity: lifecycle.append(
             "gateway-opened"
         ) or {"status": "opened"},
+        attest_legacy_activity_drain=(
+            attest_external_drain if external_drain else None
+        ),
         expected_candidate_identity=expected_candidate,
         transaction_id=transaction_id,
         transaction_journal_path=journal_path,
@@ -4479,7 +4508,11 @@ def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
         interval_seconds=0.01,
     )
 
-    assert [row[0] for row in actions] == ["fence", "commit", "fence", "accept"]
+    expected_actions = ["fence", "fence", "accept"]
+    if not external_drain:
+        expected_actions.insert(1, "commit")
+    assert [row[0] for row in actions] == expected_actions
+    assert len(external_drain_calls) == int(external_drain)
     assert result["status"] == "accepted"
     assert result["identity"] == candidate_identity
     assert lifecycle[0] == "activated"
@@ -4499,6 +4532,14 @@ def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
         journal_path,
         transaction_id=transaction_id,
     )
+    if external_drain:
+        assert journal["phases"]["old_committed"][
+            "external_activity_drain"
+        ]["proof"] == "exact-external-process-barrier"
+    else:
+        assert "external_activity_drain" not in journal["phases"][
+            "old_committed"
+        ]
     assert set(journal["phases"]) == {
         "staged",
         "plist_installed",
@@ -4516,6 +4557,156 @@ def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
         "accepted_health_proved",
         "pair_accepted",
     }
+
+
+def test_legacy_webui_activity_drain_uses_exact_locked_durable_zero(
+    tmp_path,
+    monkeypatch,
+):
+    identity = {
+        "build_id": "last-good",
+        "pid": 123,
+        "pid_start_token": "old-start",
+    }
+    plan = {
+        "last_good_identity": {"build_id": "last-good"},
+        "synthetic_process_notifications_path": str(
+            tmp_path / "process_notifications.json"
+        ),
+    }
+    inspection = {
+        "status": "inspected",
+        "identity": identity,
+        "admission": {
+            "state": "fenced",
+            "active_runs": 0,
+            "reservations": 0,
+        },
+        "activity": {
+            "active_streams": 0,
+            "active_async_delegations": 0,
+            "async_delegations_available": True,
+            "active_background_memory_commits": 0,
+            "in_flight_memory_commits": 0,
+            "memory_commit_activity_available": True,
+            "pending_oauth_flows": 0,
+            "oauth_activity_available": True,
+            "active_terminals": 0,
+            "terminal_activity_available": True,
+            "process_completion_activity_available": False,
+        },
+    }
+    events = []
+
+    def acquire(_plan, *, kind):
+        events.append(("acquire", kind))
+        return {
+            "kind": kind,
+            "handle": object(),
+            "receipt": {"kind": kind, "inode": len(events)},
+        }
+
+    monkeypatch.setattr(cutover, "_acquire_process_registry_lock", acquire)
+    monkeypatch.setattr(
+        cutover,
+        "_release_process_registry_lock",
+        lambda _plan, held: events.append(("release", held["kind"]))
+        or {"status": "released", "kind": held["kind"]},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_durable_activity_receipt",
+        lambda _plan: {
+            "status": "verified",
+            "webui_active_run_leases": 0,
+            "gateway_process_checkpoint": {"active_records": 0},
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_synthetic_store_receipt",
+        lambda *_args, **_kwargs: (
+            {"status": "present", "sha256": "a" * 64},
+            {"version": 1, "events": {}},
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda *_args, **_kwargs: {
+            "status": "verified",
+            "listener_pid": 456,
+            "pid_start_token": "gateway-start",
+            "build_id": "last-good",
+        },
+    )
+
+    receipt = cutover._attest_legacy_webui_activity_drain(
+        plan,
+        identity,
+        inspection,
+        inspect_control=lambda: inspection,
+    )
+
+    assert receipt["status"] == "verified"
+    assert receipt["identity"] == identity
+    assert receipt["outbox"]["undelivered"] == 0
+    assert events == [
+        ("acquire", "admission"),
+        ("acquire", "completion"),
+        ("acquire", "authority"),
+        ("release", "authority"),
+        ("release", "completion"),
+        ("release", "admission"),
+    ]
+    busy = {
+        **inspection,
+        "activity": {**inspection["activity"], "active_streams": 1},
+    }
+    assert (
+        cutover._attest_legacy_webui_activity_drain(
+            plan,
+            identity,
+            busy,
+            inspect_control=lambda: busy,
+        )
+        is None
+    )
+    events.clear()
+    monkeypatch.setattr(
+        cutover,
+        "_read_synthetic_store_receipt",
+        lambda *_args, **_kwargs: (
+            {"status": "present", "sha256": "b" * 64},
+            {
+                "version": 1,
+                "events": {
+                    "process:busy:completion": {
+                        "event_id": "process:busy:completion",
+                        "delivered": False,
+                    }
+                },
+            },
+        ),
+    )
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="undelivered work",
+    ):
+        cutover._attest_legacy_webui_activity_drain(
+            plan,
+            identity,
+            inspection,
+            inspect_control=lambda: inspection,
+        )
+    assert events == [
+        ("acquire", "admission"),
+        ("acquire", "completion"),
+        ("acquire", "authority"),
+        ("release", "authority"),
+        ("release", "completion"),
+        ("release", "admission"),
+    ]
 
 
 @pytest.mark.parametrize(

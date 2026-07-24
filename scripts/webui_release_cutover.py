@@ -2470,6 +2470,9 @@ def run_release_control_cutover(
     install_pair_gate_before_commit: Callable[[dict, dict], dict] | None = None,
     open_pair_after_promotion: Callable[[dict], dict] | None = None,
     release_pair_after_acceptance: Callable[[dict, dict], dict] | None = None,
+    attest_legacy_activity_drain: (
+        Callable[[dict, dict], dict | None] | None
+    ) = None,
     force_restart_on_rollback: bool = False,
 ) -> dict:
     """Replace and accept one exact startup-fenced WebUI process transaction."""
@@ -2593,6 +2596,26 @@ def run_release_control_cutover(
     identity: dict = {}
     token = ""
     selection = journal["phases"].get("selection_activated", {}).get("selection")
+
+    def attest_external_drain(
+        old_identity: dict,
+        inspection: dict,
+    ) -> dict | None:
+        if attest_legacy_activity_drain is None:
+            return None
+        receipt = attest_legacy_activity_drain(old_identity, inspection)
+        if receipt is None:
+            return None
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("status") != "verified"
+            or receipt.get("identity") != old_identity
+        ):
+            raise ReleaseBuildError(
+                "external legacy activity drain receipt is invalid"
+            )
+        return receipt
+
     def require_external_state_attestations() -> None:
         selector_attestation = attest_selector_state()
         if (
@@ -3122,6 +3145,8 @@ def run_release_control_cutover(
                     "admission": {"state": "fenced"},
                 },
             )
+            external_drain: dict | None = None
+            inspection: dict = {}
             while True:
                 if monotonic() - started_at > timeout_seconds:
                     raise DrainTimeout("release control drain timed out")
@@ -3134,19 +3159,33 @@ def run_release_control_cutover(
                 )
                 if _release_inspection_is_drained(inspection):
                     break
+                external_drain = attest_external_drain(identity, inspection)
+                if external_drain is not None:
+                    break
                 sleep(interval_seconds)
-            receipt = _require_bound_control_receipt(
-                send_control("commit", identity, token),
-                status="committing",
-                transaction_id=transaction_id,
-                identity=identity,
-            )
+            if external_drain is None:
+                receipt = _require_bound_control_receipt(
+                    send_control("commit", identity, token),
+                    status="committing",
+                    transaction_id=transaction_id,
+                    identity=identity,
+                )
+                committed_admission = {"state": "committing"}
+                committed_activity = receipt.get("activity")
+            else:
+                committed_admission = {"state": "fenced-external-drain"}
+                committed_activity = inspection.get("activity")
             record_phase(
                 "old_committed",
                 {
                     "identity": identity,
-                    "admission": {"state": "committing"},
-                    "activity": receipt.get("activity"),
+                    "admission": committed_admission,
+                    "activity": committed_activity,
+                    **(
+                        {"external_activity_drain": external_drain}
+                        if external_drain is not None
+                        else {}
+                    ),
                 },
             )
         elif (
@@ -3197,6 +3236,7 @@ def run_release_control_cutover(
                     "durable old commit re-fence token is missing"
                 )
             if refenced_status == "fenced":
+                external_drain = None
                 while True:
                     if monotonic() - started_at > timeout_seconds:
                         raise DrainTimeout("release control drain timed out")
@@ -3208,13 +3248,20 @@ def run_release_control_cutover(
                     )
                     if _release_inspection_is_drained(inspection):
                         break
+                    external_drain = attest_external_drain(
+                        identity,
+                        inspection,
+                    )
+                    if external_drain is not None:
+                        break
                     sleep(interval_seconds)
-                _require_bound_control_receipt(
-                    send_control("commit", identity, token),
-                    status="committing",
-                    transaction_id=transaction_id,
-                    identity=identity,
-                )
+                if external_drain is None:
+                    _require_bound_control_receipt(
+                        send_control("commit", identity, token),
+                        status="committing",
+                        transaction_id=transaction_id,
+                        identity=identity,
+                    )
         if "selection_activated" not in completed_phases:
             selection = activate_selection()
             activated = True
@@ -7234,6 +7281,14 @@ def _run_release_commit_plan_core(
         install_pair_gate_before_commit=install_pair_gate,
         open_pair_after_promotion=open_pair,
         release_pair_after_acceptance=release_pair,
+        attest_legacy_activity_drain=lambda identity, inspection: (
+            _attest_legacy_webui_activity_drain(
+                plan,
+                identity,
+                inspection,
+                inspect_control=inspect_control,
+            )
+        ),
         force_restart_on_rollback=True,
     )
     return result
@@ -12829,6 +12884,8 @@ def _process_registry_lock_path(plan: dict, *, kind: str) -> Path:
         name = ".processes.json.admission.lock"
     elif kind == "authority":
         name = ".processes.json.lock"
+    elif kind == "completion":
+        name = ".process_notifications.json.lock"
     else:
         raise ReleaseBuildError("process registry lock kind is invalid")
     return home / name
@@ -13127,6 +13184,219 @@ def _legacy_process_checkpoint_receipt(plan: dict) -> dict:
         "mode": stat.S_IMODE(opened.st_mode),
         "nlink": opened.st_nlink,
         "size": opened.st_size,
+    }
+
+
+def _attest_legacy_webui_activity_drain(
+    plan: dict,
+    identity: dict,
+    inspection: dict,
+    *,
+    inspect_control: Callable[[], dict],
+) -> dict | None:
+    """Bridge one old signed activity schema with exact durable zero proof."""
+    activity = inspection.get("activity")
+    expected_activity_keys = {
+        "active_streams",
+        "active_async_delegations",
+        "async_delegations_available",
+        "active_background_memory_commits",
+        "in_flight_memory_commits",
+        "memory_commit_activity_available",
+        "pending_oauth_flows",
+        "oauth_activity_available",
+        "active_terminals",
+        "terminal_activity_available",
+        "process_completion_activity_available",
+    }
+    zero_keys = {
+        "active_streams",
+        "active_async_delegations",
+        "active_background_memory_commits",
+        "in_flight_memory_commits",
+        "pending_oauth_flows",
+        "active_terminals",
+    }
+    available_keys = {
+        "async_delegations_available",
+        "memory_commit_activity_available",
+        "oauth_activity_available",
+        "terminal_activity_available",
+    }
+
+    def exact_legacy_gap(candidate: object) -> bool:
+        if not isinstance(candidate, dict):
+            raise ReleaseBuildError(
+                "legacy WebUI activity inspection is invalid"
+            )
+        candidate_admission = candidate.get("admission")
+        candidate_activity = candidate.get("activity")
+        if (
+            candidate.get("status") != "inspected"
+            or candidate.get("identity") != identity
+            or not isinstance(candidate_admission, dict)
+            or candidate_admission.get("state") != "fenced"
+            or not isinstance(candidate_activity, dict)
+            or set(candidate_activity) != expected_activity_keys
+        ):
+            raise DrainIdentityMismatch(
+                "legacy WebUI activity identity or schema changed"
+            )
+        try:
+            counts = {
+                "active_runs": int(candidate_admission.get("active_runs", -1)),
+                "reservations": int(candidate_admission.get("reservations", -1)),
+                **{
+                    key: int(candidate_activity.get(key, -1))
+                    for key in zero_keys
+                },
+            }
+        except (TypeError, ValueError) as exc:
+            raise ReleaseBuildError(
+                "legacy WebUI activity counts are invalid"
+            ) from exc
+        if any(value != 0 for value in counts.values()):
+            return False
+        if any(candidate_activity.get(key) is not True for key in available_keys):
+            return False
+        if (
+            candidate_activity.get(
+                "process_completion_activity_available"
+            )
+            is not False
+        ):
+            raise ReleaseBuildError(
+                "legacy process activity gap is not the known schema mismatch"
+            )
+        return True
+
+    if not _candidate_identity_matches(
+        identity,
+        plan["last_good_identity"],
+    ):
+        raise DrainIdentityMismatch(
+            "legacy activity drain process is not the exact last-good build"
+        )
+    if not exact_legacy_gap(inspection):
+        return None
+
+    gateway_before = _attest_managed_gateway_binding(
+        plan,
+        plan["last_good_identity"],
+        expected_admission="accepting_new_work",
+        expected_pair_gate="absent",
+    )
+    admission_lock = _acquire_process_registry_lock(
+        plan,
+        kind="admission",
+    )
+    completion_lock: dict | None = None
+    authority_lock: dict | None = None
+    completion_release: dict | None = None
+    authority_release: dict | None = None
+    try:
+        completion_lock = _acquire_process_registry_lock(
+            plan,
+            kind="completion",
+        )
+        try:
+            authority_lock = _acquire_process_registry_lock(
+                plan,
+                kind="authority",
+            )
+            try:
+                durable = _legacy_durable_activity_receipt(plan)
+                outbox_receipt, outbox = _read_synthetic_store_receipt(
+                    Path(plan["synthetic_process_notifications_path"]),
+                    label="process completion outbox",
+                    allowed_modes={0o600},
+                )
+                if (
+                    not isinstance(outbox, dict)
+                    or set(outbox) != {"version", "events"}
+                    or outbox.get("version") != 1
+                    or not isinstance(outbox.get("events"), dict)
+                ):
+                    raise ReleaseBuildError(
+                        "process completion outbox schema is invalid"
+                    )
+                undelivered = 0
+                for event_id, event in outbox["events"].items():
+                    if (
+                        not isinstance(event_id, str)
+                        or not isinstance(event, dict)
+                        or event.get("event_id") != event_id
+                        or not isinstance(event.get("delivered"), bool)
+                    ):
+                        raise ReleaseBuildError(
+                            "process completion outbox record is invalid"
+                        )
+                    undelivered += event["delivered"] is not True
+                if undelivered != 0:
+                    raise ReleaseBuildError(
+                        "process completion outbox still has undelivered work"
+                    )
+            finally:
+                authority_release = _release_process_registry_lock(
+                    plan,
+                    authority_lock,
+                )
+        finally:
+            completion_release = _release_process_registry_lock(
+                plan,
+                completion_lock,
+            )
+
+        repeated = inspect_control()
+        if not exact_legacy_gap(repeated):
+            raise ReleaseBuildError(
+                "legacy WebUI became busy during external activity proof"
+            )
+        gateway_after = _attest_managed_gateway_binding(
+            plan,
+            plan["last_good_identity"],
+            expected_admission="accepting_new_work",
+            expected_pair_gate="absent",
+        )
+        if any(
+            gateway_before.get(key) != gateway_after.get(key)
+            for key in ("listener_pid", "pid_start_token", "build_id")
+        ):
+            raise DrainIdentityMismatch(
+                "managed gateway changed during legacy activity proof"
+            )
+    finally:
+        admission_release = _release_process_registry_lock(
+            plan,
+            admission_lock,
+        )
+
+    return {
+        "status": "verified",
+        "identity": copy.deepcopy(identity),
+        "proof": "exact-external-process-barrier",
+        "activity": copy.deepcopy(activity),
+        "durable_activity": durable,
+        "outbox": {
+            "receipt": outbox_receipt,
+            "undelivered": undelivered,
+        },
+        "gateway": {
+            "build_id": gateway_after["build_id"],
+            "listener_pid": gateway_after["listener_pid"],
+            "pid_start_token": gateway_after["pid_start_token"],
+        },
+        "locks": {
+            "admission": copy.deepcopy(admission_lock["receipt"]),
+            "completion": copy.deepcopy(completion_lock["receipt"]),
+            "authority": copy.deepcopy(authority_lock["receipt"]),
+            "authority_release": authority_release,
+            "completion_release": completion_release,
+            "admission_release": admission_release,
+        },
+        "bounded_host_assumption": copy.deepcopy(
+            _FIRST_ACTIVATION_BOUNDED_HOST_ASSUMPTION
+        ),
     }
 
 

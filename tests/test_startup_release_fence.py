@@ -518,7 +518,12 @@ def test_process_completion_recovery_runs_once_inside_signed_accept(
 
     calls = []
     fake_registry = SimpleNamespace(
-        recover_completion_notifications=lambda: calls.append("recover") or 2
+        recover_from_checkpoint=lambda: calls.append("checkpoint") or 0,
+        recover_completion_notifications=lambda: calls.append("recover") or 2,
+        completion_activity_snapshot=lambda: {
+            "process_checkpoint_available": True,
+            "process_checkpoint_reason": "verified",
+        },
     )
     monkeypatch.setitem(
         sys.modules,
@@ -553,7 +558,7 @@ def test_process_completion_recovery_runs_once_inside_signed_accept(
 
     assert accepted["state"] == "open"
     assert repeated["state"] == "open"
-    assert calls == ["recover"]
+    assert calls == ["checkpoint", "recover"]
 
 
 def test_async_delegation_recovery_runs_once_inside_signed_accept(

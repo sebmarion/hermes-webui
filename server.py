@@ -704,20 +704,46 @@ def _recover_goal_continuations_for_startup() -> dict:
 def _recover_process_completion_notifications() -> dict:
     from tools.process_registry import process_registry
 
+    recover_processes = getattr(process_registry, "recover_from_checkpoint", None)
     recover = getattr(process_registry, "recover_completion_notifications", None)
-    if not callable(recover):
+    snapshot = getattr(process_registry, "completion_activity_snapshot", None)
+    if not all(callable(value) for value in (recover_processes, recover, snapshot)):
         if api_config.startup_run_admission_is_closed():
             raise RuntimeError(
-                "paired Agent lacks durable process completion recovery"
+                "paired Agent lacks durable process checkpoint recovery"
             )
         logger.warning(
-            "durable process completion recovery unavailable in this Agent build"
+            "durable process checkpoint recovery unavailable in this Agent build"
         )
-        return {"status": "unavailable", "recovered": 0}
+        return {
+            "status": "unavailable",
+            "recovered": 0,
+            "recovered_processes": 0,
+            "recovered_notifications": 0,
+        }
+    recovered_processes = recover_processes()
+    if (
+        isinstance(recovered_processes, bool)
+        or not isinstance(recovered_processes, int)
+        or recovered_processes < 0
+    ):
+        raise RuntimeError("process checkpoint recovery returned an invalid receipt")
+    checkpoint = snapshot()
+    if (
+        not isinstance(checkpoint, dict)
+        or checkpoint.get("process_checkpoint_available") is not True
+        or checkpoint.get("process_checkpoint_reason") != "verified"
+    ):
+        raise RuntimeError("process checkpoint recovery is not verified")
     recovered = recover()
     if isinstance(recovered, bool) or not isinstance(recovered, int) or recovered < 0:
         raise RuntimeError("process completion recovery returned an invalid receipt")
-    return {"status": "complete", "recovered": recovered}
+    return {
+        "status": "complete",
+        "recovered": recovered,
+        "recovered_processes": recovered_processes,
+        "recovered_notifications": recovered,
+    }
 
 
 def _recover_async_delegation_notifications() -> dict:

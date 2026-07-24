@@ -216,6 +216,49 @@ def _component_activity_snapshot(loader, *, availability_key: str) -> dict:
         return {availability_key: False}
 
 
+def _process_completion_activity_snapshot(loader) -> dict:
+    """Validate the Agent process barrier without treating metadata as counts."""
+    count_keys = {
+        "running_processes",
+        "finalizing_processes",
+        "durable_undelivered_completions",
+    }
+    expected_keys = count_keys | {
+        "process_completion_activity_available",
+        "process_checkpoint_available",
+        "process_checkpoint_reason",
+    }
+    try:
+        snapshot = loader()
+        if not isinstance(snapshot, dict) or set(snapshot) != expected_keys:
+            raise ValueError("process activity source schema is invalid")
+        if any(
+            not isinstance(snapshot[key], int)
+            or isinstance(snapshot[key], bool)
+            or snapshot[key] < 0
+            for key in count_keys
+        ):
+            raise ValueError("process activity source returned an invalid count")
+        if not isinstance(
+            snapshot["process_completion_activity_available"], bool
+        ) or not isinstance(snapshot["process_checkpoint_available"], bool):
+            raise ValueError("process activity availability is invalid")
+        reason = snapshot["process_checkpoint_reason"]
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("process checkpoint reason is invalid")
+        if (
+            snapshot["process_checkpoint_available"] is True
+        ) != (reason == "verified"):
+            raise ValueError("process checkpoint availability is inconsistent")
+        return dict(snapshot)
+    except Exception:
+        return {
+            "process_completion_activity_available": False,
+            "process_checkpoint_available": False,
+            "process_checkpoint_reason": "unavailable",
+        }
+
+
 def release_activity_snapshot() -> dict:
     with config.STREAMS_LOCK:
         active_streams = len(config.STREAMS)
@@ -254,10 +297,7 @@ def release_activity_snapshot() -> dict:
     except Exception:
         process_loader = lambda: {"process_completion_activity_available": False}
     snapshot.update(
-        _component_activity_snapshot(
-            process_loader,
-            availability_key="process_completion_activity_available",
-        )
+        _process_completion_activity_snapshot(process_loader)
     )
     return snapshot
 
@@ -278,6 +318,7 @@ def _require_external_activity_drained(snapshot: dict) -> None:
         "oauth_activity_available",
         "terminal_activity_available",
         "process_completion_activity_available",
+        "process_checkpoint_available",
     )
     unavailable = [key for key in availability if snapshot.get(key) is not True]
     if unavailable:
