@@ -15415,6 +15415,20 @@ def _stop_prepared_pair_and_bind_gate(
     return {"services": stopped, "gate": gate}
 
 
+def _managed_gateway_transaction_id(plan: dict, identity: dict) -> str:
+    """Return the transaction that created one exact managed gateway."""
+    transaction_id = str(
+        identity.get("startup_transaction_id")
+        or plan.get("transaction_id")
+        or ""
+    )
+    if not _TRANSACTION_ID.fullmatch(transaction_id):
+        raise ReleaseBuildError(
+            "managed gateway release transaction identity is invalid"
+        )
+    return transaction_id
+
+
 def _gateway_pair_gate_state(
     receipt: object,
     *,
@@ -15490,6 +15504,10 @@ def _gateway_pair_gate_state(
     webui = receipt.get("webui")
     identity_keys = {"build_id", "pid", "start_time", "instance_epoch"}
     expected_generation = int(expected_identity["selector_generation"])
+    expected_transaction_id = _managed_gateway_transaction_id(
+        plan,
+        expected_identity,
+    )
     if (
         set(receipt) != expected_keys
         or receipt.get("active") is not True
@@ -15498,7 +15516,7 @@ def _gateway_pair_gate_state(
         or receipt.get("structure_verified") is not True
         or receipt.get("local_identity_matches") is not True
         or receipt.get("schema") != "hermes.pair_open_gate.v1"
-        or receipt.get("transaction_id") != plan["transaction_id"]
+        or receipt.get("transaction_id") != expected_transaction_id
         or not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("owner_hash") or ""))
         or receipt.get("epoch") != expected_generation
         or not re.fullmatch(
@@ -15571,6 +15589,10 @@ def _gateway_health_receipt(
     process = release.get("process") if isinstance(release, dict) else None
     sealed = release.get("release") if isinstance(release, dict) else None
     expected_generation = int(expected_identity["selector_generation"])
+    expected_transaction_id = _managed_gateway_transaction_id(
+        plan,
+        expected_identity,
+    )
     expected_release = {
         "agent_commit": str(expected_identity["agent_source_commit"]),
         "agent_tree": str(expected_identity["agent_source_tree"]),
@@ -15583,14 +15605,14 @@ def _gateway_health_receipt(
         "release_pair_id": release_selector.release_pair_id(
             expected_identity,
             selector_generation=expected_generation,
-            transaction_id=plan["transaction_id"],
+            transaction_id=expected_transaction_id,
         ),
         "webui_build_id": str(expected_identity["build_id"]),
         "webui_commit": str(expected_identity["commit"]),
         "webui_tree": str(expected_identity["tree"]),
         "webui_manifest_sha256": str(expected_identity["manifest_sha256"]),
         "selector_generation": str(expected_generation),
-        "release_transaction_id": str(plan["transaction_id"]),
+        "release_transaction_id": expected_transaction_id,
         "gateway_launchd_label": str(plan["gateway_launchd_label"]),
     }
     try:
@@ -15884,6 +15906,7 @@ def _attest_managed_gateway_binding(
     template_arguments = template.get("ProgramArguments")
     if not isinstance(template_arguments, list) or not template_arguments:
         raise ReleaseBuildError("gateway rollback template argv is invalid")
+    release_transaction_id = _managed_gateway_transaction_id(plan, identity)
     expected_plist = transform_gateway_launchd_target(
         template,
         expected_label=plan["gateway_launchd_label"],
@@ -15891,13 +15914,13 @@ def _attest_managed_gateway_binding(
         managed_cli_shim=str(arguments[0]),
         release_identity=identity,
         managed_routing_environment=routing,
-        release_transaction_id=plan["transaction_id"],
+        release_transaction_id=release_transaction_id,
     )
     selector_generation = int(identity["selector_generation"])
     pair_id = release_selector.release_pair_id(
         identity,
         selector_generation=selector_generation,
-        transaction_id=plan["transaction_id"],
+        transaction_id=release_transaction_id,
     )
     expected_environment = {
         **routing,
@@ -15934,7 +15957,7 @@ def _attest_managed_gateway_binding(
         "HERMES_WEBUI_COMMIT": str(identity["commit"]),
         "HERMES_WEBUI_TREE": str(identity["tree"]),
         "HERMES_SELECTOR_GENERATION": str(selector_generation),
-        "HERMES_RELEASE_TRANSACTION_ID": str(plan["transaction_id"]),
+        "HERMES_RELEASE_TRANSACTION_ID": release_transaction_id,
         "HERMES_GATEWAY_LAUNCHD_LABEL": str(plan["gateway_launchd_label"]),
     }
     if (

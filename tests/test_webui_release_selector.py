@@ -10440,6 +10440,29 @@ def test_gateway_health_accepts_generated_absent_pair_gate_expectation(
     assert receipt["drain"] == health["drain"]
 
 
+def test_gateway_health_attests_last_good_originating_transaction(monkeypatch):
+    plan, identity, health = _canonical_gateway_health_fixture(
+        pair_gate_active=False,
+    )
+    originating_transaction = plan["transaction_id"]
+    identity["startup_transaction_id"] = originating_transaction
+    plan["transaction_id"] = "gateway-health-next-transaction-0000001"
+    monkeypatch.setattr(cutover, "_http_json", lambda *args, **kwargs: health)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+
+    receipt = cutover._gateway_health_receipt(
+        plan,
+        expected_identity=identity,
+        expected_admission="accepting_new_work",
+        expected_pair_gate="absent",
+    )
+
+    assert receipt["release_identity"]["release"][
+        "release_transaction_id"
+    ] == originating_transaction
+
+
 def test_gateway_health_rejects_changed_absent_pair_gate_expectation(
     monkeypatch,
 ):
@@ -10949,6 +10972,156 @@ def test_gateway_binding_wait_does_not_retry_programming_errors(monkeypatch):
             previous_pid_start=None,
         )
     assert calls == {"count": 1}
+
+
+def test_managed_gateway_attestation_uses_last_good_originating_transaction(
+    tmp_path,
+    monkeypatch,
+):
+    originating_transaction = "managed-gateway-origin-transaction-0001"
+    new_transaction = "managed-gateway-next-transaction-0000001"
+    identity = {
+        "build_id": "candidate-r32",
+        "commit": "1" * 40,
+        "tree": "2" * 40,
+        "manifest_sha256": "3" * 64,
+        "interpreter_path": "/sealed/python",
+        "agent_source_path": "/sealed/agent",
+        "agent_source_commit": "4" * 40,
+        "agent_source_tree": "5" * 40,
+        "agent_source_manifest_sha256": "6" * 64,
+        "runtime_path": "/sealed/runtime",
+        "runtime_python_home_path": "/sealed/runtime/python-home",
+        "runtime_site_packages_path": "/sealed/runtime/site-packages",
+        "runtime_manifest_sha256": "7" * 64,
+        "release_path": "/sealed/webui",
+        "selector_generation": 82,
+        "startup_transaction_id": originating_transaction,
+    }
+    routing = {
+        "HERMES_WEBUI_DEFAULT_MODEL": "model",
+        "HERMES_WEBUI_DEFAULT_PROVIDER": "provider",
+        "HERMES_WEBUI_HOST": "127.0.0.1",
+        "HERMES_WEBUI_PORT": "8787",
+    }
+    pair_id = "pair-originating-transaction"
+    arguments = ["/sealed/hermes", "gateway", "run", "--replace"]
+    environment = {
+        **routing,
+        "PYTHONHOME": identity["runtime_python_home_path"],
+        "PYTHONPATH": os.pathsep.join(
+            [
+                identity["agent_source_path"],
+                identity["runtime_site_packages_path"],
+            ]
+        ),
+        "HERMES_WEBUI_RELEASE_PATH": identity["release_path"],
+        "HERMES_WEBUI_MANIFEST_SHA256": identity["manifest_sha256"],
+        "HERMES_WEBUI_AGENT_DIR": identity["agent_source_path"],
+        "HERMES_WEBUI_AGENT_MANIFEST_SHA256": identity[
+            "agent_source_manifest_sha256"
+        ],
+        "HERMES_WEBUI_RUNTIME_PATH": identity["runtime_path"],
+        "HERMES_WEBUI_RUNTIME_MANIFEST_SHA256": identity[
+            "runtime_manifest_sha256"
+        ],
+        "HERMES_WEBUI_LAUNCH_MODE": "managed-gateway",
+        "HERMES_AGENT_COMMIT": identity["agent_source_commit"],
+        "HERMES_AGENT_TREE": identity["agent_source_tree"],
+        "HERMES_AGENT_MANIFEST_SHA256": identity[
+            "agent_source_manifest_sha256"
+        ],
+        "HERMES_AGENT_SOURCE_PATH": identity["agent_source_path"],
+        "HERMES_RUNTIME_MANIFEST_SHA256": identity[
+            "runtime_manifest_sha256"
+        ],
+        "HERMES_RUNTIME_PATH": identity["runtime_path"],
+        "HERMES_RELEASE_PAIR_ID": pair_id,
+        "HERMES_WEBUI_BUILD_ID": identity["build_id"],
+        "HERMES_WEBUI_COMMIT": identity["commit"],
+        "HERMES_WEBUI_TREE": identity["tree"],
+        "HERMES_SELECTOR_GENERATION": str(identity["selector_generation"]),
+        "HERMES_RELEASE_TRANSACTION_ID": originating_transaction,
+        "HERMES_GATEWAY_LAUNCHD_LABEL": "ai.hermes.gateway",
+    }
+    installed = {
+        "Label": "ai.hermes.gateway",
+        "ProgramArguments": arguments,
+        "EnvironmentVariables": environment,
+        "WorkingDirectory": identity["agent_source_path"],
+    }
+    installed_path = tmp_path / "installed.plist"
+    rollback_path = tmp_path / "rollback.plist"
+    installed_path.write_text("installed")
+    rollback_path.write_text("rollback")
+    plan = {
+        "transaction_id": new_transaction,
+        "gateway_installed_plist": str(installed_path),
+        "gateway_rollback_plist": str(rollback_path),
+        "gateway_launchd_label": "ai.hermes.gateway",
+    }
+    shim_sha256 = hashlib.sha256(b"sealed-shim").hexdigest()
+    program = {"sha256": shim_sha256}
+    binding = {
+        "status": "verified",
+        "runtime": {
+            "program_identity": program,
+            "program_arguments": arguments,
+            "cwd": identity["agent_source_path"],
+        },
+    }
+    observed_transactions = []
+
+    monkeypatch.setattr(
+        cutover,
+        "_wait_for_gateway_binding",
+        lambda *_args, **_kwargs: binding,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_plist",
+        lambda path: (
+            installed
+            if Path(path) == installed_path
+            else {"ProgramArguments": arguments}
+        ),
+    )
+    monkeypatch.setattr(cutover, "_render_cli_shim", lambda _identity: b"sealed-shim")
+    monkeypatch.setattr(
+        cutover,
+        "_file_identity_receipt",
+        lambda path: program if str(path) == arguments[0] else {"path": str(path)},
+    )
+    monkeypatch.setattr(cutover, "_managed_gateway_routing", lambda _plan: routing)
+
+    def transform(*_args, release_transaction_id, **_kwargs):
+        observed_transactions.append(("transform", release_transaction_id))
+        return installed
+
+    def release_pair_id(
+        _identity,
+        *,
+        selector_generation,
+        transaction_id,
+    ):
+        assert selector_generation == 82
+        observed_transactions.append(("pair", transaction_id))
+        return pair_id
+
+    monkeypatch.setattr(cutover, "transform_gateway_launchd_target", transform)
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "release_pair_id",
+        release_pair_id,
+    )
+
+    result = cutover._attest_managed_gateway_binding(plan, identity)
+
+    assert result["build_id"] == identity["build_id"]
+    assert observed_transactions == [
+        ("transform", originating_transaction),
+        ("pair", originating_transaction),
+    ]
 
 
 def test_rollback_gateway_stop_intent_drains_restored_legacy_without_managed_wait(
