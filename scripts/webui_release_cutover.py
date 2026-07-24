@@ -7002,7 +7002,7 @@ def _run_release_commit_plan_core(
             }
         gateway = _attest_managed_gateway_binding(
             plan,
-            candidate_identity,
+            plan["expected_candidate_identity"],
             expected_admission="rejecting_new_work",
             expected_pair_gate=_expected_agent_pair_gate_receipt(
                 gate_intent,
@@ -7040,7 +7040,7 @@ def _run_release_commit_plan_core(
             raise ReleaseBuildError("pair-open release intent is invalid")
         gateway_gated = _attest_managed_gateway_binding(
             plan,
-            candidate_identity,
+            plan["expected_candidate_identity"],
             expected_admission="rejecting_new_work",
             expected_pair_gate=_expected_agent_pair_gate_receipt(
                 gate_intent,
@@ -7066,7 +7066,7 @@ def _run_release_commit_plan_core(
         )
         gateway_open = _attest_managed_gateway_binding(
             plan,
-            candidate_identity,
+            plan["expected_candidate_identity"],
             expected_admission="accepting_new_work",
             expected_pair_gate=_expected_agent_pair_gate_receipt(
                 gate_intent,
@@ -15670,7 +15670,7 @@ def _wait_for_gateway_binding(
                 ),
                 "runtime": runtime,
             }
-        except Exception as exc:
+        except (DrainIdentityMismatch, ReleaseBuildError) as exc:
             last_error = exc
             time.sleep(float(plan["interval_seconds"]))
     raise DrainTimeout(f"gateway binding timed out: {last_error}")

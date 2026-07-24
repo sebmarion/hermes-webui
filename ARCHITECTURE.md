@@ -1993,6 +1993,13 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   between the live and journaled promoted selector, the expected post-promotion
   generation, and the sealed candidate release record. It never recreates a
   missing journal from an already-promoted selector.
+- Pair-open gateway attestation always uses the sealed release identity from
+  the cutover plan. The signed WebUI process identity is intentionally slimmer
+  and uses process-facing agent field names, so it remains the PID-bound
+  authorization for WebUI control actions but is never substituted for the
+  full gateway release identity. Gateway binding retries are limited to
+  explicit identity and release-readiness failures; programming errors escape
+  immediately instead of being hidden behind the cutover timeout.
 
 This is a bounded single-operator-host contract. Same-FD/path, inode, mode,
 ownership, link-count, and compare-before-replace checks fail closed for

@@ -1653,7 +1653,9 @@ matches the exact staged selector receipt; foreign mutation and incomplete
 control sets remain rejected. Journal-reconciliation tests also resume an
 exact durable promotion while rejecting a missing pair-commit intent, a
 changed live selector, a changed candidate identity, and an unavailable
-promoted journal.
+promoted journal. Pair-open tests prove all gateway attestations receive the
+sealed release identity rather than the slimmer signed process identity, and
+that unexpected programming errors are not retried until the binding timeout.
 
 
 ---

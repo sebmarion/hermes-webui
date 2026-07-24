@@ -10421,6 +10421,193 @@ def test_release_commit_prepares_bootstrap_watchdog_before_state_lock(
     ]
 
 
+def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
+    monkeypatch,
+):
+    transaction_id = "sealed-gateway-attestation-transaction-0001"
+    sealed_identity = {
+        "build_id": "candidate-r35",
+        "commit": "1" * 40,
+        "tree": "2" * 40,
+        "manifest_sha256": "3" * 64,
+        "agent_source_commit": "4" * 40,
+        "agent_source_tree": "5" * 40,
+        "agent_source_manifest_sha256": "6" * 64,
+        "runtime_manifest_sha256": "7" * 64,
+        "selector_generation": 84,
+    }
+    signed_process_identity = {
+        "build_id": sealed_identity["build_id"],
+        "commit": sealed_identity["commit"],
+        "tree": sealed_identity["tree"],
+        "manifest_sha256": sealed_identity["manifest_sha256"],
+        "agent_commit": sealed_identity["agent_source_commit"],
+        "agent_tree": sealed_identity["agent_source_tree"],
+        "agent_manifest_sha256": sealed_identity[
+            "agent_source_manifest_sha256"
+        ],
+        "runtime_manifest_sha256": sealed_identity[
+            "runtime_manifest_sha256"
+        ],
+        "selector_generation": sealed_identity["selector_generation"],
+        "pid": 71,
+        "pid_start_token": "candidate-start",
+    }
+    paired_keys = (
+        cutover._BOOTSTRAP_GATEWAY_PLAN_KEYS
+        | cutover._BOOTSTRAP_WATCHDOG_PLAN_KEYS
+        | cutover._BOOTSTRAP_LEGACY_BOUNDARY_PLAN_KEYS
+    )
+    plan = {key: f"unused-{key}" for key in paired_keys}
+    plan.update(
+        {
+            "transaction_id": transaction_id,
+            "transaction_journal": "transaction.json",
+            "expected_candidate_identity": sealed_identity,
+            "last_good_identity": {"build_id": "last-good"},
+            "base_url": "http://127.0.0.1:8787",
+            "signing_key_file": "release-control.key",
+            "timeout_seconds": 1,
+            "interval_seconds": 0.01,
+        }
+    )
+    gate_intent = {"transaction_id": transaction_id}
+    gate_installed = {
+        "owner_hash": "8" * 64,
+        "payload_sha256": "9" * 64,
+    }
+    journal = {
+        "rollback_receipt": {},
+        "phases": {
+            "gateway_last_good_attested": {"status": "verified"},
+            "pair_gate_install_intent": gate_intent,
+            "pair_gate_installed": gate_installed,
+        },
+    }
+    gateway_identities = []
+    monkeypatch.setattr(
+        cutover,
+        "_reconcile_cutover_journal",
+        lambda _plan: copy.deepcopy(journal),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootstrap_rollback_context",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_release_control_client",
+        lambda *_args, **_kwargs: (
+            lambda: {"status": "inspected"},
+            lambda *_args, **_kwargs: {"status": "unused"},
+            transaction_id,
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_release_control_key",
+        lambda _path: b"test-release-control-key",
+    )
+    monkeypatch.setattr(
+        cutover,
+        "read_transaction_journal",
+        lambda *_args, **_kwargs: copy.deepcopy(journal),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_install_or_adopt_pair_open_gate",
+        lambda *_args, **_kwargs: copy.deepcopy(gate_installed),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_expected_agent_pair_gate_receipt",
+        lambda _intent, *, active: {"active": active},
+    )
+
+    def attest_gateway(_plan, identity, **_kwargs):
+        gateway_identities.append(identity)
+        return {
+            "health": {
+                "drain": {
+                    "pair_open_gate": {
+                        "active": _kwargs["expected_admission"]
+                        == "rejecting_new_work"
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        attest_gateway,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_collect_process_binding",
+        lambda *_args, **_kwargs: {"status": "verified"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_require_candidate_binding",
+        lambda binding, **_kwargs: binding,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_require_webui_pair_gate_state",
+        lambda _binding, _intent, *, active: {"active": active},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_release_owned_pair_open_gate",
+        lambda *_args, **_kwargs: {"status": "released"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_wait_for_expected_binding",
+        lambda *_args, **_kwargs: {"status": "verified"},
+    )
+
+    def run_cutover(**kwargs):
+        kwargs["open_pair_after_promotion"](signed_process_identity)
+        kwargs["release_pair_after_acceptance"](
+            signed_process_identity,
+            gate_installed,
+        )
+        return {"status": "accepted"}
+
+    monkeypatch.setattr(cutover, "run_release_control_cutover", run_cutover)
+
+    assert cutover._run_release_commit_plan_core(
+        plan,
+        bootstrap_open_pair=lambda _identity: {"status": "ready"},
+    ) == {"status": "accepted"}
+    assert gateway_identities == [sealed_identity] * 3
+
+
+def test_gateway_binding_wait_does_not_retry_programming_errors(monkeypatch):
+    calls = {"count": 0}
+
+    def broken_job_probe(_plan, *, gateway):
+        assert gateway is True
+        calls["count"] += 1
+        raise KeyError("agent_source_commit")
+
+    monkeypatch.setattr(cutover, "_job_pid", broken_job_probe)
+
+    with pytest.raises(KeyError, match="agent_source_commit"):
+        cutover._wait_for_gateway_binding(
+            {
+                "timeout_seconds": 0.01,
+                "interval_seconds": 0,
+                "gateway_listener_port": 8642,
+            },
+            previous_pid_start=None,
+        )
+    assert calls == {"count": 1}
+
+
 def test_rollback_gateway_stop_intent_drains_restored_legacy_without_managed_wait(
     tmp_path,
     monkeypatch,
