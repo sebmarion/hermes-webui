@@ -2907,6 +2907,11 @@ def test_internal_watchdog_registry_is_an_admitted_cutover_plan_path():
     assert "watchdog_scheduler_registry" in cutover._CUTOVER_PLAN_PATH_KEYS
 
 
+def test_last_good_gateway_identity_is_an_admitted_cutover_plan_path():
+    assert "last_good_gateway_identity_json" in cutover._CUTOVER_PLAN_OPTIONAL
+    assert "last_good_gateway_identity_json" in cutover._CUTOVER_PLAN_PATH_KEYS
+
+
 def test_expected_old_interpreter_plan_path_allows_only_its_leaf_symlink(tmp_path):
     interpreter = tmp_path / "python3.11"
     interpreter.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -11537,6 +11542,12 @@ def test_managed_gateway_attestation_uses_last_good_originating_transaction(
         "selector_generation": 82,
         "startup_transaction_id": originating_transaction,
     }
+    restarted_webui_identity = {
+        **identity,
+        "selector_generation": 90,
+        "startup_fenced": False,
+        "startup_transaction_id": None,
+    }
     routing = {
         "HERMES_WEBUI_DEFAULT_MODEL": "model",
         "HERMES_WEBUI_DEFAULT_PROVIDER": "provider",
@@ -11598,6 +11609,8 @@ def test_managed_gateway_attestation_uses_last_good_originating_transaction(
         "gateway_installed_plist": str(installed_path),
         "gateway_rollback_plist": str(rollback_path),
         "gateway_launchd_label": "ai.hermes.gateway",
+        "last_good_identity": restarted_webui_identity,
+        "last_good_gateway_identity": identity,
     }
     shim_sha256 = hashlib.sha256(b"sealed-shim").hexdigest()
     program = {"sha256": shim_sha256}
@@ -11654,7 +11667,10 @@ def test_managed_gateway_attestation_uses_last_good_originating_transaction(
         release_pair_id,
     )
 
-    result = cutover._attest_managed_gateway_binding(plan, identity)
+    result = cutover._attest_managed_gateway_binding(
+        plan,
+        restarted_webui_identity,
+    )
 
     assert result["build_id"] == identity["build_id"]
     assert observed_transactions == [

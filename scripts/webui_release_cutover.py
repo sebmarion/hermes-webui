@@ -3724,6 +3724,7 @@ _BOOTSTRAP_LEGACY_BOUNDARY_PLAN_KEYS = {
 _CUTOVER_PLAN_OPTIONAL = {
     "timeout_seconds",
     "interval_seconds",
+    "last_good_gateway_identity_json",
     *_BOOTSTRAP_GATEWAY_PLAN_KEYS,
     *_BOOTSTRAP_WATCHDOG_PLAN_KEYS,
     *_BOOTSTRAP_WATCHDOG_SCHEDULER_PLAN_KEYS,
@@ -3737,6 +3738,7 @@ _CUTOVER_PLAN_PATH_KEYS = {
     "transaction_journal",
     "expected_candidate_identity_json",
     "last_good_identity_json",
+    "last_good_gateway_identity_json",
     "installed_plist",
     "bootstrap_rollback_plist",
     "managed_plist",
@@ -3923,6 +3925,10 @@ def _load_cutover_plan(path: Path | str) -> dict:
     configured_gateway = _BOOTSTRAP_GATEWAY_PLAN_KEYS.intersection(plan)
     if configured_gateway and configured_gateway != _BOOTSTRAP_GATEWAY_PLAN_KEYS:
         raise ReleaseBuildError("cutover plan gateway transaction is incomplete")
+    if "last_good_gateway_identity_json" in plan and not configured_gateway:
+        raise ReleaseBuildError(
+            "cutover plan last-good gateway identity has no gateway transaction"
+        )
     if configured_gateway:
         gateway_domain = str(plan.get("gateway_launchd_domain") or "")
         gateway_label = str(plan.get("gateway_launchd_label") or "")
@@ -4096,6 +4102,12 @@ def _load_cutover_plan(path: Path | str) -> dict:
         plan["last_good_identity_json"],
         label="last-good identity",
     )
+    last_good_gateway = last_good
+    if "last_good_gateway_identity_json" in plan:
+        last_good_gateway = _read_json_object(
+            plan["last_good_gateway_identity_json"],
+            label="last-good gateway identity",
+        )
     if (
         candidate.get("startup_fenced") is not True
         or candidate.get("startup_transaction_id") != transaction_id
@@ -4115,8 +4127,32 @@ def _load_cutover_plan(path: Path | str) -> dict:
         selector_path=plan["selector_path"],
         label="last-good",
     )
+    if last_good_gateway is not last_good:
+        if (
+            any(
+                last_good_gateway.get(key) != last_good.get(key)
+                for key in _VERIFIED_RELEASE_IDENTITY_KEYS
+            )
+            or last_good_gateway.get("launchd_label")
+            != last_good.get("launchd_label")
+            or isinstance(last_good_gateway.get("selector_generation"), bool)
+            or not isinstance(last_good_gateway.get("selector_generation"), int)
+            or last_good_gateway["selector_generation"] <= 0
+            or not _TRANSACTION_ID.fullmatch(
+                str(last_good_gateway.get("startup_transaction_id") or "")
+            )
+        ):
+            raise ReleaseBuildError(
+                "cutover plan last-good gateway provenance is invalid"
+            )
+        _attest_expected_release_identity(
+            last_good_gateway,
+            selector_path=plan["selector_path"],
+            label="last-good gateway",
+        )
     plan["expected_candidate_identity"] = candidate
     plan["last_good_identity"] = last_good
+    plan["last_good_gateway_identity"] = last_good_gateway
     return plan
 
 
@@ -16180,6 +16216,14 @@ def _attest_managed_gateway_binding(
     expected_pair_gate: str | dict | None = None,
 ) -> dict:
     """Prove the gateway is the exact immutable peer for one WebUI build."""
+    if identity == plan.get("last_good_identity"):
+        gateway_identity = plan.get("last_good_gateway_identity")
+        if gateway_identity is not None:
+            if not isinstance(gateway_identity, dict):
+                raise ReleaseBuildError(
+                    "last-good gateway identity is invalid"
+                )
+            identity = gateway_identity
     binding = _wait_for_gateway_binding(
         plan,
         previous_pid_start=None,
