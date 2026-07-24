@@ -10232,6 +10232,82 @@ def test_gateway_health_accepts_canonical_agent_pair_gate_receipts(
     assert receipt["drain"] == health["drain"]
 
 
+def test_gateway_health_accepts_generated_absent_pair_gate_expectation(
+    monkeypatch,
+):
+    plan, identity, health = _canonical_gateway_health_fixture(
+        pair_gate_active=False,
+    )
+    expected_absent = cutover._expected_agent_pair_gate_receipt(
+        {},
+        active=False,
+    )
+    assert expected_absent == health["drain"]["pair_open_gate"]
+    monkeypatch.setattr(cutover, "_http_json", lambda *args, **kwargs: health)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+
+    receipt = cutover._gateway_health_receipt(
+        plan,
+        expected_identity=identity,
+        expected_admission="accepting_new_work",
+        expected_pair_gate=expected_absent,
+    )
+
+    assert receipt["drain"] == health["drain"]
+
+
+def test_gateway_health_rejects_changed_absent_pair_gate_expectation(
+    monkeypatch,
+):
+    plan, identity, health = _canonical_gateway_health_fixture(
+        pair_gate_active=False,
+    )
+    expected_absent = cutover._expected_agent_pair_gate_receipt(
+        {},
+        active=False,
+    )
+    expected_absent["verified"] = False
+    monkeypatch.setattr(cutover, "_http_json", lambda *args, **kwargs: health)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="absent pair-open gate receipt changed",
+    ):
+        cutover._gateway_health_receipt(
+            plan,
+            expected_identity=identity,
+            expected_admission="accepting_new_work",
+            expected_pair_gate=expected_absent,
+        )
+
+
+@pytest.mark.parametrize("active", [None, 0, "false"])
+def test_gateway_health_rejects_inexact_expected_pair_gate_state(
+    monkeypatch,
+    active,
+):
+    plan, identity, health = _canonical_gateway_health_fixture(
+        pair_gate_active=False,
+    )
+    monkeypatch.setattr(cutover, "_http_json", lambda *args, **kwargs: health)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+
+    with pytest.raises(
+        ValueError,
+        match="expected pair-gate receipt has no exact state",
+    ):
+        cutover._gateway_health_receipt(
+            plan,
+            expected_identity=identity,
+            expected_admission="accepting_new_work",
+            expected_pair_gate={"active": active},
+        )
+
+
 def test_gateway_health_rejects_incomplete_work_status_schema(monkeypatch):
     plan, identity, health = _canonical_gateway_health_fixture(
         pair_gate_active=True,

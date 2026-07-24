@@ -15402,6 +15402,26 @@ def _gateway_pair_gate_state(
         and expected_pair_gate not in {None, "active", "absent"}
     ):
         raise ValueError("expected pair-gate state is invalid")
+    if (
+        isinstance(expected_pair_gate, dict)
+        and expected_pair_gate.get("active") is not True
+        and expected_pair_gate.get("active") is not False
+    ):
+        raise ValueError("expected pair-gate receipt has no exact state")
+    expected_active = (
+        expected_pair_gate == "active"
+        or (
+            isinstance(expected_pair_gate, dict)
+            and expected_pair_gate.get("active") is True
+        )
+    )
+    expected_absent = (
+        expected_pair_gate == "absent"
+        or (
+            isinstance(expected_pair_gate, dict)
+            and expected_pair_gate.get("active") is False
+        )
+    )
     if not isinstance(receipt, dict):
         raise ReleaseBuildError("gateway pair-open gate receipt is missing")
     if receipt.get("active") is False:
@@ -15415,9 +15435,13 @@ def _gateway_pair_gate_state(
             raise ReleaseBuildError(
                 "gateway absent pair-open gate receipt is invalid"
             )
-        if expected_pair_gate == "active" or isinstance(expected_pair_gate, dict):
+        if expected_active:
             raise DrainIdentityMismatch(
                 "gateway pair-open gate disappeared before release"
+            )
+        if isinstance(expected_pair_gate, dict) and receipt != expected_pair_gate:
+            raise DrainIdentityMismatch(
+                "gateway absent pair-open gate receipt changed"
             )
         return "absent"
     expected_keys = {
@@ -15476,7 +15500,7 @@ def _gateway_pair_gate_state(
         raise DrainIdentityMismatch(
             "gateway pair-open gate ownership changed"
         )
-    if expected_pair_gate == "absent":
+    if expected_absent:
         raise DrainIdentityMismatch(
             "gateway pair-open gate survived release"
         )
@@ -15599,6 +15623,20 @@ def _gateway_health_receipt(
         listener_start=listener_start,
         expected_pair_gate=expected_pair_gate,
     )
+    expected_pair_gate_active = (
+        expected_pair_gate == "active"
+        or (
+            isinstance(expected_pair_gate, dict)
+            and expected_pair_gate.get("active") is True
+        )
+    )
+    expected_pair_gate_absent = (
+        expected_pair_gate == "absent"
+        or (
+            isinstance(expected_pair_gate, dict)
+            and expected_pair_gate.get("active") is False
+        )
+    )
     if expected_admission not in {
         "accepting_new_work",
         "rejecting_new_work",
@@ -15610,12 +15648,12 @@ def _gateway_health_receipt(
         expected_gate_active = False
         expected_effective_rejection = False
         admission_contract_valid = pair_gate_state == "absent"
-    elif expected_pair_gate == "active" or isinstance(expected_pair_gate, dict):
+    elif expected_pair_gate_active:
         expected_drain_requested = False
         expected_gate_active = True
         expected_effective_rejection = True
         admission_contract_valid = pair_gate_state == "active"
-    elif expected_pair_gate == "absent":
+    elif expected_pair_gate_absent:
         expected_drain_requested = True
         expected_gate_active = False
         expected_effective_rejection = True
