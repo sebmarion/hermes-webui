@@ -2766,11 +2766,39 @@ def run_release_control_cutover(
         else:
             raise ReleaseBuildError("candidate admission state is invalid")
 
-        pair_receipt = (
-            prepare_pair_before_commit(candidate_identity)
-            if prepare_pair_before_commit is not None
-            else {"status": "not-required"}
+        release_resume_phases = {
+            "pair_ready",
+            "pair_gate_install_intent",
+            "pair_gate_installed",
+            "pair_commit_intent",
+            "promoted",
+            "gateway_opened",
+            "candidate_accepted",
+            "pair_accepted",
+            "pair_gate_release_intent",
+        }
+        resuming_pair_release = (
+            release_pair_after_acceptance is not None
+            and "pair_gate_release_intent" in completed_phases
         )
+        if resuming_pair_release:
+            if not release_resume_phases.issubset(completed_phases):
+                raise ReleaseBuildError(
+                    "paired release intent has incomplete durable history"
+                )
+            current_pair_journal = refresh_completed_phases()
+            pair_ready = current_pair_journal["phases"].get("pair_ready")
+            pair_receipt = (
+                pair_ready.get("pair")
+                if isinstance(pair_ready, dict)
+                else None
+            )
+        else:
+            pair_receipt = (
+                prepare_pair_before_commit(candidate_identity)
+                if prepare_pair_before_commit is not None
+                else {"status": "not-required"}
+            )
         if not isinstance(pair_receipt, dict):
             raise ReleaseBuildError("paired pre-commit receipt is invalid")
         if "pair_ready" not in completed_phases:

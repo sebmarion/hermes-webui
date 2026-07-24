@@ -3639,6 +3639,189 @@ def _record_webui_pair_commit_phases(
     raise AssertionError(f"unknown pair phase: {through}")
 
 
+def test_release_transaction_resumes_release_intent_without_repreparing_pair(
+    tmp_path,
+):
+    transaction_id = "released-pair-resume-transaction-000001"
+    expected_candidate = {
+        "build_id": "candidate",
+        "manifest_sha256": "a" * 64,
+        "agent_manifest_sha256": "b" * 64,
+        "runtime_manifest_sha256": "c" * 64,
+        "selector_generation": 2,
+        "release_path": "/immutable/releases/candidate",
+        "launchd_label": "com.example.webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    candidate_identity = {
+        **expected_candidate,
+        "pid": 202,
+        "pid_start_token": "candidate-start",
+    }
+    journal_path = tmp_path / "release-intent-resume.json"
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=expected_candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "d" * 64,
+            "state_snapshot_id": "snapshot-before-candidate",
+            "state_snapshot_sha256": "f" * 64,
+        },
+    )
+    durable_phases = (
+        ("staged", {"generation": 1}),
+        ("plist_installed", {"plist_sha256": "e" * 64}),
+        ("old_fenced", {"identity": {"pid": 101}}),
+        ("old_committed", {"identity": {"pid": 101}}),
+        ("selection_activated", {"selection": {"generation": 2}}),
+        ("old_stopped", {"identity": {"pid": 101}}),
+        ("replacement_proved", {"identity": candidate_identity}),
+        ("candidate_fenced_health_proved", {"identity": candidate_identity}),
+        ("pair_ready", {"pair": {"status": "ready"}}),
+        ("pair_gate_install_intent", {"status": "prepared"}),
+        (
+            "pair_gate_installed",
+            {"owner_hash": "1" * 64, "payload_sha256": "2" * 64},
+        ),
+        ("pair_commit_intent", {"build_id": "candidate"}),
+        ("promoted", {"promotion": {"generation": 3}}),
+        ("gateway_opened", {"gateway": {"status": "opened"}}),
+        (
+            "candidate_accepted",
+            {"identity": candidate_identity, "admission": {"state": "open"}},
+        ),
+        ("accepted_health_proved", {"identity": candidate_identity}),
+        ("pair_accepted", {"identity": candidate_identity}),
+        (
+            "pair_gate_release_intent",
+            {"owner_hash": "1" * 64, "payload_sha256": "2" * 64},
+        ),
+    )
+    for phase, receipt in durable_phases:
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipt,
+        )
+
+    open_inspection = {
+        "status": "inspected",
+        "transaction_id": transaction_id,
+        "identity": candidate_identity,
+        "admission": {"state": "open", "transaction_id": None},
+    }
+    accepted_health = {
+        "status": "verified",
+        "launchd_pid": 202,
+        "listener_pid": 202,
+        "signed_health_pid": 202,
+        "pid_start_token": "candidate-start",
+        "deep_health": {
+            "status": "ok",
+            "build": {
+                "status": "managed",
+                "valid": True,
+                **{
+                    key: expected_candidate[key]
+                    for key in (
+                        "build_id",
+                        "manifest_sha256",
+                        "agent_manifest_sha256",
+                        "runtime_manifest_sha256",
+                        "selector_generation",
+                    )
+                },
+            },
+            "admission": {"state": "open"},
+            "checks": {
+                name: {"status": "ok"}
+                for name in (
+                    "streams_lock",
+                    "stream_runtime",
+                    "sessions",
+                    "projects",
+                    "state_db",
+                )
+            },
+        },
+    }
+    lifecycle = []
+
+    result = cutover.run_release_control_cutover(
+        initial_inspection=open_inspection,
+        inspect_control=lambda: open_inspection,
+        send_control=lambda *_args: pytest.fail("accepted candidate is already open"),
+        attest_selector_state=lambda: {
+            "status": "verified",
+            "transaction_id": transaction_id,
+            "current": "candidate",
+            "candidate": None,
+            "pending_transaction_id": None,
+        },
+        attest_installed_plist=lambda: {
+            "status": "verified",
+            "launchd_label": "com.example.webui",
+            "plist_sha256": "e" * 64,
+        },
+        activate_selection=lambda: pytest.fail("selector is already activated"),
+        promote_selection=lambda: pytest.fail("selector is already promoted"),
+        rollback_selection=lambda: pytest.fail("rollback is forbidden"),
+        restore_plist=lambda: pytest.fail("rollback is forbidden"),
+        stop_failed_candidate=lambda: pytest.fail("rollback is forbidden"),
+        restore_state_snapshot=lambda: pytest.fail("rollback is forbidden"),
+        restart_selection=lambda: pytest.fail("rollback is forbidden"),
+        verify_rollback=lambda: pytest.fail("rollback is forbidden"),
+        signal_process=lambda _identity: pytest.fail("old process is already stopped"),
+        wait_for_process_exit=lambda *_args: pytest.fail(
+            "old process is already stopped"
+        ),
+        inspect_candidate_binding=lambda _identity: accepted_health,
+        inspect_accepted_binding=lambda _identity: accepted_health,
+        prepare_pair_before_commit=lambda _identity: pytest.fail(
+            "durably released pair must not be prepared again"
+        ),
+        pair_gate_intent_before_commit=lambda *_args: pytest.fail(
+            "pair-gate intent is already durable"
+        ),
+        install_pair_gate_before_commit=lambda *_args: pytest.fail(
+            "released pair gate must not be reinstalled"
+        ),
+        open_pair_after_promotion=lambda _identity: pytest.fail(
+            "gateway is already open"
+        ),
+        release_pair_after_acceptance=lambda _identity, intent: (
+            lifecycle.append(("release", intent))
+            or {
+                "release": {"status": "already-released"},
+                "opened": {"status": "verified"},
+            }
+        ),
+        expected_candidate_identity=expected_candidate,
+        transaction_id=transaction_id,
+        transaction_journal_path=journal_path,
+        timeout_seconds=2,
+        interval_seconds=0.01,
+    )
+
+    assert result["status"] == "accepted"
+    assert lifecycle == [
+        (
+            "release",
+            {"owner_hash": "1" * 64, "payload_sha256": "2" * 64},
+        )
+    ]
+    phases = cutover.read_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+    )["phases"]
+    assert phases["pair_released"] == {"status": "already-released"}
+    assert phases["pair_opened"] == {"status": "verified"}
+
+
 def test_release_watchdog_barrier_restores_cron_under_lock_after_pair_opened(
     tmp_path,
     monkeypatch,
