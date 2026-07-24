@@ -11724,6 +11724,11 @@ def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
     }
     gateway_identities = []
     candidate_health_proofs = []
+    process_exit_waits = []
+    old_process_identity = {
+        "pid": 41,
+        "pid_start_token": "old-process-start",
+    }
     monkeypatch.setattr(
         cutover,
         "_reconcile_cutover_journal",
@@ -11818,8 +11823,19 @@ def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
         "_wait_for_expected_binding",
         lambda *_args, **_kwargs: {"status": "verified"},
     )
+    monkeypatch.setattr(
+        cutover,
+        "wait_for_exact_process_exit",
+        lambda identity,
+        timeout,
+        *,
+        allow_exact_signaled_zombie=False: process_exit_waits.append(
+            (identity, timeout, allow_exact_signaled_zombie)
+        ),
+    )
 
     def run_cutover(**kwargs):
+        kwargs["wait_for_process_exit"](old_process_identity, 1.0)
         kwargs["open_pair_after_promotion"](signed_process_identity)
         kwargs["release_pair_after_acceptance"](
             signed_process_identity,
@@ -11838,6 +11854,7 @@ def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
         3 if gate_release_state == "active" else 2
     )
     assert len(candidate_health_proofs) == expected_proof_count
+    assert process_exit_waits == [(old_process_identity, 1.0, True)]
     assert all(
         proof[1]["admission_state"] == "open"
         and proof[1]["require_full_health"] is True

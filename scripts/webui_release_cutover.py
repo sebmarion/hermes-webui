@@ -7322,6 +7322,16 @@ def _run_release_commit_plan_core(
             },
         }
 
+    def wait_for_booted_out_process_exit(
+        identity: dict,
+        timeout_seconds: float,
+    ) -> None:
+        wait_for_exact_process_exit(
+            identity,
+            timeout_seconds,
+            allow_exact_signaled_zombie=True,
+        )
+
     result = run_release_control_cutover(
         initial_inspection=initial,
         inspect_control=inspect_control,
@@ -7337,7 +7347,7 @@ def _run_release_commit_plan_core(
         restart_selection=restart_selection,
         verify_rollback=verify_rollback,
         signal_process=signal_exact_release_process,
-        wait_for_process_exit=wait_for_exact_process_exit,
+        wait_for_process_exit=wait_for_booted_out_process_exit,
         inspect_candidate_binding=lambda _identity: _collect_process_binding(
             plan,
             inspect_control=inspect_control,
