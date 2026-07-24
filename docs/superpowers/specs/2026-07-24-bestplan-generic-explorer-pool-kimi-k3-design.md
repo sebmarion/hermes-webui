@@ -60,9 +60,9 @@ bestplan:
       api_mode: chat_completions
       reasoning_effort: high
     - name: kimi-k3
-      provider: custom:kimi-code
+      provider: kimi-coding
       model: k3
-      api_mode: chat_completions
+      api_mode: anthropic_messages
       reasoning_effort: max
     - name: sol
       provider: openai-codex
@@ -196,15 +196,21 @@ non-secret failure message to the operator.
 
 ## Provider configuration for Kimi K3
 
-Kimi K3 is registered through Hermes' existing custom OpenAI-compatible
-provider mechanism:
+Kimi K3 uses Hermes' existing first-class Kimi Coding provider rather than a
+new custom provider:
 
-- provider name: `custom:kimi-code`;
-- API root: `https://api.kimi.com/coding/v1`;
+- provider name: `kimi-coding`;
+- API root selected for `sk-kimi-*` credentials:
+  `https://api.kimi.com/coding/v1`;
 - wire model: `k3`;
-- API mode: Chat Completions / Hermes `chat_completions`;
-- API key: stored only through Hermes' normal secret environment or credential
-  store with restrictive file permissions.
+- API mode for the coding endpoint: Hermes `anthropic_messages`;
+- API key variable: `KIMI_API_KEY`, written only through Hermes' normal secret
+  setup flow or credential store with restrictive file permissions.
+
+The Kimi model catalog adds `k3` to the existing `kimi-coding` provider so the
+model is selectable and inspectable through normal Hermes surfaces. BestPlan
+still records the explicit wire model and does not infer K3 from a picker
+label.
 
 Before persistence, a minimal authenticated model or chat probe must confirm
 that the supplied credential belongs to the coding endpoint and accepts model
@@ -231,8 +237,8 @@ Every new run persists this version-2 logical receipt shape:
       "index": 0,
       "strategy": "evidence-first",
       "explorer": "kimi-k3",
-      "configured": {"provider": "custom:kimi-code", "model": "k3"},
-      "resolved": {"provider": "custom:kimi-code", "model": "k3"},
+      "configured": {"provider": "kimi-coding", "model": "k3"},
+      "resolved": {"provider": "kimi-coding", "model": "k3"},
       "status": "success",
       "reason_code": null
     }
@@ -320,12 +326,16 @@ Expected implementation surfaces:
   `tests/agent/test_bestplan_orchestrator.py`
 - BestPlan inspection CLI:
   `hermes_cli/subcommands/bestplan.py`
+- Kimi provider model catalog:
+  `hermes_cli/models.py`
+- Kimi provider catalog tests:
+  `tests/hermes_cli/test_api_key_providers.py`
 - Installed BestPlan skill documentation:
   `~/.hermes/skills/software-development/bestplan/SKILL.md`
 - Active global Hermes configuration:
   `~/.hermes/config.yaml`
-- Active secret environment or credential store selected by the existing custom
-  provider implementation
+- Active secret environment or credential store used by the built-in
+  `kimi-coding` provider through `KIMI_API_KEY`
 
 The code change belongs in the Hermes Agent source branch used by the managed
 release pipeline. The active configuration and credential mutation are
@@ -380,10 +390,11 @@ Live acceptance, after a separately approved activation window, must prove:
 
 ## Rollback
 
-Configuration rollback removes the `kimi-k3` explorer and its custom provider
-reference, restores the preceding secret-file backup, and re-runs read-only
-validation. Code rollback restores the previous BestPlan schema support while
-leaving historical receipts readable.
+Configuration rollback removes the `kimi-k3` BestPlan explorer, restores and
+revalidates the preceding `KIMI_API_KEY` secret state, and re-runs read-only
+validation. The built-in `kimi-coding` provider remains intact. Code rollback
+restores the previous BestPlan schema support while leaving historical receipts
+readable.
 
 No active process is restarted or killed during rollback without explicit
 operator approval.
