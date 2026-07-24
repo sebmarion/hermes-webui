@@ -1598,6 +1598,31 @@ async function send(){
           $('msg').value='';autoResize();hideCmdDropdown();return;
         }
       }
+      // Skill slash commands: /skill-name loads the skill and sends to agent.
+      // Mirrors bundle resolution but for individual skills. Bare /skill-name
+      // (no args) is valid — the skill body loads with no user instruction.
+      if(!_agentCmd&&!_bundleCmd){
+        const _skillCmd=typeof getSkillCommandMetadata==='function'
+          ? await getSkillCommandMetadata(_parsedCmd.name)
+          : null;
+        if(_skillCmd){
+          try{
+            const _skillResolved=typeof resolveSkillCommand==='function'
+              ? await resolveSkillCommand(text,_skillCmd)
+              : null;
+            const _skillMessage=String(_skillResolved&&_skillResolved.message||'').trim();
+            if(!_skillMessage) throw new Error('Skill command runtime returned no invocation text.');
+            _slashDisplayTextOverride=text;
+            text=_skillMessage;
+          }catch(e){
+            if(!S.session){await newSession();await renderSessionList();}
+            S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
+            S.messages.push({role:'assistant',content:`Skill command error: ${e&&e.message||e}`,_ts:Date.now()/1000});
+            renderMessages();
+            $('msg').value='';autoResize();hideCmdDropdown();return;
+          }
+        }
+      }
     }
   }
   if(_sendOwnership.targetSid){

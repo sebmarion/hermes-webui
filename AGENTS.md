@@ -73,6 +73,16 @@ Follow that checklist's safety rules:
   in both the `rsync` and `cp -a` paths — `/opt/hermes` may contain subdirectories
   with restricted permissions (e.g. `.playwright/`).
 
+## Evidence before implementation
+
+- Define an observable success criterion before editing code.
+- For a bug, reproduce the failure first. When practical, add a regression test
+  and observe it fail before applying the fix.
+- Test user-visible behavior and the relevant invariant, not implementation
+  details.
+- During debugging, read the complete error and stack trace, change one variable
+  at a time, and explain unexpected state instead of masking it.
+
 ## Local state and secrets
 
 Hermes WebUI can read and write real agent state, sessions, workspaces,
@@ -94,7 +104,7 @@ git-ignored local note for personal workflow details.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **hermes-webui** (32023 symbols, 65039 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **hermes-webui** (32052 symbols, 65075 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 

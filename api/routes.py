@@ -16715,6 +16715,22 @@ def handle_post(handler, parsed) -> bool:
         return _handle_clarify_respond(handler, body)
 
     # ── Commands (POST) ──
+    if parsed.path == "/api/commands/skills/resolve":
+        from api.commands import resolve_skill_command
+
+        command = str(body.get("command", "") or "").strip()
+        if not command:
+            return bad(handler, "command is required")
+
+        try:
+            return j(handler, resolve_skill_command(command))
+        except KeyError:
+            return bad(handler, "Skill command not found", 404)
+        except ValueError as e:
+            return bad(handler, str(e), 400)
+        except RuntimeError as e:
+            return bad(handler, _sanitize_error(e), 500)
+
     if parsed.path == "/api/commands/bundles/resolve":
         from api.commands import resolve_bundle_command
 
