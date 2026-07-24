@@ -2000,6 +2000,11 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   full gateway release identity. Gateway binding retries are limited to
   explicit identity and release-readiness failures; programming errors escape
   immediately instead of being hidden behind the cutover timeout.
+- Startup acceptance and pair-open admission are separate fences. Before signed
+  startup acceptance, deep health remains mutation-free and defers state-backed
+  probes. After acceptance, those probes run even while the pair-open gate
+  still rejects ordinary work, allowing the controller to prove sessions,
+  projects, and `state.db` before it atomically opens the pair.
 
 This is a bounded single-operator-host contract. Same-FD/path, inode, mode,
 ownership, link-count, and compare-before-replace checks fail closed for

@@ -1656,6 +1656,9 @@ changed live selector, a changed candidate identity, and an unavailable
 promoted journal. Pair-open tests prove all gateway attestations receive the
 sealed release identity rather than the slimmer signed process identity, and
 that unexpected programming errors are not retried until the binding timeout.
+Startup-fence health tests also prove an accepted WebUI performs its state-backed
+deep probes behind the still-active pair gate, while a not-yet-accepted WebUI
+continues to report mutation-free deferred checks.
 
 
 ---

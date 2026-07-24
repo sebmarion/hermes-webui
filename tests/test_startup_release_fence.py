@@ -1059,6 +1059,38 @@ def test_startup_fenced_deep_health_is_in_memory_and_does_not_build_index(
     assert missing_index.exists() is False
 
 
+def test_pair_gate_does_not_defer_deep_health_after_startup_acceptance(
+    monkeypatch,
+    tmp_path,
+):
+    from api import routes
+
+    monkeypatch.setattr(
+        routes.api_config,
+        "startup_run_admission_is_closed",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        routes.api_config,
+        "run_admission_snapshot",
+        lambda: {"state": "open", "effective_state": "pair-gated"},
+    )
+    monkeypatch.setattr(routes, "_stream_runtime_diagnostics", lambda: {})
+    monkeypatch.setattr(routes, "all_sessions", lambda: ["session-a"])
+    monkeypatch.setattr(routes, "load_projects", lambda **_kwargs: {"project-a": {}})
+    monkeypatch.setattr(routes, "_active_state_db_path", lambda: tmp_path / "missing.db")
+
+    checks, healthy = routes._deep_health_checks(
+        stream_check={"status": "ok", "active_streams": 0}
+    )
+
+    assert healthy is True
+    assert checks["sessions"]["status"] == "ok"
+    assert checks["projects"]["status"] == "ok"
+    assert checks["state_db"]["status"] == "missing"
+    assert "startup_fence" not in checks
+
+
 def test_fresh_managed_import_and_prepare_do_not_mutate_state_before_accept(
     tmp_path,
 ):

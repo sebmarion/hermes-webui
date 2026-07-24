@@ -11957,12 +11957,19 @@ def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
     if checks["streams_lock"].get("status") != "ok":
         return checks, False
 
-    if api_config.startup_run_admission_is_closed():
+    startup_admission = api_config.run_admission_snapshot()
+    if startup_admission.get("state") in {
+        "startup-invalid",
+        "startup-fenced",
+        "startup-accepting",
+    }:
         # A selected immutable candidate must be inspectable before acceptance,
         # but deep health cannot trigger session-index rebuilds, DB opens, file
         # repair, plugin work, or any other state mutation while startup-fenced.
-        # Report only state that was already loaded during module import; the
-        # ordinary deep probes run immediately after signed acceptance.
+        # Report only state that was already loaded during module import. The
+        # pair-open gate remains active after signed acceptance, but must not
+        # masquerade as the startup fence: the controller needs ordinary deep
+        # probes to verify the accepted process before releasing the pair.
         with LOCK:
             loaded_sessions = len(SESSIONS)
         checks.update(
