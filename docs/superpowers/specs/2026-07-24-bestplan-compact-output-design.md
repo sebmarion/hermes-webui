@@ -36,8 +36,18 @@ Risks
 ```
 
 The host builds the two identity lines from terminal attempt metadata and the
-resolved synthesizer identity. It never asks a child model to report which
-models ran.
+resolved synthesizer identity. For each entry, it displays resolved
+provider/model identity when resolution succeeded and falls back to configured
+identity only when `resolved` is `null`. It never asks a child model to report
+which models ran.
+
+Every ledger token is rendered through one host-owned sanitizer. It permits
+only ASCII letters, digits, spaces, `.`, `_`, `-`, `+`, `/`, `:`, and `@`;
+replaces every other character, newline, control character, or Markdown
+delimiter with `?`; collapses repeated whitespace; and truncates each token to
+64 characters. Status reasons come only from the existing reason-code
+allow-list. This prevents model/provider text from forging another ledger line
+or injecting Markdown.
 
 Attempt order matches configured scheduling order. A failed attempt that does
 not prevent quorum remains visible with a sanitized host-owned reason:
@@ -51,16 +61,24 @@ included.
 
 ## Compact body contract
 
-The synthesis prompt requests:
+The synthesis prompt and host validator require:
 
 - `TL;DR`: two to four concise bullets;
 - `Next steps`: at most five short numbered actions;
 - `Risks`: only material risks, at most three bullets, omitted when none.
 
-The prompt explicitly rejects preambles, candidate-by-candidate narration,
-repeated context, and a second model ledger. The host does not hard-truncate
-the body because preserving an essential verification instruction is more
-important than enforcing a byte limit.
+The body contains no preamble, extra headings, candidate-by-candidate
+narration, repeated context, or second model ledger. Each non-empty content
+line is at most 240 characters and the complete body is at most 2,000
+characters.
+
+The host validates the returned structure before exposing it. If the first
+synthesis body is invalid, BestPlan performs one bounded reformat retry through
+the same named synthesizer, supplying the invalid body as untrusted source
+text. If the retry also fails validation, times out, or raises a provider
+error, the run fails as `synthesizer_failed` and returns no plan body. The host
+does not truncate a body because preserving an essential verification
+instruction is more important than forcing an invalid plan through.
 
 ## Receipts and failures
 
@@ -68,12 +86,14 @@ The version-2 receipt schema, durable JSONL record, hashes, reason codes, and
 validation rules remain unchanged.
 
 On success, `final_response` contains only the host-owned model ledger and the
-compact body. The raw receipt is returned separately in the structured outcome
-for internal consumers but is not concatenated into visible assistant text.
+validated compact body. The structured outcome always contains a mandatory
+`receipt` field holding the complete marker-wrapped version-2 receipt string.
+Internal consumers use this field and must not parse `final_response`.
 
 If durable receipt persistence fails after successful synthesis, the visible
 response still includes the compact plan plus the existing static persistence
-warning.
+warning. The mandatory structured `receipt` remains present, while
+`receipt_persisted` is `false`.
 
 Terminal BestPlan failures continue to return no plan body. Their existing
 sanitized error presentation remains unchanged; the durable failed receipt
@@ -87,22 +107,31 @@ continues to carry the full ordered attempt ledger.
   synthesis remain unchanged.
 - The structured `body`, `attempts`, `runtime`, `successes`, and `quorum`
   outcome fields remain available.
-- A new structured receipt field may carry the visible run's receipt without
-  placing it in `final_response`.
+- Every terminal outcome created after canonical validation carries the
+  marker-wrapped receipt in its mandatory structured `receipt` field without
+  placing it in visible success output.
 
 ## Verification
 
 Tests must prove:
 
-1. visible success output contains no receipt markers or receipt JSON;
-2. persisted receipt content remains byte-for-byte equivalent to the receipt
-   metadata for the run;
-3. model entries appear in scheduled order with configured model identity and
-   terminal status;
-4. the named synthesizer identity is explicit;
-5. failed-but-nonfatal explorers show only allow-listed reason codes;
-6. the synthesis prompt requests the compact body contract;
-7. receipt-write warnings remain visible without exposing exception text.
+1. visible success output, the finalized assistant message, and streamed chat
+   contain no receipt markers or receipt JSON;
+2. parsed canonical inner receipt JSON equals the persisted JSONL record;
+3. model entries appear in scheduled order with resolved identity when
+   available, configured fallback otherwise, and terminal status;
+4. configured-versus-resolved identity drift is displayed truthfully;
+5. the named synthesizer identity is explicit;
+6. failed-but-nonfatal explorers show only allow-listed reason codes;
+7. ledger tokens cannot inject newlines, control characters, or Markdown and
+   obey the 64-character bound;
+8. the synthesis prompt requests the compact body contract;
+9. the host accepts only the exact heading/item/line/body bounds;
+10. one invalid body causes exactly one bounded reformat retry;
+11. a second invalid body fails without returning a plan;
+12. successful and failed structured outcomes carry a marker-wrapped
+    `receipt`, and internal consumers do not parse it from `final_response`;
+13. receipt-write warnings remain visible without exposing exception text.
 
 No live configuration, credential, deployment, process restart, or activation
 is part of this change.
