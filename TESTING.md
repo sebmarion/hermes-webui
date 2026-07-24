@@ -1637,7 +1637,12 @@ health accepts only mutation-free deferred session/project/database probes,
 then rejects those deferred results after admission opens. FIRST-activation
 rollback tests distinguish an exact restored legacy gateway from a managed
 candidate without a managed-schema timeout, reuse the durable drain owner, and
-restore the captured legacy pair from the bootstrap handoff receipt.
+restore the captured legacy pair from the bootstrap handoff receipt. Watchdog
+ordering tests prove that both installed-script reconcile-only calls finish
+while scheduling is disabled and before the state lock is acquired, that the
+locked commit reuses the durable readiness receipt instead of recursively
+contending on the lock, and that barrier cleanup adopts state drift only after
+an exact signed snapshot rollback has been reverified live.
 
 
 ---

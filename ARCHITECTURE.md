@@ -1913,6 +1913,15 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   probes must be `deferred`. After signed acceptance opens admission, those
   deferred probes are no longer valid and must return `ok` or an allowed
   `missing` state.
+- FIRST activation installs the exact candidate watchdog and executes both
+  pre-open reconcile-only proofs while watchdog scheduling is durably disabled
+  and before the release transaction acquires the watchdog state lock. The
+  resulting readiness receipt is reused inside the locked pair commit; no
+  watchdog subprocess is launched while its own state lock is held. A final
+  candidate-script reconciliation immediately precedes lock acquisition, and
+  the cron schedule is restored only after `pair_opened`. Barrier cleanup
+  accepts a changed watchdog state only when the same transaction has durably
+  restored and reverified its exact signed state snapshot.
 - Legacy cron admission is excluded with an exclusive flock on
   `~/.hermes/cron/.tick.lock`, not `.jobs.lock`. The canonical cron directory
   must be private `0700`. A pre-existing same-uid, single-link regular lock may

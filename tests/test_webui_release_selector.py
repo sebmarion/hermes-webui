@@ -3358,6 +3358,93 @@ def test_watchdog_reconcile_rejects_stderr_without_retry(tmp_path, monkeypatch):
     assert invocations == [[str(candidate)]]
 
 
+def test_bootstrap_pair_readiness_uses_disabled_cron_and_contiguous_reconciles(
+    tmp_path,
+    monkeypatch,
+):
+    installed = tmp_path / "hermes-session-watchdog.py"
+    installed.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    installed.chmod(0o700)
+    script = {
+        "resolved_path": str(installed),
+        "sha256": "a" * 64,
+        "resolved_mode": 0o700,
+        "resolved_uid": os.getuid(),
+    }
+    disabled = {
+        "status": "disabled",
+        "crontab_sha256": "b" * 64,
+        "marker_sha256": "c" * 64,
+    }
+    state_before = {"claim_revision": 7, "sha256": "d" * 64}
+    state_middle = {"claim_revision": 8, "sha256": "e" * 64}
+    state_after = {"claim_revision": 8, "sha256": "f" * 64}
+    plan = {
+        "watchdog_installed_script": str(installed),
+        "watchdog_expected_sha256": script["sha256"],
+    }
+    prepared = {"watchdog_cron": {"status": "prepared"}}
+    phases = {
+        "watchdog_installed": {"script": script},
+        "watchdog_reconciled_once": {
+            "status": "superseded_turn_after_abandoned_dispatch",
+            "state_before": state_before,
+            "state_after": state_middle,
+            "installed_script": script,
+        },
+        "watchdog_reconciled_twice": {
+            "status": "no_reconcilable_slot",
+            "state_before": state_middle,
+            "state_after": state_after,
+            "installed_script": script,
+        },
+        "watchdog_cron_disabled": disabled,
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_file_identity_receipt",
+        lambda actual: script
+        if Path(actual) == installed
+        else pytest.fail("unexpected script"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_disabled_watchdog_cron",
+        lambda actual_plan, actual_prepared: disabled
+        if actual_plan is plan and actual_prepared is prepared
+        else pytest.fail("wrong disabled cron inputs"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_cron_watchdog_receipt",
+        lambda _plan: pytest.fail("pre-open readiness must not require active cron"),
+    )
+
+    receipt = cutover._attest_bootstrap_pair_readiness(
+        plan,
+        prepared,
+        phases,
+    )
+
+    assert receipt["status"] == "verified"
+    assert receipt["cron"] == disabled
+    assert receipt["reconcile_claim_revision"] == 8
+
+    phases["watchdog_reconciled_twice"]["state_before"] = {
+        "claim_revision": 8,
+        "sha256": "0" * 64,
+    }
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="durable watchdog reconciliation proof is invalid",
+    ):
+        cutover._attest_bootstrap_pair_readiness(
+            plan,
+            prepared,
+            phases,
+        )
+
+
 def test_release_watchdog_barrier_disables_reconciles_and_holds_exact_lock(
     tmp_path,
     monkeypatch,
@@ -3708,6 +3795,102 @@ def test_release_watchdog_barrier_keeps_cron_disabled_after_pair_commit_failure(
         transaction_id=plan["transaction_id"],
     )["phases"]
     assert "watchdog_cron_restored" not in phases
+
+
+def test_release_watchdog_barrier_adopts_exact_snapshot_rollback_state(
+    tmp_path,
+    monkeypatch,
+):
+    plan, _candidate = _watchdog_barrier_transaction(tmp_path)
+    snapshot = {
+        "manifest_path": str(tmp_path / "snapshot-manifest.json"),
+        "state_snapshot_id": "snapshot-before-candidate",
+        "state_snapshot_sha256": "a" * 64,
+    }
+    restored = {
+        "status": "restored",
+        "state_snapshot_id": snapshot["state_snapshot_id"],
+        "state_snapshot_sha256": snapshot["state_snapshot_sha256"],
+    }
+    verified = {
+        "status": "verified",
+        "state_snapshot_id": snapshot["state_snapshot_id"],
+        "state_snapshot_sha256": snapshot["state_snapshot_sha256"],
+    }
+    cron = {"status": "restored", "crontab_sha256": "b" * 64}
+    phases = {
+        "paired_state_snapshot_created": snapshot,
+        "rollback_started": {"error_type": "ReleaseBuildError"},
+        "state_snapshot_restored": restored,
+        "rollback_verified": verified,
+        "watchdog_cron_rollback_restored": cron,
+    }
+    lock = object()
+    expected_state = {"sha256": "c" * 64, "claim_revision": 9}
+    rollback_state = {"sha256": "d" * 64, "claim_revision": 7}
+    barrier = {
+        "lock": lock,
+        "prepared": {"watchdog_cron": {"status": "prepared"}},
+        "disabled": {"status": "disabled"},
+        "state": expected_state,
+    }
+    events = []
+    monkeypatch.setattr(
+        cutover,
+        "_verify_watchdog_state_lock",
+        lambda _plan, actual: {"status": "locked"}
+        if actual is lock
+        else pytest.fail("wrong lock"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_watchdog_state_receipt",
+        lambda _plan: rollback_state,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "read_transaction_journal",
+        lambda *_args, **_kwargs: {"phases": phases},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_verified_state_snapshot",
+        lambda manifest_path, **kwargs: events.append(
+            (manifest_path, kwargs)
+        )
+        or ({}, {"status": "verified"}),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_watchdog_cron",
+        lambda *_args: cron,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_release_watchdog_state_lock",
+        lambda _plan, actual: {"status": "released"}
+        if actual is lock
+        else pytest.fail("wrong lock"),
+    )
+
+    result = cutover._finish_release_watchdog_barrier(plan, barrier)
+
+    assert result["status"] == "restored-after-rollback"
+    assert result["state"]["status"] == "restored-by-exact-rollback"
+    assert result["state"]["before"] == expected_state
+    assert result["state"]["after"] == rollback_state
+    assert events == [
+        (
+            snapshot["manifest_path"],
+            {
+                "expected_snapshot_id": snapshot["state_snapshot_id"],
+                "expected_manifest_sha256": snapshot[
+                    "state_snapshot_sha256"
+                ],
+                "live": True,
+            },
+        )
+    ]
 
 
 def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
@@ -9690,6 +9873,69 @@ def test_release_commit_reports_watchdog_barrier_finish_failure(monkeypatch):
         ),
     ):
         cutover._run_release_commit_plan({})
+
+
+def test_release_commit_prepares_bootstrap_watchdog_before_state_lock(
+    monkeypatch,
+):
+    expected_identity = {
+        "build_id": "candidate-r31",
+        "selector_generation": 79,
+    }
+    plan = {"expected_candidate_identity": expected_identity}
+    prepared = {"watchdog_cron": {"status": "disabled"}}
+    readiness = {
+        "status": "ready",
+        "watchdog": {"script": {"sha256": "a" * 64}},
+    }
+    barrier = {"status": "held"}
+    events = []
+
+    def prepare(identity):
+        assert identity == expected_identity
+        events.append("prepare-watchdog")
+        return readiness
+
+    def begin(actual_plan, *, prepared=None):
+        assert actual_plan is plan
+        assert prepared is prepared_receipt
+        events.append("acquire-state-lock")
+        return barrier
+
+    def core(actual_plan, *, bootstrap_prepare_pair=None, **_kwargs):
+        assert actual_plan is plan
+        events.append("run-cutover")
+        assert bootstrap_prepare_pair is not None
+        assert bootstrap_prepare_pair(expected_identity) == readiness
+        events.append("use-cached-readiness")
+        return {"status": "accepted"}
+
+    prepared_receipt = prepared
+    monkeypatch.setattr(cutover, "_begin_release_watchdog_barrier", begin)
+    monkeypatch.setattr(cutover, "_run_release_commit_plan_core", core)
+    monkeypatch.setattr(
+        cutover,
+        "_finish_release_watchdog_barrier",
+        lambda actual_plan, actual_barrier: events.append("release-state-lock")
+        or {"status": "released"}
+        if actual_plan is plan and actual_barrier is barrier
+        else pytest.fail("wrong barrier"),
+    )
+
+    result = cutover._run_release_commit_plan(
+        plan,
+        bootstrap_prepare_pair=prepare,
+        watchdog_prepared=prepared_receipt,
+    )
+
+    assert result["watchdog_barrier"] == {"status": "released"}
+    assert events == [
+        "prepare-watchdog",
+        "acquire-state-lock",
+        "run-cutover",
+        "use-cached-readiness",
+        "release-state-lock",
+    ]
 
 
 def test_rollback_gateway_stop_intent_drains_restored_legacy_without_managed_wait(

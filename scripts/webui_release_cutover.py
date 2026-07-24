@@ -7068,7 +7068,7 @@ def _run_release_commit_plan(
     bootstrap_open_pair: Callable[[dict], dict] | None = None,
     watchdog_prepared: dict | None = None,
 ) -> dict:
-    """Run one paired commit while the watchdog writer is durably excluded."""
+    """Prepare watchdog subprocesses, then commit with their writer excluded."""
     if dry_run:
         return _run_release_commit_plan_core(
             plan,
@@ -7076,6 +7076,33 @@ def _run_release_commit_plan(
             bootstrap_prepare_pair=bootstrap_prepare_pair,
             bootstrap_open_pair=bootstrap_open_pair,
         )
+    prepared_bootstrap_pair: dict | None = None
+    core_bootstrap_prepare_pair = bootstrap_prepare_pair
+    if bootstrap_prepare_pair is not None:
+        expected_identity = plan.get("expected_candidate_identity")
+        if not isinstance(expected_identity, dict):
+            raise ReleaseBuildError(
+                "bootstrap paired readiness has no candidate identity"
+            )
+        prepared_bootstrap_pair = bootstrap_prepare_pair(
+            copy.deepcopy(expected_identity)
+        )
+        if (
+            not isinstance(prepared_bootstrap_pair, dict)
+            or prepared_bootstrap_pair.get("status") != "ready"
+        ):
+            raise ReleaseBuildError(
+                "bootstrap paired readiness receipt is invalid"
+            )
+
+        def use_prepared_bootstrap_pair(candidate_identity: dict) -> dict:
+            if candidate_identity != expected_identity:
+                raise DrainIdentityMismatch(
+                    "bootstrap paired readiness candidate changed"
+                )
+            return copy.deepcopy(prepared_bootstrap_pair)
+
+        core_bootstrap_prepare_pair = use_prepared_bootstrap_pair
     barrier = _begin_release_watchdog_barrier(
         plan,
         prepared=watchdog_prepared,
@@ -7083,7 +7110,7 @@ def _run_release_commit_plan(
     try:
         result = _run_release_commit_plan_core(
             plan,
-            bootstrap_prepare_pair=bootstrap_prepare_pair,
+            bootstrap_prepare_pair=core_bootstrap_prepare_pair,
             bootstrap_open_pair=bootstrap_open_pair,
         )
     except BaseException as original:
@@ -15848,7 +15875,7 @@ def _attest_bootstrap_pair_readiness(
         "watchdog_installed",
         "watchdog_reconciled_once",
         "watchdog_reconciled_twice",
-        "watchdog_cron_restored",
+        "watchdog_cron_disabled",
     )
     if any(name not in phases for name in required):
         raise ReleaseBuildError("paired pre-open watchdog proof is incomplete")
@@ -15870,6 +15897,7 @@ def _attest_bootstrap_pair_readiness(
         phases["watchdog_reconciled_twice"],
     ]
     prior_revision = -1
+    prior_after: dict | None = None
     for receipt in reconciles:
         before = receipt.get("state_before")
         after = receipt.get("state_after")
@@ -15887,18 +15915,17 @@ def _attest_bootstrap_pair_readiness(
             or int(after.get("claim_revision", -1))
             < int(before.get("claim_revision", -1))
             or int(before.get("claim_revision", -1)) < prior_revision
+            or (prior_after is not None and before != prior_after)
         ):
             raise ReleaseBuildError(
                 "durable watchdog reconciliation proof is invalid"
             )
         prior_revision = int(after["claim_revision"])
-    cron = _cron_watchdog_receipt(plan)
-    if (
-        not _cron_receipt_matches_prepared(cron, prepared)
-        or cron != phases["watchdog_cron_restored"]
-    ):
+        prior_after = after
+    cron = _attest_disabled_watchdog_cron(plan, prepared)
+    if cron != phases["watchdog_cron_disabled"]:
         raise DrainIdentityMismatch(
-            "watchdog cron changed after paired readiness proof"
+            "disabled watchdog cron changed after paired readiness proof"
         )
     return {
         "status": "verified",
@@ -16240,15 +16267,59 @@ def _finish_release_watchdog_barrier(plan: dict, barrier: dict) -> dict:
     outcome: dict
     try:
         _verify_watchdog_state_lock(plan, handle)
-        if _watchdog_state_receipt(plan) != expected_state:
-            raise DrainIdentityMismatch(
-                "watchdog state changed while release barrier was held"
-            )
         journal = read_transaction_journal(
             plan["transaction_journal"],
             transaction_id=plan["transaction_id"],
         )
         phases = journal["phases"]
+        observed_state = _watchdog_state_receipt(plan)
+        state_outcome = {
+            "status": "unchanged",
+            "before": expected_state,
+            "after": observed_state,
+        }
+        if observed_state != expected_state:
+            snapshot = phases.get("paired_state_snapshot_created")
+            restored = phases.get("state_snapshot_restored")
+            verified = phases.get("rollback_verified")
+            if (
+                not isinstance(snapshot, dict)
+                or not isinstance(restored, dict)
+                or restored.get("status") != "restored"
+                or not isinstance(verified, dict)
+                or verified.get("status") != "verified"
+                or any(
+                    receipt.get("state_snapshot_id")
+                    != snapshot.get("state_snapshot_id")
+                    or receipt.get("state_snapshot_sha256")
+                    != snapshot.get("state_snapshot_sha256")
+                    for receipt in (restored, verified)
+                )
+            ):
+                raise DrainIdentityMismatch(
+                    "watchdog state changed while release barrier was held"
+                )
+            _read_verified_state_snapshot(
+                snapshot["manifest_path"],
+                expected_snapshot_id=snapshot["state_snapshot_id"],
+                expected_manifest_sha256=snapshot[
+                    "state_snapshot_sha256"
+                ],
+                live=True,
+            )
+            if _watchdog_state_receipt(plan) != observed_state:
+                raise DrainIdentityMismatch(
+                    "watchdog rollback state changed during verification"
+                )
+            state_outcome = {
+                "status": "restored-by-exact-rollback",
+                "before": expected_state,
+                "after": observed_state,
+                "state_snapshot_id": snapshot["state_snapshot_id"],
+                "state_snapshot_sha256": snapshot[
+                    "state_snapshot_sha256"
+                ],
+            }
         if "pair_opened" in phases:
             restore_intent = _watchdog_cron_restore_intent_receipt(
                 plan,
@@ -16330,7 +16401,7 @@ def _finish_release_watchdog_barrier(plan: dict, barrier: dict) -> dict:
             }
     finally:
         release = _release_watchdog_state_lock(plan, handle)
-    return {**outcome, "lock": release}
+    return {**outcome, "state": state_outcome, "lock": release}
 
 
 def _prove_no_mutable_writers(
