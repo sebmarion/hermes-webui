@@ -1907,6 +1907,12 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   `pair_opened` receipt authorizes a second CAS switch to the candidate shim.
   Early abort and rollback restore the captured legacy link only when the live
   target is the transaction-owned maintenance or candidate shim.
+- A startup-fenced WebUI proves full pre-commit health without opening or
+  repairing shared state. Stream checks must be `ok`; the startup-fence check
+  must be `fenced` and `mutation_free`; session, project, and state-database
+  probes must be `deferred`. After signed acceptance opens admission, those
+  deferred probes are no longer valid and must return `ok` or an allowed
+  `missing` state.
 - Legacy cron admission is excluded with an exclusive flock on
   `~/.hermes/cron/.tick.lock`, not `.jobs.lock`. The canonical cron directory
   must be private `0700`. A pre-existing same-uid, single-link regular lock may
@@ -1947,6 +1953,14 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   quarantine and are never replayed. Rollback can restore the legacy live-file
   mode, but the live payload remains the canonical empty store while the exact
   terminal bytes remain sealed in quarantine.
+- Before the first managed promotion is durable, rollback identity comes from
+  the exact bootstrap handoff receipt, not the managed last-good release
+  schema. The release rollback restores and attests the captured legacy WebUI
+  and gateway pair and clears the original transaction-owned drain marker.
+  If the outer bootstrap rollback observes that already-restored legacy
+  gateway, it classifies it by the restored plist and runtime receipts,
+  re-drains it under the existing transaction intent, and completes state
+  restoration without entering a managed-gateway attestation wait.
 
 This is a bounded single-operator-host contract. Same-FD/path, inode, mode,
 ownership, link-count, and compare-before-replace checks fail closed for

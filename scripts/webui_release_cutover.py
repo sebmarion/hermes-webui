@@ -2354,20 +2354,44 @@ def _require_candidate_binding(
         )
     if require_full_health:
         checks = deep_health.get("checks")
-        required_checks = {
+        required_checks = (
             "streams_lock",
             "stream_runtime",
             "sessions",
             "projects",
             "state_db",
-        }
-        if not isinstance(checks, dict) or not required_checks.issubset(checks):
+        )
+        if (
+            not isinstance(checks, dict)
+            or not set(required_checks).issubset(checks)
+        ):
             raise ReleaseBuildError("accepted candidate full deep health is incomplete")
+        state_checks = {"sessions", "projects", "state_db"}
+        expected_state_statuses = (
+            {"deferred"}
+            if admission_state == "startup-fenced"
+            else {"ok", "missing"}
+        )
+        if admission_state == "startup-fenced":
+            startup_fence = checks.get("startup_fence")
+            if (
+                not isinstance(startup_fence, dict)
+                or startup_fence.get("status") != "fenced"
+                or startup_fence.get("mutation_free") is not True
+            ):
+                raise ReleaseBuildError(
+                    "startup-fenced candidate health is not mutation-free"
+                )
         for name in required_checks:
             check = checks.get(name)
+            expected_statuses = (
+                expected_state_statuses
+                if name in state_checks
+                else {"ok"}
+            )
             if (
                 not isinstance(check, dict)
-                or check.get("status") not in {"ok", "missing"}
+                or check.get("status") not in expected_statuses
             ):
                 raise ReleaseBuildError(
                     f"accepted candidate deep health check failed: {name}"
@@ -6257,6 +6281,54 @@ def _inspect_cutover_plan(plan: dict) -> dict:
     return result
 
 
+def _bootstrap_rollback_context(
+    plan: dict,
+    cutover_journal: dict,
+) -> dict | None:
+    """Return exact legacy rollback evidence for a first activation."""
+    phases = cutover_journal.get("phases")
+    staged = phases.get("staged") if isinstance(phases, dict) else None
+    bootstrap_evidence = (
+        staged.get("bootstrap_evidence")
+        if isinstance(staged, dict)
+        else None
+    )
+    if bootstrap_evidence is None:
+        return None
+    prepared = (
+        bootstrap_evidence.get("prepared")
+        if isinstance(bootstrap_evidence, dict)
+        else None
+    )
+    if not isinstance(prepared, dict):
+        raise ReleaseBuildError(
+            "bootstrap cutover has no exact legacy rollback receipt"
+        )
+    bootstrap = _read_bootstrap_journal(plan)
+    bootstrap_phases = bootstrap.get("phases")
+    durable_prepared = (
+        bootstrap_phases.get("prepared")
+        if isinstance(bootstrap_phases, dict)
+        else None
+    )
+    if durable_prepared != prepared:
+        raise DrainIdentityMismatch(
+            "bootstrap legacy rollback receipt changed after handoff"
+        )
+    drain_intent = bootstrap_phases.get("legacy_gateway_drain_intent")
+    if not isinstance(drain_intent, dict):
+        raise ReleaseBuildError(
+            "bootstrap legacy gateway drain receipt is missing"
+        )
+    return {
+        "prepared": _upgrade_internal_watchdog_prepared_receipt(
+            plan,
+            prepared,
+        ),
+        "drain_intent": copy.deepcopy(drain_intent),
+    }
+
+
 def _run_release_commit_plan_core(
     plan: dict,
     *,
@@ -6287,6 +6359,7 @@ def _run_release_commit_plan_core(
         )
     journal = _reconcile_cutover_journal(plan)
     phases = journal["phases"]
+    bootstrap_rollback = _bootstrap_rollback_context(plan, journal)
     if (
         "gateway_last_good_attested" not in phases
         and "rollback_started" not in phases
@@ -6538,6 +6611,8 @@ def _run_release_commit_plan_core(
                 if isinstance(drain_phase, dict)
                 else None
             )
+            if drain_intent is None and bootstrap_rollback is not None:
+                drain_intent = bootstrap_rollback["drain_intent"]
             cleared = (
                 _clear_legacy_gateway_drain_marker(plan, drain_intent)
                 if isinstance(drain_intent, dict)
@@ -6563,6 +6638,15 @@ def _run_release_commit_plan_core(
                 released,
             )
             gateway_phases = current["phases"]
+        if bootstrap_rollback is not None:
+            restored = _restart_or_adopt_restored_legacy_pair(
+                plan,
+                prepared=bootstrap_rollback["prepared"],
+            )
+            return {
+                "status": "restored-legacy-bootstrap",
+                **restored,
+            }
         gateway_status: dict
         try:
             gateway_status = {
@@ -6715,12 +6799,33 @@ def _run_release_commit_plan_core(
         )
         if health.get("status") != "ok":
             raise ReleaseBuildError("rollback legacy health is not healthy")
-        gateway = _attest_managed_gateway_binding(
-            plan,
-            plan["last_good_identity"],
-        )
-        if gateway.get("status") != "verified":
-            raise ReleaseBuildError("rollback managed gateway is not healthy")
+        if bootstrap_rollback is not None:
+            gateway = _attest_restored_legacy_binding(
+                plan,
+                prepared=bootstrap_rollback["prepared"],
+                gateway=True,
+            )
+            webui = _attest_restored_legacy_binding(
+                plan,
+                prepared=bootstrap_rollback["prepared"],
+                gateway=False,
+            )
+            if (
+                gateway.get("status") != "verified"
+                or webui.get("status") != "verified"
+            ):
+                raise ReleaseBuildError(
+                    "rollback restored legacy pair is not healthy"
+                )
+        else:
+            gateway = _attest_managed_gateway_binding(
+                plan,
+                plan["last_good_identity"],
+            )
+            if gateway.get("status") != "verified":
+                raise ReleaseBuildError(
+                    "rollback managed gateway is not healthy"
+                )
         return state_receipt
 
     try:
@@ -6984,7 +7089,7 @@ def _run_release_commit_plan(
     except BaseException as original:
         try:
             _finish_release_watchdog_barrier(plan, barrier)
-        except Exception:
+        except Exception as barrier_error:
             raise ReleaseBuildError(
                 f"paired release failed: {original}; watchdog barrier finish failed: "
                 f"{barrier_error}"
@@ -16373,10 +16478,14 @@ def _stop_current_service(
         if not start:
             raise DrainIdentityMismatch("current listener start identity is unavailable")
         identity = {"pid": listener_pid, "pid_start_token": start}
+        require_git_source = not gateway and any(
+            isinstance(receipt, dict) and "source" in receipt
+            for receipt in authorized_receipts
+        )
         actual_runtime = _listener_process_receipt(
             plan,
             gateway=gateway,
-            require_git_source=False,
+            require_git_source=require_git_source,
         )
         authorized = any(
             int(receipt.get("pid", -1)) == listener_pid
@@ -16642,6 +16751,39 @@ def _attest_restored_legacy_binding(
     }
 
 
+def _restored_legacy_runtime_authorization(
+    plan: dict,
+    *,
+    prepared: dict,
+    gateway: bool,
+) -> dict:
+    """Authorize a newly started process only from exact legacy artifacts."""
+    installed_key = "gateway_installed_plist" if gateway else "installed_plist"
+    receipt_key = "gateway_plist" if gateway else "webui_plist"
+    expected_plist = prepared.get(receipt_key)
+    if not isinstance(expected_plist, dict):
+        raise ReleaseBuildError(
+            "restored legacy stop authorization has no plist receipt"
+        )
+    actual_plist = _file_identity_receipt(plan[installed_key])
+    for key in ("sha256", "resolved_mode", "resolved_uid", "resolved_size"):
+        if actual_plist.get(key) != expected_plist.get(key):
+            raise DrainIdentityMismatch(
+                "restored legacy stop authorization plist changed"
+            )
+    binding = _attest_restored_legacy_binding(
+        plan,
+        prepared=prepared,
+        gateway=gateway,
+    )
+    runtime = binding.get("runtime")
+    if not isinstance(runtime, dict):
+        raise DrainIdentityMismatch(
+            "restored legacy stop authorization runtime is missing"
+        )
+    return runtime
+
+
 def _wait_for_legacy_binding(
     plan: dict,
     *,
@@ -16722,7 +16864,12 @@ def _restart_or_adopt_restored_legacy_pair(
     }
 
 
-def _rollback_gateway_stop_intent(plan: dict) -> dict:
+def _rollback_gateway_stop_intent(
+    plan: dict,
+    *,
+    prepared: dict,
+    legacy_drain_intent: dict | None,
+) -> dict:
     try:
         listener = _listener_pid(int(plan["gateway_listener_port"]))
     except DrainIdentityMismatch:
@@ -16733,6 +16880,46 @@ def _rollback_gateway_stop_intent(plan: dict) -> dict:
     if listener is None or job != listener:
         raise DrainIdentityMismatch(
             "rollback gateway launchd/listener boundary is ambiguous"
+        )
+    installed_sha256 = sha256_file(Path(plan["gateway_installed_plist"]))
+    rollback_sha256 = sha256_file(Path(plan["gateway_rollback_plist"]))
+    managed_sha256 = sha256_file(Path(plan["managed_gateway_plist"]))
+    if installed_sha256 == rollback_sha256:
+        if not isinstance(legacy_drain_intent, dict):
+            raise ReleaseBuildError(
+                "restored legacy gateway has no durable drain intent"
+            )
+        binding = _attest_restored_legacy_binding(
+            plan,
+            prepared=prepared,
+            gateway=True,
+        )
+        live_prepared = {
+            "gateway": {
+                "pid": int(binding["pid"]),
+                "pid_start_token": str(binding["pid_start_token"]),
+            }
+        }
+        drained = _wait_for_legacy_gateway_drain(
+            plan,
+            live_prepared,
+            legacy_drain_intent,
+        )
+        return {
+            "status": "prepared",
+            "runtime_mode": "restored-legacy",
+            "prepared": live_prepared,
+            "drain_intent": copy.deepcopy(legacy_drain_intent),
+            "drain_receipt": drained,
+            "intent": _legacy_gateway_stop_intent_receipt(
+                plan,
+                live_prepared,
+                drained,
+            ),
+        }
+    if installed_sha256 != managed_sha256:
+        raise DrainIdentityMismatch(
+            "rollback gateway plist is neither managed nor restored legacy"
         )
     binding = _attest_managed_gateway_binding(
         plan,
@@ -16752,6 +16939,7 @@ def _rollback_gateway_stop_intent(plan: dict) -> dict:
     }
     return {
         "status": "prepared",
+        "runtime_mode": "managed-candidate",
         "prepared": prepared,
         "intent": _legacy_gateway_stop_intent_receipt(
             plan,
@@ -16791,6 +16979,14 @@ def _stop_bootstrap_pair_for_rollback(
 
     authorized = _authorized_bootstrap_runtimes(journal, gateway=False)
     authorized.extend(_authorized_cutover_runtimes(plan, gateway=False))
+    if _listener_pid_or_none(int(plan["listener_port"])) is not None:
+        authorized.append(
+            _restored_legacy_runtime_authorization(
+                plan,
+                prepared=journal["phases"]["prepared"],
+                gateway=False,
+            )
+        )
     incomplete_runtime = _incomplete_managed_webui_stop_authorization(
         plan,
         journal,
@@ -16831,7 +17027,13 @@ def _resume_bootstrap_rollback(plan: dict, journal: dict) -> dict:
         journal = _record_bootstrap_phase(
             plan,
             "rollback_gateway_stop_intent",
-            _rollback_gateway_stop_intent(plan),
+            _rollback_gateway_stop_intent(
+                plan,
+                prepared=prepared,
+                legacy_drain_intent=phases.get(
+                    "legacy_gateway_drain_intent"
+                ),
+            ),
         )
         phases = journal["phases"]
     if "rollback_services_stopped" not in phases:

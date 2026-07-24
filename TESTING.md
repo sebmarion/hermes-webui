@@ -1632,6 +1632,13 @@ classification, and pre-snapshot abort recovery for healthy replacement, clean
 absence, foreign-owner cases, and a crash after the cron tick lock was already
 restored but before the abort receipt was durable.
 
+Release acceptance coverage additionally proves that startup-fenced deep
+health accepts only mutation-free deferred session/project/database probes,
+then rejects those deferred results after admission opens. FIRST-activation
+rollback tests distinguish an exact restored legacy gateway from a managed
+candidate without a managed-schema timeout, reuse the durable drain owner, and
+restore the captured legacy pair from the bootstrap handoff receipt.
+
 
 ---
 

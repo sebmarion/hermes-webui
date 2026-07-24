@@ -3862,6 +3862,30 @@ def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
         state = "startup-fenced" if not deep_health_calls else "open"
         deep_health_calls.append(state)
         lifecycle.append(f"candidate-{state}-health")
+        checks = {
+            "streams_lock": {"status": "ok"},
+            "stream_runtime": {"status": "ok"},
+        }
+        if state == "startup-fenced":
+            checks.update(
+                {
+                    "startup_fence": {
+                        "status": "fenced",
+                        "mutation_free": True,
+                    },
+                    "sessions": {"status": "deferred"},
+                    "projects": {"status": "deferred"},
+                    "state_db": {"status": "deferred"},
+                }
+            )
+        else:
+            checks.update(
+                {
+                    "sessions": {"status": "ok"},
+                    "projects": {"status": "ok"},
+                    "state_db": {"status": "ok"},
+                }
+            )
         return {
             "status": "verified",
             "launchd_pid": 456,
@@ -3885,13 +3909,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(tmp_path):
                     },
                 },
                 "admission": {"state": state},
-                "checks": {
-                    "streams_lock": {"status": "ok"},
-                    "stream_runtime": {"status": "ok"},
-                    "sessions": {"status": "ok"},
-                    "projects": {"status": "ok"},
-                    "state_db": {"status": "ok"},
-                },
+                "checks": checks,
             },
         }
 
@@ -4244,14 +4262,15 @@ def test_release_transaction_resumes_from_each_durable_external_phase(
         },
     }
     preaccepted_health["deep_health"]["checks"] = {
-        name: {"status": "ok"}
-        for name in (
-            "streams_lock",
-            "stream_runtime",
-            "sessions",
-            "projects",
-            "state_db",
-        )
+        "streams_lock": {"status": "ok"},
+        "stream_runtime": {"status": "ok"},
+        "startup_fence": {
+            "status": "fenced",
+            "mutation_free": True,
+        },
+        "sessions": {"status": "deferred"},
+        "projects": {"status": "deferred"},
+        "state_db": {"status": "deferred"},
     }
     accepted_health = copy.deepcopy(preaccepted_health)
     accepted_health["deep_health"]["admission"] = {"state": "open"}
@@ -5622,6 +5641,64 @@ def test_stop_current_service_allows_exact_signaled_terminal_zombie(monkeypatch)
 
     assert receipt["status"] == "stopped"
     assert signals == [(41, signal.SIGKILL)]
+
+
+def test_stop_current_service_collects_source_for_source_bound_authorization(
+    monkeypatch,
+):
+    plan = {
+        "listener_port": 8787,
+        "timeout_seconds": 1,
+    }
+    runtime = {
+        "pid": 41,
+        "pid_start_token": "legacy-start",
+        "command": "legacy command",
+        "source": {"tree": "a" * 40},
+        "routing_environment": {"HERMES_WEBUI_PORT": "8787"},
+    }
+    listener_probes = iter((41, None))
+    job_probes = iter((41, None))
+    source_requests = []
+
+    def listener(_port):
+        value = next(listener_probes)
+        if value is None:
+            raise cutover.ListenerAbsent("listener absent")
+        return value
+
+    monkeypatch.setattr(cutover, "_listener_pid", listener)
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: next(job_probes),
+    )
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "legacy-start")
+
+    def process_receipt(_plan, *, gateway, require_git_source):
+        source_requests.append(require_git_source)
+        return runtime
+
+    monkeypatch.setattr(
+        cutover,
+        "_listener_process_receipt",
+        process_receipt,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *_args, **_kwargs: {"status": "stopped"},
+    )
+    monkeypatch.setattr(cutover, "_exact_process_is_alive", lambda _row: False)
+
+    receipt = cutover._stop_current_service(
+        plan,
+        gateway=False,
+        authorized_receipts=[runtime],
+    )
+
+    assert receipt["status"] == "stopped"
+    assert source_requests == [True]
 
 
 def test_wait_for_exact_process_exit_accepts_reap_during_zombie_probe(
@@ -7077,6 +7154,104 @@ def test_probe_startup_fenced_webui_does_not_require_mutating_deep_checks(
     monkeypatch.setattr(cutover, "_require_candidate_binding", require_candidate)
 
     assert cutover._probe_startup_fenced_webui_binding(plan, identity) is binding
+
+
+def test_candidate_binding_accepts_mutation_free_deferred_startup_checks():
+    expected = {
+        "build_id": "candidate-r29",
+        "manifest_sha256": "a" * 64,
+        "agent_manifest_sha256": "b" * 64,
+        "runtime_manifest_sha256": "c" * 64,
+        "selector_generation": 73,
+    }
+    identity = {
+        "pid": 41,
+        "pid_start_token": "candidate-start",
+    }
+    evidence = {
+        "status": "verified",
+        "launchd_pid": 41,
+        "listener_pid": 41,
+        "signed_health_pid": 41,
+        "pid_start_token": "candidate-start",
+        "deep_health": {
+            "status": "ok",
+            "build": {
+                "status": "managed",
+                "valid": True,
+                **expected,
+            },
+            "admission": {"state": "startup-fenced"},
+            "checks": {
+                "streams_lock": {"status": "ok"},
+                "stream_runtime": {"status": "ok"},
+                "startup_fence": {
+                    "status": "fenced",
+                    "mutation_free": True,
+                },
+                "sessions": {"status": "deferred"},
+                "projects": {"status": "deferred"},
+                "state_db": {"status": "deferred"},
+            },
+        },
+    }
+
+    assert cutover._require_candidate_binding(
+        evidence,
+        candidate_identity=identity,
+        expected_candidate_identity=expected,
+        admission_state="startup-fenced",
+        require_full_health=True,
+    ) is evidence
+
+
+def test_candidate_binding_rejects_deferred_checks_after_admission_opens():
+    expected = {
+        "build_id": "candidate-r29",
+        "manifest_sha256": "a" * 64,
+        "agent_manifest_sha256": "b" * 64,
+        "runtime_manifest_sha256": "c" * 64,
+        "selector_generation": 73,
+    }
+    identity = {
+        "pid": 41,
+        "pid_start_token": "candidate-start",
+    }
+    evidence = {
+        "status": "verified",
+        "launchd_pid": 41,
+        "listener_pid": 41,
+        "signed_health_pid": 41,
+        "pid_start_token": "candidate-start",
+        "deep_health": {
+            "status": "ok",
+            "build": {
+                "status": "managed",
+                "valid": True,
+                **expected,
+            },
+            "admission": {"state": "open"},
+            "checks": {
+                "streams_lock": {"status": "ok"},
+                "stream_runtime": {"status": "ok"},
+                "sessions": {"status": "deferred"},
+                "projects": {"status": "deferred"},
+                "state_db": {"status": "deferred"},
+            },
+        },
+    }
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="deep health check failed: sessions",
+    ):
+        cutover._require_candidate_binding(
+            evidence,
+            candidate_identity=identity,
+            expected_candidate_identity=expected,
+            admission_state="open",
+            require_full_health=True,
+        )
 
 
 def test_bootstrap_journal_allows_exact_abort_after_job_bootout():
@@ -9432,6 +9607,264 @@ def test_gateway_health_rejects_incomplete_cron_admission_schema(monkeypatch):
             expected_admission="rejecting_new_work",
             expected_pair_gate=health["drain"]["pair_open_gate"],
         )
+
+
+def test_bootstrap_rollback_context_uses_exact_durable_legacy_receipts(
+    monkeypatch,
+):
+    prepared = {
+        "legacy": {"pid": 41, "pid_start_token": "webui-start"},
+        "gateway": {"pid": 42, "pid_start_token": "gateway-start"},
+    }
+    drain_intent = {
+        "status": "prepared",
+        "marker": {
+            "path": "/tmp/.drain_request.json",
+            "payload": {
+                "release_transaction_id": "bootstrap-transaction-000001",
+            },
+            "sha256": "d" * 64,
+        },
+    }
+    plan = {"transaction_id": "bootstrap-transaction-000001"}
+    cutover_journal = {
+        "phases": {
+            "staged": {
+                "bootstrap_evidence": {
+                    "prepared": prepared,
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_read_bootstrap_journal",
+        lambda _plan: {
+            "phases": {
+                "prepared": prepared,
+                "legacy_gateway_drain_intent": drain_intent,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_upgrade_internal_watchdog_prepared_receipt",
+        lambda _plan, actual: actual,
+    )
+
+    assert cutover._bootstrap_rollback_context(
+        plan,
+        cutover_journal,
+    ) == {
+        "prepared": prepared,
+        "drain_intent": drain_intent,
+    }
+
+
+def test_release_commit_reports_watchdog_barrier_finish_failure(monkeypatch):
+    monkeypatch.setattr(
+        cutover,
+        "_begin_release_watchdog_barrier",
+        lambda *_args, **_kwargs: {"status": "held"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_run_release_commit_plan_core",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            cutover.ReleaseBuildError("candidate failed")
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_finish_release_watchdog_barrier",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            cutover.ReleaseBuildError("barrier failed")
+        ),
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match=(
+            "paired release failed: candidate failed; "
+            "watchdog barrier finish failed: barrier failed"
+        ),
+    ):
+        cutover._run_release_commit_plan({})
+
+
+def test_rollback_gateway_stop_intent_drains_restored_legacy_without_managed_wait(
+    tmp_path,
+    monkeypatch,
+):
+    installed = tmp_path / "installed-gateway.plist"
+    rollback = tmp_path / "rollback-gateway.plist"
+    managed = tmp_path / "managed-gateway.plist"
+    installed.write_bytes(b"legacy gateway plist\n")
+    rollback.write_bytes(b"legacy gateway plist\n")
+    managed.write_bytes(b"managed gateway plist\n")
+    plan = {
+        "gateway_listener_port": 8642,
+        "gateway_installed_plist": str(installed),
+        "gateway_rollback_plist": str(rollback),
+        "managed_gateway_plist": str(managed),
+        "expected_candidate_identity": {"build_id": "candidate-r29"},
+    }
+    captured = {
+        "gateway": {
+            "pid": 31,
+            "pid_start_token": "retired-gateway",
+        }
+    }
+    drain_intent = {
+        "status": "prepared",
+        "marker": {"sha256": "d" * 64},
+    }
+    restored_binding = {
+        "status": "verified",
+        "pid": 51,
+        "pid_start_token": "restored-gateway",
+    }
+    events = []
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 51)
+    monkeypatch.setattr(
+        cutover,
+        "_job_pid",
+        lambda _plan, *, gateway: 51,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_restored_legacy_binding",
+        lambda _plan, *, prepared, gateway: (
+            events.append(("legacy-attest", prepared, gateway))
+            or restored_binding
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exact restored legacy must not enter managed wait")
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_wait_for_legacy_gateway_drain",
+        lambda _plan, prepared, intent: (
+            events.append(("legacy-drain", prepared, intent))
+            or {"status": "drained"}
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_gateway_stop_intent_receipt",
+        lambda _plan, prepared, drained: {
+            "status": "prepared",
+            "prepared": prepared,
+            "drained": drained,
+        },
+    )
+
+    receipt = cutover._rollback_gateway_stop_intent(
+        plan,
+        prepared=captured,
+        legacy_drain_intent=drain_intent,
+    )
+
+    live_prepared = {
+        "gateway": {
+            "pid": 51,
+            "pid_start_token": "restored-gateway",
+        }
+    }
+    assert receipt == {
+        "status": "prepared",
+        "runtime_mode": "restored-legacy",
+        "prepared": live_prepared,
+        "drain_intent": drain_intent,
+        "drain_receipt": {"status": "drained"},
+        "intent": {
+            "status": "prepared",
+            "prepared": live_prepared,
+            "drained": {"status": "drained"},
+        },
+    }
+    assert events == [
+        ("legacy-attest", captured, True),
+        ("legacy-drain", live_prepared, drain_intent),
+    ]
+
+
+def test_bootstrap_rollback_authorizes_exact_restarted_legacy_webui(
+    monkeypatch,
+):
+    plan = {
+        "gateway_listener_port": 8642,
+        "listener_port": 8787,
+    }
+    journal = {"phases": {"prepared": {"captured": "legacy"}}}
+    restored_runtime = {
+        "pid": 77,
+        "pid_start_token": "restarted-legacy",
+        "command": "legacy command",
+    }
+    captured_authorizations = []
+    monkeypatch.setattr(
+        cutover,
+        "_acquire_legacy_cron_tick_lock",
+        lambda _plan: {"status": "held"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_verify_legacy_cron_tick_lock",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: None)
+    monkeypatch.setattr(cutover, "_job_pid", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        cutover,
+        "_listener_pid_or_none",
+        lambda port: 77 if port == 8787 else None,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_authorized_bootstrap_runtimes",
+        lambda *_args, **_kwargs: [{"pid": 31}],
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_authorized_cutover_runtimes",
+        lambda *_args, **_kwargs: [{"pid": 41}],
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restored_legacy_runtime_authorization",
+        lambda _plan, *, prepared, gateway: (
+            restored_runtime
+            if prepared == journal["phases"]["prepared"] and gateway is False
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_incomplete_managed_webui_stop_authorization",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def stop_current(_plan, *, gateway, authorized_receipts):
+        assert gateway is False
+        captured_authorizations.extend(authorized_receipts)
+        return {"status": "stopped"}
+
+    monkeypatch.setattr(cutover, "_stop_current_service", stop_current)
+
+    receipt = cutover._stop_bootstrap_pair_for_rollback(
+        plan,
+        journal,
+        {"status": "not-running"},
+    )
+
+    assert receipt["webui"] == {"status": "stopped"}
+    assert restored_runtime in captured_authorizations
 
 
 def test_restart_or_adopt_restored_legacy_pair_adopts_exact_running_pair(
