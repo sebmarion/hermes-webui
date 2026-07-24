@@ -2693,10 +2693,17 @@ def run_release_control_cutover(
                 "installed launchd plist does not match durable transaction phase"
             )
 
-    def inspect_with_retry(first: dict | None = None) -> dict:
+    def inspect_with_retry(
+        first: dict | None = None,
+        *,
+        window_started_at: float | None = None,
+    ) -> dict:
+        deadline_started_at = (
+            started_at if window_started_at is None else window_started_at
+        )
         candidate = first
         while True:
-            if monotonic() - started_at > timeout_seconds:
+            if monotonic() - deadline_started_at > timeout_seconds:
                 raise DrainTimeout("release replacement did not become ready")
             if candidate is None:
                 try:
@@ -3063,7 +3070,12 @@ def run_release_control_cutover(
                 {"bootstrap": bootstrapped},
             )
             candidate_may_have_started = True
-            return finish_candidate(candidate_probe or inspect_with_retry())
+            candidate_inspection = candidate_probe
+            if candidate_inspection is None:
+                candidate_inspection = inspect_with_retry(
+                    window_started_at=monotonic(),
+                )
+            return finish_candidate(candidate_inspection)
 
         initial = inspect_with_retry(initial_inspection)
         initial_identity = initial.get("identity")
@@ -3293,7 +3305,9 @@ def run_release_control_cutover(
                 )
             candidate_may_have_started = True
 
-        candidate_inspection = inspect_with_retry()
+        candidate_inspection = inspect_with_retry(
+            window_started_at=monotonic(),
+        )
         return finish_candidate(candidate_inspection)
     except Exception as original:
         durable_now = read_transaction_journal(

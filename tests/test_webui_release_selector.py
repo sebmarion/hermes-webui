@@ -4376,6 +4376,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(
 
     lifecycle = []
     deep_health_calls = []
+    clock = {"now": 0.0}
 
     def inspect_deep_candidate(_identity):
         state = "startup-fenced" if not deep_health_calls else "open"
@@ -4432,6 +4433,14 @@ def test_release_control_driver_commits_pair_before_sequential_open(
             },
         }
 
+    def bootstrap_candidate():
+        lifecycle.append("candidate-bootstrapped")
+        # Gateway preparation is a separate bounded phase and may consume the
+        # original drain window before WebUI launch.  The replacement must
+        # still receive its own readiness window after bootstrap completes.
+        clock["now"] = 3.0
+        return {"status": "started"}
+
     result = cutover.run_release_control_cutover(
         initial_inspection={
             "status": "inspected",
@@ -4464,6 +4473,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(
         wait_for_process_exit=lambda exact, timeout: lifecycle.append(
             ("exited", exact, timeout)
         ),
+        bootstrap_candidate_job=bootstrap_candidate,
         inspect_candidate_binding=lambda _identity: lifecycle.append(
             "candidate-binding"
         ) or {
@@ -4506,6 +4516,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(
         transaction_journal_path=journal_path,
         timeout_seconds=2,
         interval_seconds=0.01,
+        monotonic=lambda: clock["now"],
     )
 
     expected_actions = ["fence", "fence", "accept"]
@@ -4519,6 +4530,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(
     assert lifecycle[1] == ("signalled", old_identity)
     assert lifecycle[2][0:2] == ("exited", old_identity)
     assert lifecycle[3:] == [
+        "candidate-bootstrapped",
         "candidate-binding",
         "candidate-startup-fenced-health",
         "pair-ready",
@@ -4547,6 +4559,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(
         "old_committed",
         "selection_activated",
         "old_stopped",
+        "candidate_job_bootstrapped",
         "replacement_proved",
         "candidate_fenced_health_proved",
         "pair_ready",
