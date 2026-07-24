@@ -8064,7 +8064,7 @@ def test_candidate_binding_rejects_deferred_checks_after_admission_opens():
         )
 
 
-def test_candidate_binding_accepts_deferred_checks_only_behind_pair_gate():
+def test_candidate_binding_accepts_full_health_behind_pair_gate_after_acceptance():
     expected = {
         "build_id": "candidate-r32",
         "manifest_sha256": "a" * 64,
@@ -8105,13 +8105,9 @@ def test_candidate_binding_accepts_deferred_checks_only_behind_pair_gate():
             "checks": {
                 "streams_lock": {"status": "ok"},
                 "stream_runtime": {"status": "ok"},
-                "startup_fence": {
-                    "status": "fenced",
-                    "mutation_free": True,
-                },
-                "sessions": {"status": "deferred"},
-                "projects": {"status": "deferred"},
-                "state_db": {"status": "deferred"},
+                "sessions": {"status": "ok"},
+                "projects": {"status": "ok"},
+                "state_db": {"status": "missing"},
             },
         },
     }

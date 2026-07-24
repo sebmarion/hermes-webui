@@ -2377,40 +2377,12 @@ def _require_candidate_binding(
         ):
             raise ReleaseBuildError("accepted candidate full deep health is incomplete")
         state_checks = {"sessions", "projects", "state_db"}
-        pair_gate = admission.get("pair_gate")
-        deferred_pair_health = (
-            admission_state == "open"
-            and admission.get("effective_state") == "pair-gated"
-            and isinstance(pair_gate, dict)
-            and pair_gate.get("status") == "active"
-            and isinstance(pair_gate.get("transaction_id"), str)
-            and bool(
-                re.fullmatch(
-                    r"[A-Za-z0-9_-]{32,128}",
-                    pair_gate["transaction_id"],
-                )
-            )
-            and isinstance(pair_gate.get("epoch"), int)
-            and not isinstance(pair_gate.get("epoch"), bool)
-            and pair_gate["epoch"] > 0
-            and isinstance(pair_gate.get("owner_hash"), str)
-            and bool(re.fullmatch(r"[0-9a-f]{64}", pair_gate["owner_hash"]))
-            and isinstance(pair_gate.get("payload_sha256"), str)
-            and bool(
-                re.fullmatch(
-                    r"[0-9a-f]{64}",
-                    pair_gate["payload_sha256"],
-                )
-            )
-            and isinstance(pair_gate.get("agent"), dict)
-            and isinstance(pair_gate.get("webui"), dict)
-        )
         expected_state_statuses = (
             {"deferred"}
-            if admission_state == "startup-fenced" or deferred_pair_health
+            if admission_state == "startup-fenced"
             else {"ok", "missing"}
         )
-        if admission_state == "startup-fenced" or deferred_pair_health:
+        if admission_state == "startup-fenced":
             startup_fence = checks.get("startup_fence")
             if (
                 not isinstance(startup_fence, dict)
