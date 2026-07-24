@@ -6602,6 +6602,7 @@ def _run_release_commit_plan_core(
     dry_run: bool = False,
     bootstrap_prepare_pair: Callable[[dict], dict] | None = None,
     bootstrap_open_pair: Callable[[dict], dict] | None = None,
+    managed_watchdog_readiness: Callable[[], dict] | None = None,
 ) -> dict:
     if dry_run:
         inspected = _inspect_cutover_plan(plan)
@@ -7085,6 +7086,20 @@ def _run_release_commit_plan_core(
     except ReleaseBuildError:
         initial = None
 
+    def attest_managed_watchdog_readiness() -> dict:
+        if managed_watchdog_readiness is not None:
+            readiness = managed_watchdog_readiness()
+            expected_status = "verified-disabled-barrier"
+        else:
+            readiness = _attest_managed_watchdog_readiness(plan)
+            expected_status = "verified"
+        if (
+            not isinstance(readiness, dict)
+            or readiness.get("status") != expected_status
+        ):
+            raise ReleaseBuildError("managed watchdog readiness receipt is invalid")
+        return readiness
+
     def prepare_pair(candidate_identity: dict) -> dict:
         gateway = _complete_candidate_gateway_transition(
             plan,
@@ -7103,7 +7118,7 @@ def _run_release_commit_plan_core(
         extra = (
             bootstrap_prepare_pair(candidate_identity)
             if bootstrap_prepare_pair is not None
-            else _attest_managed_watchdog_readiness(plan)
+            else attest_managed_watchdog_readiness()
         )
         return {
             "status": "ready",
@@ -7146,7 +7161,7 @@ def _run_release_commit_plan_core(
         if bootstrap_open_pair is not None:
             extra = bootstrap_open_pair(candidate_identity)
         else:
-            live_readiness = _attest_managed_watchdog_readiness(plan)
+            live_readiness = attest_managed_watchdog_readiness()
             current = read_transaction_journal(
                 plan["transaction_journal"],
                 transaction_id=plan["transaction_id"],
@@ -7247,6 +7262,11 @@ def _run_release_commit_plan_core(
                 "status": "adopted-durable-release-intent",
                 "active": True,
             }
+        release_barrier = (
+            attest_managed_watchdog_readiness()
+            if managed_watchdog_readiness is not None
+            else None
+        )
         released = _release_owned_pair_open_gate(
             plan,
             gate_intent,
@@ -7298,6 +7318,7 @@ def _run_release_commit_plan_core(
                 "gateway_open": gateway_open["health"]["drain"][
                     "pair_open_gate"
                 ],
+                "watchdog_barrier": release_barrier,
             },
         }
 
@@ -7402,11 +7423,16 @@ def _run_release_commit_plan(
         plan,
         prepared=watchdog_prepared,
     )
+
+    def attest_held_watchdog_barrier() -> dict:
+        return _attest_release_watchdog_barrier(plan, barrier)
+
     try:
         result = _run_release_commit_plan_core(
             plan,
             bootstrap_prepare_pair=core_bootstrap_prepare_pair,
             bootstrap_open_pair=bootstrap_open_pair,
+            managed_watchdog_readiness=attest_held_watchdog_barrier,
         )
     except BaseException as original:
         try:
@@ -17019,6 +17045,52 @@ def _begin_release_watchdog_barrier(
         "state": live_state,
         "lock": handle,
         "lock_receipt": lock_receipt,
+    }
+
+
+def _attest_release_watchdog_barrier(plan: dict, barrier: dict) -> dict:
+    if not isinstance(barrier, dict) or barrier.get("status") != "held":
+        raise ReleaseBuildError("watchdog release barrier receipt is invalid")
+    handle = barrier.get("lock")
+    prepared = barrier.get("prepared")
+    expected_disabled = barrier.get("disabled")
+    expected_state = barrier.get("state")
+    expected_lock = barrier.get("lock_receipt")
+    if (
+        handle is None
+        or not isinstance(prepared, dict)
+        or not isinstance(expected_disabled, dict)
+        or not isinstance(expected_state, dict)
+        or not isinstance(expected_lock, dict)
+    ):
+        raise ReleaseBuildError("watchdog release barrier receipt is invalid")
+    lock = _verify_watchdog_state_lock(plan, handle)
+    if lock != expected_lock:
+        raise DrainIdentityMismatch(
+            "watchdog state lock changed while release barrier was held"
+        )
+    state = _watchdog_state_receipt(plan)
+    if state != expected_state:
+        raise DrainIdentityMismatch(
+            "watchdog state changed while release barrier was held"
+        )
+    cron = _attest_disabled_watchdog_cron(plan, prepared)
+    if cron != expected_disabled:
+        raise DrainIdentityMismatch(
+            "disabled watchdog scheduler changed while release barrier was held"
+        )
+    script = _file_identity_receipt(plan["watchdog_installed_script"])
+    if (
+        script.get("sha256") != plan["watchdog_expected_sha256"]
+        or int(script.get("resolved_mode", 0)) & 0o111 == 0
+    ):
+        raise DrainIdentityMismatch("managed watchdog identity changed")
+    return {
+        "status": "verified-disabled-barrier",
+        "script": script,
+        "cron": cron,
+        "state": state,
+        "lock": lock,
     }
 
 

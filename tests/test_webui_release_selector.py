@@ -3660,6 +3660,114 @@ def test_release_watchdog_barrier_disables_reconciles_and_holds_exact_lock(
     assert phases["watchdog_state_reconciled"]["state_after"] == expected_state
 
 
+def test_release_watchdog_barrier_readiness_attests_disabled_writer_and_lock(
+    monkeypatch,
+):
+    plan = {
+        "watchdog_installed_script": "/tmp/managed-watchdog.py",
+        "watchdog_expected_sha256": "a" * 64,
+    }
+    lock = object()
+    prepared = {"watchdog_cron": {"watchdog_command": "managed-watchdog"}}
+    disabled = {
+        "status": "disabled",
+        "crontab_sha256": "b" * 64,
+        "marker_sha256": "c" * 64,
+    }
+    state = {"sha256": "d" * 64, "claim_revision": 9}
+    lock_receipt = {"status": "locked", "inode": 41}
+    barrier = {
+        "status": "held",
+        "lock": lock,
+        "prepared": prepared,
+        "disabled": disabled,
+        "state": state,
+        "lock_receipt": lock_receipt,
+    }
+    script = {
+        "sha256": plan["watchdog_expected_sha256"],
+        "resolved_mode": 0o700,
+    }
+    events = []
+    monkeypatch.setattr(
+        cutover,
+        "_verify_watchdog_state_lock",
+        lambda actual_plan, actual_lock: events.append("verify-lock")
+        or lock_receipt
+        if actual_plan is plan and actual_lock is lock
+        else pytest.fail("wrong barrier lock"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_watchdog_state_receipt",
+        lambda actual_plan: events.append("state") or state
+        if actual_plan is plan
+        else pytest.fail("wrong plan"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_disabled_watchdog_cron",
+        lambda actual_plan, actual_prepared: events.append("disabled")
+        or disabled
+        if actual_plan is plan and actual_prepared is prepared
+        else pytest.fail("wrong disabled barrier"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_file_identity_receipt",
+        lambda path: events.append("script") or script
+        if path == plan["watchdog_installed_script"]
+        else pytest.fail("wrong watchdog script"),
+    )
+
+    assert cutover._attest_release_watchdog_barrier(plan, barrier) == {
+        "status": "verified-disabled-barrier",
+        "script": script,
+        "cron": disabled,
+        "state": state,
+        "lock": lock_receipt,
+    }
+    assert events == ["verify-lock", "state", "disabled", "script"]
+
+
+def test_release_watchdog_barrier_readiness_rejects_changed_disabled_receipt(
+    monkeypatch,
+):
+    plan = {
+        "watchdog_installed_script": "/tmp/managed-watchdog.py",
+        "watchdog_expected_sha256": "a" * 64,
+    }
+    lock = object()
+    prepared = {"watchdog_cron": {"watchdog_command": "managed-watchdog"}}
+    disabled = {"status": "disabled", "marker_sha256": "b" * 64}
+    state = {"sha256": "c" * 64, "claim_revision": 9}
+    barrier = {
+        "status": "held",
+        "lock": lock,
+        "prepared": prepared,
+        "disabled": disabled,
+        "state": state,
+        "lock_receipt": {"status": "locked"},
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_verify_watchdog_state_lock",
+        lambda *_args: barrier["lock_receipt"],
+    )
+    monkeypatch.setattr(cutover, "_watchdog_state_receipt", lambda _plan: state)
+    monkeypatch.setattr(
+        cutover,
+        "_attest_disabled_watchdog_cron",
+        lambda *_args: {**disabled, "marker_sha256": "d" * 64},
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="disabled watchdog scheduler changed while release barrier was held",
+    ):
+        cutover._attest_release_watchdog_barrier(plan, barrier)
+
+
 def test_release_watchdog_barrier_rejects_state_change_and_leaves_cron_disabled(
     tmp_path,
     monkeypatch,
@@ -11135,6 +11243,68 @@ def test_release_commit_reconciles_journal_before_watchdog_barrier(monkeypatch):
     ]
 
 
+def test_release_commit_passes_held_watchdog_barrier_to_managed_readiness(
+    monkeypatch,
+):
+    plan = {"transaction_id": "managed-barrier-readiness-transaction-0001"}
+    barrier = {"status": "held"}
+    readiness = {"status": "verified-disabled-barrier"}
+    events = []
+
+    monkeypatch.setattr(
+        cutover,
+        "_reconcile_cutover_journal",
+        lambda actual_plan: {"phases": {}}
+        if actual_plan is plan
+        else pytest.fail("wrong plan"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_ensure_gateway_last_good_attested",
+        lambda actual_plan, journal: journal
+        if actual_plan is plan
+        else pytest.fail("wrong plan"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_begin_release_watchdog_barrier",
+        lambda actual_plan, *, prepared=None: barrier
+        if actual_plan is plan and prepared is None
+        else pytest.fail("wrong barrier input"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_release_watchdog_barrier",
+        lambda actual_plan, actual_barrier: events.append("attest-held")
+        or readiness
+        if actual_plan is plan and actual_barrier is barrier
+        else pytest.fail("wrong held barrier"),
+        raising=False,
+    )
+
+    def core(actual_plan, *, managed_watchdog_readiness=None, **_kwargs):
+        assert actual_plan is plan
+        assert managed_watchdog_readiness is not None
+        assert managed_watchdog_readiness() is readiness
+        assert managed_watchdog_readiness() is readiness
+        return {"status": "accepted"}
+
+    monkeypatch.setattr(cutover, "_run_release_commit_plan_core", core)
+    monkeypatch.setattr(
+        cutover,
+        "_finish_release_watchdog_barrier",
+        lambda actual_plan, actual_barrier: {"status": "released"}
+        if actual_plan is plan and actual_barrier is barrier
+        else pytest.fail("wrong barrier"),
+    )
+
+    result = cutover._run_release_commit_plan(plan)
+
+    assert result["status"] == "accepted"
+    assert result["watchdog_barrier"] == {"status": "released"}
+    assert events == ["attest-held", "attest-held"]
+
+
 def test_release_commit_resumes_after_crash_between_reconcile_and_barrier(
     monkeypatch,
 ):
@@ -11305,6 +11475,185 @@ def test_release_commit_prepares_bootstrap_watchdog_before_state_lock(
         "run-cutover",
         "use-cached-readiness",
         "release-state-lock",
+    ]
+
+
+def test_release_core_uses_barrier_readiness_while_watchdog_is_disabled(
+    monkeypatch,
+):
+    transaction_id = "disabled-watchdog-core-transaction-0001"
+    candidate_identity = {
+        "build_id": "candidate-r47",
+        "selector_generation": 95,
+    }
+    paired_keys = (
+        cutover._BOOTSTRAP_GATEWAY_PLAN_KEYS
+        | cutover._BOOTSTRAP_WATCHDOG_PLAN_KEYS
+        | cutover._BOOTSTRAP_LEGACY_BOUNDARY_PLAN_KEYS
+    )
+    plan = {key: f"unused-{key}" for key in paired_keys}
+    plan.update(
+        {
+            "transaction_id": transaction_id,
+            "transaction_journal": "transaction.json",
+            "expected_candidate_identity": candidate_identity,
+            "last_good_identity": {"build_id": "last-good"},
+            "base_url": "http://127.0.0.1:8787",
+            "signing_key_file": "release-control.key",
+            "timeout_seconds": 1,
+            "interval_seconds": 0.01,
+        }
+    )
+    gateway_binding = {"status": "verified"}
+    gate_intent = {"transaction_id": transaction_id}
+    gate_installed = {
+        "owner_hash": "8" * 64,
+        "payload_sha256": "9" * 64,
+    }
+    drain_intent = {"transaction_id": transaction_id}
+    journal = {
+        "rollback_receipt": {},
+        "phases": {
+            "gateway_last_good_attested": {"status": "verified"},
+            "candidate_gateway_accepted": {"binding": gateway_binding},
+            "pair_gate_install_intent": gate_intent,
+            "pair_gate_installed": gate_installed,
+            "gateway_drain_intent": {"intent": drain_intent},
+        },
+    }
+    readiness_receipts = [
+        {"status": "verified-disabled-barrier", "sequence": 1},
+        {"status": "verified-disabled-barrier", "sequence": 2},
+        {"status": "verified-disabled-barrier", "sequence": 3},
+    ]
+    readiness_calls = []
+    events = []
+    monkeypatch.setattr(
+        cutover,
+        "_reconcile_cutover_journal",
+        lambda _plan: copy.deepcopy(journal),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootstrap_rollback_context",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_release_control_client",
+        lambda *_args, **_kwargs: (
+            lambda: {"status": "inspected"},
+            lambda *_args, **_kwargs: {"status": "unused"},
+            transaction_id,
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_release_control_key",
+        lambda _path: b"test-release-control-key",
+    )
+    monkeypatch.setattr(
+        cutover,
+        "read_transaction_journal",
+        lambda *_args, **_kwargs: copy.deepcopy(journal),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_complete_candidate_gateway_transition",
+        lambda *_args, **_kwargs: {"gateway": gateway_binding},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_install_or_adopt_pair_open_gate",
+        lambda *_args, **_kwargs: copy.deepcopy(gate_installed),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_expected_agent_pair_gate_receipt",
+        lambda _intent, *, active: {"active": active},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_clear_legacy_gateway_drain_marker",
+        lambda _plan, actual_intent: {"status": "cleared"}
+        if actual_intent == drain_intent
+        else pytest.fail("wrong drain intent"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda *_args, **kwargs: {
+            "health": {
+                "drain": {"pair_open_gate": kwargs["expected_pair_gate"]}
+            }
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_collect_process_binding",
+        lambda *_args, **_kwargs: {"status": "verified"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_require_candidate_binding",
+        lambda binding, **_kwargs: binding,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_require_webui_pair_gate_state",
+        lambda _binding, _intent, *, active: {"active": active},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_pair_open_gate_release_state",
+        lambda *_args, **_kwargs: "active",
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_release_owned_pair_open_gate",
+        lambda *_args, **_kwargs: events.append("release-gate")
+        or {"status": "released"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_wait_for_expected_binding",
+        lambda *_args, **_kwargs: {"status": "verified"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_watchdog_readiness",
+        lambda _plan: pytest.fail("disabled watchdog cannot attest as active"),
+    )
+
+    def managed_readiness():
+        receipt = readiness_receipts[len(readiness_calls)]
+        readiness_calls.append(receipt)
+        events.append(f"readiness-{receipt['sequence']}")
+        return receipt
+
+    def run_cutover(**kwargs):
+        prepared = kwargs["prepare_pair_before_commit"](candidate_identity)
+        opened = kwargs["open_pair_after_promotion"](candidate_identity)
+        kwargs["release_pair_after_acceptance"](
+            candidate_identity,
+            gate_installed,
+        )
+        assert prepared["pre_open"] == readiness_receipts[0]
+        assert opened["open"]["live_readiness"] == readiness_receipts[1]
+        return {"status": "accepted"}
+
+    monkeypatch.setattr(cutover, "run_release_control_cutover", run_cutover)
+
+    assert cutover._run_release_commit_plan_core(
+        plan,
+        managed_watchdog_readiness=managed_readiness,
+    ) == {"status": "accepted"}
+    assert readiness_calls == readiness_receipts
+    assert events == [
+        "readiness-1",
+        "readiness-2",
+        "readiness-3",
+        "release-gate",
     ]
 
 
