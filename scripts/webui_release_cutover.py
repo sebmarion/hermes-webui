@@ -7340,6 +7340,7 @@ def _run_release_commit_plan(
             return copy.deepcopy(prepared_bootstrap_pair)
 
         core_bootstrap_prepare_pair = use_prepared_bootstrap_pair
+    _reconcile_cutover_journal(plan)
     barrier = _begin_release_watchdog_barrier(
         plan,
         prepared=watchdog_prepared,
