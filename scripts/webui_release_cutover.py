@@ -6525,6 +6525,27 @@ def _bootstrap_rollback_context(
     }
 
 
+def _ensure_gateway_last_good_attested(plan: dict, journal: dict) -> dict:
+    phases = journal.get("phases") if isinstance(journal, dict) else None
+    if not isinstance(phases, dict):
+        raise ReleaseBuildError("cutover journal phases are invalid")
+    if (
+        "gateway_last_good_attested" not in phases
+        and "rollback_started" not in phases
+    ):
+        gateway_last_good = _attest_managed_gateway_binding(
+            plan,
+            plan["last_good_identity"],
+        )
+        return record_transaction_phase(
+            plan["transaction_journal"],
+            transaction_id=plan["transaction_id"],
+            phase="gateway_last_good_attested",
+            receipt={"binding": gateway_last_good},
+        )
+    return journal
+
+
 def _run_release_commit_plan_core(
     plan: dict,
     *,
@@ -6554,23 +6575,8 @@ def _run_release_commit_plan_core(
             "release commit requires the complete paired safety transaction"
         )
     journal = _reconcile_cutover_journal(plan)
-    phases = journal["phases"]
+    journal = _ensure_gateway_last_good_attested(plan, journal)
     bootstrap_rollback = _bootstrap_rollback_context(plan, journal)
-    if (
-        "gateway_last_good_attested" not in phases
-        and "rollback_started" not in phases
-    ):
-        gateway_last_good = _attest_managed_gateway_binding(
-            plan,
-            plan["last_good_identity"],
-        )
-        journal = record_transaction_phase(
-            plan["transaction_journal"],
-            transaction_id=plan["transaction_id"],
-            phase="gateway_last_good_attested",
-            receipt={"binding": gateway_last_good},
-        )
-        phases = journal["phases"]
     inspect_control, send_control, client_transaction = _release_control_client(
         plan["base_url"],
         _read_release_control_key(plan["signing_key_file"]),
@@ -7340,7 +7346,8 @@ def _run_release_commit_plan(
             return copy.deepcopy(prepared_bootstrap_pair)
 
         core_bootstrap_prepare_pair = use_prepared_bootstrap_pair
-    _reconcile_cutover_journal(plan)
+    journal = _reconcile_cutover_journal(plan)
+    _ensure_gateway_last_good_attested(plan, journal)
     barrier = _begin_release_watchdog_barrier(
         plan,
         prepared=watchdog_prepared,

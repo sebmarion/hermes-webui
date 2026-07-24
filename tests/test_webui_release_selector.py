@@ -10980,6 +10980,12 @@ def test_release_commit_reports_watchdog_barrier_finish_failure(monkeypatch):
     )
     monkeypatch.setattr(
         cutover,
+        "_ensure_gateway_last_good_attested",
+        lambda _plan, journal: journal,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        cutover,
         "_begin_release_watchdog_barrier",
         lambda *_args, **_kwargs: {"status": "held"},
     )
@@ -11008,6 +11014,47 @@ def test_release_commit_reports_watchdog_barrier_finish_failure(monkeypatch):
         cutover._run_release_commit_plan({})
 
 
+def test_gateway_last_good_attestation_is_idempotent_before_barrier(monkeypatch):
+    plan = {
+        "transaction_id": "gateway-before-barrier-transaction-0001",
+        "transaction_journal": "/tmp/gateway-before-barrier.json",
+        "last_good_identity": {"build_id": "last-good"},
+    }
+    journal = {"phases": {"staged": {}, "plist_installed": {}}}
+    binding = {"status": "verified", "build_id": "last-good"}
+    calls = {"attest": 0, "record": 0}
+
+    def attest(actual_plan, identity):
+        assert actual_plan is plan
+        assert identity == plan["last_good_identity"]
+        calls["attest"] += 1
+        return binding
+
+    def record(path, *, transaction_id, phase, receipt):
+        assert path == plan["transaction_journal"]
+        assert transaction_id == plan["transaction_id"]
+        assert phase == "gateway_last_good_attested"
+        assert receipt == {"binding": binding}
+        calls["record"] += 1
+        return {
+            "phases": {
+                **journal["phases"],
+                phase: receipt,
+            }
+        }
+
+    monkeypatch.setattr(cutover, "_attest_managed_gateway_binding", attest)
+    monkeypatch.setattr(cutover, "record_transaction_phase", record)
+
+    attested = cutover._ensure_gateway_last_good_attested(plan, journal)
+    assert cutover._ensure_gateway_last_good_attested(plan, attested) == attested
+    assert cutover._ensure_gateway_last_good_attested(
+        plan,
+        {"phases": {"rollback_started": {}}},
+    ) == {"phases": {"rollback_started": {}}}
+    assert calls == {"attest": 1, "record": 1}
+
+
 def test_release_commit_reconciles_journal_before_watchdog_barrier(monkeypatch):
     plan = {"transaction_id": "journal-before-barrier-transaction-0001"}
     barrier = {"status": "held"}
@@ -11021,7 +11068,10 @@ def test_release_commit_reconciles_journal_before_watchdog_barrier(monkeypatch):
     def begin(actual_plan, *, prepared=None):
         assert actual_plan is plan
         assert prepared is None
-        assert events == ["reconcile-journal"]
+        assert events == [
+            "reconcile-journal",
+            "attest-last-good-gateway",
+        ]
         events.append("begin-watchdog-barrier")
         return barrier
 
@@ -11037,6 +11087,17 @@ def test_release_commit_reconciles_journal_before_watchdog_barrier(monkeypatch):
         return {"status": "released"}
 
     monkeypatch.setattr(cutover, "_reconcile_cutover_journal", reconcile)
+    monkeypatch.setattr(
+        cutover,
+        "_ensure_gateway_last_good_attested",
+        lambda actual_plan, journal: events.append(
+            "attest-last-good-gateway"
+        )
+        or journal
+        if actual_plan is plan
+        else pytest.fail("wrong plan"),
+        raising=False,
+    )
     monkeypatch.setattr(cutover, "_begin_release_watchdog_barrier", begin)
     monkeypatch.setattr(cutover, "_run_release_commit_plan_core", core)
     monkeypatch.setattr(cutover, "_finish_release_watchdog_barrier", finish)
@@ -11049,6 +11110,7 @@ def test_release_commit_reconciles_journal_before_watchdog_barrier(monkeypatch):
     }
     assert events == [
         "reconcile-journal",
+        "attest-last-good-gateway",
         "begin-watchdog-barrier",
         "run-cutover",
         "finish-watchdog-barrier",
@@ -11060,7 +11122,13 @@ def test_release_commit_resumes_after_crash_between_reconcile_and_barrier(
 ):
     plan = {"transaction_id": "journal-before-barrier-crash-transaction-0001"}
     barrier = {"status": "held"}
-    calls = {"reconcile": 0, "begin": 0, "core": 0, "finish": 0}
+    calls = {
+        "reconcile": 0,
+        "attest_gateway": 0,
+        "begin": 0,
+        "core": 0,
+        "finish": 0,
+    }
 
     def reconcile(actual_plan):
         assert actual_plan is plan
@@ -11087,6 +11155,18 @@ def test_release_commit_resumes_after_crash_between_reconcile_and_barrier(
         return {"status": "released"}
 
     monkeypatch.setattr(cutover, "_reconcile_cutover_journal", reconcile)
+    monkeypatch.setattr(
+        cutover,
+        "_ensure_gateway_last_good_attested",
+        lambda actual_plan, journal: calls.__setitem__(
+            "attest_gateway",
+            calls["attest_gateway"] + 1,
+        )
+        or journal
+        if actual_plan is plan
+        else pytest.fail("wrong plan"),
+        raising=False,
+    )
     monkeypatch.setattr(cutover, "_begin_release_watchdog_barrier", begin)
     monkeypatch.setattr(cutover, "_run_release_commit_plan_core", core)
     monkeypatch.setattr(cutover, "_finish_release_watchdog_barrier", finish)
@@ -11103,6 +11183,7 @@ def test_release_commit_resumes_after_crash_between_reconcile_and_barrier(
     assert result["watchdog_barrier"] == {"status": "released"}
     assert calls == {
         "reconcile": 2,
+        "attest_gateway": 2,
         "begin": 2,
         "core": 1,
         "finish": 1,
@@ -11169,6 +11250,17 @@ def test_release_commit_prepares_bootstrap_watchdog_before_state_lock(
         if actual_plan is plan
         else pytest.fail("wrong plan"),
     )
+    monkeypatch.setattr(
+        cutover,
+        "_ensure_gateway_last_good_attested",
+        lambda actual_plan, journal: events.append(
+            "attest-last-good-gateway"
+        )
+        or journal
+        if actual_plan is plan
+        else pytest.fail("wrong plan"),
+        raising=False,
+    )
     monkeypatch.setattr(cutover, "_begin_release_watchdog_barrier", begin)
     monkeypatch.setattr(cutover, "_run_release_commit_plan_core", core)
     monkeypatch.setattr(
@@ -11190,6 +11282,7 @@ def test_release_commit_prepares_bootstrap_watchdog_before_state_lock(
     assert events == [
         "prepare-watchdog",
         "reconcile-journal",
+        "attest-last-good-gateway",
         "acquire-state-lock",
         "run-cutover",
         "use-cached-readiness",
