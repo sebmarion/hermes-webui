@@ -1986,6 +1986,13 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   requires the durable pair-commit intent. Missing controls, another
   transaction, a changed journal identity, or any selector bytes that cannot
   reconstruct the staged hash still fail closed.
+- Release-journal reconciliation is likewise phase-aware: staged and activated
+  states retain the previous last-good build, while a promoted state has the
+  candidate as both current and last-good. Promoted reconciliation requires an
+  exact journal candidate identity, durable pair-commit intent, full equality
+  between the live and journaled promoted selector, the expected post-promotion
+  generation, and the sealed candidate release record. It never recreates a
+  missing journal from an already-promoted selector.
 
 This is a bounded single-operator-host contract. Same-FD/path, inode, mode,
 ownership, link-count, and compare-before-replace checks fail closed for

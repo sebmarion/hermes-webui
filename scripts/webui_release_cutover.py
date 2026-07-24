@@ -6040,22 +6040,41 @@ def _reconcile_cutover_journal(
     staged_evidence: dict | None = None,
 ) -> dict:
     selector_attestation = _selector_state_attestation(plan)
-    candidate_id = plan["expected_candidate_identity"]["build_id"]
+    candidate = plan["expected_candidate_identity"]
+    candidate_id = candidate["build_id"]
     last_good_id = plan["last_good_identity"]["build_id"]
-    if selector_attestation["last_good"] != last_good_id:
-        raise ReleaseBuildError("selector last-good identity changed")
+    if (
+        not isinstance(candidate_id, str)
+        or not candidate_id
+        or not isinstance(last_good_id, str)
+        or not last_good_id
+        or candidate_id == last_good_id
+    ):
+        raise ReleaseBuildError("cutover selector identities are invalid")
     selector_tuple = (
         selector_attestation["current"],
         selector_attestation["candidate"],
         selector_attestation["pending_transaction_id"],
+        selector_attestation["last_good"],
     )
     allowed = {
-        (last_good_id, candidate_id, plan["transaction_id"]),
-        (candidate_id, candidate_id, plan["transaction_id"]),
-        (candidate_id, None, None),
-        (last_good_id, None, None),
+        (
+            last_good_id,
+            candidate_id,
+            plan["transaction_id"],
+            last_good_id,
+        ): "staged",
+        (
+            candidate_id,
+            candidate_id,
+            plan["transaction_id"],
+            last_good_id,
+        ): "activated",
+        (candidate_id, None, None, candidate_id): "promoted",
+        (last_good_id, None, None, last_good_id): "last-good",
     }
-    if selector_tuple not in allowed:
+    selector_phase = allowed.get(selector_tuple)
+    if selector_phase is None:
         raise ReleaseBuildError("selector state cannot reconcile cutover journal")
     managed_plist_sha256 = sha256_file(Path(plan["managed_plist"]))
     rollback_plist_path = Path(plan["bootstrap_rollback_plist"])
@@ -6076,8 +6095,12 @@ def _reconcile_cutover_journal(
             plan["transaction_journal"],
             transaction_id=plan["transaction_id"],
         )
-    except ReleaseBuildError as exc:
-        if "unreadable" not in str(exc):
+    except (ReleaseBuildError, OSError) as exc:
+        if selector_phase == "promoted":
+            raise ReleaseBuildError(
+                "promoted selector durable journal is unavailable"
+            ) from exc
+        if not isinstance(exc, ReleaseBuildError) or "unreadable" not in str(exc):
             raise
         journal = initialize_transaction_journal(
             plan["transaction_journal"],
@@ -6092,12 +6115,67 @@ def _reconcile_cutover_journal(
                 "state_snapshot_sha256": snapshot_sha256,
             },
         )
+    if journal["expected_candidate_identity"] != candidate:
+        raise ReleaseBuildError("transaction journal candidate identity mismatch")
+    if selector_phase == "promoted":
+        phases = journal["phases"]
+        durable_promoted = (
+            phases.get("promoted", {})
+            .get("promotion", {})
+            .get("selector_and_cli", {})
+            .get("selector")
+        )
+        live_selector = release_selector.read_selector_state(
+            plan["selector_state"],
+            lock_path=plan["selector_lock"],
+        )
+        live_projection = {
+            field: live_selector.get(field)
+            for field in (
+                "generation",
+                "current",
+                "candidate",
+                "pending_transaction_id",
+                "last_good",
+            )
+        }
+        attested_projection = {
+            field: selector_attestation.get(field)
+            for field in live_projection
+        }
+        startup_generation = candidate.get("selector_generation")
+        if live_projection != attested_projection:
+            raise DrainIdentityMismatch(
+                "promoted selector changed during journal reconciliation"
+            )
+        if (
+            "pair_commit_intent" not in phases
+            or live_selector != durable_promoted
+            or not isinstance(startup_generation, int)
+            or isinstance(startup_generation, bool)
+            or live_selector["generation"] != startup_generation + 1
+            or live_selector["releases"].get(candidate_id)
+            != _release_record_from_identity(candidate)
+        ):
+            raise DrainIdentityMismatch(
+                "promoted selector does not match durable transaction"
+            )
     phases = journal["phases"]
     if "staged" not in phases:
         if selector_tuple not in {
-            (last_good_id, candidate_id, plan["transaction_id"]),
-            (candidate_id, candidate_id, plan["transaction_id"]),
-            (candidate_id, None, None),
+            (
+                last_good_id,
+                candidate_id,
+                plan["transaction_id"],
+                last_good_id,
+            ),
+            (
+                candidate_id,
+                candidate_id,
+                plan["transaction_id"],
+                last_good_id,
+            ),
+            (candidate_id, None, None, candidate_id),
         }:
             raise ReleaseBuildError("candidate stage is not externally attested")
         staged_receipt = {
@@ -6128,7 +6206,12 @@ def _reconcile_cutover_journal(
         "old_committed" in phases
         and "selection_activated" not in phases
         and selector_tuple
-        == (candidate_id, candidate_id, plan["transaction_id"])
+        == (
+            candidate_id,
+            candidate_id,
+            plan["transaction_id"],
+            last_good_id,
+        )
     ):
         journal = record_transaction_phase(
             plan["transaction_journal"],

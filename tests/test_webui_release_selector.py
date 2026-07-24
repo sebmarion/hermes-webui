@@ -8848,6 +8848,323 @@ def test_pre_managed_control_resume_adopts_durably_promoted_selector(
         )
 
 
+def test_reconcile_cutover_journal_accepts_exact_durable_promotion(
+    monkeypatch,
+    tmp_path,
+):
+    candidate = {
+        "build_id": "candidate",
+        "commit": "d" * 40,
+        "tree": "e" * 40,
+        "manifest_sha256": "f" * 64,
+        "selector_generation": 2,
+        "startup_fenced": True,
+        "startup_transaction_id": "reconcile-promoted-transaction-0001",
+    }
+    plan = {
+        "transaction_id": candidate["startup_transaction_id"],
+        "expected_candidate_identity": candidate,
+        "last_good_identity": {"build_id": "last-good"},
+        "selector_state": str(tmp_path / "selector-state.json"),
+        "selector_lock": str(tmp_path / "selector-state.lock"),
+        "managed_plist": str(tmp_path / "managed.plist"),
+        "bootstrap_rollback_plist": str(tmp_path / "rollback.plist"),
+        "installed_plist": str(tmp_path / "installed.plist"),
+        "snapshot_manifest": str(tmp_path / "snapshot.json"),
+        "transaction_journal": str(tmp_path / "transaction.json"),
+        "cli_old_target": str(tmp_path / "legacy-hermes"),
+    }
+    promoted_state = {
+        "version": 2,
+        "generation": 3,
+        "release_root": str(tmp_path / "releases"),
+        "current": "candidate",
+        "last_good": "candidate",
+        "candidate": None,
+        "pending_transaction_id": None,
+        "bootstrap_fallback": "last-good",
+        "releases": {
+            "last-good": {
+                "commit": "a" * 40,
+                "tree": "b" * 40,
+                "manifest_sha256": "c" * 64,
+            },
+            "candidate": {
+                "commit": "d" * 40,
+                "tree": "e" * 40,
+                "manifest_sha256": "f" * 64,
+            },
+        },
+    }
+    journal = {
+        "expected_candidate_identity": candidate,
+        "rollback_receipt": {},
+        "phases": {
+            "staged": {"status": "recorded"},
+            "plist_installed": {"status": "recorded"},
+            "old_fenced": {"status": "recorded"},
+            "old_committed": {"status": "recorded"},
+            "selection_activated": {"status": "recorded"},
+            "old_stopped": {"status": "recorded"},
+            "replacement_proved": {"status": "recorded"},
+            "candidate_fenced_health_proved": {"status": "recorded"},
+            "pair_ready": {"status": "recorded"},
+            "pair_commit_intent": {"status": "recorded"},
+            "promoted": {
+                "promotion": {
+                    "selector_and_cli": {"selector": promoted_state},
+                }
+            },
+        },
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_selector_state_attestation",
+        lambda _plan: {
+            "status": "verified",
+            "transaction_id": plan["transaction_id"],
+            "generation": promoted_state["generation"],
+            "current": promoted_state["current"],
+            "candidate": None,
+            "pending_transaction_id": None,
+            "last_good": promoted_state["last_good"],
+        },
+    )
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: copy.deepcopy(promoted_state),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "sha256_file",
+        lambda path: (
+            "1" * 64
+            if Path(path) == Path(plan["managed_plist"])
+            else "2" * 64
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_installed_plist_attestation",
+        lambda _plan: {"plist_sha256": "1" * 64},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_json_object",
+        lambda *_args, **_kwargs: {"snapshot_id": "snapshot"},
+    )
+    monkeypatch.setattr(cutover, "verify_state_snapshot", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        cutover,
+        "read_transaction_journal",
+        lambda *_args, **_kwargs: copy.deepcopy(journal),
+    )
+
+    assert cutover._reconcile_cutover_journal(plan) == journal
+
+    journal["phases"].pop("pair_commit_intent")
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="promoted selector does not match durable transaction",
+    ):
+        cutover._reconcile_cutover_journal(plan)
+
+    journal["phases"]["pair_commit_intent"] = {"status": "recorded"}
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: {
+            **copy.deepcopy(promoted_state),
+            "generation": promoted_state["generation"] + 1,
+        },
+    )
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="promoted selector changed during journal reconciliation",
+    ):
+        cutover._reconcile_cutover_journal(plan)
+
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: copy.deepcopy(promoted_state),
+    )
+    journal["expected_candidate_identity"] = {
+        **candidate,
+        "tree": "0" * 40,
+    }
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="transaction journal candidate identity mismatch",
+    ):
+        cutover._reconcile_cutover_journal(plan)
+
+    journal["expected_candidate_identity"] = candidate
+
+    def unreadable_journal(*_args, **_kwargs):
+        raise cutover.ReleaseBuildError("transaction journal is unreadable")
+
+    monkeypatch.setattr(
+        cutover,
+        "read_transaction_journal",
+        unreadable_journal,
+    )
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="promoted selector durable journal is unavailable",
+    ):
+        cutover._reconcile_cutover_journal(plan)
+
+    def journal_io_error(*_args, **_kwargs):
+        raise OSError("journal lock unavailable")
+
+    monkeypatch.setattr(
+        cutover,
+        "read_transaction_journal",
+        journal_io_error,
+    )
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="promoted selector durable journal is unavailable",
+    ):
+        cutover._reconcile_cutover_journal(plan)
+
+    monkeypatch.setattr(
+        cutover,
+        "read_transaction_journal",
+        lambda *_args, **_kwargs: copy.deepcopy(journal),
+    )
+    plan["last_good_identity"] = {"build_id": "candidate"}
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="cutover selector identities are invalid",
+    ):
+        cutover._reconcile_cutover_journal(plan)
+
+
+@pytest.mark.parametrize("selector_phase", ["staged", "activated", "last-good"])
+def test_reconcile_cutover_journal_preserves_pre_promotion_states(
+    monkeypatch,
+    tmp_path,
+    selector_phase,
+):
+    transaction_id = "reconcile-pre-promotion-transaction-0001"
+    candidate = {
+        "build_id": "candidate",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    plan = {
+        "transaction_id": transaction_id,
+        "expected_candidate_identity": candidate,
+        "last_good_identity": {"build_id": "last-good"},
+        "managed_plist": str(tmp_path / "managed.plist"),
+        "bootstrap_rollback_plist": str(tmp_path / "rollback.plist"),
+        "installed_plist": str(tmp_path / "installed.plist"),
+        "snapshot_manifest": str(tmp_path / "snapshot.json"),
+        "transaction_journal": str(tmp_path / "transaction.json"),
+        "cli_old_target": str(tmp_path / "legacy-hermes"),
+    }
+    states = {
+        "staged": {
+            "generation": 1,
+            "current": "last-good",
+            "candidate": "candidate",
+            "pending_transaction_id": transaction_id,
+            "last_good": "last-good",
+        },
+        "activated": {
+            "generation": 2,
+            "current": "candidate",
+            "candidate": "candidate",
+            "pending_transaction_id": transaction_id,
+            "last_good": "last-good",
+        },
+        "last-good": {
+            "generation": 0,
+            "current": "last-good",
+            "candidate": None,
+            "pending_transaction_id": None,
+            "last_good": "last-good",
+        },
+    }
+    selector_attestation = {
+        "status": "verified",
+        "transaction_id": transaction_id,
+        **states[selector_phase],
+    }
+    journal = {
+        "expected_candidate_identity": candidate,
+        "rollback_receipt": {},
+        "phases": {
+            "staged": {"status": "recorded"},
+            "plist_installed": {"status": "recorded"},
+        },
+    }
+    if selector_phase == "activated":
+        journal["phases"]["old_committed"] = {
+            "identity": {
+                "pid": 123,
+                "pid_start_token": "old-start",
+            }
+        }
+    active_journal = copy.deepcopy(journal)
+    monkeypatch.setattr(
+        cutover,
+        "_selector_state_attestation",
+        lambda _plan: copy.deepcopy(selector_attestation),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "sha256_file",
+        lambda path: (
+            "1" * 64
+            if Path(path) == Path(plan["managed_plist"])
+            else "2" * 64
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_installed_plist_attestation",
+        lambda _plan: {"plist_sha256": "1" * 64},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_json_object",
+        lambda *_args, **_kwargs: {"snapshot_id": "snapshot"},
+    )
+    monkeypatch.setattr(cutover, "verify_state_snapshot", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        cutover,
+        "read_transaction_journal",
+        lambda *_args, **_kwargs: copy.deepcopy(active_journal),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_pid_start_token",
+        lambda _pid: "old-start",
+    )
+    monkeypatch.setattr(cutover, "_launchd_pid", lambda _plan: 123)
+
+    def record_phase(*_args, phase, receipt, **_kwargs):
+        active_journal["phases"][phase] = receipt
+        return copy.deepcopy(active_journal)
+
+    monkeypatch.setattr(cutover, "record_transaction_phase", record_phase)
+
+    reconciled = cutover._reconcile_cutover_journal(plan)
+    if selector_phase == "activated":
+        assert reconciled["phases"]["selection_activated"] == {
+            "selection": {
+                "generation": selector_attestation["generation"],
+                "external_state_reconciled": True,
+            }
+        }
+    else:
+        assert reconciled == journal
+
+
 def _process_checkpoint_plan(tmp_path: Path) -> tuple[dict, Path]:
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir(mode=0o700)

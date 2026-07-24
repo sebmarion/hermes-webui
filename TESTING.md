@@ -1650,7 +1650,10 @@ losing rollback authority, while any command, executable, or argv drift still
 fails closed. Resume tests prove that the same transaction may adopt its
 durably activated or promoted selector only when inverse reconstruction
 matches the exact staged selector receipt; foreign mutation and incomplete
-control sets remain rejected.
+control sets remain rejected. Journal-reconciliation tests also resume an
+exact durable promotion while rejecting a missing pair-commit intent, a
+changed live selector, a changed candidate identity, and an unavailable
+promoted journal.
 
 
 ---
