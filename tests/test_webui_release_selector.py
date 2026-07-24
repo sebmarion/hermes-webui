@@ -1954,6 +1954,133 @@ def test_gateway_launchd_transform_binds_immutable_agent_runtime_and_routing(tmp
     assert "VIRTUAL_ENV" not in environment
 
 
+def test_gateway_launchd_transform_rebinds_exact_managed_gateway_shape(tmp_path):
+    release = _managed_release(tmp_path)
+    identity = {
+        **selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        ),
+        "selector_generation": 8,
+    }
+    transaction_id = "managed-release-transaction-0000000001"
+    prior_shim = tmp_path / "control" / "hermes-prior"
+    candidate_shim = tmp_path / "control" / "hermes-candidate"
+    _write(prior_shim, "#!/bin/sh\nexit 0\n")
+    _write(candidate_shim, "#!/bin/sh\nexit 0\n")
+    _chmod(prior_shim, 0o555)
+    _chmod(candidate_shim, 0o555)
+    routing = {
+        "HERMES_WEBUI_DEFAULT_PROVIDER": "openai-codex",
+        "HERMES_WEBUI_DEFAULT_MODEL": "gpt-5.5",
+        "HERMES_WEBUI_HOST": "127.0.0.1",
+        "HERMES_WEBUI_PORT": "8787",
+    }
+    original = {
+        "Label": "ai.hermes.gateway",
+        "ProgramArguments": [
+            str(prior_shim),
+            "gateway",
+            "run",
+            "--replace",
+        ],
+        "WorkingDirectory": "/prior/immutable/agent",
+        "EnvironmentVariables": {
+            **routing,
+            "HERMES_RELEASE_TRANSACTION_ID": (
+                "prior-managed-transaction-000000001"
+            ),
+            "HERMES_RELEASE_PAIR_ID": "prior-pair",
+            "PYTHONHOME": "/prior/runtime",
+            "PYTHONPATH": "/prior/agent",
+        },
+    }
+
+    transformed = cutover.transform_gateway_launchd_target(
+        original,
+        expected_label="ai.hermes.gateway",
+        expected_old_program=str(prior_shim),
+        managed_cli_shim=str(candidate_shim),
+        release_identity=identity,
+        managed_routing_environment=routing,
+        release_transaction_id=transaction_id,
+    )
+
+    assert transformed["ProgramArguments"] == [
+        str(candidate_shim),
+        "gateway",
+        "run",
+        "--replace",
+    ]
+    assert transformed["WorkingDirectory"] == identity["agent_source_path"]
+    assert transformed["EnvironmentVariables"][
+        "HERMES_RELEASE_TRANSACTION_ID"
+    ] == transaction_id
+    assert transformed["EnvironmentVariables"][
+        "HERMES_RELEASE_PAIR_ID"
+    ] == selector.release_pair_id(
+        identity,
+        selector_generation=8,
+        transaction_id=transaction_id,
+    )
+
+
+@pytest.mark.parametrize(
+    "managed_arguments",
+    [
+        ["gateway"],
+        ["gateway", "status"],
+        ["other", "run"],
+    ],
+)
+def test_gateway_launchd_transform_rejects_ambiguous_managed_shape(
+    tmp_path,
+    managed_arguments,
+):
+    release = _managed_release(tmp_path)
+    identity = {
+        **selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        ),
+        "selector_generation": 8,
+    }
+    prior_shim = tmp_path / "control" / "hermes-prior"
+    candidate_shim = tmp_path / "control" / "hermes-candidate"
+    _write(prior_shim, "#!/bin/sh\nexit 0\n")
+    _write(candidate_shim, "#!/bin/sh\nexit 0\n")
+    _chmod(prior_shim, 0o555)
+    _chmod(candidate_shim, 0o555)
+
+    with pytest.raises(ValueError, match="gateway launchd"):
+        cutover.transform_gateway_launchd_target(
+            {
+                "Label": "ai.hermes.gateway",
+                "ProgramArguments": [
+                    str(prior_shim),
+                    *managed_arguments,
+                ],
+            },
+            expected_label="ai.hermes.gateway",
+            expected_old_program=str(prior_shim),
+            managed_cli_shim=str(candidate_shim),
+            release_identity=identity,
+            managed_routing_environment={
+                "HERMES_WEBUI_DEFAULT_PROVIDER": "openai-codex",
+                "HERMES_WEBUI_DEFAULT_MODEL": "gpt-5.5",
+                "HERMES_WEBUI_HOST": "127.0.0.1",
+                "HERMES_WEBUI_PORT": "8787",
+            },
+            release_transaction_id=(
+                "managed-release-transaction-0000000001"
+            ),
+        )
+
+
 @pytest.mark.parametrize("mutation", ["wrong-label", "wrong-module", "wrong-program"])
 def test_gateway_launchd_transform_rejects_unattested_legacy_shape(
     tmp_path, mutation

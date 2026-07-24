@@ -433,11 +433,20 @@ def transform_gateway_launchd_target(
     if not isinstance(plist, dict) or plist.get("Label") != expected_label:
         raise ValueError("gateway launchd label does not match")
     arguments = plist.get("ProgramArguments")
+    legacy_shape = (
+        isinstance(arguments, list)
+        and len(arguments) >= 5
+        and arguments[1:5] == ["-m", "hermes_cli.main", "gateway", "run"]
+    )
+    managed_shape = (
+        isinstance(arguments, list)
+        and len(arguments) >= 3
+        and arguments[1:3] == ["gateway", "run"]
+    )
     if (
         not isinstance(arguments, list)
-        or len(arguments) < 5
         or arguments[0] != expected_old_program
-        or arguments[1:4] != ["-m", "hermes_cli.main", "gateway"]
+        or not (legacy_shape or managed_shape)
         or any(not isinstance(argument, str) for argument in arguments)
     ):
         raise ValueError("gateway launchd argv does not match frozen source shape")
@@ -489,7 +498,8 @@ def transform_gateway_launchd_target(
         raise ValueError("gateway managed routing identity is invalid")
     transformed = copy.deepcopy(plist)
     transformed.pop("Program", None)
-    transformed["ProgramArguments"] = [str(shim), *arguments[3:]]
+    gateway_arguments = arguments[3:] if legacy_shape else arguments[1:]
+    transformed["ProgramArguments"] = [str(shim), *gateway_arguments]
     transformed["WorkingDirectory"] = str(release_identity["agent_source_path"])
     environment = _sanitized_managed_environment(
         plist.get("EnvironmentVariables"),
