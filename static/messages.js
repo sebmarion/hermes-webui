@@ -1514,6 +1514,7 @@ async function send(){
         $('msg').value='';autoResize();hideCmdDropdown();return;
       }
       const _agentCmdName=String(_agentCmd&&_agentCmd.name||_parsedCmd&&_parsedCmd.name||'').trim().toLowerCase();
+      const _hostOwnedTurnCommand=['moa','bestplan','bp'].includes(_agentCmdName);
       if(_AGENT_COMMANDS_RUN_ON_WEBUI.has(_agentCmdName)){
         if(!S.session){await newSession();await renderSessionList();}
         S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
@@ -1578,7 +1579,7 @@ async function send(){
         text=_bpArgs;
         _pendingBestplanConfig={count:_bpCount};
       }
-      const _bundleCmd=!_agentCmd&&typeof getBundleCommandMetadata==='function'
+      const _bundleCmd=!_hostOwnedTurnCommand&&!_agentCmd&&typeof getBundleCommandMetadata==='function'
         ? await getBundleCommandMetadata(_parsedCmd.name)
         : null;
       if(_bundleCmd){
@@ -1601,7 +1602,7 @@ async function send(){
       // Skill slash commands: /skill-name loads the skill and sends to agent.
       // Mirrors bundle resolution but for individual skills. Bare /skill-name
       // (no args) is valid — the skill body loads with no user instruction.
-      if(!_agentCmd&&!_bundleCmd){
+      if(!_hostOwnedTurnCommand&&!_agentCmd&&!_bundleCmd){
         const _skillCmd=typeof getSkillCommandMetadata==='function'
           ? await getSkillCommandMetadata(_parsedCmd.name)
           : null;
