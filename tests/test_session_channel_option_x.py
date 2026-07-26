@@ -416,6 +416,13 @@ def test_server_starts_session_channel_reaper():
     assert "stop_session_channel_reaper" in src
 
 
+def test_server_proves_socket_ownership_before_starting_gateway_watcher():
+    src = (REPO_ROOT / "server.py").read_text()
+    bind = src.index("httpd = QuietHTTPServer((HOST, PORT), Handler)")
+    watcher = src.index("from api.gateway_watcher import start_watcher")
+    assert bind < watcher
+
+
 def test_frontend_opens_session_stream():
     js = (REPO_ROOT / "static" / "messages.js").read_text()
     assert "api/session/stream?session_id=" in js

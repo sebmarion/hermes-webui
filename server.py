@@ -633,6 +633,17 @@ def main() -> None:
     DEFAULT_WORKSPACE.mkdir(parents=True, exist_ok=True)
 
     try:
+        from api.plugins import load_plugins
+        load_plugins()
+    except Exception as e:
+        print(f'[!!] WARNING: Plugin loading failed: {e}', flush=True)
+
+    _abort_if_already_serving(HOST, PORT)
+    httpd = QuietHTTPServer((HOST, PORT), Handler)
+
+    # No side-effecting watcher may claim work until this process owns the
+    # listening socket. A second instance must exit without starting consumers.
+    try:
         from api.gateway_watcher import start_watcher
 
         def _start_watcher_safe():
@@ -648,15 +659,6 @@ def main() -> None:
             print('[tip] Gateway watcher still initializing (non-blocking)', flush=True)
     except Exception as e:
         print(f'[!!] WARNING: Gateway watcher failed to start: {e}', flush=True)
-
-    try:
-        from api.plugins import load_plugins
-        load_plugins()
-    except Exception as e:
-        print(f'[!!] WARNING: Plugin loading failed: {e}', flush=True)
-
-    _abort_if_already_serving(HOST, PORT)
-    httpd = QuietHTTPServer((HOST, PORT), Handler)
 
     # Single-instance ownership and bind are proven before any durable wakeup
     # recovery or queue intake can claim work.
