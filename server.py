@@ -914,6 +914,11 @@ def main() -> None:
             else:
                 print('[ok] Agent dependencies installed successfully.', flush=True)
 
+    _abort_if_already_serving(HOST, PORT)
+    httpd = QuietHTTPServer((HOST, PORT), Handler)
+
+    # No side-effecting watcher may claim work until this process owns the
+    # listening socket. A second instance must exit without starting consumers.
     startup_mutators = _prepare_startup_mutators()
     if startup_mutators == "deferred":
         print(
@@ -921,9 +926,6 @@ def main() -> None:
             "state mutators await signed release acceptance.",
             flush=True,
         )
-
-    _abort_if_already_serving(HOST, PORT)
-    httpd = QuietHTTPServer((HOST, PORT), Handler)
 
     from api.config import TLS_ENABLED, TLS_CERT, TLS_KEY
     scheme = 'https' if TLS_ENABLED else 'http'
@@ -985,11 +987,6 @@ def main() -> None:
         except Exception:
             logger.debug("Failed to stop gateway watcher during shutdown")
         try:
-            from api.session_lifecycle import drain_all_on_shutdown
-            drain_all_on_shutdown()
-        except Exception:
-            logger.debug("Failed to drain lifecycle on shutdown", exc_info=True)
-        try:
             from api.background_process import stop_drain_thread
             stop_drain_thread()
         except Exception:
@@ -999,4 +996,11 @@ def main() -> None:
             stop_session_channel_reaper()
         except Exception:
             logger.debug("Failed to stop SessionChannel reaper during shutdown", exc_info=True)
-if __name__ == '__main__': main()
+        try:
+            from api.session_lifecycle import drain_all_on_shutdown
+            drain_all_on_shutdown()
+        except Exception:
+            logger.debug("Failed to drain lifecycle on shutdown", exc_info=True)
+
+if __name__ == '__main__':
+    main()

@@ -11,6 +11,7 @@ import os
 import re
 import time
 import uuid
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
@@ -23,6 +24,38 @@ except ImportError:  # pragma: no cover
 TURN_JOURNAL_DIR_NAME = "_turn_journal"
 _TERMINAL_EVENTS = {"completed", "interrupted"}
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_DELEGATION_RESERVATION_LOCK = threading.RLock()
+
+
+def _process_start_token(pid: int) -> str:
+    try:
+        from api.process_identity import process_start_token
+
+        token = process_start_token(pid)
+        return token if isinstance(token, str) else ""
+    except Exception:
+        return ""
+
+
+def _owner_identity_alive(event: dict | None) -> bool:
+    try:
+        if not isinstance(event, dict):
+            return False
+        pid = int(event.get("owner_pid"))
+        expected_token = str(event.get("owner_pid_start_token") or "")
+        if pid <= 0:
+            return False
+        return bool(expected_token and _process_start_token(pid) == expected_token)
+    except (TypeError, ValueError):
+        return False
+
+
+def _owner_fields() -> dict:
+    pid = os.getpid()
+    token = _process_start_token(pid)
+    if not token:
+        raise RuntimeError("delegation owner start token is unavailable")
+    return {"owner_pid": pid, "owner_pid_start_token": token}
 
 
 def _default_session_dir() -> Path:
@@ -116,6 +149,119 @@ def append_turn_journal_event(
     if journal_dir_was_missing:
         _fsync_directory(path.parent.parent)
     return payload
+
+
+def reserve_delegation_turn(
+    session_id: str,
+    delegation_id: str,
+    *,
+    session_dir: Path | None = None,
+) -> tuple[dict, bool]:
+    """Durably reserve one logical target turn for a delegation id."""
+    key = str(delegation_id or "").strip()
+    if not key:
+        raise ValueError("delegation_id is required")
+    root = Path(session_dir) if session_dir is not None else _default_session_dir()
+    lock_path = root / TURN_JOURNAL_DIR_NAME / f"{session_id}.delegation.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _DELEGATION_RESERVATION_LOCK:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(fd, "r+") as lock_file:
+            with _journal_file_lock(lock_file):
+                journal = read_turn_journal(session_id, session_dir=root)
+                matches = [
+                    event for event in journal.get("events") or []
+                    if str((event or {}).get("delegation_id") or "") == key
+                ]
+                latest = matches[-1] if matches else None
+                if (
+                    latest is not None
+                    and str(latest.get("event") or "") == "worker_started"
+                ):
+                    return latest, False
+                if (
+                    latest is not None
+                    and str(latest.get("event") or "") == "delegation_reserved"
+                    and _owner_identity_alive(latest)
+                ):
+                    return latest, False
+                event = append_turn_journal_event(
+                    session_id,
+                    {
+                        "event": "delegation_reserved",
+                        "delegation_id": key,
+                        **_owner_fields(),
+                        "recovered": latest is not None,
+                        "created_at": time.time(),
+                    },
+                    session_dir=root,
+                )
+                return event, True
+
+
+def release_delegation_turn(
+    session_id: str,
+    delegation_id: str,
+    *,
+    reason: str,
+    session_dir: Path | None = None,
+) -> dict:
+    """Durably release a reservation whose target turn did not start."""
+    return append_turn_journal_event(
+        session_id,
+        {
+            "event": "delegation_released",
+            "delegation_id": str(delegation_id),
+            **_owner_fields(),
+            "reason": str(reason),
+        },
+        session_dir=session_dir,
+    )
+
+
+def find_delegation_turn(
+    session_id: str,
+    delegation_id: str,
+    *,
+    session_dir: Path | None = None,
+) -> dict | None:
+    key = str(delegation_id or "").strip()
+    if not key:
+        return None
+    journal = read_turn_journal(session_id, session_dir=session_dir)
+    matches = [
+        event for event in journal.get("events") or []
+        if str((event or {}).get("delegation_id") or "") == key
+    ]
+    latest = matches[-1] if matches else None
+    return (
+        latest
+        if latest is not None
+        and str(latest.get("event") or "") == "worker_started"
+        else None
+    )
+
+
+def mark_delegation_turn_started(
+    session_id: str,
+    delegation_id: str,
+    *,
+    turn_id: str,
+    stream_id: str,
+    session_dir: Path | None = None,
+) -> dict:
+    """Persist the replay boundary only after the provider worker starts."""
+    return append_turn_journal_event(
+        session_id,
+        {
+            "event": "worker_started",
+            "delegation_id": str(delegation_id),
+            "turn_id": str(turn_id),
+            "stream_id": str(stream_id),
+            **_owner_fields(),
+        },
+        session_dir=session_dir,
+    )
 
 
 def read_turn_journal(session_id: str, *, session_dir: Path | None = None) -> dict:

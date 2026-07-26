@@ -297,6 +297,7 @@ _CLIENT_EVENT_RATE_LIMIT_LOCK = threading.Lock()
 _CLIENT_EVENT_RATE_LIMIT_WINDOW_SECONDS = 60
 _CLIENT_EVENT_RATE_LIMIT_MAX = 30
 _CLIENT_EVENT_MAX_BODY_BYTES = 4 * 1024
+_DELEGATION_WORKER_ACCEPT_TIMEOUT_SECONDS = 10.0
 _EXTENSION_SIDECAR_PROXY_MAX_RESPONSE_BYTES = 512 * 1024
 _CLIENT_EVENT_ALLOWED_FIELDS = {
     "event": 64,
@@ -22965,6 +22966,8 @@ def _start_chat_stream_for_session(
     recovery_fingerprint: str | None = None,
     _admission_reservation_id=None,
     _admission_transfer_state=None,
+    delegation_id: str = "",
+    delegation_turn_id: str = "",
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     attachments = attachments or []
@@ -23157,10 +23160,25 @@ def _start_chat_stream_for_session(
                     else {}
                 ),
                 "created_at": s.pending_started_at,
+                **(
+                    {
+                        "delegation_id": str(delegation_id),
+                        "turn_id": str(delegation_turn_id),
+                    }
+                    if delegation_id else {}
+                ),
             },
         )
     except Exception:
         logger.warning("Failed to append submitted turn journal event", exc_info=True)
+        if delegation_id:
+            # The durable delegation id is the exactly-once boundary. Never
+            # launch a provider turn that cannot be found by a fresh process.
+            _clear_stale_stream_state(s)
+            return {
+                "error": "delegation turn journal could not be persisted",
+                "_status": 503,
+            }
         if recovery_claim_token or recovery_fingerprint:
             # Recovery requires a durable reservation before any worker starts.
             # Keep the persisted active/pending owner fail-closed and return an
@@ -23197,13 +23215,114 @@ def _start_chat_stream_for_session(
             worker_kwargs["moa_config"] = moa_config
         if bestplan_config and not backend_is_gateway:
             worker_kwargs["bestplan_config"] = bestplan_config
+
+        worker_ready = threading.Event()
+        worker_start_lock = threading.Lock()
+        worker_start = {
+            "state": "accepted" if not delegation_id else "pending",
+            "event": journal_event,
+            "error": None,
+        }
+
+        def _accept_durable_worker() -> bool:
+            if not delegation_id:
+                return True
+            with worker_start_lock:
+                if worker_start["state"] != "pending":
+                    return worker_start["state"] == "accepted"
+                worker_start["state"] = "accepting"
+            try:
+                from api.turn_journal import mark_delegation_turn_started
+
+                accepted = mark_delegation_turn_started(
+                    s.session_id,
+                    delegation_id,
+                    turn_id=str(
+                        delegation_turn_id
+                        or journal_event.get("turn_id")
+                        or ""
+                    ),
+                    stream_id=stream_id,
+                )
+                with worker_start_lock:
+                    worker_start["event"] = accepted
+                    worker_start["state"] = "accepted"
+                    worker_ready.set()
+                    return True
+            except Exception as exc:
+                with worker_start_lock:
+                    worker_start["state"] = "rejected"
+                    worker_start["error"] = exc
+                    worker_ready.set()
+                logger.exception(
+                    "Failed to persist delegation worker-start boundary"
+                )
+                return False
+
+        if delegation_id:
+            worker_kwargs["worker_accept_callback"] = _accept_durable_worker
+
+        def _durable_worker_target():
+            try:
+                worker_target(
+                    s.session_id,
+                    msg,
+                    model,
+                    workspace,
+                    stream_id,
+                    attachments,
+                    **worker_kwargs,
+                )
+            except Exception as exc:
+                if delegation_id and not worker_ready.is_set():
+                    with worker_start_lock:
+                        if worker_start["state"] == "pending":
+                            worker_start["state"] = "rejected"
+                            worker_start["error"] = exc
+                            worker_ready.set()
+                raise
+            finally:
+                # Test adapters and third-party worker targets may return
+                # without implementing the callback. In that case the target
+                # has already run, so persisting acceptance now is truthful.
+                if delegation_id and not worker_ready.is_set():
+                    _accept_durable_worker()
+
         thr = threading.Thread(
-            target=worker_target,
-            args=(s.session_id, msg, model, workspace, stream_id, attachments),
-            kwargs=worker_kwargs,
+            target=_durable_worker_target if delegation_id else worker_target,
+            args=(
+                ()
+                if delegation_id
+                else (s.session_id, msg, model, workspace, stream_id, attachments)
+            ),
+            kwargs={} if delegation_id else worker_kwargs,
             daemon=True,
         )
         thr.start()
+        if delegation_id:
+            if not worker_ready.wait(
+                timeout=_DELEGATION_WORKER_ACCEPT_TIMEOUT_SECONDS
+            ):
+                with worker_start_lock:
+                    if worker_start["state"] == "pending":
+                        worker_start["state"] = "rejected"
+                        worker_start["error"] = RuntimeError(
+                            "delegation worker acceptance timed out"
+                        )
+                        worker_ready.set()
+            with worker_start_lock:
+                worker_accepted = worker_start["state"] in {
+                    "accepting",
+                    "accepted",
+                }
+                worker_event = worker_start["event"]
+            if not worker_accepted:
+                _clear_stale_stream_state(s)
+                return {
+                    "error": "delegation worker-start boundary could not be persisted",
+                    "_status": 503,
+                }
+            journal_event = worker_event
         _admission_transfer_state["transferred"] = True
     except Exception:
         if not (recovery_claim_token or recovery_fingerprint):
@@ -23359,6 +23478,8 @@ def _start_run(
     recovery_fingerprint: str | None = None,
     _admission_reservation_id=None,
     _admission_transfer_state=None,
+    delegation_id: str = "",
+    delegation_turn_id: str = "",
 ):
     """Shared start-run helper for /api/chat/start and start_session_turn.
 
@@ -23437,6 +23558,8 @@ def _start_run(
                 session_lock_held=session_lock_held,
                 recovery_claim_token=recovery_claim_token,
                 recovery_fingerprint=recovery_fingerprint,
+                delegation_id=delegation_id,
+                delegation_turn_id=delegation_turn_id,
             )
 
         def _legacy_adapter_factory():
@@ -23459,7 +23582,22 @@ def _start_run(
                     provider=model_provider,
                     model=model,
                     source=source,
-                    metadata={"route": route},
+                    metadata={
+                        "route": route,
+                        **({"delegation_id": delegation_id} if delegation_id else {}),
+                        **(
+                            {"delegation_turn_id": delegation_turn_id}
+                            if delegation_turn_id else {}
+                        ),
+                        **(
+                            {"recovery_claim_token": recovery_claim_token}
+                            if recovery_claim_token else {}
+                        ),
+                        **(
+                            {"recovery_fingerprint": recovery_fingerprint}
+                            if recovery_fingerprint else {}
+                        ),
+                    },
                 )
             )
         except NotImplementedError as exc:
@@ -23482,6 +23620,8 @@ def _start_run(
         session_lock_held=session_lock_held,
         recovery_claim_token=recovery_claim_token,
         recovery_fingerprint=recovery_fingerprint,
+        delegation_id=delegation_id,
+        delegation_turn_id=delegation_turn_id,
     )
 
 
@@ -23544,6 +23684,7 @@ def start_session_turn(
     source: str = "process_wakeup",
     _admission_reservation_id=None,
     _admission_transfer_state=None,
+    delegation_id: str = "",
 ):
     """Start a server-side agent turn for ``session_id`` with ``message``.
 
@@ -23719,17 +23860,58 @@ def start_session_turn(
                 }
     if _paused_wakeup_response is not None:
         return _paused_wakeup_response
-    resp = _start_run(
-        s,
-        msg=msg,
-        attachments=[],
-        workspace=workspace,
-        model=model,
-        model_provider=model_provider,
-        normalized_model=normalized_model,
-        source=turn_source,
-        route="start_session_turn",
-    )
+    delegation_turn_id = ""
+    if delegation_id:
+        from api.turn_journal import find_delegation_turn, reserve_delegation_turn
+
+        existing_turn = find_delegation_turn(session_id, delegation_id)
+        if existing_turn is not None:
+            return {
+                "_status": 200,
+                "session_id": str(session_id),
+                "stream_id": str(existing_turn.get("stream_id") or ""),
+                "turn_id": str(existing_turn.get("turn_id") or ""),
+                "idempotent_replay": True,
+            }
+        reservation, inserted = reserve_delegation_turn(session_id, delegation_id)
+        if not inserted:
+            existing_turn = find_delegation_turn(session_id, delegation_id)
+            if existing_turn is not None:
+                return {
+                    "_status": 200,
+                    "session_id": str(session_id),
+                    "stream_id": str(existing_turn.get("stream_id") or ""),
+                    "turn_id": str(existing_turn.get("turn_id") or ""),
+                    "idempotent_replay": True,
+                }
+            return {
+                "error": "delegation turn is already reserved by a live owner",
+                "_status": 409,
+                "delegation_id": str(delegation_id),
+            }
+        delegation_turn_id = str(reservation.get("turn_id") or "")
+    try:
+        resp = _start_run(
+            s,
+            msg=msg,
+            attachments=[],
+            workspace=workspace,
+            model=model,
+            model_provider=model_provider,
+            normalized_model=normalized_model,
+            source=turn_source,
+            route="start_session_turn",
+            delegation_id=str(delegation_id or ""),
+            delegation_turn_id=delegation_turn_id,
+        )
+    except Exception:
+        if delegation_id:
+            from api.turn_journal import release_delegation_turn
+            release_delegation_turn(session_id, delegation_id, reason="start_exception")
+        raise
+    if delegation_id and int((resp or {}).get("_status", 200) or 200) >= 400:
+        from api.turn_journal import release_delegation_turn
+        release_delegation_turn(session_id, delegation_id, reason="start_rejected")
 
     # A durable continuation reconciles a replayed 409 only when the exact
     # stream is registered in this process. Sidecar ownership fields can be
@@ -24291,6 +24473,28 @@ def _handle_chat_start(handler, body, diag=None):
                 return bad(handler, "Session not found", 404)
         diag.stage("normalize_message") if diag else None
         msg = str(body.get("message", "")).strip()
+        recovered_bestplan_config = None
+        if not body.get("bestplan_config"):
+            bestplan_match = re.match(
+                r"^/(?:bestplan|bp)(?:\s+|$)", msg, flags=re.IGNORECASE
+            )
+            if bestplan_match:
+                bestplan_parts = msg[bestplan_match.end():].strip().split()
+                bestplan_count = 3
+                if (
+                    bestplan_parts
+                    and bestplan_parts[0].isascii()
+                    and bestplan_parts[0].isdigit()
+                ):
+                    bestplan_count = int(bestplan_parts.pop(0))
+                msg = " ".join(bestplan_parts).strip()
+                if not msg:
+                    return bad(
+                        handler,
+                        "BestPlan unavailable: provide a task after /bestplan.",
+                        400,
+                    )
+                recovered_bestplan_config = {"count": bestplan_count}
         if not msg:
             return bad(handler, "message is required")
         diag.stage("normalize_attachments") if diag else None
@@ -24333,10 +24537,10 @@ def _handle_chat_start(handler, body, diag=None):
                 moa_config = resolve_moa_config()
             except RuntimeError as e:
                 return bad(handler, str(e), 503)
-        if body.get("bestplan_config"):
+        raw_bestplan = body.get("bestplan_config") or recovered_bestplan_config
+        if raw_bestplan:
             if gateway_chat_enabled:
                 return bad(handler, "BestPlan is unavailable on gateway-backed sessions", 409)
-            raw_bestplan = body.get("bestplan_config")
             if not isinstance(raw_bestplan, dict):
                 return bad(handler, "Invalid BestPlan configuration", 400)
             from agent.bestplan_orchestrator import normalize_count

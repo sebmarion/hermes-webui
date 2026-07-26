@@ -590,6 +590,7 @@ def _run_gateway_chat_streaming(
     profile=None,
     admission_reservation_id=None,
     process_completion_events=None,
+    worker_accept_callback=None,
 ):
     """Bridge a WebUI chat turn through Hermes Gateway's API server.
 
@@ -655,6 +656,29 @@ def _run_gateway_chat_streaming(
         unregister_stream_owner(stream_id)
         release_run_admission(admission_reservation_id)
         return
+    if worker_accept_callback is not None:
+        try:
+            worker_accepted = bool(worker_accept_callback())
+        except Exception:
+            worker_accepted = False
+            logger.exception(
+                "Delegation gateway-worker acceptance callback failed for %s",
+                stream_id,
+            )
+        if not worker_accepted:
+            _settle_process_completion_claims(committed=False)
+            with STREAMS_LOCK:
+                STREAMS.pop(stream_id, None)
+            try:
+                _clear_gateway_pending_state(get_session(session_id), stream_id)
+            except Exception:
+                logger.warning(
+                    "Failed to clear rejected gateway delegation stream state",
+                    exc_info=True,
+                )
+            unregister_active_run(stream_id)
+            unregister_stream_owner(stream_id)
+            return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
     except Exception:
