@@ -24064,6 +24064,28 @@ def _handle_chat_start(handler, body, diag=None):
                 return bad(handler, "Session not found", 404)
         diag.stage("normalize_message") if diag else None
         msg = str(body.get("message", "")).strip()
+        recovered_bestplan_config = None
+        if not body.get("bestplan_config"):
+            bestplan_match = re.match(
+                r"^/(?:bestplan|bp)(?:\s+|$)", msg, flags=re.IGNORECASE
+            )
+            if bestplan_match:
+                bestplan_parts = msg[bestplan_match.end():].strip().split()
+                bestplan_count = 3
+                if (
+                    bestplan_parts
+                    and bestplan_parts[0].isascii()
+                    and bestplan_parts[0].isdigit()
+                ):
+                    bestplan_count = int(bestplan_parts.pop(0))
+                msg = " ".join(bestplan_parts).strip()
+                if not msg:
+                    return bad(
+                        handler,
+                        "BestPlan unavailable: provide a task after /bestplan.",
+                        400,
+                    )
+                recovered_bestplan_config = {"count": bestplan_count}
         if not msg:
             return bad(handler, "message is required")
         diag.stage("normalize_attachments") if diag else None
@@ -24106,10 +24128,10 @@ def _handle_chat_start(handler, body, diag=None):
                 moa_config = resolve_moa_config()
             except RuntimeError as e:
                 return bad(handler, str(e), 503)
-        if body.get("bestplan_config"):
+        raw_bestplan = body.get("bestplan_config") or recovered_bestplan_config
+        if raw_bestplan:
             if gateway_chat_enabled:
                 return bad(handler, "BestPlan is unavailable on gateway-backed sessions", 409)
-            raw_bestplan = body.get("bestplan_config")
             if not isinstance(raw_bestplan, dict):
                 return bad(handler, "Invalid BestPlan configuration", 400)
             from agent.bestplan_orchestrator import normalize_count

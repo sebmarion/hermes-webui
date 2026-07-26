@@ -36,3 +36,14 @@ def test_host_owned_bestplan_does_not_fall_through_to_generic_skill_resolution()
         "if(!_hostOwnedTurnCommand&&!_agentCmd&&!_bundleCmd){"
         in intercept
     )
+
+
+def test_server_recovers_bestplan_routing_from_stale_browser_tabs():
+    routes = (ROOT / "api" / "routes.py").read_text()
+
+    assert 'r"^/(?:bestplan|bp)(?:\\s+|$)"' in routes
+    assert 'recovered_bestplan_config = {"count": bestplan_count}' in routes
+    assert "bestplan_parts[0].isascii()" in routes
+    assert "bestplan_parts[0].isdigit()" in routes
+    assert 'raw_bestplan = body.get("bestplan_config") or recovered_bestplan_config' in routes
+    assert 'msg = " ".join(bestplan_parts).strip()' in routes
