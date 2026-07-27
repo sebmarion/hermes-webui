@@ -7135,6 +7135,32 @@ function _sessionRowsWithActiveEphemeralSession(rows){
   if(!S.session||!S.session.session_id) return rows;
   const sid=S.session.session_id;
   if(rows.some(s=>s&&s.session_id===sid)) return rows;
+  const requestedSid=S.session.requested_session_id;
+  if(typeof requestedSid==='string'&&requestedSid&&requestedSid!==sid){
+    const requestedIndex=rows.findIndex(s=>s&&s.session_id===requestedSid);
+    if(requestedIndex>=0){
+      const requestedRow=rows[requestedIndex];
+      const runtimeFields=[
+        'active_stream_id','pending_user_message','pending_attachments','pending_started_at',
+        'pending_user_source','attention','activity_phase','activity_started_at','activity_heartbeat_at',
+      ];
+      const runtimeOverlay={};
+      for(const field of runtimeFields){
+        if(S.session[field]==null&&requestedRow[field]!=null) runtimeOverlay[field]=requestedRow[field];
+      }
+      const mergedRow={
+        ...S.session,
+        ...runtimeOverlay,
+        session_id:sid,
+        has_pending_user_message:Boolean(S.session.has_pending_user_message||requestedRow.has_pending_user_message),
+        is_streaming:Boolean(S.session.is_streaming||requestedRow.is_streaming),
+        is_working:Boolean(S.session.is_working||requestedRow.is_working),
+      };
+      const mergedRows=rows.slice();
+      mergedRows[requestedIndex]=mergedRow;
+      return mergedRows;
+    }
+  }
   const nowSec=Math.floor(Date.now()/1000);
   const activeRow={
     ...S.session,
