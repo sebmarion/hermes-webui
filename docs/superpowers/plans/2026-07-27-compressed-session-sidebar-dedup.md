@@ -126,7 +126,7 @@ Update `_sessionRowsWithActiveEphemeralSession()` so it:
 
 1. Keeps the existing early return when the canonical active ID is already present.
 2. Finds a cached alias only when `S.session.requested_session_id` is non-empty and differs from the canonical active ID.
-3. Builds the canonical row from alias metadata followed by canonical session metadata.
+3. Starts from canonical session metadata and adds only the enumerated runtime fallbacks from the alias.
 4. Uses the canonical message count and identity.
 5. Carries these live alias fields only when the canonical detail lacks their live value:
    `active_stream_id`, `pending_user_message`, `pending_attachments`,

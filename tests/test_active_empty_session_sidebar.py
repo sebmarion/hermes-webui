@@ -1,9 +1,13 @@
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 SESSIONS_JS = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+NODE = shutil.which("node")
 
 
 def _extract_js_function(src: str, name: str) -> str:
@@ -29,7 +33,9 @@ const rows = {json.dumps(rows)};
 const result = _sessionRowsWithActiveEphemeralSession(rows);
 console.log(JSON.stringify({{ result, rows }}));
 """
-    result = subprocess.run(["node", "-e", script], check=True, text=True, capture_output=True)
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
     return json.loads(result.stdout)
 
 
@@ -45,6 +51,7 @@ def test_active_empty_session_is_injected_into_sidebar_rows():
     assert "rows.some(s=>s&&s.session_id===sid)" in helper
 
 
+@pytest.mark.skipif(NODE is None, reason="node is required for active sidebar helper behavior tests")
 def test_compressed_active_session_replaces_requested_cached_alias_in_place():
     cached_rows = [
         {
@@ -110,6 +117,7 @@ def test_compressed_active_session_replaces_requested_cached_alias_in_place():
     assert payload["rows"] == cached_rows
 
 
+@pytest.mark.skipif(NODE is None, reason="node is required for active sidebar helper behavior tests")
 def test_active_session_without_requested_cached_alias_is_prepended_even_with_same_title():
     cached_rows = [{"session_id": "other", "title": "Shared title", "message_count": 12}]
     active_session = {
@@ -125,6 +133,7 @@ def test_active_session_without_requested_cached_alias_is_prepended_even_with_sa
     assert payload["rows"] == cached_rows
 
 
+@pytest.mark.skipif(NODE is None, reason="node is required for active sidebar helper behavior tests")
 def test_active_session_does_not_normalize_requested_alias_before_matching():
     cached_rows = [{"session_id": "root", "title": "Cached title", "message_count": 116}]
     active_session = {
@@ -140,6 +149,7 @@ def test_active_session_does_not_normalize_requested_alias_before_matching():
     assert payload["rows"] == cached_rows
 
 
+@pytest.mark.skipif(NODE is None, reason="node is required for active sidebar helper behavior tests")
 def test_compressed_alias_contributes_only_explicit_runtime_overlay_fields():
     cached_rows = [
         {
