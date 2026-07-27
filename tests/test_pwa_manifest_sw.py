@@ -57,7 +57,7 @@ class TestServiceWorker:
         src = SW.read_text(encoding="utf-8")
         assert "__WEBUI_VERSION__" in src, (
             "sw.js must contain __WEBUI_VERSION__ placeholder for the server "
-            "handler at /sw.js to replace with WEBUI_VERSION at request time"
+            "handler at /sw.js to replace with WEBUI_ASSET_VERSION at request time"
         )
 
     def test_sw_js_has_no_merge_conflict_markers(self):

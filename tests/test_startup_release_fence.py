@@ -1140,6 +1140,7 @@ def test_fresh_managed_import_and_prepare_do_not_mutate_state_before_accept(
             ),
             "HERMES_WEBUI_RELEASE_PATH": repo_root,
             "HERMES_WEBUI_LAUNCH_MODE": "selector",
+            "HERMES_WEBUI_MANIFEST_SHA256": "a" * 64,
             "HERMES_WEBUI_STARTUP_FENCED": "1",
             "HERMES_WEBUI_STARTUP_TRANSACTION_ID": "t" * 40,
             "HERMES_WEBUI_TEST_NETWORK_BLOCK": "1",

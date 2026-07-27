@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 from pathlib import Path
+import re
 from types import SimpleNamespace
 from urllib.parse import quote
 
@@ -140,6 +141,25 @@ def test_index_shell_and_static_route_use_selected_root(tmp_path, monkeypatch):
     assert traversal.status == 404
 
 
+def test_real_app_shell_uses_exact_asset_cache_version(monkeypatch):
+    _patch_asset_version(monkeypatch)
+    monkeypatch.setattr(
+        api_config, "get_index_html_path", lambda: ROOT / "static" / "index.html"
+    )
+    monkeypatch.setattr(routes, "_INDEX_SHELL_CACHE", {})
+
+    shell = routes._render_index_shell_base()
+    query_versions = re.findall(r"[?&]v=([^\"'&<>\s]+)", shell)
+
+    assert query_versions
+    assert set(query_versions) == {ASSET_DIGEST}
+    assert (
+        f"window.__HERMES_WEBUI_BUNDLE_VERSION__='{ASSET_DIGEST}';" in shell
+    )
+    assert "v=unknown" not in shell
+    assert "__WEBUI_VERSION__" not in shell
+
+
 def test_login_and_service_worker_use_exact_asset_cache_version(monkeypatch):
     _patch_asset_version(monkeypatch)
     monkeypatch.setattr(routes, "_INDEX_SHELL_CACHE", {})
@@ -156,6 +176,17 @@ def test_login_and_service_worker_use_exact_asset_cache_version(monkeypatch):
     assert service_worker.status == 200
     assert f"const CACHE_NAME = 'hermes-shell-{ASSET_DIGEST}';" in sw_body
     assert f"const VQ = '?v={ASSET_DIGEST}';" in sw_body
+    shell_assets = sw_body.split("const SHELL_ASSETS = [", 1)[1].split("];", 1)[0]
+    versioned_paths = re.findall(r"'([^']+)'\s*\+\s*VQ", shell_assets)
+    resolved_versioned_paths = [
+        f"{path}?v={ASSET_DIGEST}" for path in versioned_paths
+    ]
+    assert versioned_paths
+    assert all(
+        path.rsplit("?v=", 1)[1] == ASSET_DIGEST
+        for path in resolved_versioned_paths
+    )
+    assert shell_assets.count("+ VQ") == len(versioned_paths)
     assert "hermes-shell-unknown" not in sw_body
     assert "?v=unknown" not in sw_body
     assert "__WEBUI_VERSION__" not in sw_body

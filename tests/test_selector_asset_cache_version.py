@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+
 import pytest
 
 import api.updates as updates
@@ -70,3 +75,28 @@ def test_non_selector_mode_preserves_product_version(monkeypatch, launch_mode):
 def test_exported_asset_version_is_non_empty():
     assert isinstance(updates.WEBUI_ASSET_VERSION, str)
     assert updates.WEBUI_ASSET_VERSION
+
+
+@pytest.mark.parametrize("digest", [None, "A" * 64])
+def test_invalid_selector_asset_identity_fails_during_server_import(
+    digest,
+):
+    env = os.environ.copy()
+    env["HERMES_WEBUI_LAUNCH_MODE"] = "selector"
+    if digest is None:
+        env.pop("HERMES_WEBUI_MANIFEST_SHA256", None)
+    else:
+        env["HERMES_WEBUI_MANIFEST_SHA256"] = digest
+
+    proc = subprocess.run(
+        [sys.executable, "-c", "import server"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert proc.returncode != 0
+    assert "selector asset cache identity is missing or invalid" in proc.stderr
