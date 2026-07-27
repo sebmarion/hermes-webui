@@ -45,9 +45,10 @@ The resolver follows this order:
 
 1. When `HERMES_WEBUI_LAUNCH_MODE` is `selector` and
    `HERMES_WEBUI_MANIFEST_SHA256` is exactly 64 lowercase hexadecimal
-   characters, return a cache-only token derived from that full immutable
-   manifest hash.
-2. Otherwise return the already-resolved `WEBUI_VERSION`.
+   characters, set `WEBUI_ASSET_VERSION` to that exact full digest.
+2. When selector mode is declared but the digest is missing or malformed,
+   fail startup before the server binds or serves traffic.
+3. Otherwise return the already-resolved `WEBUI_VERSION`.
 
 The selector already validates the release manifest before exec and exports
 its SHA-256 digest. Using the full digest distinguishes rebuilt candidates even
@@ -69,10 +70,11 @@ and model-cache compatibility stamps continue to use `WEBUI_VERSION`.
 
 ## Failure behavior
 
-Missing, malformed, uppercase, or non-selector manifest identity falls back to
-`WEBUI_VERSION`. This preserves all existing launch modes. A malformed selector
-environment therefore remains visible through the existing `unknown` product
-version behavior rather than accepting an untrusted cache token.
+Missing, malformed, or uppercase manifest identity in declared selector mode
+raises a startup error before bind. A selector-managed release may never serve
+with an untrusted or `unknown` cache token. Missing or malformed selector-only
+environment values in every other launch mode fall back to `WEBUI_VERSION`,
+preserving existing Git, Docker, and baked-image behavior.
 
 No runtime file reads, hashing, network calls, or selector-state reads are
 added. Both version constants resolve once at module import.
@@ -83,12 +85,14 @@ Add regression tests before implementation that prove:
 
 - a valid selector manifest digest produces a distinct asset version while
   `WEBUI_VERSION` remains unchanged;
-- two manifest digests produce two different asset versions even for the same
-  product version;
-- malformed, uppercase, missing, and non-selector values fall back to
-  `WEBUI_VERSION`;
+- `WEBUI_ASSET_VERSION` equals the exact full lowercase digest;
+- two manifest digests produce their exact distinct asset versions even for
+  the same product version;
+- malformed, uppercase, and missing values fail startup in selector mode;
+- selector-only values in non-selector modes fall back to `WEBUI_VERSION`;
 - the app shell, login page, and `/sw.js` substitute the asset version rather
-  than the product version; and
+  than the product version, with exact equality across every query token, the
+  service-worker namespace, and its versioned shell-asset list; and
 - existing Git/Docker version-detection tests remain green.
 
 Focused verification uses the repository test runner and covers the version
@@ -101,17 +105,29 @@ Build the immutable candidate from the exact currently running release commit,
 not an older checkout. Preserve the running release as `last-good`.
 
 Before cutover, require a continuous idle drain with no active runs or streams.
-After selector activation, accept the candidate only when:
+Record the expected digest from the selector-validated candidate manifest and
+use that value, not a value reported by the candidate process, as the comparison
+authority.
+
+Poll startup identity and health once per second for at most 60 seconds. Give
+each HTTP acceptance request a three-second connect/response deadline. After
+selector activation, accept the candidate only when:
 
 - `/health` reports the expected managed candidate and healthy admission;
+- `/health.build.manifest_sha256` equals the recorded expected digest;
 - the listener belongs to the new process;
-- `/login` serves a non-`unknown` asset query token;
-- `/sw.js` serves a non-`unknown` cache namespace using the same token;
-- the served token corresponds to the candidate manifest identity; and
+- `/login` serves `static/login.js?v=<expected-digest>` exactly;
+- `/sw.js` serves `hermes-shell-<expected-digest>` exactly and every resolved
+  versioned shell-asset URL uses `?v=<expected-digest>`;
+- neither response contains `unknown` or an unresolved version placeholder; and
 - restart-boundary logs contain no new cache-version or startup failure.
 
-If startup, identity, or HTTP acceptance fails, atomically restore the preserved
-`last-good` release and repeat the bounded health read-back.
+If any startup, identity, or HTTP condition fails or exceeds its deadline,
+atomically restore the preserved `last-good` release. Poll rollback
+identity/health once per second for at most 60 seconds and apply the same
+three-second deadline to each HTTP read-back. A rollback that misses its bounded
+read-back remains a visible deployment failure and is never reported as
+successful.
 
 ## Documentation
 
