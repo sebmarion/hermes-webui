@@ -7141,12 +7141,16 @@ function _sessionRowsWithActiveEphemeralSession(rows){
     if(requestedIndex>=0){
       const requestedRow=rows[requestedIndex];
       const runtimeFields=[
-        'active_stream_id','pending_user_message','pending_attachments','pending_started_at',
+        'active_stream_id','pending_user_message','pending_started_at',
         'pending_user_source','attention','activity_phase','activity_started_at','activity_heartbeat_at',
       ];
       const runtimeOverlay={};
       for(const field of runtimeFields){
         if(S.session[field]==null&&requestedRow[field]!=null) runtimeOverlay[field]=requestedRow[field];
+      }
+      if((!Array.isArray(S.session.pending_attachments)||!S.session.pending_attachments.length)
+        &&Array.isArray(requestedRow.pending_attachments)&&requestedRow.pending_attachments.length){
+        runtimeOverlay.pending_attachments=requestedRow.pending_attachments;
       }
       const mergedRow={
         ...S.session,

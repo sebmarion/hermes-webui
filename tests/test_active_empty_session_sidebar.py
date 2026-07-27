@@ -91,6 +91,7 @@ def test_compressed_active_session_replaces_requested_cached_alias_in_place():
         "message_count": 168,
         "active_stream_id": None,
         "pending_user_message": None,
+        "pending_attachments": [],
         "is_streaming": False,
         "is_working": False,
     }
@@ -178,6 +179,27 @@ def test_compressed_alias_contributes_only_explicit_runtime_overlay_fields():
     assert row["active_stream_id"] == "stream-1"
     assert "profile" not in row
     assert "last_message_at" not in row
+
+
+@pytest.mark.skipif(NODE is None, reason="node is required for active sidebar helper behavior tests")
+def test_compressed_canonical_pending_attachments_win_when_non_empty():
+    cached_rows = [
+        {
+            "session_id": "root",
+            "message_count": 116,
+            "pending_attachments": [{"name": "stale-context.txt"}],
+        }
+    ]
+    active_session = {
+        "session_id": "tip",
+        "requested_session_id": "root",
+        "message_count": 168,
+        "pending_attachments": [{"name": "fresh-context.txt"}],
+    }
+
+    payload = _active_sidebar_rows(cached_rows, active_session)
+
+    assert payload["result"][0]["pending_attachments"] == [{"name": "fresh-context.txt"}]
 
 
 def test_new_session_does_not_mutate_removed_source_filter():
