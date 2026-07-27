@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 import api.config as api_config
 import api.routes as routes
-from api.updates import WEBUI_VERSION
+from api.updates import WEBUI_ASSET_VERSION
 
 
 def _old_inline_render(csrf_token: str) -> str:
@@ -27,7 +27,7 @@ def _old_inline_render(csrf_token: str) -> str:
     index_path = api_config.get_index_html_path()
     return (
         index_path.read_text(encoding="utf-8")
-        .replace("__WEBUI_VERSION__", quote(WEBUI_VERSION, safe=""))
+        .replace("__WEBUI_VERSION__", quote(WEBUI_ASSET_VERSION, safe=""))
         .replace("__MAX_UPLOAD_BYTES__", str(routes.MAX_UPLOAD_BYTES))
         .replace("__CSRF_TOKEN_JSON__", json.dumps(csrf_token))
     )

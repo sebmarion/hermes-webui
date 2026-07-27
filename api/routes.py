@@ -12471,7 +12471,7 @@ def _render_index_shell_base() -> str:
     extension-tag injection are intentionally NOT applied here — they vary per
     request and are applied by the caller against this base string.
     """
-    from api.updates import WEBUI_VERSION
+    from api.updates import WEBUI_ASSET_VERSION
 
     index_path = api_config.get_index_html_path()
     st = index_path.stat()
@@ -12482,7 +12482,7 @@ def _render_index_shell_base() -> str:
             return cached[1]
     from urllib.parse import quote
 
-    version_token = quote(WEBUI_VERSION, safe="")
+    version_token = quote(WEBUI_ASSET_VERSION, safe="")
     base = (
         index_path.read_text(encoding="utf-8")
         .replace("__WEBUI_VERSION__", version_token)
@@ -12929,8 +12929,8 @@ def handle_get(handler, parsed) -> bool:
             _resolve_login_locale_key(_lang)
         ]
         from urllib.parse import quote
-        from api.updates import WEBUI_VERSION
-        version_token = quote(WEBUI_VERSION, safe="")
+        from api.updates import WEBUI_ASSET_VERSION
+        version_token = quote(WEBUI_ASSET_VERSION, safe="")
         _page = (
             _LOGIN_PAGE_HTML.replace("{{BOT_NAME}}", _bn)
             .replace("{{BOT_NAME_INITIAL}}", _bn[0].upper())
@@ -13073,11 +13073,11 @@ def handle_get(handler, parsed) -> bool:
         static_root = api_config.get_static_root()
         sw_path = (static_root / "sw.js").resolve()
         if sw_path.exists():
-            # Inject the current git-derived version as the cache name so the
-            # service worker cache busts automatically on every new deploy.
+            # Inject the deployment asset identity as the cache name so the
+            # service worker cache busts automatically on every new release.
             from urllib.parse import quote
-            from api.updates import WEBUI_VERSION
-            version_token = quote(WEBUI_VERSION, safe="")
+            from api.updates import WEBUI_ASSET_VERSION
+            version_token = quote(WEBUI_ASSET_VERSION, safe="")
             text = sw_path.read_text(encoding="utf-8").replace(
                 "__WEBUI_VERSION__", version_token
             )

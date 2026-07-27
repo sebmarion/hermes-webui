@@ -5,8 +5,8 @@
  * Caches only static shell assets so the app shell loads fast on repeat visits.
  */
 
-// Cache version is injected by the server at request time (routes.py /sw.js handler).
-// Bumps automatically whenever the git commit changes — no manual edits needed.
+// Cache identity is injected by the server at request time (routes.py /sw.js handler).
+// It changes with the selected immutable release (or source version outside selector mode).
 const CACHE_NAME = 'hermes-shell-__WEBUI_VERSION__';
 
 // Static assets that form the app shell.
@@ -154,8 +154,8 @@ self.addEventListener('fetch', (event) => {
   if (!SHELL_ASSETS.includes(shellPath)) return;
 
   // Shell assets: network-first with cache fallback. This keeps offline support
-  // but avoids executing stale JS/CSS after a local hotfix when WEBUI_VERSION
-  // has not changed yet (e.g. before a guarded restart updates the ?v token).
+  // but avoids executing stale JS/CSS after a local hotfix when the asset cache
+  // identity has not changed yet (e.g. before a guarded restart updates ?v).
   event.respondWith(
     fetch(new Request(event.request, { cache: 'no-store' })).then((response) => {
       if (

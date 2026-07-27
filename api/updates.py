@@ -59,6 +59,7 @@ _FETCH_NETWORK_FAILURE_SIGNATURES = (
     'ssl certificate problem',
 )
 _RELEASE_TAG_RE = re.compile(r'^v[0-9][0-9A-Za-z.+-]*$')
+_SELECTOR_MANIFEST_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 # Phrases git emits when its own short-lived index/refs lock files block a
 # subsequent operation. Tuned to match only the true "lock file already exists"
 # semantics that warrant a lock-conflict response -- v2 deliberately drops the
@@ -490,6 +491,16 @@ def _detect_webui_version() -> str:
     return 'unknown'
 
 
+def _detect_webui_asset_version(webui_version: str) -> str:
+    """Resolve the browser asset-cache identity for this process."""
+    if os.environ.get("HERMES_WEBUI_LAUNCH_MODE") != "selector":
+        return webui_version
+    manifest_sha256 = os.environ.get("HERMES_WEBUI_MANIFEST_SHA256", "")
+    if not _SELECTOR_MANIFEST_SHA256_RE.fullmatch(manifest_sha256):
+        raise RuntimeError("selector asset cache identity is missing or invalid")
+    return manifest_sha256
+
+
 def _read_agent_source_version(agent_dir: Path) -> str | None:
     """Read Hermes Agent's package version from a copied source tree."""
     init_file = agent_dir / 'hermes_cli' / '__init__.py'
@@ -594,6 +605,7 @@ def _detect_agent_version() -> str:
 
 # Resolved once at import time — tags cannot change without a process restart.
 WEBUI_VERSION: str = _detect_webui_version()
+WEBUI_ASSET_VERSION: str = _detect_webui_asset_version(WEBUI_VERSION)
 AGENT_VERSION: str = _detect_agent_version()
 
 

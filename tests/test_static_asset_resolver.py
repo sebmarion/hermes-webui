@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import importlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
 
+import api
 import api.config as api_config
 import api.routes as routes
-from api.updates import WEBUI_VERSION
-
 
 ROOT = Path(__file__).resolve().parent.parent
+ASSET_DIGEST = "c" * 64
+
+
+def _patch_asset_version(monkeypatch) -> None:
+    updates = importlib.import_module("api.updates")
+    monkeypatch.setattr(updates, "WEBUI_ASSET_VERSION", ASSET_DIGEST)
+    monkeypatch.setattr(api, "updates", updates)
 
 
 class _FakeHandler:
@@ -79,10 +86,11 @@ def test_service_worker_and_favicon_follow_selected_static_root(tmp_path, monkey
     favicon_path = static_root / "favicon.ico"
     favicon_path.write_bytes(b"favicon-bytes")
     monkeypatch.setattr(api_config, "get_static_root", lambda: static_root)
+    _patch_asset_version(monkeypatch)
 
     sw_handler = _get("/sw.js")
     expected = sw_path.read_text(encoding="utf-8").replace(
-        "__WEBUI_VERSION__", quote(WEBUI_VERSION, safe="")
+        "__WEBUI_VERSION__", quote(ASSET_DIGEST, safe="")
     ).encode("utf-8")
     assert sw_handler.status == 200
     assert sw_handler.header("Service-Worker-Allowed") == "/"
@@ -112,11 +120,13 @@ def test_index_shell_and_static_route_use_selected_root(tmp_path, monkeypatch):
 
     monkeypatch.setattr(api_config, "get_static_root", lambda: static_root)
     monkeypatch.setattr(api_config, "get_index_html_path", lambda: index_path)
+    _patch_asset_version(monkeypatch)
     monkeypatch.setattr(routes, "_INDEX_SHELL_CACHE", {})
     monkeypatch.setattr(routes, "_STATIC_CACHE", {})
 
     shell = routes._render_index_shell_base()
     assert "temp" in shell
+    assert ASSET_DIGEST in shell
     assert "__WEBUI_VERSION__" not in shell
     assert "__MAX_UPLOAD_BYTES__" not in shell
     assert "__CSRF_TOKEN_JSON__" in shell
@@ -128,3 +138,24 @@ def test_index_shell_and_static_route_use_selected_root(tmp_path, monkeypatch):
 
     traversal = _get("/static/../api/routes.py")
     assert traversal.status == 404
+
+
+def test_login_and_service_worker_use_exact_asset_cache_version(monkeypatch):
+    _patch_asset_version(monkeypatch)
+    monkeypatch.setattr(routes, "_INDEX_SHELL_CACHE", {})
+
+    login = _get("/login")
+    login_body = bytes(login.body).decode("utf-8")
+    assert login.status == 200
+    assert f'static/login.js?v={ASSET_DIGEST}' in login_body
+    assert "v=unknown" not in login_body
+    assert "__WEBUI_VERSION__" not in login_body
+
+    service_worker = _get("/sw.js")
+    sw_body = bytes(service_worker.body).decode("utf-8")
+    assert service_worker.status == 200
+    assert f"const CACHE_NAME = 'hermes-shell-{ASSET_DIGEST}';" in sw_body
+    assert f"const VQ = '?v={ASSET_DIGEST}';" in sw_body
+    assert "hermes-shell-unknown" not in sw_body
+    assert "?v=unknown" not in sw_body
+    assert "__WEBUI_VERSION__" not in sw_body

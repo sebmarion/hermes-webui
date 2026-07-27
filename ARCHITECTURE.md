@@ -35,6 +35,15 @@ frontend framework. The Python server is split into a routing shell (server.py) 
 business logic modules (api/). The frontend is seven vanilla JS modules loaded from static/.
 This makes the code easy to modify from a terminal or by an agent.
 
+Browser cache identity is deliberately separate from product version identity.
+`api.updates.WEBUI_VERSION` remains the user-facing/update/model-cache version.
+`WEBUI_ASSET_VERSION` is the process-constant token injected into app-shell and
+login asset URLs plus the service-worker cache namespace. In selector mode it
+must equal the full lowercase SHA-256 of the selector-validated immutable
+release manifest; a missing or malformed digest fails startup before bind.
+Git checkouts, Docker images, and other non-selector launches retain the
+existing `WEBUI_VERSION` asset-cache behavior.
+
 Hermes-level chrome is intentionally consolidated: the sidebar has no dedicated brand header.
 Instead, the footer exposes a single "Hermes WebUI" launch button that opens one tabbed
 control-center modal for global preferences, conversation import/export, and clear-conversation
