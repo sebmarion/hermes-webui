@@ -2101,6 +2101,39 @@ function closeOtherLiveStreams(activeSid){
   }
 }
 
+function _reconcileTerminalDoneMessages(currentMessages, completedSession, currentOffset=0){
+  const current=Array.isArray(currentMessages)?currentMessages:[];
+  const session=completedSession&&typeof completedSession==='object'?completedSession:{};
+  let next=null;
+  if(Array.isArray(session.terminal_messages)){
+    const base=Number(session.terminal_base_message_count);
+    const offset=Number.isFinite(Number(currentOffset))?Math.max(0,Number(currentOffset)):0;
+    const localBase=Number.isInteger(base)?base-offset:-1;
+    if(localBase>=0&&localBase<=current.length){
+      next=current.slice(0,localBase).concat(
+        session.terminal_messages.filter(m=>m&&m.role)
+      );
+    }
+  }
+  // Explicit correctness fallback for compression/recovery, where the server
+  // detected that the historical prefix changed and a delta is unsafe.
+  if(!next&&session.terminal_reconcile_required&&Array.isArray(session.messages)){
+    next=session.messages.filter(m=>m&&m.role);
+  }
+  // Backward compatibility while a browser tab or server process crosses a
+  // rolling update boundary.
+  if(!next&&Array.isArray(session.messages)){
+    next=session.messages.filter(m=>m&&m.role);
+  }
+  return next
+    ? _carryForwardEphemeralTurnFields(current,next)
+    : current;
+}
+
+if(typeof window!=='undefined'){
+  window._reconcileTerminalDoneMessages=_reconcileTerminalDoneMessages;
+}
+
 function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(!activeSid||!streamId) return;
   const reconnecting=!!options.reconnecting;
@@ -5434,6 +5467,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const _doneData=JSON.parse(e.data);
       const completedSession=_doneData.session||{session_id:activeSid};
       const completedSid=completedSession.session_id||activeSid;
+      const _terminalDoneMessages=Array.isArray(completedSession.terminal_messages)
+        ? completedSession.terminal_messages
+        : (Array.isArray(completedSession.messages)?completedSession.messages:[]);
       const _doneEvent=e;
       const _finishDone=()=>{
         if(typeof _recordCompletionCandidate==='function') _recordCompletionCandidate(completedSid, streamId);
@@ -5507,6 +5543,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const _prevCost=(S.session&&S.session.estimated_cost)||0;
           const _prevCacheRead=(S.session&&S.session.cache_read_tokens)||0;
           const _prevCacheWrite=(S.session&&S.session.cache_write_tokens)||0;
+          const _currentDoneOffset=(typeof _oldestIdx!=='undefined'&&Number.isFinite(Number(_oldestIdx)))
+            ? Number(_oldestIdx)
+            : 0;
+          const _nextDoneMessages=typeof _reconcileTerminalDoneMessages==='function'
+            ? _reconcileTerminalDoneMessages(S.messages||[],completedSession,_currentDoneOffset)
+            : (Array.isArray(d.session.messages)?d.session.messages:[]);
+          d.session.messages=_nextDoneMessages;
+          if(d.session._messages_offset==null)d.session._messages_offset=_currentDoneOffset;
+          if(d.session._messages_truncated==null&&typeof _messagesTruncated!=='undefined'){
+            d.session._messages_truncated=_messagesTruncated;
+          }
           S.session=d.session;S.messages=_carryForwardEphemeralTurnFields(S.messages||[], d.session.messages||[]);if(typeof _messagesTruncated!=='undefined')_messagesTruncated=!!d.session._messages_truncated;
           // #4720: reset _oldestIdx (full-load symmetry; keeps the #4613 anchor aligned).
           if(typeof _oldestIdx!=='undefined')_oldestIdx=d.session._messages_offset||0;
@@ -5663,8 +5710,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           // TTS auto-read: speak the last assistant response if enabled (#499)
           if(typeof autoReadLastAssistant==='function') setTimeout(()=>autoReadLastAssistant(), 300);
         }
-        if(!lastAsst&&d.session&&Array.isArray(d.session.messages)){
-          lastAsst=[...d.session.messages].reverse().find(m=>m&&m.role==='assistant')||null;
+        if(!lastAsst&&_terminalDoneMessages.length){
+          lastAsst=[..._terminalDoneMessages].reverse().find(m=>m&&m.role==='assistant')||null;
         }
         if(isActiveSession) _queueDrainSid=activeSid;
         renderSessionList();

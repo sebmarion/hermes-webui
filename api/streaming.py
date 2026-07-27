@@ -87,6 +87,59 @@ def _session_payload_with_full_messages(session, *, tool_calls=None):
     return raw
 
 
+def _terminal_delta_from_full_payload(
+    full_payload,
+    *,
+    previous_messages=None,
+):
+    """Replace an embedded transcript with only the messages appended by this turn.
+
+    Successful live streams already projected the turn into the browser. Sending
+    the entire historical transcript again at ``done`` makes terminal latency
+    grow with session age and can freeze the UI while a multi-megabyte SSE frame
+    is parsed. The previous transcript is captured before the turn begins, so a
+    stable prefix lets the client replace only its optimistic/live tail.
+
+    Compression or recovery may rewrite the historical prefix. In that uncommon
+    case correctness wins: mark the payload and include the full transcript so
+    the browser can reconcile canonically without a second request.
+    """
+    raw = dict(full_payload or {})
+    messages = list(raw.pop('messages', None) or [])
+    previous = list(previous_messages or [])
+
+    prefix_matches = len(previous) <= len(messages)
+    if prefix_matches:
+        for idx, expected in enumerate(previous):
+            current = messages[idx]
+            expected_identity = _message_identity(expected)
+            current_identity = _message_identity(current)
+            if expected_identity is None or current_identity is None:
+                if expected != current:
+                    prefix_matches = False
+                    break
+            elif expected_identity != current_identity:
+                prefix_matches = False
+                break
+            else:
+                expected_text = _message_text(expected.get('content', ''))
+                current_text = _message_text(current.get('content', ''))
+                if str(expected.get('role') or '') == 'user':
+                    expected_text = _strip_workspace_prefix(expected_text, include_legacy=True)
+                    current_text = _strip_workspace_prefix(current_text, include_legacy=True)
+                if expected_text != current_text:
+                    prefix_matches = False
+                    break
+
+    if prefix_matches:
+        raw['terminal_base_message_count'] = len(previous)
+        raw['terminal_messages'] = messages[len(previous):]
+    else:
+        raw['terminal_reconcile_required'] = True
+        raw['messages'] = messages
+    return raw
+
+
 def _compact_for_echo_compare(value: str) -> str:
     """Normalize visible stream text for duplicate echo detection."""
     return re.sub(r'\s+', '', str(value or ''))
@@ -10909,6 +10962,10 @@ def _run_agent_streaming(
                 logger.debug("Goal continuation hook failed for session %s: %s", session_id, _goal_exc)
             with _stream_writeback_stage(_writeback_timings, "done_payload"):
                 raw_session = _session_payload_with_full_messages(s, tool_calls=tool_calls)
+                raw_session = _terminal_delta_from_full_payload(
+                    raw_session,
+                    previous_messages=_previous_messages,
+                )
                 _done_payload = {'session': redact_session_data(raw_session), 'usage': usage}
                 if _tool_limit_reached:
                     _done_payload['terminal_state'] = 'tool_limit_reached'

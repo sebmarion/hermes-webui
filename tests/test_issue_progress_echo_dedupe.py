@@ -341,7 +341,8 @@ def test_reasoning_then_interim_progress_marks_reasoning_echo(cleanup_test_sessi
     }]
     done_payloads = [payload for event, payload in events if event == "done"]
     assert done_payloads, "run should settle"
-    final_messages = done_payloads[-1]["session"]["messages"]
+    settled_session = done_payloads[-1]["session"]
+    final_messages = settled_session.get("terminal_messages", settled_session.get("messages", []))
     assert not any(message.get("reasoning") == progress for message in final_messages)
 
 
@@ -532,7 +533,8 @@ def test_final_answer_prefix_reasoning_echo_is_not_journaled_or_merged(cleanup_t
 
     done_payloads = [payload for event, payload in events if event == "done"]
     assert done_payloads, "run should settle"
-    final_messages = done_payloads[-1]["session"]["messages"]
+    settled_session = done_payloads[-1]["session"]
+    final_messages = settled_session.get("terminal_messages", settled_session.get("messages", []))
     assistant_messages = [message for message in final_messages if message.get("role") == "assistant"]
     assert assistant_messages[-1]["content"] == final_answer
     assert leaked_prefix not in str(assistant_messages[-1].get("reasoning") or "")
