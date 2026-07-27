@@ -7428,18 +7428,6 @@ def shared_interactive_sidebar_projection(
             continue
         state_title = str(state_row.get("title") or "").strip()
         overlay_title = str((overlay or {}).get("title") or "").strip()
-        if not state_title and overlay_title and overlay_title.lower() != "untitled":
-            try:
-                from api.state_sync import sync_session_title
-
-                # Existing sidecars are the only durable title source for some
-                # older WebUI rows. Backfill only blank state.db titles; once a
-                # title exists there, state.db remains authoritative for both
-                # clients and a stale sidecar cannot overwrite a Hermes One
-                # rename.
-                sync_session_title(sid, overlay_title, profile=profile)
-            except Exception:
-                logger.debug("Failed to backfill WebUI title %s to state.db", sid, exc_info=True)
         row = {
             "id": sid,
             "session_id": sid,
