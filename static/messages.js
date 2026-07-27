@@ -5432,6 +5432,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
       _cancelThrottledSnapshotTimer();
       const _doneData=JSON.parse(e.data);
+      const completedSession=_doneData.session||{session_id:activeSid};
+      const completedSid=completedSession.session_id||activeSid;
       const _doneEvent=e;
       const _finishDone=()=>{
         if(typeof _recordCompletionCandidate==='function') _recordCompletionCandidate(completedSid, streamId);
@@ -5466,8 +5468,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _clearAnchorProseIncrementalNode();
         const isActiveSession=_isSessionCurrentPane(activeSid);
         const isSessionViewed=_isSessionActivelyViewed(activeSid);
-        const completedSession=d.session||{session_id:activeSid};
-        const completedSid=completedSession.session_id||activeSid;
         const completedMessageCount=completedSession.message_count != null
           ? completedSession.message_count
           : (
