@@ -18,6 +18,7 @@ import threading
 import time
 import traceback
 import copy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -1475,6 +1476,177 @@ def _agent_result_tool_limit_reached(result) -> bool:
     ):
         return True
     return False
+
+
+@dataclass(frozen=True)
+class GuardrailTerminal:
+    reason: str
+    tool_name: str | None = None
+    exact_count: int | None = None
+    broad_count: int | None = None
+
+
+def _bounded_guardrail_code(value, fallback: str = "guardrail_halt") -> str:
+    if not isinstance(value, str):
+        return fallback
+    code = value.strip().lower()
+    if not code or len(code) > 96 or re.fullmatch(r"[a-z0-9_.-]+", code) is None:
+        return fallback
+    return code
+
+
+def _bounded_guardrail_tool_name(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name or len(name) > 80 or re.fullmatch(r"[A-Za-z0-9_.-]+", name) is None:
+        return None
+    return name
+
+
+def _bounded_guardrail_count(value) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0 or value > 1_000_000:
+        return None
+    return value
+
+
+def _agent_result_guardrail_blocked(result) -> GuardrailTerminal | None:
+    """Classify only structured Agent guardrail halt metadata."""
+    if not isinstance(result, dict):
+        return None
+    guardrail = result.get("guardrail")
+    structured = guardrail if isinstance(guardrail, dict) else {}
+    exit_halt = result.get("turn_exit_reason") == "guardrail_halt"
+    action_halt = structured.get("action") in {"block", "halt"}
+    if not (exit_halt or action_halt):
+        return None
+    return GuardrailTerminal(
+        reason=_bounded_guardrail_code(structured.get("code")),
+        tool_name=_bounded_guardrail_tool_name(structured.get("tool_name")),
+        exact_count=_bounded_guardrail_count(structured.get("exact_count")),
+        broad_count=_bounded_guardrail_count(structured.get("broad_count")),
+    )
+
+
+def _guardrail_mapping_diagnostic(terminal: GuardrailTerminal) -> dict:
+    """Return the bounded, non-sensitive diagnostic for a mapped halt."""
+    return {
+        "event": "guardrail_terminal_mapped",
+        "guardrail_code": terminal.reason,
+        "tool_name": terminal.tool_name,
+        "exact_count": terminal.exact_count,
+        "broad_count": terminal.broad_count,
+        "terminal_state": "guardrail_blocked",
+    }
+
+
+def _guardrail_recovery_message(reason: str) -> dict:
+    """Build a current-turn recovery row when the Agent returned no answer."""
+    return {
+        "role": "assistant",
+        "content": (
+            "The agent stopped at a guardrail before producing a final response. "
+            "Start a new turn with a different strategy."
+        ),
+        "_terminal_state": "guardrail_blocked",
+        "_terminal_reason": _bounded_guardrail_code(reason),
+        "_statusCard": {
+            "title": "Needs recovery",
+            "subtitle": "The agent stopped at a guardrail and needs a new strategy.",
+            "rows": [
+                {"label": "State", "value": "Blocked"},
+                {"label": "Next step", "value": "Start a new turn with a different strategy."},
+            ],
+        },
+    }
+
+
+def _tag_current_turn_guardrail_candidate(
+    result_messages,
+    previous_context,
+    msg_text: str,
+    token: str,
+) -> bool:
+    """Tag the current result answer so display filtering cannot stale its boundary."""
+    result_rows = list(result_messages or [])
+    previous_rows = list(previous_context or [])
+    if _messages_have_prefix(result_rows, previous_rows):
+        candidates = result_rows[len(previous_rows):]
+    else:
+        current_user_idx = _find_current_user_turn(result_rows, msg_text)
+        candidates = (
+            result_rows[current_user_idx + 1:]
+            if current_user_idx is not None
+            else result_rows
+        )
+    for msg in reversed(candidates):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        if msg.get("_error") or msg.get("tool_calls"):
+            continue
+        if not _message_text(msg.get("content")).strip():
+            continue
+        msg["_guardrail_current_turn_candidate"] = str(token)
+        return True
+    return False
+
+
+def _mark_latest_assistant_guardrail_status(
+    messages,
+    reason: str,
+    *,
+    start_index: int = 0,
+    candidate_token: str | None = None,
+) -> bool:
+    """Annotate the latest usable assistant answer as blocked, preserving text."""
+    candidates = list(messages or [])
+    safe_start = max(0, min(len(candidates), int(start_index or 0)))
+    selected = None
+    for msg in reversed(candidates[safe_start:]):
+        if not isinstance(msg, dict):
+            continue
+        if (
+            candidate_token is not None
+            and msg.get("_guardrail_current_turn_candidate") != str(candidate_token)
+        ):
+            continue
+        if msg.get("_error") or msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            text = "\n".join(
+                str(part.get("text") or part.get("content") or "")
+                for part in content
+                if isinstance(part, dict)
+            )
+        else:
+            text = str(content or "")
+        if msg.get("tool_calls") or not text.strip():
+            continue
+        selected = msg
+        break
+    if candidate_token is not None:
+        for msg in candidates:
+            if isinstance(msg, dict):
+                msg.pop("_guardrail_current_turn_candidate", None)
+    if selected is None:
+        return False
+    selected["_terminal_state"] = "guardrail_blocked"
+    selected["_terminal_reason"] = _bounded_guardrail_code(reason)
+    selected.setdefault(
+        "_statusCard",
+        {
+            "title": "Needs recovery",
+            "subtitle": "The agent stopped at a guardrail and needs a new strategy.",
+            "rows": [
+                {"label": "State", "value": "Blocked"},
+                {"label": "Next step", "value": "Start a new turn with a different strategy."},
+            ],
+        },
+    )
+    return True
 
 
 def _maybe_inject_max_iteration_summary_fallback(messages, result) -> list:
@@ -7483,6 +7655,7 @@ def _run_agent_streaming(
             logger.debug("Failed to append worker_started turn journal event", exc_info=True)
     s = None
     _tool_limit_reached = False
+    _guardrail_terminal = None
     _rt = {}
     _reasoning_mode = ''
     old_cwd = None
@@ -9537,6 +9710,12 @@ def _run_agent_streaming(
                         return
                 with _stream_writeback_stage(_writeback_timings, "merge_result"):
                     _tool_limit_reached = _agent_result_tool_limit_reached(result)
+                    _guardrail_terminal = _agent_result_guardrail_blocked(result)
+                    if _guardrail_terminal is not None:
+                        logger.info(
+                            "guardrail terminal mapped: %s",
+                            _guardrail_mapping_diagnostic(_guardrail_terminal),
+                        )
                     _result_messages = result.get('messages') or _previous_context_messages
                     _result_messages = _drop_synthetic_max_iteration_summary_requests(
                         _result_messages,
@@ -9608,13 +9787,42 @@ def _run_agent_streaming(
                             _control,
                             previous_messages=_previous_context_messages,
                         )
+                    _display_result_messages = _restore_display_reasoning_metadata(
+                        _previous_messages,
+                        _result_messages,
+                    )
+                    _guardrail_candidate_token = str(stream_id)
+                    if _guardrail_terminal is not None:
+                        # The temporary candidate marker is display-only.  Some
+                        # restored rows still share dictionaries with the agent
+                        # result/context arrays, so isolate them before tagging
+                        # to keep the persisted model context clean.
+                        _display_result_messages = copy.deepcopy(
+                            _display_result_messages
+                        )
+                        _tag_current_turn_guardrail_candidate(
+                            _display_result_messages,
+                            _previous_context_messages,
+                            msg_text,
+                            _guardrail_candidate_token,
+                        )
                     s.messages = _merge_display_messages_after_agent_result(
                         _previous_messages,
                         _previous_context_messages,
-                        _restore_display_reasoning_metadata(_previous_messages, _result_messages),
+                        _display_result_messages,
                         msg_text,
                         source=getattr(s, 'pending_user_source', None) or 'webui',
                     )
+                    if _guardrail_terminal is not None:
+                        _marked_guardrail_answer = _mark_latest_assistant_guardrail_status(
+                            s.messages,
+                            _guardrail_terminal.reason,
+                            candidate_token=_guardrail_candidate_token,
+                        )
+                        if not _marked_guardrail_answer:
+                            s.messages.append(
+                                _guardrail_recovery_message(_guardrail_terminal.reason)
+                            )
                     _advance_truncation_watermark_after_commit(s)  # #3831
                 # Strip XML tool-call blocks from assistant message content.
                 # DeepSeek and some other providers emit <function_calls>...</function_calls>
@@ -9833,7 +10041,13 @@ def _run_agent_streaming(
                     and not _saved_transcript_lacks_final_answer
                 ):
                     _terminal_failure = False
-                if _tool_limit_reached:
+                if _guardrail_terminal is not None:
+                    # A structured guardrail halt is a non-success terminal
+                    # outcome, but the preserved assistant explanation is the
+                    # user-facing recovery disclosure rather than an apperror.
+                    _assistant_added = True
+                    _terminal_failure = False
+                elif _tool_limit_reached:
                     # A durable successor, rather than a terminal error card,
                     # owns this state. The teardown hook claims it only after
                     # the parent worker has fully settled.
@@ -10890,39 +11104,42 @@ def _run_agent_streaming(
             # #1932: only evaluate when the turn was goal-related (set via
             # STREAM_GOAL_RELATED or goal_related parameter).
             try:
-                from api.goals import evaluate_goal_after_turn, has_active_goal
-
-                if not goal_related or not has_active_goal(session_id, profile_home=_profile_home):
+                if _guardrail_terminal is not None:
                     _goal_decision = {}
                 else:
-                    _last_goal_response = ''
-                    for _goal_msg in reversed(s.messages or []):
-                        if not isinstance(_goal_msg, dict) or _goal_msg.get('role') != 'assistant':
-                            continue
-                        _goal_content = _goal_msg.get('content', '')
-                        if isinstance(_goal_content, list):
-                            _goal_parts = []
-                            for _goal_part in _goal_content:
-                                if isinstance(_goal_part, dict):
-                                    _goal_text = _goal_part.get('text') or _goal_part.get('content')
-                                    if _goal_text:
-                                        _goal_parts.append(str(_goal_text))
-                            _last_goal_response = '\n'.join(_goal_parts)
-                        else:
-                            _last_goal_response = str(_goal_content or '')
-                        break
-                    put('goal', {
-                        'session_id': session_id,
-                        'state': 'evaluating',
-                        'message': 'Evaluating goal progress…',
-                        'message_key': 'goal_evaluating_progress',
-                    })
-                    _goal_decision = evaluate_goal_after_turn(
-                        session_id,
-                        _last_goal_response,
-                        user_initiated=True,
-                        profile_home=_profile_home,
-                    )
+                    from api.goals import evaluate_goal_after_turn, has_active_goal
+
+                    if not goal_related or not has_active_goal(session_id, profile_home=_profile_home):
+                        _goal_decision = {}
+                    else:
+                        _last_goal_response = ''
+                        for _goal_msg in reversed(s.messages or []):
+                            if not isinstance(_goal_msg, dict) or _goal_msg.get('role') != 'assistant':
+                                continue
+                            _goal_content = _goal_msg.get('content', '')
+                            if isinstance(_goal_content, list):
+                                _goal_parts = []
+                                for _goal_part in _goal_content:
+                                    if isinstance(_goal_part, dict):
+                                        _goal_text = _goal_part.get('text') or _goal_part.get('content')
+                                        if _goal_text:
+                                            _goal_parts.append(str(_goal_text))
+                                _last_goal_response = '\n'.join(_goal_parts)
+                            else:
+                                _last_goal_response = str(_goal_content or '')
+                            break
+                        put('goal', {
+                            'session_id': session_id,
+                            'state': 'evaluating',
+                            'message': 'Evaluating goal progress…',
+                            'message_key': 'goal_evaluating_progress',
+                        })
+                        _goal_decision = evaluate_goal_after_turn(
+                            session_id,
+                            _last_goal_response,
+                            user_initiated=True,
+                            profile_home=_profile_home,
+                        )
                 decision = _goal_decision or {}
                 _goal_message = str(decision.get('message') or '').strip()
                 if _goal_message:
@@ -10936,7 +11153,7 @@ def _run_agent_streaming(
                         'message_args': decision.get('message_args') or [],
                         'decision': decision,
                     })
-                if decision.get('should_continue'):
+                if decision.get('should_continue') and _guardrail_terminal is None:
                     continuation_prompt = str(decision.get('continuation_prompt') or '').strip()
                     if continuation_prompt:
                         from api.goal_continuation import claim_goal_continuation
@@ -10967,7 +11184,10 @@ def _run_agent_streaming(
                     previous_messages=_previous_messages,
                 )
                 _done_payload = {'session': redact_session_data(raw_session), 'usage': usage}
-                if _tool_limit_reached:
+                if _guardrail_terminal is not None:
+                    _done_payload['terminal_state'] = 'guardrail_blocked'
+                    _done_payload['terminal_reason'] = _guardrail_terminal.reason
+                elif _tool_limit_reached:
                     _done_payload['terminal_state'] = 'tool_limit_reached'
                     _done_payload['terminal_reason'] = 'max_iterations'
                     # The durable claim happens only after this parent stream
@@ -11521,6 +11741,7 @@ def _run_agent_streaming(
             _completion_session_id = str(getattr(s, "session_id", session_id) or session_id)
             _emit_completion = bool(
                 _success_writeback_committed
+                and _guardrail_terminal is None
                 and not _tool_limit_reached
                 and not _continuation_pending
                 and session_id not in PENDING_GOAL_CONTINUATION

@@ -110,6 +110,16 @@ def test_terminal_state_classification_distinguishes_crash_from_user_cancel(tmp_
     append_run_event("session_1", "run_failed", "apperror", {"type": "auth_mismatch"}, session_dir=tmp_path)
     append_run_event("session_1", "run_tool_limit", "apperror", {"type": "tool_limit_reached"}, session_dir=tmp_path)
     append_run_event("session_1", "run_tool_limit_done", "done", {"terminal_state": "tool_limit_reached"}, session_dir=tmp_path)
+    append_run_event(
+        "session_1",
+        "run_guardrail_blocked",
+        "done",
+        {
+            "terminal_state": "guardrail_blocked",
+            "terminal_reason": "same_tool_failure_halt",
+        },
+        session_dir=tmp_path,
+    )
     append_run_event("session_1", "run_unknown_done", "done", {"terminal_state": "future_unknown_state"}, session_dir=tmp_path)
     append_run_event("session_1", "run_done", "done", {"session": {}}, session_dir=tmp_path)
 
@@ -118,6 +128,8 @@ def test_terminal_state_classification_distinguishes_crash_from_user_cancel(tmp_
     assert latest_run_summary("session_1", "run_failed", session_dir=tmp_path)["terminal_state"] == "errored"
     assert latest_run_summary("session_1", "run_tool_limit", session_dir=tmp_path)["terminal_state"] == "tool_limit_reached"
     assert latest_run_summary("session_1", "run_tool_limit_done", session_dir=tmp_path)["terminal_state"] == "tool_limit_reached"
+    assert latest_run_summary("session_1", "run_guardrail_blocked", session_dir=tmp_path)["terminal_state"] == "guardrail_blocked"
+    assert find_run_summary("run_guardrail_blocked", session_dir=tmp_path)["terminal_state"] == "guardrail_blocked"
     assert latest_run_summary("session_1", "run_unknown_done", session_dir=tmp_path)["terminal_state"] == "completed"
     assert latest_run_summary("session_1", "run_done", session_dir=tmp_path)["terminal_state"] == "completed"
 
@@ -131,6 +143,31 @@ def test_summary_keeps_logical_terminal_state_when_stream_end_follows(tmp_path):
     assert summary["terminal"] is True
     assert summary["last_event"] == "stream_end"
     assert summary["terminal_state"] == "errored"
+
+
+def test_summary_keeps_guardrail_blocked_when_stream_end_follows(tmp_path):
+    append_run_event(
+        "session_1",
+        "run_1",
+        "done",
+        {
+            "terminal_state": "guardrail_blocked",
+            "terminal_reason": "same_tool_failure_halt",
+        },
+        session_dir=tmp_path,
+    )
+    append_run_event(
+        "session_1",
+        "run_1",
+        "stream_end",
+        {"session_id": "session_1"},
+        session_dir=tmp_path,
+    )
+
+    summary = latest_run_summary("session_1", "run_1", session_dir=tmp_path)
+
+    assert summary["last_event"] == "stream_end"
+    assert summary["terminal_state"] == "guardrail_blocked"
 
 
 def test_stale_interrupted_event_reports_non_terminal_journal(tmp_path, monkeypatch):
