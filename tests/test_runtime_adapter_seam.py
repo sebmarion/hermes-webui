@@ -700,6 +700,73 @@ def test_configured_runner_sse_stream_observes_runner_without_process_maps(monke
     assert "STREAMS" not in routes._stream_runner_run_events.__code__.co_names
 
 
+def test_runner_lazy_terminal_event_omits_complete_transcript(monkeypatch):
+    routes = importlib.import_module("api.routes")
+
+    class FakeRunnerClient:
+        def observe_run(self, run_id, *, cursor=None):
+            return {
+                "run_id": run_id,
+                "cursor": "1",
+                "events": [
+                    {
+                        "event": "done",
+                        "event_id": "run-1:1",
+                        "payload": {
+                            "session": {
+                                "session_id": "task-1",
+                                "read_only": False,
+                                "model_provider": "provider",
+                                "messages": [
+                                    {"role": "assistant", "content": "secret"}
+                                ]
+                                * 1_000,
+                                "tool_calls": [{"id": "secret-call"}],
+                            }
+                        },
+                    },
+                    {
+                        "event": "stream_end",
+                        "event_id": "run-1:2",
+                        "payload": {"status": "completed"},
+                    },
+                ],
+            }
+
+    class FakeHandler:
+        def __init__(self):
+            self.wfile = io.BytesIO()
+
+        def send_response(self, _status):
+            return None
+
+        def send_header(self, _key, _value):
+            return None
+
+        def end_headers(self):
+            return None
+
+    monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "runner-local")
+    monkeypatch.setattr(
+        routes,
+        "_runtime_runner_client_factory",
+        lambda: FakeRunnerClient(),
+    )
+    handler = FakeHandler()
+
+    assert routes._stream_runner_run_events(
+        handler,
+        "run-1",
+        lazy_tail=True,
+    ) is True
+
+    body = handler.wfile.getvalue().decode("utf-8")
+    assert "lazy_tail_terminal_v1" in body
+    assert '"messages"' not in body
+    assert '"tool_calls"' not in body
+    assert "secret" not in body
+
+
 
 def test_runner_runtime_adapter_passes_explicit_start_payload_without_env_mutation(monkeypatch):
     runtime = importlib.import_module("api.runtime_adapter")

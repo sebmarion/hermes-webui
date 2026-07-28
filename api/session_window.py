@@ -32,14 +32,44 @@ MAX_VISIBLE_LIMIT = 50
 MAX_LINEAGE_DEPTH = 128
 MAX_RAW_ROWS = 512
 MAX_TOOL_CLOSURE_ROWS = 64
+MAX_RETURNED_ROWS_OVER_VISIBLE = MAX_TOOL_CLOSURE_ROWS * 2
 MAX_SERIALIZED_BYTES = 2_621_440
 READ_BUDGET_SECONDS = 0.750
 RECONNECT_TOKEN_VERSION = 1
 RECONNECT_TOKEN_TTL_SECONDS = 120
 MAX_RECONNECT_TOKEN_BYTES = 8 * 1024
+MAX_SESSION_METADATA_BYTES = 256 * 1024
 
 _SCHEMA = "lazy_tail_v1"
 _VALID_STATES = frozenset({"ready", "reconnecting", "legacy_required", "stale"})
+_DIAGNOSTIC_REASON_CODES = frozenset(
+    {
+        "resolution_failed",
+        "session_not_found",
+        "resolution_unavailable",
+        "lineage_limit",
+        "invalid_lineage",
+        "target_changed",
+        "bounded_reader_unavailable",
+        "reconnect_ambiguous",
+        "metadata_unavailable",
+        "visible_limit_exceeded",
+        "read_budget_exceeded",
+        "cursor_unavailable",
+        "reconnect_checkpoint_unavailable",
+        "lineage_exceeds_raw_budget",
+        "missing_database",
+        "database_identity_changed",
+        "unsupported_schema",
+        "unsupported_payload_type",
+        "payload_blob_failed",
+        "invalid_payload_encoding",
+        "payload_rows_changed",
+        "bounded_payload_budget",
+        "read_failed",
+        "unknown",
+    }
+)
 _PROCESS_RECONNECT_SIGNING_KEY = secrets.token_bytes(32)
 
 
@@ -130,6 +160,7 @@ class SessionWindowDependencies:
     encode_older_cursor: Callable[..., str]
     decode_older_cursor: Callable[..., Any]
     capture_runtime: Callable[[str, str], dict | None]
+    capture_metadata: Callable[[str, Any], dict | None]
     monotonic: Callable[[], float] = time.monotonic
     wall_time: Callable[[], float] = time.time
     diagnostic_sink: Callable[[dict[str, Any]], None] | None = None
@@ -144,11 +175,22 @@ def build_session_window(
     if not isinstance(request, SessionWindowRequest):
         raise SessionWindowRequestError("invalid_request")
     dependencies = deps or default_session_window_dependencies()
-    return _build_session_window_attempt(
+    result = _build_session_window_attempt(
         request,
         dependencies,
         handoff_retry_count=0,
     )
+    window = result.get("conversation_window", {})
+    reason = window.get("status_reason")
+    if reason:
+        _emit_diagnostic(
+            dependencies,
+            {
+                "state": str(window.get("state") or "legacy_required"),
+                "reason": _diagnostic_reason(reason),
+            },
+        )
+    return result
 
 
 def _build_session_window_attempt(
@@ -278,8 +320,37 @@ def _build_session_window_attempt(
             resolution=resolution,
         )
 
+    session_metadata = None
+    if request.older_cursor is None:
+        try:
+            session_metadata = _validated_session_metadata(
+                dependencies.capture_metadata(profile, resolution),
+                canonical_id=canonical_id,
+            )
+        except Exception:
+            session_metadata = None
+        if session_metadata is None:
+            return _typed_state(
+                request,
+                state="legacy_required",
+                reason="metadata_unavailable",
+                resolution=resolution,
+            )
+
     messages = list(getattr(page, "messages", ()) or ())
-    if len(messages) > request.visible_limit:
+    reader_visible_count = getattr(page, "visible_count", None)
+    if (
+        isinstance(reader_visible_count, bool)
+        or not isinstance(reader_visible_count, int)
+        or reader_visible_count < 0
+        or reader_visible_count
+        > request.visible_limit + MAX_TOOL_CLOSURE_ROWS
+        # The reader's bounded base page may already contain non-counting tool
+        # result rows, then append up to MAX_TOOL_CLOSURE_ROWS to complete
+        # call/result render units. Keep both independently bounded.
+        or len(messages)
+        > request.visible_limit + MAX_RETURNED_ROWS_OVER_VISIBLE
+    ):
         return _typed_state(
             request,
             state="legacy_required",
@@ -353,6 +424,7 @@ def _build_session_window_attempt(
         "model": str((getattr(resolution, "canonical_row", {}) or {}).get("model") or ""),
         "workspace": str((getattr(resolution, "canonical_row", {}) or {}).get("cwd") or ""),
         "messages": messages,
+        "session_metadata": session_metadata,
         "runtime_snapshot": runtime_snapshot,
         "conversation_window": {
             "schema": _SCHEMA,
@@ -591,6 +663,33 @@ def _stable_message_id(message: Any) -> str | None:
     return None
 
 
+def _validated_session_metadata(
+    metadata: Any,
+    *,
+    canonical_id: str,
+) -> dict | None:
+    if not isinstance(metadata, dict):
+        return None
+    if str(metadata.get("session_id") or "") != str(canonical_id or ""):
+        return None
+    if not isinstance(metadata.get("read_only"), bool):
+        return None
+    provider = metadata.get("model_provider")
+    if provider is not None and not isinstance(provider, str):
+        return None
+    try:
+        encoded = json.dumps(
+            metadata,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    if len(encoded) > MAX_SESSION_METADATA_BYTES:
+        return None
+    return dict(metadata)
+
+
 def _emit_diagnostic(deps: SessionWindowDependencies, diagnostic: dict[str, Any]) -> None:
     if deps.diagnostic_sink is None:
         return
@@ -600,9 +699,16 @@ def _emit_diagnostic(deps: SessionWindowDependencies, diagnostic: dict[str, Any]
         return
 
 
+def _diagnostic_reason(value: Any) -> str:
+    reason = str(value or "unknown").strip().lower()
+    return reason if reason in _DIAGNOSTIC_REASON_CODES else "unknown"
+
+
 def default_session_window_dependencies(
     *,
     capture_runtime: Callable[[str, str], dict | None] | None = None,
+    capture_metadata: Callable[[str, Any], dict | None] | None = None,
+    diagnostic_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> SessionWindowDependencies:
     from api.agent_sessions import resolve_shared_session
     from api.bounded_target_confirmation import confirm_shared_session_target
@@ -659,4 +765,6 @@ def default_session_window_dependencies(
         encode_older_cursor=encode_cursor,
         decode_older_cursor=decode_cursor,
         capture_runtime=capture_runtime or (lambda _profile, _canonical_id: None),
+        capture_metadata=capture_metadata or (lambda _profile, _resolution: None),
+        diagnostic_sink=diagnostic_sink,
     )

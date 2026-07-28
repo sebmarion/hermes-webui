@@ -1707,9 +1707,20 @@ async function loadSession(sid){
     !opts.forceLegacyMessagePaging &&
     (!sameSessionForceReload || !!opts.cursorRestartAttempted)
   );
+  const _useLazyTail = (
+    typeof window !== 'undefined' &&
+    window.__HERMES_CONFIG__ &&
+    window.__HERMES_CONFIG__.lazyTailV1===true &&
+    !opts.forceLegacyMessagePaging &&
+    (!sameSessionForceReload || !!opts.cursorRestartAttempted)
+  );
+  const _lazyTailLoadStartedAt = _useLazyTail ? Date.now() : null;
+  const _hasInitialMessageData = _useLazyTail || _useBoundedInitialMessagePaging;
   let data;
   try {
-    if (_useBoundedInitialMessagePaging) {
+    if (_useLazyTail) {
+      data = await api(`/api/session-window?session_id=${encodeURIComponent(sid)}&msg_limit=30&resolve_model=0`);
+    } else if (_useBoundedInitialMessagePaging) {
       data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${_INITIAL_MSG_LIMIT}&message_paging=cursor_v1`);
     } else {
       data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
@@ -1738,6 +1749,17 @@ async function loadSession(sid){
       }catch(switchErr){
         e=switchErr;
       }
+    }
+    if (_useLazyTail) {
+      if (!_isCurrentLoad()) {
+        _rearmActiveSessionStream();
+        return false;
+      }
+      _showLazyTailRecovery(sid, 'The fast task window could not be loaded.');
+      _clearSameSessionForceReloadHint(sid);
+      if (_isCurrentLoad()) _loadingSessionId = null;
+      _rearmActiveSessionStream();
+      return false;
     }
     const _msgInner = $('msgInner');
     // Stale-load guard (Codex): a newer loadSession() may have started while this
@@ -1847,6 +1869,30 @@ async function loadSession(sid){
     _rearmActiveSessionStream();
     return false;
   }
+  if (_useLazyTail) {
+    const parsedLazyTail = _parseLazyTailPayload(
+      data,
+      sid,
+      {requireMetadata:true}
+    );
+    if (
+      !parsedLazyTail ||
+      !['ready','reconnecting'].includes(parsedLazyTail.window.state)
+    ) {
+      const reason = parsedLazyTail
+        ? (parsedLazyTail.window.status_reason || parsedLazyTail.window.state)
+        : 'The server returned an invalid fast task window.';
+      _showLazyTailRecovery(sid, reason);
+      _clearSameSessionForceReloadHint(sid);
+      if (_isCurrentLoad()) _loadingSessionId = null;
+      _rearmActiveSessionStream();
+      return false;
+    }
+    data = {
+      ...data,
+      session: _lazyTailSessionEnvelope(parsedLazyTail),
+    };
+  }
   // #2980: if this (current) load resolved a hidden pre-compression snapshot,
   // follow the backend's continuation hint to the visible continuation so a
   // mobile reload mid-compression doesn't strand the user on a hidden snapshot.
@@ -1883,7 +1929,7 @@ async function loadSession(sid){
     }
   }
   if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
-  S.session._modelResolutionDeferred=true;
+  S.session._modelResolutionDeferred=!_useLazyTail;
   S.lastUsage={...(data.session.last_usage||{})};
   // Reset scroll-direction tracker only on real session switches so the new
   // chat's first scroll doesn't compare against the previous chat's scrollTop
@@ -1898,7 +1944,7 @@ async function loadSession(sid){
     try { window._resetScrollDirectionTracker(); } catch (_) {}
   }
   if(typeof _applyPendingSessionModelForSession==='function') _applyPendingSessionModelForSession(sid);
-  _resolveSessionModelForDisplaySoon(sid);
+  if(!_useLazyTail) _resolveSessionModelForDisplaySoon(sid);
   // Sync workspace display immediately so the chip label reflects the new session's workspace
   // before any async message-loading begins (mirrors how model is handled).
   if(typeof syncTopbar==='function') syncTopbar();
@@ -2011,10 +2057,10 @@ async function loadSession(sid){
     // this session's INFLIGHT snapshot, not leave prior-session rows in place.
     if(typeof clearLiveToolCards==='function') clearLiveToolCards();
     try {
-      if (_useBoundedInitialMessagePaging) {
-        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, initialData:data});
+      if (_hasInitialMessageData) {
+        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, initialData:data, completeLegacyTranscript:!!opts.completeLegacyTranscript});
       } else {
-        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});
+        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, completeLegacyTranscript:!!opts.completeLegacyTranscript});
       }
     } catch(e) {
       if (!_isCurrentLoad()) {
@@ -2061,7 +2107,11 @@ async function loadSession(sid){
       INFLIGHT[sid].reattach=false;
       if (!_isCurrentLoad()) return;
       didReconnect=true;
-      attachLiveStream(sid, activeStreamId, S.session.pending_attachments||[], {reconnecting:true});
+      attachLiveStream(sid, activeStreamId, S.session.pending_attachments||[], {
+        reconnecting:true,
+        reconnectToken:_messagePaging.mode==='lazy_tail_v1'?_messagePaging.reconnectToken:null,
+        runtimeSnapshot:_messagePaging.mode==='lazy_tail_v1'?_messagePaging.runtimeSnapshot:null,
+      });
     }
     syncTopbar();renderMessages(sameSessionForceReload?{preserveScroll:true}:undefined);
     const restoredAnchorScene=activeStreamId&&typeof window!=='undefined'
@@ -2121,10 +2171,10 @@ async function loadSession(sid){
     // "messages already populated" early-return inside _ensureMessagesLoaded
     // does NOT skip the swap to the new transcript.
     try {
-      if (_useBoundedInitialMessagePaging) {
-        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, initialData:data});
+      if (_hasInitialMessageData) {
+        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, initialData:data, completeLegacyTranscript:!!opts.completeLegacyTranscript});
       } else {
-        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});
+        await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, completeLegacyTranscript:!!opts.completeLegacyTranscript});
       }
     } catch (e) {
       if (!_isCurrentLoad()) {
@@ -2193,7 +2243,11 @@ async function loadSession(sid){
     if(activeStreamId){
       S.busy=true;
       S.activeStreamId=activeStreamId;
-      if(typeof attachLiveStream==='function') attachLiveStream(sid, activeStreamId, S.session.pending_attachments||[], {reconnecting:true});
+      if(typeof attachLiveStream==='function') attachLiveStream(sid, activeStreamId, S.session.pending_attachments||[], {
+        reconnecting:true,
+        reconnectToken:_messagePaging.mode==='lazy_tail_v1'?_messagePaging.reconnectToken:null,
+        runtimeSnapshot:_messagePaging.mode==='lazy_tail_v1'?_messagePaging.runtimeSnapshot:null,
+      });
       else if(typeof watchInflightSession==='function') watchInflightSession(sid, activeStreamId);
       updateSendBtn();
       setStatus('');
@@ -2286,6 +2340,19 @@ async function loadSession(sid){
   }
 
   if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
+
+  if (
+    _lazyTailLoadStartedAt !== null &&
+    S.session &&
+    S.session.session_id === sid
+  ) {
+    recordLazyTailEvent('lazy_tail_first_paint',{
+      session_id:sid,
+      state:_messagePaging.runtimeSnapshot?'reconnecting':'ready',
+      visible_count:_messagePaging.visibleCount,
+      elapsed_ms:Date.now()-_lazyTailLoadStartedAt,
+    });
+  }
 
   // ── Cross-channel handoff hint ──
   // After session fully loaded, check if this is a messaging session with
@@ -2863,6 +2930,11 @@ let _messagePaging = {
   hasMore: false,
   visibleCount: 0,
   restartAttempted: false,
+  canonicalSessionId: null,
+  reconnectToken: null,
+  runtimeSnapshot: null,
+  statusReason: null,
+  pageIndex: 0,
 };
 
 function _resetMessagePaging(opts) {
@@ -2871,6 +2943,11 @@ function _resetMessagePaging(opts) {
   _messagePaging.hasMore = false;
   _messagePaging.visibleCount = 0;
   _messagePaging.restartAttempted = !!(opts && opts.restartAttempted);
+  _messagePaging.canonicalSessionId = null;
+  _messagePaging.reconnectToken = null;
+  _messagePaging.runtimeSnapshot = null;
+  _messagePaging.statusReason = null;
+  _messagePaging.pageIndex = 0;
   _messagesTruncated = false;
   _oldestIdx = 0;
 }
@@ -2895,6 +2972,146 @@ function _parseMessagePage(page) {
     hasMore: page.has_more,
     visibleCount: page.visible_count,
   };
+}
+
+function _parseLazyTailPayload(payload, requestedSid, options) {
+  options = options || {};
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  const windowState = payload.conversation_window;
+  if (!windowState || typeof windowState !== 'object' || Array.isArray(windowState)) return null;
+  if (windowState.schema !== 'lazy_tail_v1') return null;
+  if (!['ready','reconnecting','legacy_required','stale'].includes(windowState.state)) return null;
+  if (String(payload.requested_session_id || '') !== String(requestedSid || '')) return null;
+  if (!String(payload.canonical_session_id || '').trim()) return null;
+  // A 50-visible-row page may contain its bounded non-counting tool results
+  // plus up to 64 closure rows needed to keep call/result render units intact.
+  if (!Array.isArray(payload.messages) || payload.messages.length > 178) return null;
+  if (!Number.isSafeInteger(windowState.visible_count) || windowState.visible_count !== payload.messages.length) return null;
+  if (typeof windowState.has_older !== 'boolean') return null;
+  if (windowState.older_cursor !== null && typeof windowState.older_cursor !== 'string') return null;
+  if (windowState.has_older && !windowState.older_cursor) return null;
+  if (typeof windowState.exact_total_available !== 'boolean' || windowState.exact_total_available) return null;
+  if (windowState.active_stream_id !== null && typeof windowState.active_stream_id !== 'string') return null;
+  if (windowState.reconnect_token !== null && typeof windowState.reconnect_token !== 'string') return null;
+  const snapshot = payload.runtime_snapshot;
+  if (snapshot !== null) {
+    if (!snapshot || snapshot.schema !== 'run_snapshot_v1') return null;
+    if (String(snapshot.stream_id || '') !== String(windowState.active_stream_id || '')) return null;
+    if (!String(snapshot.through_event_id || '').trim()) return null;
+    if (!String(windowState.reconnect_token || '').trim()) return null;
+  }
+  if (windowState.state === 'reconnecting') {
+    if (!String(windowState.active_stream_id || '').trim()) return null;
+    if (!String(windowState.reconnect_token || '').trim()) return null;
+    if (snapshot === null) return null;
+  }
+  if (windowState.state === 'ready') {
+    if (windowState.active_stream_id !== null) return null;
+    if (windowState.reconnect_token !== null) return null;
+    if (snapshot !== null) return null;
+  }
+  const metadata = payload.session_metadata;
+  if (options.requireMetadata) {
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+    if (String(metadata.session_id || '') !== String(payload.canonical_session_id || '')) return null;
+    if (typeof metadata.read_only !== 'boolean') return null;
+    if (metadata.model_provider !== null && typeof metadata.model_provider !== 'string') return null;
+  }
+  return {
+    sourceMode: 'lazy_tail_v1',
+    payload,
+    window: windowState,
+    runtimeSnapshot: snapshot,
+    sessionMetadata: metadata,
+  };
+}
+
+function _lazyTailSessionEnvelope(parsed) {
+  if (!parsed || parsed.sourceMode !== 'lazy_tail_v1') return null;
+  const payload = parsed.payload;
+  const windowState = parsed.window;
+  const metadata = parsed.sessionMetadata;
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+  return {
+    ...metadata,
+    session_id: payload.requested_session_id,
+    requested_session_id: payload.requested_session_id,
+    canonical_session_id: payload.canonical_session_id,
+    title: String(payload.title || ''),
+    model: String(payload.model || ''),
+    workspace: String(payload.workspace || ''),
+    messages: payload.messages,
+    tool_calls: Array.isArray(parsed.runtimeSnapshot && parsed.runtimeSnapshot.tool_calls)
+      ? parsed.runtimeSnapshot.tool_calls
+      : [],
+    active_stream_id: windowState.active_stream_id,
+    runtime_journal_snapshot: parsed.runtimeSnapshot,
+    pending_attachments: Array.isArray(metadata.pending_attachments)
+      ? metadata.pending_attachments
+      : [],
+    last_usage: {},
+    _lazy_tail_window: windowState,
+  };
+}
+
+function _adoptLazyTailWindow(session) {
+  const windowState = session && session._lazy_tail_window;
+  if (!windowState || windowState.schema !== 'lazy_tail_v1') return null;
+  _messagePaging.mode = 'lazy_tail_v1';
+  _messagePaging.beforeCursor = windowState.older_cursor;
+  _messagePaging.hasMore = !!windowState.has_older;
+  _messagePaging.visibleCount = Number(windowState.visible_count) || 0;
+  _messagePaging.canonicalSessionId = String(session.canonical_session_id || session.session_id || '');
+  _messagePaging.reconnectToken = windowState.reconnect_token || null;
+  _messagePaging.runtimeSnapshot = session.runtime_journal_snapshot || null;
+  _messagePaging.statusReason = windowState.status_reason || null;
+  _messagesTruncated = !!windowState.has_older;
+  _oldestIdx = 0;
+  return windowState;
+}
+
+function _mergeLazyTailOlderMessages(currentMessages, olderMessages) {
+  const current = (Array.isArray(currentMessages) ? currentMessages : []).filter(m => m && m.role);
+  const older = (Array.isArray(olderMessages) ? olderMessages : []).filter(m => m && m.role);
+  const stableIds = new Set(current
+    .map(message => message && message._state_db_message_id)
+    .filter(id => id !== undefined && id !== null)
+    .map(String));
+  const prepend = [];
+  for (const message of older) {
+    const stableId = message._state_db_message_id;
+    if (stableId !== undefined && stableId !== null) {
+      const key = String(stableId);
+      if (stableIds.has(key)) continue;
+      stableIds.add(key);
+      prepend.push(message);
+      continue;
+    }
+    if (current.some(existing => _sameTranscriptMessage(existing, message))) continue;
+    if (prepend.some(existing => _sameTranscriptMessage(existing, message))) continue;
+    prepend.push(message);
+  }
+  return [...prepend, ...current];
+}
+
+let _lazyTailRecoverySessionId = null;
+function _showLazyTailRecovery(sid, reason) {
+  _lazyTailRecoverySessionId = String(sid || '');
+  const inner = $('msgInner');
+  if (!inner) return;
+  const detail = reason ? `<div style="margin-top:8px;color:var(--text-muted)">${esc(String(reason))}</div>` : '';
+  inner.innerHTML = `<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:40px;text-align:center;"><div>Fast task loading is unavailable for this conversation.</div>${detail}<button class="btn" style="margin-top:16px" onclick="loadCompleteLegacyTranscript()">Load complete legacy transcript</button></div>`;
+}
+
+async function loadCompleteLegacyTranscript() {
+  const sid = _lazyTailRecoverySessionId || (S.session && S.session.session_id);
+  if (!sid) return false;
+  recordLazyTailEvent('lazy_tail_legacy_explicit',{
+    session_id:sid,
+    state:'legacy_required',
+  });
+  _lazyTailRecoverySessionId = null;
+  return loadSession(sid,{force:true,forceLegacyMessagePaging:true,completeLegacyTranscript:true});
 }
 
 function _adoptMessagePaging(session) {
@@ -2927,6 +3144,37 @@ function _adoptMessagePaging(session) {
 // Older messages are loaded on-demand via _loadOlderMessages().
 const _INITIAL_MSG_LIMIT = 30;
 let _sameSessionForceReloadHint = null;
+
+function recordLazyTailEvent(event, details={}){
+  try{
+    const boundedInt=(value,max)=>{
+      if(typeof value==='boolean') return undefined;
+      const parsed=Number.parseInt(value,10);
+      if(!Number.isFinite(parsed)) return undefined;
+      return Math.max(0,Math.min(max,parsed));
+    };
+    const payload={
+      event:String(event||'lazy_tail_unknown').slice(0,64),
+      source:'session-window',
+      session_id:details.session_id||null,
+      stream_id:details.stream_id||null,
+      state:details.state||null,
+      source_mode:details.source_mode||'lazy_tail_v1',
+      anchor_result:details.anchor_result||null,
+      reconnect_status:details.reconnect_status||null,
+      page_index:boundedInt(details.page_index,1000000),
+      visible_count:boundedInt(details.visible_count,1000000),
+      elapsed_ms:boundedInt(details.elapsed_ms,3600000),
+      reason:details.reason||null,
+    };
+    void api('/api/client-events/log',{
+      method:'POST',
+      body:JSON.stringify(payload),
+      timeoutMs:3000,
+      timeoutToast:false,
+    }).catch(()=>{});
+  }catch(_){}
+}
 
 function _currentLoadedRenderableMessageCount(){
   if(typeof _messageRenderableMessageCount==='function'){
@@ -3029,7 +3277,9 @@ async function _ensureMessagesLoaded(sid, opts) {
     return;
   }
   // Fetch session messages with a tail window for fast initial load.
-  const reloadLimit = _messageReloadLimitForSession(sid); // defaults to _INITIAL_MSG_LIMIT
+  const reloadLimit = opts.completeLegacyTranscript
+    ? null
+    : _messageReloadLimitForSession(sid); // defaults to _INITIAL_MSG_LIMIT
   const reloadLimitParam = reloadLimit ? `&msg_limit=${reloadLimit}` : '';
   // Older frontends used expand_renderable=1 to request visible-row expansion.
   // The server now counts msg_limit by visible transcript rows by default; keep
@@ -3053,7 +3303,10 @@ async function _ensureMessagesLoaded(sid, opts) {
   // also keeps this independently-extractable load helper compatible with
   // focused recovery tests and partial script loads.
   let _pagingMode = 'legacy';
-  if (typeof _adoptMessagePaging === 'function') {
+  if (data.session._lazy_tail_window && typeof _adoptLazyTailWindow === 'function') {
+    _adoptLazyTailWindow(data.session);
+    _pagingMode = _messagePaging.mode;
+  } else if (typeof _adoptMessagePaging === 'function') {
     _adoptMessagePaging(data.session);
     _pagingMode = _messagePaging.mode;
   }
@@ -3095,7 +3348,9 @@ async function _ensureMessagesLoaded(sid, opts) {
     _messageRenderWindowSize=Math.max(_currentMessageRenderWindowSize(), _messageRenderableMessageCount());
   }
   if(S.session&&S.session.session_id===sid){
-    S.session.message_count=Number(data.session.message_count || msgs.length);
+    if (_pagingMode !== 'lazy_tail_v1') {
+      S.session.message_count=Number(data.session.message_count || msgs.length);
+    }
     S.lastUsage={...(data.session.last_usage||S.lastUsage||{})};
     // Phase 2: the messages=1 response carries the canonical cold-load
     // `todo_state` snapshot, derived server-side from the FULL untruncated
@@ -3546,10 +3801,151 @@ async function _recoverCursorPaging(sid, startLoadGeneration, startGeneration) {
   return true;
 }
 
+async function _recoverLazyTailPaging(sid, startLoadGeneration, startGeneration, reason) {
+  if (!S.session || S.session.session_id !== sid) return false;
+  if (_loadingSessionId !== null && _loadingSessionId !== sid) return false;
+  if (_loadSessionGeneration !== startLoadGeneration) return false;
+  if (_messagesGeneration !== startGeneration) return false;
+  _messagePaging.beforeCursor = null;
+  _messagePaging.hasMore = false;
+  _messagesTruncated = false;
+  if (!_messagePaging.restartAttempted) {
+    _messagePaging.restartAttempted = true;
+    await loadSession(sid, {force:true, cursorRestartAttempted:true});
+    return true;
+  }
+  _showLazyTailRecovery(
+    sid,
+    reason || 'Older messages could not be loaded safely.'
+  );
+  return true;
+}
+
 async function _loadOlderMessages() {
   if (_loadingOlder || !_messagesTruncated) return;
   const sid = S.session ? S.session.session_id : null;
   if (!sid || !S.messages.length) return;
+  if (_messagePaging.mode === 'lazy_tail_v1') {
+    if (!_messagePaging.hasMore || !_messagePaging.beforeCursor) {
+      _messagePaging.hasMore = false;
+      _messagesTruncated = false;
+      return;
+    }
+    _loadingOlder = true;
+    const startGeneration = _messagesGeneration;
+    const startLoadGeneration = _loadSessionGeneration;
+    const requestedCursor = _messagePaging.beforeCursor;
+    const pageStartedAt = Date.now();
+    try {
+      const data = await api(
+        `/api/session-window?session_id=${encodeURIComponent(sid)}&msg_limit=50&resolve_model=0&older_cursor=${encodeURIComponent(requestedCursor)}`,
+        {timeoutMs:120000}
+      );
+      const parsed = _parseLazyTailPayload(data, sid);
+      const page = parsed && parsed.window;
+      const invalidPage = (
+        !parsed ||
+        !['ready','reconnecting'].includes(page.state) ||
+        String(data.canonical_session_id || '') !== String(_messagePaging.canonicalSessionId || '') ||
+        (page.has_older && page.older_cursor === requestedCursor)
+      );
+      if (invalidPage) {
+        await _recoverLazyTailPaging(
+          sid,
+          startLoadGeneration,
+          startGeneration,
+          page && (page.status_reason || page.state)
+        );
+        return;
+      }
+      if (!S.session || S.session.session_id !== sid) return;
+      if (_loadingSessionId !== null && _loadingSessionId !== sid) return;
+      if (_loadSessionGeneration !== startLoadGeneration) return;
+      if (_messagesGeneration !== startGeneration) return;
+      const currentMsgs = (S.messages || []).filter(m => m && m.role);
+      const nextMessages = _mergeLazyTailOlderMessages(currentMsgs, data.messages);
+      const addedCount = Math.max(0, nextMessages.length - currentMsgs.length);
+      _messagePaging.beforeCursor = page.older_cursor;
+      _messagePaging.hasMore = page.has_older;
+      _messagePaging.visibleCount = page.visible_count;
+      _messagesTruncated = page.has_older;
+      if (!addedCount) return;
+      const container = $('messages');
+      const prevScrollH = container ? container.scrollHeight : 0;
+      const oldTop = container ? container.scrollTop : 0;
+      const viewportAnchor = (
+        container &&
+        typeof _captureMessageViewportAnchor === 'function'
+      ) ? _captureMessageViewportAnchor() : null;
+      let anchorResult = 'lost';
+      let messagesToAssign = nextMessages;
+      if (typeof window._carryForwardEphemeralTurnFields === 'function') {
+        messagesToAssign = window._carryForwardEphemeralTurnFields(
+          S.messages || [],
+          nextMessages
+        );
+      }
+      S.messages = messagesToAssign;
+      const addedRenderable = nextMessages.slice(0, addedCount).filter(message => {
+        if (typeof _messageIsRenderable === 'function') {
+          return _messageIsRenderable(message);
+        }
+        return !!(message && message.role && message.role !== 'tool');
+      }).length;
+      _messageRenderWindowSize = _currentMessageRenderWindowSize()
+        + Math.max(addedRenderable, MESSAGE_RENDER_WINDOW_DEFAULT);
+      renderMessages({preserveScroll:true});
+      if (container) {
+        const restoredViaAnchor = (
+          viewportAnchor &&
+          typeof _restoreMessageViewportAnchor === 'function'
+        ) ? _restoreMessageViewportAnchor(viewportAnchor, addedCount) : false;
+        anchorResult = restoredViaAnchor ? 'preserved' : 'lost';
+        if (!restoredViaAnchor) {
+          const virtualAddedHeight = (
+            typeof _messageVirtualPrependedHeightDelta === 'function'
+          ) ? _messageVirtualPrependedHeightDelta(addedRenderable) : null;
+          const addedHeight = Number.isFinite(virtualAddedHeight)
+            ? virtualAddedHeight
+            : Math.max(0, container.scrollHeight - prevScrollH);
+          _programmaticScroll = true;
+          container.scrollTop = oldTop + addedHeight;
+          requestAnimationFrame(() => { _programmaticScroll = false; });
+        }
+      }
+      _scrollPinned = false;
+      _messagePaging.pageIndex += 1;
+      recordLazyTailEvent('lazy_tail_older_page',{
+        session_id:sid,
+        state:page.state,
+        page_index:_messagePaging.pageIndex,
+        visible_count:page.visible_count,
+        elapsed_ms:Date.now()-pageStartedAt,
+        anchor_result:anchorResult,
+      });
+    } catch (e) {
+      if (e && (e.status === 400 || e.status === 409)) {
+        if (await _recoverLazyTailPaging(
+          sid,
+          startLoadGeneration,
+          startGeneration,
+          'The older-message cursor expired.'
+        )) return;
+      }
+      console.warn('_loadOlderMessages lazy tail page failed:', e);
+      if (!S.session || S.session.session_id !== sid) return;
+      if (_loadingSessionId !== null && _loadingSessionId !== sid) return;
+      if (_loadSessionGeneration !== startLoadGeneration) return;
+      if (_messagesGeneration !== startGeneration) return;
+      _showLazyTailRecovery(
+        sid,
+        'Older messages could not be loaded.'
+      );
+    } finally {
+      _loadingOlder = false;
+    }
+    return;
+  }
   if (_messagePaging.mode === 'cursor_v1') {
     if (!_messagePaging.hasMore || !_messagePaging.beforeCursor) {
       _messagePaging.hasMore = false;

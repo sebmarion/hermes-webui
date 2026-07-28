@@ -2134,9 +2134,104 @@ if(typeof window!=='undefined'){
   window._reconcileTerminalDoneMessages=_reconcileTerminalDoneMessages;
 }
 
+function _boundedLazyTailTerminalState(
+  currentSession,
+  currentMessages,
+  terminalSession,
+  inflightMessages
+){
+  const metadata={
+    ...(currentSession&&typeof currentSession==='object'?currentSession:{}),
+    ...(terminalSession&&typeof terminalSession==='object'?terminalSession:{}),
+  };
+  delete metadata.messages;
+  delete metadata.tool_calls;
+  delete metadata.anchor_activity_scenes;
+  delete metadata.pre_compression_snapshot;
+  const source=(
+    Array.isArray(inflightMessages)&&inflightMessages.length
+      ? inflightMessages
+      : (Array.isArray(currentMessages)?currentMessages:[])
+  );
+  return {
+    session:metadata,
+    messages:source.filter(message=>message&&message.role),
+  };
+}
+
 function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(!activeSid||!streamId) return;
   const reconnecting=!!options.reconnecting;
+  const reconnectToken=String(options.reconnectToken||'').trim();
+  const lazyTailStream=!!(
+    options.lazyTail ||
+    reconnectToken ||
+    (
+      typeof _messagePaging!=='undefined' &&
+      _messagePaging &&
+      _messagePaging.mode==='lazy_tail_v1'
+    )
+  );
+  const runtimeSnapshot=options.runtimeSnapshot;
+  const reconnectCheckpoint=String(
+    runtimeSnapshot&&runtimeSnapshot.through_event_id||''
+  ).trim();
+  const reconnectSnapshotApplied=(
+    !reconnectToken ||
+    !!(
+      runtimeSnapshot &&
+      runtimeSnapshot.schema==='run_snapshot_v1' &&
+      String(runtimeSnapshot.stream_id||'')===String(streamId) &&
+      reconnectCheckpoint
+    )
+  );
+  function _showLazyReconnectRecovery(status, reason){
+    if(typeof recordLazyTailEvent==='function'){
+      recordLazyTailEvent('lazy_tail_reconnect_failed',{
+        session_id:activeSid,
+        stream_id:streamId,
+        reconnect_status:status||'failed',
+        reason:reason||'bounded_reconnect_failed',
+      });
+    }
+    if(typeof setComposerStatus==='function'){
+      setComposerStatus('Reconnect needs recovery');
+    }
+    if(typeof _showLazyTailRecovery==='function'){
+      _showLazyTailRecovery(
+        activeSid,
+        'The latest turn could not be reattached safely.'
+      );
+    }
+    const live=LIVE_STREAMS[activeSid];
+    if(live&&(!streamId||live.streamId===streamId)){
+      try{if(live.source&&live.source.readyState!==2)live.source.close();}catch(_){}
+      delete LIVE_STREAMS[activeSid];
+    }
+    _clearStreamHidden(activeSid,streamId);
+    _clearStreamNotificationBackground(activeSid,streamId);
+    if(S.session&&S.session.session_id===activeSid){
+      S.activeStreamId=null;
+      S.busy=false;
+      if(typeof updateSendBtn==='function') updateSendBtn();
+      if(typeof renderSessionList==='function') renderSessionList();
+    }
+  }
+  if(reconnectToken&&!reconnectSnapshotApplied){
+    _showLazyReconnectRecovery('invalid_snapshot','snapshot_mismatch');
+    return;
+  }
+  let reconnectAcknowledged=!reconnectToken;
+  if(reconnectToken&&typeof setComposerStatus==='function'){
+    setComposerStatus('Reconnecting to latest turn');
+  }
+  if(reconnectToken&&typeof recordLazyTailEvent==='function'){
+    recordLazyTailEvent('lazy_tail_reconnect_start',{
+      session_id:activeSid,
+      stream_id:streamId,
+      reconnect_status:'started',
+    });
+  }
   // #4416: start (or, on reconnect for the SAME stream, keep) tracking whether
   // the tab was hidden during this stream so the done-notification fires for a
   // backgrounded tab. A reconnect with a different streamId re-seeds (the old
@@ -2167,6 +2262,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   if(S.session&&S.session.session_id===activeSid&&S.activeStreamId===streamId&&typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
   const existingLive=LIVE_STREAMS[activeSid];
   if(
+    !reconnectToken&&
     existingLive&&existingLive.streamId===streamId&&existingLive.source&&
     // During explicit reconnects, only reuse a proven-open transport. A stale
     // CONNECTING EventSource can survive in page state while the server has no
@@ -2475,6 +2571,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     _streamEndRecoveryTimer=null;
     const status=await _restoreSettledSession(source,{status:true});
+    if(status==='bounded_recovery_required'){
+      _clearStreamEndRecovery();
+      return;
+    }
     if(status==='restored'){
       _clearStreamEndRecovery();
       return;
@@ -2654,7 +2754,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const st=await api(`/api/chat/stream/status?stream_id=${encodeURIComponent(streamId)}`);
           if(st.active){
             setComposerStatus('Reconnected');
-            _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
+            _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}${_lazyTailReconnectParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
             return;
           }
         }
@@ -2662,6 +2762,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(_deferStreamErrorIfOffline()||_pageHiddenForStreamError()) return;
       }
       if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
+      if(lazyTailStream) return;
       if(_deferStreamErrorIfOffline()||_pageHiddenForStreamError()) return;
       _flushReasoningToAnchor();
       _scheduleAnchorRegistryCleanup(120000);
@@ -4722,6 +4823,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // sequence numbers started over from 1.
     return `&replay=1&after_seq=${encodeURIComponent(String(_runJournalReplayAfterSeq()))}&after_event_id=${encodeURIComponent(_lastRunJournalEventId||'')}`;
   }
+  function _lazyTailReconnectParams(){
+    const lazyParam=lazyTailStream?'&lazy_tail=1':'';
+    if(!reconnectToken||reconnectAcknowledged) return lazyParam;
+    return `${lazyParam}&reconnect_token=${encodeURIComponent(reconnectToken)}&session_id=${encodeURIComponent(activeSid)}`;
+  }
 
   function _stableStringify(value){
     const normalize=(v)=>{
@@ -5085,6 +5191,27 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // Bug A (trailing rAF after `done` inserting a new live-turn wrapper) —
     // the fixes below (_streamFinalized guard + cancelAnimationFrame in the
     // terminal handlers) address it without needing a reset here.
+
+    source.addEventListener('reconnect_ack',e=>{
+      if(!reconnectToken||!reconnectSnapshotApplied) return;
+      let d;
+      try{d=JSON.parse(e.data);}catch(_){return;}
+      if(
+        !d ||
+        d.schema!=='lazy_tail_reconnect_ack_v1' ||
+        String(d.stream_id||'')!==String(streamId) ||
+        String(d.checkpoint_event_id||'')!==reconnectCheckpoint
+      ) return;
+      reconnectAcknowledged=true;
+      if(typeof recordLazyTailEvent==='function'){
+        recordLazyTailEvent('lazy_tail_reconnect_attached',{
+          session_id:activeSid,
+          stream_id:streamId,
+          reconnect_status:'attached',
+        });
+      }
+      if(typeof setComposerStatus==='function') setComposerStatus('');
+    });
 
     source.addEventListener('token',e=>{
       if(_terminalStateReached||_streamFinalized) return;
@@ -5470,6 +5597,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const _terminalDoneMessages=Array.isArray(completedSession.terminal_messages)
         ? completedSession.terminal_messages
         : (Array.isArray(completedSession.messages)?completedSession.messages:[]);
+      const _lazyTailDone=!!(_doneData&&_doneData.lazy_tail_terminal_v1);
+      const _lazyTailDoneMessages=(
+        _lazyTailDone &&
+        INFLIGHT[activeSid] &&
+        Array.isArray(INFLIGHT[activeSid].messages)
+      ) ? [...INFLIGHT[activeSid].messages] : null;
       const _doneEvent=e;
       const _finishDone=()=>{
         if(typeof _recordCompletionCandidate==='function') _recordCompletionCandidate(completedSid, streamId);
@@ -5546,15 +5679,36 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const _currentDoneOffset=(typeof _oldestIdx!=='undefined'&&Number.isFinite(Number(_oldestIdx)))
             ? Number(_oldestIdx)
             : 0;
-          const _nextDoneMessages=typeof _reconcileTerminalDoneMessages==='function'
-            ? _reconcileTerminalDoneMessages(S.messages||[],completedSession,_currentDoneOffset)
-            : (Array.isArray(d.session.messages)?d.session.messages:[]);
-          d.session.messages=_nextDoneMessages;
-          if(d.session._messages_offset==null)d.session._messages_offset=_currentDoneOffset;
-          if(d.session._messages_truncated==null&&typeof _messagesTruncated!=='undefined'){
-            d.session._messages_truncated=_messagesTruncated;
+          if(_lazyTailDone){
+            const boundedTerminal=_boundedLazyTailTerminalState(
+              S.session,
+              S.messages,
+              d.session,
+              _lazyTailDoneMessages
+            );
+            S.session=boundedTerminal.session;
+            S.messages=_carryForwardEphemeralTurnFields(
+              S.messages||[],
+              boundedTerminal.messages
+            );
+          }else{
+            const _nextDoneMessages=typeof _reconcileTerminalDoneMessages==='function'
+              ? _reconcileTerminalDoneMessages(S.messages||[],completedSession,_currentDoneOffset)
+              : (Array.isArray(d.session.messages)?d.session.messages:[]);
+            d.session.messages=_nextDoneMessages;
+            if(d.session._messages_offset==null)d.session._messages_offset=_currentDoneOffset;
+            if(d.session._messages_truncated==null&&typeof _messagesTruncated!=='undefined'){
+              d.session._messages_truncated=_messagesTruncated;
+            }
+            S.session=d.session;
+            S.messages=_carryForwardEphemeralTurnFields(
+              S.messages||[],
+              d.session.messages||[]
+            );
+            if(typeof _messagesTruncated!=='undefined'){
+              _messagesTruncated=!!d.session._messages_truncated;
+            }
           }
-          S.session=d.session;S.messages=_carryForwardEphemeralTurnFields(S.messages||[], d.session.messages||[]);if(typeof _messagesTruncated!=='undefined')_messagesTruncated=!!d.session._messages_truncated;
           // #4720: reset _oldestIdx (full-load symmetry; keeps the #4613 anchor aligned).
           if(typeof _oldestIdx!=='undefined')_oldestIdx=d.session._messages_offset||0;
           S.messages=_filterRecoveryControlMessages(S.messages || []);
@@ -5758,6 +5912,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // assistant content until a later session switch. Settle from the persisted
       // session before closing so the pane converges on canonical state.
       const status=await _restoreSettledSession(source,{status:true});
+      if(status==='bounded_recovery_required'){
+        return;
+      }
       if(status==='restored'){
         return;
       }
@@ -5963,6 +6120,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(isRecoveryControlMessage){
           (async()=>{
             if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
+            if(lazyTailStream) return;
             if(S.session&&S.session.session_id===activeSid){
               S.messages=_filterRecoveryControlMessages(S.messages||[]);
               _markSessionViewed(activeSid, S.messages.length);
@@ -6047,24 +6205,31 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             const st=await api(`/api/chat/stream/status?stream_id=${encodeURIComponent(streamId)}`);
             if(st&&st.active){
               setComposerStatus('Reconnected');
-              _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
+              _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}${_lazyTailReconnectParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
               return;
             }
             if(st&&st.replay_available){
               setComposerStatus('Restoring stream…');
-              _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
+              _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}${_lazyTailReconnectParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
               return;
             }
           }catch(_){
             if(_deferStreamErrorIfOffline()) return;
           }
-          if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
+          if(!lazyTailStream&&await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
           if(_deferStreamErrorIfOffline()) return;
           if(_deferStreamErrorIfPageHidden(source)) return;
           const nextDelay=_retryDelays[attempt+1];
           if(nextDelay){
             setComposerStatus(`Reconnecting… (${attempt+2}/${_retryDelays.length})`);
             setTimeout(()=>{void _probeReconnect(attempt+1);}, nextDelay);
+            return;
+          }
+          if(lazyTailStream){
+            _showLazyReconnectRecovery(
+              'exhausted',
+              'retry_exhausted'
+            );
             return;
           }
           // Last-ditch: the stream may have finished while we were retrying.
@@ -6084,6 +6249,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
               if(_deferStreamErrorIfPageHidden(source)) return;
               _flushReasoningToAnchor();
               _scheduleAnchorRegistryCleanup(120000);
+              if(reconnectToken&&typeof recordLazyTailEvent==='function'){
+                recordLazyTailEvent('lazy_tail_reconnect_failed',{
+                  session_id:activeSid,
+                  stream_id:streamId,
+                  reconnect_status:'timeout',
+                  reason:'retry_timeout',
+                });
+              }
               _handleStreamError(source);
             }
           },8000);
@@ -6105,9 +6278,24 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(_deferStreamErrorIfPageHidden(source)) return;
           _flushReasoningToAnchor();
           _scheduleAnchorRegistryCleanup(120000);
+          if(reconnectToken&&typeof recordLazyTailEvent==='function'){
+            recordLazyTailEvent('lazy_tail_reconnect_failed',{
+              session_id:activeSid,
+              stream_id:streamId,
+              reconnect_status:'exhausted',
+              reason:'retry_exhausted',
+            });
+          }
           _handleStreamError(source);
         };
         setTimeout(()=>{void _probeReconnect(0);},_retryDelays[0]);
+        return;
+      }
+      if(lazyTailStream){
+        _showLazyReconnectRecovery(
+          'transport_rejected',
+          'reconnect_transport_rejected'
+        );
         return;
       }
       if(await _restoreSettledSession(source, {preserveVisibleOnShorterTerminalSnapshot:true})) return;
@@ -6131,13 +6319,19 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _smdEndParser();
       if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
       try{if(source&&source.readyState!==2)source.close();}catch(_){ }
+      let _cancelData={};
+      try{ _cancelData=JSON.parse(e.data||'{}')||{}; }catch(_){ _cancelData={}; }
+      const _lazyTailCancel=!!_cancelData.lazy_tail_terminal_v1;
+      const _lazyTailCancelMessages=(
+        _lazyTailCancel &&
+        INFLIGHT[activeSid] &&
+        Array.isArray(INFLIGHT[activeSid].messages)
+      ) ? [...INFLIGHT[activeSid].messages] : null;
       _clearOwnerInflightState();
       _clearStreamHidden(activeSid, streamId);  // #4416: terminal path, drop hidden tracker
       _clearStreamNotificationBackground(activeSid, streamId);
       _clearApprovalForOwner();
       _clearClarifyForOwner('cancelled');
-      let _cancelData={};
-      try{ _cancelData=JSON.parse(e.data||'{}')||{}; }catch(_){ _cancelData={}; }
       _flushReasoningToAnchor();
       _applyToAnchor('cancel',{
         status:_cancelData.status||_cancelData.type||'cancelled',
@@ -6165,6 +6359,44 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           && !((typeof _isMessageReaderUnpinned==='function')
             ? _isMessageReaderUnpinned()
             : (typeof _messageUserUnpinned!=='undefined' && _messageUserUnpinned));
+        if(_lazyTailCancel){
+          const boundedTerminal=_boundedLazyTailTerminalState(
+            S.session,
+            S.messages,
+            sessionPayload,
+            _lazyTailCancelMessages
+          );
+          S.session=boundedTerminal.session;
+          S.messages=_carryForwardEphemeralTurnFields(
+            S.messages||[],
+            boundedTerminal.messages
+          );
+          const last=S.messages[S.messages.length-1];
+          if(
+            !last ||
+            last.role!=='assistant' ||
+            !/task cancelled/i.test(String(last.content||''))
+          ){
+            S.messages.push({
+              role:'assistant',
+              content:'**Task cancelled:** Task cancelled.',
+              provider_details:'Task cancelled.',
+              provider_details_label:'Cancellation details',
+              _error:true,
+            });
+          }
+          _attachProjectedAnchorSceneToLastAssistant(S.messages);
+          clearLiveToolCards();if(!assistantText)removeThinking();
+          _markSessionViewed(
+            activeSid,
+            sessionPayload.message_count ?? S.messages.length
+          );
+          renderMessages({preserveScroll:true});
+          if(_wasFollowingAtCancel && typeof scrollToBottom==='function'){
+            scrollToBottom();
+          }
+          return true;
+        }
         S.session=sessionPayload;
         const _nextMsgs3018=(sessionPayload.messages||[]).filter(m=>m&&m.role);
         _attachProjectedAnchorSceneToLastAssistant(_nextMsgs3018);
@@ -6184,6 +6416,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       (async()=>{
         try{
           if(_applyCancelSessionPayload(_cancelSessionPayload)) return;
+          if(_lazyTailCancel){
+            if(typeof _showLazyTailRecovery==='function'){
+              _showLazyTailRecovery(
+                activeSid,
+                'The cancelled task could not be reconciled safely.'
+              );
+            }
+            return;
+          }
           // Fetch latest session from server to get accurate message list (includes cancel status)
           // This ensures messages stay in sync with server, fixing race condition where local
           // "*Task cancelled.*" message gets lost when done event overwrites S.messages
@@ -6262,6 +6503,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   async function _restoreSettledSession(source, options=null){
     const returnStatus=!!(options&&options.status);
     const preserveVisibleOnShorterTerminalSnapshot=!!(options&&options.preserveVisibleOnShorterTerminalSnapshot);
+    if(lazyTailStream){
+      _showLazyReconnectRecovery(
+        'bounded_recovery_required',
+        'legacy_restore_blocked'
+      );
+      return returnStatus?'bounded_recovery_required':false;
+    }
     if(_isActiveSession() && S.activeStreamId!==streamId){
       _closeSource(source);
       return returnStatus?'stale':false;
@@ -6471,7 +6719,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }catch(_){}
     }
     const replayParams=(reconnecting||replayOnly)?_runJournalReplayParams():'';
-    _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${replayParams}`,document.baseURI||location.href).href,{withCredentials:true}));
+    _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${replayParams}${_lazyTailReconnectParams()}`,document.baseURI||location.href).href,{withCredentials:true}));
   })();
 
 }

@@ -307,6 +307,15 @@ _CLIENT_EVENT_ALLOWED_FIELDS = {
     "visibility_state": 32,
     "url_path": 256,
     "reason": 160,
+    "state": 32,
+    "source_mode": 32,
+    "anchor_result": 16,
+    "reconnect_status": 32,
+}
+_CLIENT_EVENT_ALLOWED_NUMERIC_FIELDS = {
+    "page_index": 1_000_000,
+    "visible_count": 1_000_000,
+    "elapsed_ms": 3_600_000,
 }
 
 
@@ -6556,6 +6565,15 @@ def _sanitize_client_event_payload(payload: dict | None) -> dict:
             value = _bounded_client_event_string(payload.get(field), limit)
         if value is not None:
             sanitized[field] = value
+    for field, upper_bound in _CLIENT_EVENT_ALLOWED_NUMERIC_FIELDS.items():
+        value = payload.get(field)
+        if isinstance(value, bool):
+            continue
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            continue
+        sanitized[field] = max(0, min(upper_bound, normalized))
     ready_state = payload.get("ready_state")
     if isinstance(ready_state, bool):
         pass
@@ -12526,6 +12544,127 @@ def _lazy_tail_runtime_snapshot(handler, canonical_session_id: str) -> dict | No
     }
 
 
+_LAZY_TAIL_SESSION_METADATA_FIELDS = frozenset(
+    {
+        "session_id",
+        "title",
+        "workspace",
+        "model",
+        "model_provider",
+        "created_at",
+        "updated_at",
+        "last_message_at",
+        "pinned",
+        "archived",
+        "project_id",
+        "profile",
+        "input_tokens",
+        "output_tokens",
+        "estimated_cost",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "cache_hit_percent",
+        "personality",
+        "compression_anchor_visible_idx",
+        "compression_anchor_message_key",
+        "compression_anchor_summary",
+        "context_engine",
+        "compression_anchor_engine",
+        "compression_anchor_mode",
+        "compression_anchor_details",
+        "context_engine_state",
+        "context_length",
+        "threshold_tokens",
+        "last_prompt_tokens",
+        "post_compression_context_tokens_estimate",
+        "compression_recovery",
+        "recommended_recovery_action",
+        "gateway_routing",
+        "gateway_routing_history",
+        "manual_title",
+        "parent_session_id",
+        "worktree_path",
+        "worktree_branch",
+        "worktree_repo_root",
+        "worktree_created_at",
+        "pending_user_message",
+        "has_pending_user_message",
+        "pending_started_at",
+        "pending_user_source",
+        "pending_attachments",
+        "is_cli_session",
+        "source",
+        "source_tag",
+        "raw_source",
+        "session_source",
+        "source_label",
+        "read_only",
+        "enabled_toolsets",
+        "composer_draft",
+        "process_wakeup_pause",
+    }
+)
+
+
+def _lazy_tail_session_metadata(profile: str, resolution) -> dict | None:
+    """Return bounded session behavior metadata without reading messages."""
+    canonical_id = str(getattr(resolution, "canonical_id", "") or "")
+    if not canonical_id:
+        return None
+    try:
+        session = _shared_session_sidecar(canonical_id, metadata_only=True)
+    except Exception:
+        return None
+    if session is None:
+        return None
+    session_profile = getattr(session, "profile", None)
+    if not _profiles_match(session_profile, profile):
+        return None
+    try:
+        raw = session.compact()
+    except Exception:
+        return None
+    if _session_requires_cli_metadata_lookup(session):
+        cli_meta = _targeted_cli_metadata_for_resolution(resolution)
+        if cli_meta and _session_source_is_webui(cli_meta):
+            raw = _reconcile_session_detail_source_flags(raw, cli_meta)
+        elif cli_meta and _is_messaging_session_record(cli_meta):
+            raw = _merge_cli_sidebar_metadata(raw, cli_meta)
+    raw = _apply_resolution_metadata_to_payload(raw, resolution)
+    raw["session_id"] = canonical_id
+    raw["pending_attachments"] = (
+        getattr(session, "pending_attachments", []) or []
+    )
+    raw["pending_started_at"] = getattr(session, "pending_started_at", None)
+    raw["pending_user_source"] = getattr(session, "pending_user_source", None)
+    if (
+        str(
+            raw.get("source_tag")
+            or raw.get("raw_source")
+            or raw.get("session_source")
+            or ""
+        ).strip().lower()
+        == "subagent"
+        or _is_subagent_child_session_id(canonical_id)
+    ):
+        raw["is_cli_session"] = False
+        raw["read_only"] = True
+    if not isinstance(raw.get("read_only"), bool):
+        return None
+    provider = raw.get("model_provider")
+    if provider is not None and not isinstance(provider, str):
+        return None
+    metadata = {
+        key: raw.get(key)
+        for key in _LAZY_TAIL_SESSION_METADATA_FIELDS
+        if key in raw
+    }
+    metadata["session_id"] = canonical_id
+    metadata["read_only"] = raw["read_only"]
+    metadata["model_provider"] = provider
+    return metadata
+
+
 def _handle_session_window(handler, parsed):
     from api.session_window import (
         SessionWindowRequest,
@@ -12534,6 +12673,37 @@ def _handle_session_window(handler, parsed):
         default_session_window_dependencies,
     )
 
+    diag = RequestDiagnostics.maybe_start(
+        "GET",
+        parsed.path,
+        logger=logger,
+        print_fn=getattr(handler, "_safe_webui_print", None),
+    )
+    diagnostic_state = {"published": False}
+
+    def publish_diagnostic(values):
+        if diag is None or not isinstance(values, dict):
+            return
+        for name in (
+            "lineage_depth",
+            "sql_count",
+            "raw_rows_examined",
+            "visible_rows",
+            "serialized_bytes",
+            "state_db_read_ms",
+            "handoff_retry_count",
+        ):
+            if name in values:
+                diag.set_metric(name, values[name])
+        state = str(values.get("state") or "unknown")
+        if state not in {"ready", "reconnecting", "legacy_required", "stale"}:
+            state = "unknown"
+        diag.stage(f"state_{state}")
+        reason = str(values.get("reason") or "").strip().lower()
+        if reason and re.fullmatch(r"[a-z0-9_]{1,64}", reason):
+            diag.stage(f"reason_{reason}")
+        diagnostic_state["published"] = True
+
     try:
         request = SessionWindowRequest.parse(
             parse_qs(parsed.query or "", keep_blank_values=True)
@@ -12541,16 +12711,52 @@ def _handle_session_window(handler, parsed):
         dependencies = default_session_window_dependencies(
             capture_runtime=lambda _profile, canonical_id: (
                 _lazy_tail_runtime_snapshot(handler, canonical_id)
-            )
+            ),
+            capture_metadata=_lazy_tail_session_metadata,
+            diagnostic_sink=publish_diagnostic,
         )
         payload = build_session_window(request, deps=dependencies)
+        return j(handler, payload)
     except SessionWindowRequestError as exc:
         return j(
             handler,
             {"error": exc.code, "code": exc.code},
             status=exc.status,
         )
-    return j(handler, payload)
+    finally:
+        if diag and "payload" in locals() and not diagnostic_state["published"]:
+            window = payload.get("conversation_window", {})
+            publish_diagnostic(
+                {
+                    "state": window.get("state"),
+                    "reason": window.get("status_reason"),
+                }
+            )
+        if diag:
+            diag.finish()
+
+
+def _lazy_tail_terminal_sse_payload(event: str, data, *, enabled: bool):
+    """Strip complete history from lazy-tail terminal stream events."""
+    if not enabled or event not in {"done", "cancel"} or not isinstance(data, dict):
+        return data
+    payload = dict(data)
+    session = data.get("session")
+    if isinstance(session, dict):
+        allowed = _LAZY_TAIL_SESSION_METADATA_FIELDS | {
+            "message_count",
+            "active_stream_id",
+        }
+        projected = {
+            key: session.get(key)
+            for key in allowed
+            if key in session
+        }
+        projected["session_id"] = str(session.get("session_id") or "")
+        projected["_lazy_tail_terminal_v1"] = True
+        payload["session"] = projected
+    payload["lazy_tail_terminal_v1"] = True
+    return payload
 
 
 def _bounded_runtime_owner_absent_snapshot(
@@ -18976,6 +19182,7 @@ def _replay_run_journal(
     *,
     max_seq: int | None = None,
     include_stale: bool = True,
+    lazy_tail: bool = False,
 ) -> bool:
     summary = find_run_summary(stream_id)
     if not summary:
@@ -18987,10 +19194,15 @@ def _replay_run_journal(
         max_seq=max_seq,
     )
     for entry in journal.get("events") or []:
+        event = entry.get("event") or entry.get("type") or "message"
         _sse_with_id(
             handler,
-            entry.get("event") or entry.get("type") or "message",
-            entry.get("payload"),
+            event,
+            _lazy_tail_terminal_sse_payload(
+                event,
+                entry.get("payload"),
+                enabled=lazy_tail,
+            ),
             entry.get("event_id"),
         )
     if include_stale and not summary.get("terminal"):
@@ -19121,6 +19333,7 @@ def _sse_replay_run_journal_gap_checked(
                 after_seq,
                 max_seq=replay_max_seq,
                 include_stale=False,
+                lazy_tail=str(qs.get("lazy_tail", [""])[0] or "") == "1",
             ):
                 replay_cutoff_seq = replay_max_seq
         except _CLIENT_DISCONNECT_ERRORS:
@@ -19220,7 +19433,13 @@ def _runner_event_id(run_id: str, entry: dict) -> str | None:
     return None
 
 
-def _stream_runner_run_events(handler, run_id: str, cursor: str | None = None) -> bool:
+def _stream_runner_run_events(
+    handler,
+    run_id: str,
+    cursor: str | None = None,
+    *,
+    lazy_tail: bool = False,
+) -> bool:
     """Stream events from a configured runner without WebUI-owned runtime maps."""
     run_id = str(run_id or "").strip()
     if not run_id:
@@ -19256,7 +19475,16 @@ def _stream_runner_run_events(handler, run_id: str, cursor: str | None = None) -
                 if not isinstance(entry, dict):
                     continue
                 event = _runner_event_name(entry)
-                _sse_with_id(handler, event, _runner_event_payload(entry), _runner_event_id(run_id, entry))
+                _sse_with_id(
+                    handler,
+                    event,
+                    _lazy_tail_terminal_sse_payload(
+                        event,
+                        _runner_event_payload(entry),
+                        enabled=lazy_tail,
+                    ),
+                    _runner_event_id(run_id, entry),
+                )
                 emitted = True
                 if event in ("stream_end", "error", "cancel"):
                     terminal = True
@@ -19286,11 +19514,105 @@ def _stream_runner_run_events(handler, run_id: str, cursor: str | None = None) -
 def _handle_sse_stream(handler, parsed):
     qs = parse_qs(parsed.query)
     stream_id = qs.get("stream_id", [""])[0]
+    lazy_tail_stream = str(qs.get("lazy_tail", [""])[0] or "") == "1"
+    reconnect_claims = None
+    reconnect_token = str(qs.get("reconnect_token", [""])[0] or "").strip()
+    reconnect_session_id = str(qs.get("session_id", [""])[0] or "").strip()
+    if reconnect_token:
+        if not reconnect_session_id:
+            return j(
+                handler,
+                {
+                    "error": "invalid reconnect authority",
+                    "code": "reconnect_session_required",
+                },
+                status=409,
+            )
+        try:
+            reconnect_claims = _validated_lazy_tail_reconnect_claims(
+                reconnect_token,
+                reconnect_session_id,
+            )
+        except ValueError as exc:
+            return j(
+                handler,
+                {
+                    "error": "invalid reconnect authority",
+                    "code": str(exc),
+                },
+                status=409,
+            )
+        if reconnect_claims.stream_id != stream_id:
+            return j(
+                handler,
+                {
+                    "error": "invalid reconnect authority",
+                    "code": "reconnect_stream_mismatch",
+                },
+                status=409,
+            )
+        _checkpoint_run_id, _checkpoint_seq = _parse_run_journal_event_id(
+            reconnect_claims.checkpoint_event_id
+        )
+        qs["replay"] = ["1"]
+        qs["after_event_id"] = [reconnect_claims.checkpoint_event_id]
+        qs["after_seq"] = [str(_checkpoint_seq or 0)]
+
+    def emit_reconnect_ack():
+        if reconnect_claims is None:
+            return
+        checkpoint_run_id, checkpoint_seq = _parse_run_journal_event_id(
+            reconnect_claims.checkpoint_event_id
+        )
+        _sse(
+            handler,
+            "reconnect_ack",
+            {
+                "schema": "lazy_tail_reconnect_ack_v1",
+                "stream_id": reconnect_claims.stream_id,
+                "checkpoint_event_id": reconnect_claims.checkpoint_event_id,
+                "next_event_id": (
+                    f"{checkpoint_run_id}:{checkpoint_seq + 1}"
+                    if checkpoint_run_id and checkpoint_seq is not None
+                    else None
+                ),
+            },
+        )
+
+    def reconnect_authority_is_current() -> bool:
+        if reconnect_claims is None:
+            return True
+        return (
+            _active_run_stream_for_session(
+                reconnect_claims.canonical_session_id
+            )
+            == reconnect_claims.stream_id
+        )
+
     if not _stream_id_visible_to_request_profile(handler, stream_id):
         return True
     stream = STREAMS.get(stream_id)
+    if reconnect_claims is not None and (
+        stream is None or not reconnect_authority_is_current()
+    ):
+        return j(
+            handler,
+            {
+                "error": "reconnect authority changed",
+                "code": "reconnect_stream_changed",
+            },
+            status=409,
+        )
     if stream is None:
-        if _stream_runner_run_events(handler, stream_id, _runner_stream_cursor_from_query(qs)):
+        if (
+            reconnect_claims is None
+            and _stream_runner_run_events(
+                handler,
+                stream_id,
+                _runner_stream_cursor_from_query(qs),
+                lazy_tail=lazy_tail_stream,
+            )
+        ):
             return True
         try:
             journal_available = bool(find_run_summary(stream_id)) if stream_id else False
@@ -19305,7 +19627,13 @@ def _handle_sse_stream(handler, parsed):
         handler.send_header("Connection", "close")
         end_sse_headers(handler)
         try:
-            _replay_run_journal(handler, stream_id, _parse_run_journal_after_seq(qs, stream_id))
+            emit_reconnect_ack()
+            _replay_run_journal(
+                handler,
+                stream_id,
+                _parse_run_journal_after_seq(qs, stream_id),
+                lazy_tail=lazy_tail_stream,
+            )
         except _CLIENT_DISCONNECT_ERRORS:
             pass
         return True
@@ -19314,6 +19642,20 @@ def _handle_sse_stream(handler, parsed):
     else:
         subscriber = stream.subscribe() if hasattr(stream, "subscribe") else stream
         stream_snapshot = {}
+    if not reconnect_authority_is_current():
+        if subscriber is not stream and hasattr(stream, "unsubscribe"):
+            try:
+                stream.unsubscribe(subscriber)
+            except Exception:
+                pass
+        return j(
+            handler,
+            {
+                "error": "reconnect authority changed",
+                "code": "reconnect_stream_changed",
+            },
+            status=409,
+        )
     handler.send_response(200)
     handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
     handler.send_header("Cache-Control", "no-cache")
@@ -19323,6 +19665,7 @@ def _handle_sse_stream(handler, parsed):
     _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
     # Replay shares the drain loop's try/finally so every exit path unsubscribes.
     try:
+        emit_reconnect_ack()
         gap_recovered, replay_cutoff_seq = _sse_replay_run_journal_gap_checked(
             handler, qs, stream_id, stream_snapshot
         )
@@ -19349,9 +19692,26 @@ def _handle_sse_stream(handler, parsed):
             if replay_cutoff_seq is not None and event_seq is not None and event_seq <= replay_cutoff_seq:
                 continue
             if event_id:
-                _sse_with_id(handler, event, data, event_id)
+                _sse_with_id(
+                    handler,
+                    event,
+                    _lazy_tail_terminal_sse_payload(
+                        event,
+                        data,
+                        enabled=lazy_tail_stream,
+                    ),
+                    event_id,
+                )
             else:
-                _sse(handler, event, data)
+                _sse(
+                    handler,
+                    event,
+                    _lazy_tail_terminal_sse_payload(
+                        event,
+                        data,
+                        enabled=lazy_tail_stream,
+                    ),
+                )
             if event in ("stream_end", "error", "cancel"):
                 break
     except _CLIENT_DISCONNECT_ERRORS:

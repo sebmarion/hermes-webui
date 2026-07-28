@@ -109,6 +109,176 @@ def test_session_window_route_maps_typed_request_errors(query, monkeypatch):
     assert "session" not in captured["payload"]
 
 
+def test_lazy_tail_metadata_preserves_non_transcript_session_state(monkeypatch):
+    import api.routes as routes
+
+    session = SimpleNamespace(
+        profile="default",
+        pending_attachments=[{"name": "queued.txt"}],
+        pending_started_at=123.0,
+        pending_user_source="webui",
+        compact=lambda: {
+            "session_id": "canonical",
+            "read_only": True,
+            "model_provider": "openai",
+            "profile": "default",
+            "enabled_toolsets": ["web"],
+            "composer_draft": {"text": "draft"},
+            "project_id": "project-1",
+            "worktree_path": "/workspace/task",
+            "messages": [{"role": "user", "content": "must not leak"}],
+            "message_count": 999,
+        },
+    )
+    resolution = SimpleNamespace(
+        canonical_id="canonical",
+        canonical_row={},
+    )
+    monkeypatch.setattr(
+        routes,
+        "_shared_session_sidecar",
+        lambda sid, metadata_only=False: (
+            session
+            if sid == "canonical" and metadata_only is True
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_session_requires_cli_metadata_lookup",
+        lambda _session: False,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_apply_resolution_metadata_to_payload",
+        lambda raw, _resolution: raw,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_is_subagent_child_session_id",
+        lambda _sid: False,
+    )
+
+    metadata = routes._lazy_tail_session_metadata("default", resolution)
+
+    assert metadata["session_id"] == "canonical"
+    assert metadata["read_only"] is True
+    assert metadata["model_provider"] == "openai"
+    assert metadata["profile"] == "default"
+    assert metadata["enabled_toolsets"] == ["web"]
+    assert metadata["composer_draft"] == {"text": "draft"}
+    assert metadata["project_id"] == "project-1"
+    assert metadata["worktree_path"] == "/workspace/task"
+    assert metadata["pending_attachments"] == [{"name": "queued.txt"}]
+    assert "messages" not in metadata
+    assert "message_count" not in metadata
+
+
+def test_lazy_tail_metadata_fails_closed_without_read_only(monkeypatch):
+    import api.routes as routes
+
+    session = SimpleNamespace(
+        profile="default",
+        pending_attachments=[],
+        pending_started_at=None,
+        pending_user_source=None,
+        compact=lambda: {
+            "session_id": "canonical",
+            "model_provider": "openai",
+        },
+    )
+    resolution = SimpleNamespace(
+        canonical_id="canonical",
+        canonical_row={},
+    )
+    monkeypatch.setattr(
+        routes,
+        "_shared_session_sidecar",
+        lambda _sid, metadata_only=False: session if metadata_only else None,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_session_requires_cli_metadata_lookup",
+        lambda _session: False,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_apply_resolution_metadata_to_payload",
+        lambda raw, _resolution: raw,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_is_subagent_child_session_id",
+        lambda _sid: False,
+    )
+
+    assert routes._lazy_tail_session_metadata("default", resolution) is None
+
+
+def test_lazy_tail_metadata_never_falls_back_to_full_session_load(
+    tmp_path,
+    monkeypatch,
+):
+    import json
+    import api.routes as routes
+
+    sid = "strict-prefix"
+    sidecar = {
+        "session_id": sid,
+        "title": "Strict prefix",
+        "workspace": "/workspace",
+        "model": "model",
+        "model_provider": "provider",
+        "created_at": 1.0,
+        "updated_at": 2.0,
+        "profile": "default",
+        "read_only": False,
+        "messages": [
+            {"role": "user", "content": "large transcript must not parse"}
+        ],
+        "tool_calls": [],
+    }
+    (tmp_path / f"{sid}.json").write_text(
+        json.dumps(sidecar),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(routes, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(
+        routes.Session,
+        "load",
+        classmethod(
+            lambda _cls, _sid: (_ for _ in ()).throw(
+                AssertionError("strict lazy metadata must never full-load")
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_session_requires_cli_metadata_lookup",
+        lambda _session: False,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_apply_resolution_metadata_to_payload",
+        lambda raw, _resolution: raw,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_is_subagent_child_session_id",
+        lambda _sid: False,
+    )
+
+    metadata = routes._lazy_tail_session_metadata(
+        "default",
+        SimpleNamespace(canonical_id=sid, canonical_row={}),
+    )
+
+    assert metadata["session_id"] == sid
+    assert metadata["read_only"] is False
+    assert metadata["model_provider"] == "provider"
+    assert "messages" not in metadata
+
+
 def test_app_shell_injects_independent_literal_browser_gate(monkeypatch):
     import api.routes as routes
 
