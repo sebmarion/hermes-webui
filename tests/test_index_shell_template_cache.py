@@ -29,6 +29,10 @@ def _old_inline_render(csrf_token: str) -> str:
         index_path.read_text(encoding="utf-8")
         .replace("__WEBUI_VERSION__", quote(WEBUI_VERSION, safe=""))
         .replace("__MAX_UPLOAD_BYTES__", str(routes.MAX_UPLOAD_BYTES))
+        .replace(
+            "__LAZY_TAIL_BROWSER_V1__",
+            "true" if routes._lazy_tail_browser_enabled() else "false",
+        )
         .replace("__CSRF_TOKEN_JSON__", json.dumps(csrf_token))
     )
 

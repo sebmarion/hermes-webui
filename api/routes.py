@@ -12371,10 +12371,70 @@ def _render_index_shell_base() -> str:
         index_path.read_text(encoding="utf-8")
         .replace("__WEBUI_VERSION__", version_token)
         .replace("__MAX_UPLOAD_BYTES__", str(MAX_UPLOAD_BYTES))
+        .replace(
+            "__LAZY_TAIL_BROWSER_V1__",
+            "true" if _lazy_tail_browser_enabled() else "false",
+        )
     )
     with _INDEX_SHELL_CACHE_LOCK:
         _INDEX_SHELL_CACHE["base"] = (sig, base)
     return base
+
+
+def _lazy_tail_server_enabled() -> bool:
+    return str(os.environ.get("HERMES_WEBUI_LAZY_TAIL_V1", "")).strip() == "1"
+
+
+def _lazy_tail_browser_enabled() -> bool:
+    return (
+        str(os.environ.get("HERMES_WEBUI_LAZY_TAIL_BROWSER_V1", "")).strip()
+        == "1"
+    )
+
+
+def _lazy_tail_runtime_snapshot(handler, canonical_session_id: str) -> dict | None:
+    stream_id = _active_run_stream_for_session(canonical_session_id)
+    if not stream_id:
+        return None
+    snapshot = _run_journal_live_snapshot(stream_id, handler=handler)
+    if not isinstance(snapshot, dict):
+        return None
+    checkpoint = str(snapshot.get("last_event_id") or "").strip()
+    if not checkpoint:
+        return None
+    return {
+        **snapshot,
+        "schema": "run_snapshot_v1",
+        "stream_id": stream_id,
+        "through_event_id": checkpoint,
+    }
+
+
+def _handle_session_window(handler, parsed):
+    from api.session_window import (
+        SessionWindowRequest,
+        SessionWindowRequestError,
+        build_session_window,
+        default_session_window_dependencies,
+    )
+
+    try:
+        request = SessionWindowRequest.parse(
+            parse_qs(parsed.query or "", keep_blank_values=True)
+        )
+        dependencies = default_session_window_dependencies(
+            capture_runtime=lambda _profile, canonical_id: (
+                _lazy_tail_runtime_snapshot(handler, canonical_id)
+            )
+        )
+        payload = build_session_window(request, deps=dependencies)
+    except SessionWindowRequestError as exc:
+        return j(
+            handler,
+            {"error": exc.code, "code": exc.code},
+            status=exc.status,
+        )
+    return j(handler, payload)
 
 
 def _bounded_runtime_owner_absent_snapshot(
@@ -13305,6 +13365,10 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path.startswith("/static/"):
         return _serve_static(handler, parsed)
 
+    if parsed.path == "/api/session-window":
+        if not _lazy_tail_server_enabled():
+            return j(handler, {"error": "not found"}, status=404)
+        return _handle_session_window(handler, parsed)
 
     if parsed.path == "/api/session/worktree/status":
         query = parse_qs(parsed.query)
@@ -18686,6 +18750,37 @@ def _session_events_resume_event_id(handler, parsed) -> str | None:
     return raw or None
 
 
+def _validated_lazy_tail_reconnect_claims(
+    token: str,
+    requested_session_id: str,
+    *,
+    now: float | None = None,
+):
+    from api.session_window import decode_reconnect_token
+
+    claims = decode_reconnect_token(token, now=now)
+    active_profile = str(get_active_profile_name() or "default").strip() or "default"
+    if claims.profile_id != active_profile:
+        raise ValueError("reconnect_profile_mismatch")
+    resolution = resolve_shared_session(
+        _active_state_db_path(),
+        requested_session_id,
+    )
+    if getattr(resolution, "status", None) != "found":
+        raise ValueError("reconnect_session_unavailable")
+    canonical_id = str(getattr(resolution, "canonical_id", "") or "")
+    if claims.canonical_session_id != canonical_id:
+        raise ValueError("reconnect_session_mismatch")
+    if _active_run_stream_for_session(canonical_id) != claims.stream_id:
+        raise ValueError("reconnect_stream_mismatch")
+    run_id, checkpoint_seq = _parse_run_journal_event_id(
+        claims.checkpoint_event_id
+    )
+    if run_id != claims.stream_id or checkpoint_seq is None:
+        raise ValueError("reconnect_checkpoint_mismatch")
+    return claims
+
+
 def _session_snapshot_payload(session, *, active_stream_id: str | None = None) -> dict:
     try:
         payload = session.compact(
@@ -19115,6 +19210,30 @@ def _handle_sse_stream(handler, parsed):
 def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
     if not _session_id_visible_to_request_profile(handler, session_id):
         return True
+    reconnect_claims = None
+    reconnect_token = str(
+        parse_qs(getattr(parsed, "query", "") or "").get(
+            "reconnect_token",
+            [""],
+        )[0]
+        or ""
+    ).strip()
+    if reconnect_token:
+        try:
+            reconnect_claims = _validated_lazy_tail_reconnect_claims(
+                reconnect_token,
+                session_id,
+            )
+            session_id = reconnect_claims.canonical_session_id
+        except ValueError as exc:
+            return j(
+                handler,
+                {
+                    "error": "invalid reconnect authority",
+                    "code": str(exc),
+                },
+                status=409,
+            )
     try:
         session = get_session(session_id, metadata_only=True)
     except KeyError:
@@ -19125,7 +19244,11 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
     # end_sse_headers() leaves a window where a run finishing between header commit
     # and baseline is absorbed into the baseline and silently lost. Both operations
     # are side-effect-free (header read + stat-only fingerprint), safe pre-response.
-    resume_event_id = _session_events_resume_event_id(handler, parsed)
+    resume_event_id = (
+        reconnect_claims.checkpoint_event_id
+        if reconnect_claims is not None
+        else _session_events_resume_event_id(handler, parsed)
+    )
     _idle_journal_fp = session_journal_fingerprint(session_id)
 
     handler.send_response(200)
@@ -19194,6 +19317,37 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
                 replay_ok = True
                 replay_events = replay.get("events") or []
         subscriber, subscriber_stream, stream_snapshot, active_stream_id = attach_active_stream()
+        if reconnect_claims is not None:
+            if (
+                subscriber is None
+                or active_stream_id != reconnect_claims.stream_id
+            ):
+                _sse(
+                    handler,
+                    "reconnect_error",
+                    {
+                        "schema": "lazy_tail_reconnect_error_v1",
+                        "code": "reconnect_stream_changed",
+                    },
+                )
+                return True
+            _checkpoint_run_id, _checkpoint_seq = _parse_run_journal_event_id(
+                reconnect_claims.checkpoint_event_id
+            )
+            _sse(
+                handler,
+                "reconnect_ack",
+                {
+                    "schema": "lazy_tail_reconnect_ack_v1",
+                    "stream_id": reconnect_claims.stream_id,
+                    "checkpoint_event_id": reconnect_claims.checkpoint_event_id,
+                    "next_event_id": (
+                        f"{_checkpoint_run_id}:{_checkpoint_seq + 1}"
+                        if _checkpoint_run_id and _checkpoint_seq is not None
+                        else None
+                    ),
+                },
+            )
         if subscriber is None:
             if replay_ok:
                 emit_replay(replay_events, active_stream_id, None)
