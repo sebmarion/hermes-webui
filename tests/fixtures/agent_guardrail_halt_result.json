@@ -1,0 +1,56 @@
+{
+  "api_calls": 4,
+  "completed": true,
+  "failed": false,
+  "final_response": "I stopped retrying terminal because it hit the tool-call guardrail (same_tool_failure_halt) after 4 repeated non-progressing attempts. The last tool result explains the blocker; the next step is to change strategy instead of repeating the same call.",
+  "guardrail": {
+    "action": "halt",
+    "broad_count": 4,
+    "code": "same_tool_failure_halt",
+    "count": 4,
+    "exact_count": 1,
+    "message": "Stopped terminal: it failed 4 assistant tool batches this turn. Stop retrying the same failing tool path and choose a different approach.",
+    "signature": {
+      "args_hash": "c9d49a37c271f84e3bfa3d240558762dd97b95ed23c3e925ac3f47c7aeb9d866",
+      "tool_name": "terminal"
+    },
+    "tool_name": "terminal"
+  },
+  "messages": [
+    {
+      "content": "try distinct terminal recovery commands",
+      "role": "user"
+    },
+    {
+      "content": "",
+      "finish_reason": "tool_calls",
+      "reasoning": null,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "call_id": "call-4",
+          "function": {
+            "arguments": "{\"command\": \"bad-4\"}",
+            "name": "terminal"
+          },
+          "id": "call-4",
+          "response_item_id": "fc_call-4",
+          "type": "function"
+        }
+      ]
+    },
+    {
+      "content": "{\"exit_code\": 127, \"output\": \"missing\"}\n\n[Tool loop hard stop: same_tool_failure_halt; count=4; Stopped terminal: it failed 4 assistant tool batches this turn. Stop retrying the same failing tool path and choose a different approach.]",
+      "name": "terminal",
+      "role": "tool",
+      "tool_call_id": "call-4",
+      "tool_name": "terminal"
+    },
+    {
+      "content": "I stopped retrying terminal because it hit the tool-call guardrail (same_tool_failure_halt) after 4 repeated non-progressing attempts. The last tool result explains the blocker; the next step is to change strategy instead of repeating the same call.",
+      "role": "assistant"
+    }
+  ],
+  "partial": false,
+  "turn_exit_reason": "guardrail_halt"
+}

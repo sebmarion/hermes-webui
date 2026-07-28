@@ -418,6 +418,50 @@ function _statusCardHtml(card){
   </div>`;
 }
 
+function _assistantMessageTerminalState(message){
+  const scene=(message&&message._anchor_activity_scene&&typeof message._anchor_activity_scene==='object')
+    ? message._anchor_activity_scene
+    : {};
+  const lifecycle=(scene.lifecycle&&typeof scene.lifecycle==='object')?scene.lifecycle:{};
+  return String(
+    (message&&message._terminal_state)
+    || scene.terminal_state
+    || lifecycle.terminal_state
+    || ''
+  ).trim().toLowerCase();
+}
+
+function _assistantMessageStatusCard(message){
+  const existing=(message&&message._statusCard&&typeof message._statusCard==='object')
+    ? message._statusCard
+    : null;
+  if(_assistantMessageTerminalState(message)!=='guardrail_blocked') return existing;
+  return {
+    ...(existing||{}),
+    title:'Needs recovery',
+    subtitle:(existing&&existing.subtitle)||'The agent stopped at a guardrail and needs a new strategy.',
+    rows:(existing&&Array.isArray(existing.rows)&&existing.rows.length)
+      ? existing.rows
+      : [
+        {label:'State',value:'Blocked'},
+        {label:'Next step',value:'Start a new turn with a different strategy.'},
+      ],
+  };
+}
+
+function _assistantTurnStatusLabel(message){
+  if(_assistantMessageTerminalState(message)==='guardrail_blocked') return 'Needs recovery';
+  return t('done')||'Done';
+}
+
+function _assistantTurnDurationLabel(message, durationText){
+  if(!durationText) return '';
+  if(_assistantMessageTerminalState(message)==='guardrail_blocked'){
+    return `Needs recovery · ${durationText}`;
+  }
+  return `Done in ${durationText}`;
+}
+
 function _compressionRecoveryHtml(recovery, sessionId){
   if(!recovery||typeof recovery!=='object') return '';
   if(String(recovery.terminal_state||'')!=='compression_exhausted') return '';
@@ -12139,7 +12183,7 @@ function _anchorSceneNodeForRow(row, opts){
     });
   }else if(row.role==='terminal'){
     const status=String(row.status||row.source_event_type||'').trim();
-    const isError=['error','failed','connection_lost','interrupted','compression_exhausted','tool_limit_reached','no_response'].includes(status);
+    const isError=['error','failed','connection_lost','interrupted','compression_exhausted','tool_limit_reached','guardrail_blocked','no_response'].includes(status);
     node=_activityStatusNode({
       kind:isError?'warning':'done',
       label:row.text||status||'Turn ended',
@@ -12877,7 +12921,7 @@ function _anchorSceneSceneHasWorklogWorthyRows(scene){
 // preservation) are left to their existing behavior — this is scoped to the
 // error/failure family the report is about.
 const _ANCHOR_SCENE_ERRORED_TERMINAL_STATES=new Set([
-  'error','no_response','degraded','connection_lost','tool_limit_reached','compression_exhausted',
+  'error','no_response','degraded','connection_lost','tool_limit_reached','guardrail_blocked','compression_exhausted',
 ]);
 function _anchorSceneHasErroredTerminalState(scene){
   const state=String(scene&&scene.terminal_state||'').trim().toLowerCase();
@@ -15461,7 +15505,14 @@ function renderMessages(options){
       : (!isUser&&isLastAssistant&&isTurnFinalAssistant&&typeof _activeCompressionRecoveryPayload==='function' ? _activeCompressionRecoveryPayload() : null);
     const recoveryHtml=recoveryPayload ? _compressionRecoveryHtml(recoveryPayload, (S.session&&S.session.session_id)||'') : '';
     if(recoveryHtml) bodyHtml += recoveryHtml;
-    const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
+    const messageStatusCard=!isUser
+      ? (
+        typeof _assistantMessageStatusCard==='function'
+          ? _assistantMessageStatusCard(m)
+          : (m._statusCard||null)
+      )
+      : null;
+    const statusHtml = messageStatusCard ? _statusCardHtml(messageStatusCard) : '';
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
@@ -16285,7 +16336,9 @@ function renderMessages(options){
       if(durationText){
         const duration=document.createElement('span');
         duration.className='msg-duration-inline';
-        duration.textContent=`Done in ${durationText}`;
+        duration.textContent=typeof _assistantTurnDurationLabel==='function'
+          ? _assistantTurnDurationLabel(msg,durationText)
+          : `Done in ${durationText}`;
         fragments.push(duration);
       }
       if(window._showTokenUsage&&hasTurnUsage){
@@ -16337,13 +16390,14 @@ function renderMessages(options){
       if(hasTransparentRows){
         // Find the corresponding message to read duration/usage.
         const seg=turn.querySelector('.assistant-segment');
+        let msg={};
         let durationText='';
         let ttftText='';
         let tokensText='';
         if(seg){
           const mi=seg.getAttribute('data-msg-idx');
           if(mi!=null){
-            const msg=S.messages[Number(mi)]||{};
+            msg=S.messages[Number(mi)]||{};
             if(msg._turnDuration!=null) durationText=_formatTurnDuration(msg._turnDuration);
             if(msg._firstTokenMs!=null) ttftText=_formatFirstToken(msg._firstTokenMs);
             if(msg._turnUsage){
@@ -16357,7 +16411,9 @@ function renderMessages(options){
           durationText,
           ttftText,
           tokensText,
-          statusText: t('done')||'Done',
+          statusText:typeof _assistantTurnStatusLabel==='function'
+            ? _assistantTurnStatusLabel(msg)
+            : (t('done')||'Done'),
         });
       }else{
         // No transparent rows → no footer needed.

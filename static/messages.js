@@ -2821,9 +2821,43 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // in-closure SSE handlers). Explicit terminal-path calls above just expire it
   // sooner; this guarantees window._liveAnchorRegistries can't grow unbounded.
   _scheduleAnchorRegistryCleanup(600000);
+  function _adoptStructuredTerminalStateIntoAnchor(raw, previousState, previousReason){
+    if(!_anchorRegistry||!_anchorRegistry.anchor) return false;
+    const incoming=String(raw&&raw.terminal_state||'').trim().toLowerCase();
+    const _previousTerminalState=String(previousState||'').trim().toLowerCase();
+    const guardrailBlocked=(
+      incoming==='guardrail_blocked'
+      || _previousTerminalState==='guardrail_blocked'
+    );
+    if(!guardrailBlocked) return false;
+    const anchor=_anchorRegistry.anchor;
+    const lifecycle=(anchor.lifecycle&&typeof anchor.lifecycle==='object')
+      ? {...anchor.lifecycle}
+      : {};
+    const incomingReason=String(raw&&raw.terminal_reason||'').trim();
+    const terminalReason=incomingReason||String(previousReason||'').trim()||'guardrail_halt';
+    lifecycle.status='guardrail_blocked';
+    lifecycle.terminal_state='guardrail_blocked';
+    lifecycle.terminal_reason=terminalReason;
+    anchor.lifecycle=lifecycle;
+    anchor.terminal_state='guardrail_blocked';
+    anchor.terminal_reason=terminalReason;
+    return true;
+  }
   function _applyToAnchor(sourceEventType, rawEventData, sseEvent){
     if(!_anchorRegistry||!_anchorApi||typeof _anchorApi.applyAssistantTurnAnchorSourceEvent!=='function') return null;
     const raw=(rawEventData&&typeof rawEventData==='object')?rawEventData:{};
+    const previousLifecycle=(_anchorRegistry.anchor&&_anchorRegistry.anchor.lifecycle)||{};
+    const previousTerminalState=(
+      (_anchorRegistry.anchor&&_anchorRegistry.anchor.terminal_state)
+      || previousLifecycle.terminal_state
+      || ''
+    );
+    const previousTerminalReason=(
+      (_anchorRegistry.anchor&&_anchorRegistry.anchor.terminal_reason)
+      || previousLifecycle.terminal_reason
+      || ''
+    );
     const eventId=(sseEvent&&sseEvent.lastEventId)||raw.event_id||raw.lastEventId||raw.last_event_id||'';
     const sourceEvent={
       ...raw,
@@ -2844,6 +2878,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _anchorRegistry,
         sourceEvent,
         {session_id:activeSid,stream_id:streamId}
+      );
+      _adoptStructuredTerminalStateIntoAnchor(
+        raw,
+        previousTerminalState,
+        previousTerminalReason,
       );
       _renderAnchorLiveScene();
       return result;
@@ -5567,7 +5606,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       ) ? [...INFLIGHT[activeSid].messages] : null;
       const _doneEvent=e;
       const _finishDone=()=>{
-        if(typeof _recordCompletionCandidate==='function') _recordCompletionCandidate(completedSid, streamId);
+        const d=_doneData;
+        const _isGuardrailBlocked=d.terminal_state==='guardrail_blocked';
+        const completedSession=d.session||{session_id:activeSid};
+        const completedSid=completedSession.session_id||activeSid;
+        if(!_isGuardrailBlocked&&typeof _recordCompletionCandidate==='function') _recordCompletionCandidate(completedSid, streamId);
         // Bug A fix: cancel any pending rAF and mark stream finalized before
         // the DOM is settled by renderMessages, so no trailing token/reasoning rAF
         // can reintroduce a stale thinking card or duplicate content.
@@ -5588,10 +5631,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         } else {
           _smdEndParser();
         }
-        const d=_doneData;
         _flushReasoningToAnchor();
         _applyToAnchor('done',{
-          status:d.status||'completed',
+          status:d.terminal_state||d.status||'completed',
+          terminal_state:d.terminal_state,
+          terminal_reason:d.terminal_reason,
           usage:d.usage||null,
           created_at:d.created_at||null,
         },_doneEvent);
@@ -5599,8 +5643,6 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _clearAnchorProseIncrementalNode();
         const isActiveSession=_isSessionCurrentPane(activeSid);
         const isSessionViewed=_isSessionActivelyViewed(activeSid);
-        const completedSession=d.session||{session_id:activeSid};
-        const completedSid=completedSession.session_id||activeSid;
         const completedMessageCount=completedSession.message_count != null
           ? completedSession.message_count
           : (
@@ -5612,7 +5654,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
                   : ((Array.isArray(S.messages)&&S.messages.length)||0)
               )
           );
-        if(!isSessionViewed && typeof _markSessionCompletionUnread==='function'){
+        if(!_isGuardrailBlocked&&!isSessionViewed && typeof _markSessionCompletionUnread==='function'){
           _markSessionCompletionUnread(completedSid, completedMessageCount);
         }
         if(isSessionViewed) _markSessionViewed(completedSid, completedMessageCount);
@@ -5697,6 +5739,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           }
           // Stamp _ts on the last assistant message if it has no timestamp
           if(lastAsst&&!lastAsst._ts&&!lastAsst.timestamp) lastAsst._ts=Date.now()/1000;
+          if(lastAsst&&d.terminal_state==='guardrail_blocked'){
+            lastAsst._terminal_state='guardrail_blocked';
+            lastAsst._terminal_reason=String(d.terminal_reason||'guardrail_halt');
+          }
           if(d.usage){
             const _doneUsageFallback={...(S.lastUsage||{})};
             if(S.session){
@@ -5823,7 +5869,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         if(isActiveSession) _queueDrainSid=activeSid;
         renderSessionList();
         _setActivePaneIdleIfOwner();
-        playNotificationSound();
+        if(!_isGuardrailBlocked) playNotificationSound();
         // #4416: notify if the tab was hidden at ANY point during this stream
         // (not just at done-receive time, which a throttled background-tab SSE
         // delivers late — after the user returns and document.hidden is false).
@@ -5834,7 +5880,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           sessionId:completedSid,
           liveDisplayText:typeof _streamDisplay==='function'?_streamDisplay():assistantText,
         });
-        sendBrowserNotification('Response complete',_completionPreview||'Task finished',{forceHidden:_wasEverBackgrounded,sid:activeSid});
+        if(!_isGuardrailBlocked) sendBrowserNotification('Response complete',_completionPreview||'Task finished',{forceHidden:_wasEverBackgrounded,sid:activeSid});
       };
       if(_shouldUseLiveProseFade()&&assistantBody){
         _cancelAnimationFramePendingStreamRender();

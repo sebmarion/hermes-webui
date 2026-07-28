@@ -148,6 +148,46 @@ navigation both before and during the asynchronous child load, exact-text
 collisions preserve legitimate user turns, and a claim failure persists a visible
 terminal blocker.
 
+### Guardrail terminal-truth gate
+
+The Agent behavior change is default-off:
+`tool_loop_guardrails.terminal_exact_failure_only: false`. When enabled, only
+distinct `terminal` request signatures bypass the broad same-tool halt;
+identical failed signatures, policy and authorization blocks, other tools, and
+the global iteration limit remain unchanged. The WebUI mapping of a genuine
+structured halt to `guardrail_blocked` is unconditional and must stay enabled
+even when the Agent gate is rolled back.
+
+Run the focused Agent contract from the matching Hermes Agent checkout:
+
+```bash
+scripts/run_tests.sh \
+  tests/agent/test_tool_guardrails.py \
+  tests/run_agent/test_tool_call_guardrail_runtime.py \
+  tests/run_agent/test_required_policy_halt_runtime.py -q
+```
+
+Run the focused WebUI contract with:
+
+```bash
+./scripts/test.sh \
+  tests/test_guardrail_terminal_state.py \
+  tests/test_guardrail_observability.py \
+  tests/test_tool_limit_terminal_state.py \
+  tests/test_run_journal.py \
+  tests/test_issue5941_errored_turn_response_visible.py -q
+```
+
+For live verification, use isolated `HERMES_HOME` and
+`HERMES_WEBUI_STATE_DIR`. With the Agent gate enabled, force four distinct
+failing terminal commands and verify the turn continues until another outcome
+or the configured global limit. Then repeat one identical failing command to
+the exact threshold and verify the task and settled answer show
+`Needs recovery`, never `Done`; the last explanation and tool output remain
+visible after reload/replay. Confirm the server emits one bounded
+`guardrail_terminal_mapped` diagnostic containing only reason, tool name,
+exact/broad counts, and mapped state.
+
 ### Unified Hermes conversation-list gate
 
 Run the focused contract with:
