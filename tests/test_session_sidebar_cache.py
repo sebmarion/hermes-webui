@@ -841,7 +841,7 @@ def test_source_stamp_ignores_wal_churn_when_idle(tmp_path, monkeypatch):
     assert after == before
 
 
-def _streaming_ttl_key():
+def _cache_policy_key():
     return routes._session_list_cache_key(
         active_profile="default",
         all_profiles=False,
@@ -858,38 +858,35 @@ def _age_cache_entry(key, seconds):
         routes._SESSIONS_CACHE[key] = (ts - seconds, stamp, payload)
 
 
-def test_streaming_widens_cache_freshness_window(monkeypatch):
-    """#4808: while a turn streams, an entry older than the idle TTL but younger
-    than the streaming TTL must still read FRESH, so the fixed 5s streaming poll
-    does not force a rebuild every poll."""
+def test_cache_age_policy_is_unified_during_streaming(monkeypatch):
+    """Idle and streaming reads share the same bounded age policy."""
     routes._session_list_cache_clear()
-    key = _streaming_ttl_key()
-    # Keep the source stamp stable across the get() calls (no structural change).
+    key = _cache_policy_key()
     monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda k: ("stable",))
 
-    routes._session_list_cache_set(key, _session_cache_payload("live"))
-    # Age it past the idle 2.5s TTL but under the 10s streaming TTL.
-    _age_cache_entry(key, routes._SESSIONS_CACHE_TTL_SECONDS + 1.0)
+    for active_stream_ids in (set(), {"turn-1"}):
+        monkeypatch.setattr(
+            routes,
+            "_active_stream_ids",
+            lambda active=active_stream_ids: active,
+        )
+        routes._session_list_cache_set(key, _session_cache_payload("fresh"))
+        _age_cache_entry(key, 29.0)
+        payload, fresh = routes._session_list_cache_get(key)
+        assert fresh is True
+        assert payload == _session_cache_payload("fresh")
 
-    # Idle (no active stream) → stale → miss.
-    monkeypatch.setattr(routes, "_active_stream_ids", lambda: set())
-    payload_idle, fresh_idle = routes._session_list_cache_get(key)
-    assert payload_idle is None and fresh_idle is False
-
-    # Re-seed + re-age, now WITH an active stream → fresh (held).
-    routes._session_list_cache_set(key, _session_cache_payload("live"))
-    _age_cache_entry(key, routes._SESSIONS_CACHE_TTL_SECONDS + 1.0)
-    monkeypatch.setattr(routes, "_active_stream_ids", lambda: {"turn-1"})
-    payload_stream, fresh_stream = routes._session_list_cache_get(key)
-    assert fresh_stream is True
-    assert payload_stream == _session_cache_payload("live")
+        routes._session_list_cache_set(key, _session_cache_payload("expired"))
+        _age_cache_entry(key, 30.0)
+        payload, fresh = routes._session_list_cache_get(key)
+        assert payload is None
+        assert fresh is False
 
 
-def test_streaming_window_still_evicts_past_streaming_ttl(monkeypatch):
-    """Even while streaming, an entry older than the streaming TTL is evicted —
-    the hold-down is bounded, not indefinite."""
+def test_cache_convergence_bound_still_evicts_during_streaming(monkeypatch):
+    """The shared age hold-down remains bounded while streaming."""
     routes._session_list_cache_clear()
-    key = _streaming_ttl_key()
+    key = _cache_policy_key()
     monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda k: ("stable",))
     monkeypatch.setattr(routes, "_active_stream_ids", lambda: {"turn-1"})
 
@@ -899,15 +896,20 @@ def test_streaming_window_still_evicts_past_streaming_ttl(monkeypatch):
     assert payload is None and fresh is False
 
 
-def test_streaming_window_does_not_extend_idle_ttl(monkeypatch):
-    """Regression guard: with NO active stream the idle 2.5s TTL is unchanged —
-    an entry aged just past it must read stale (byte-for-byte idle behavior)."""
+def test_idle_cache_spans_activity_poll_but_expires_at_convergence_bound(monkeypatch):
     routes._session_list_cache_clear()
-    key = _streaming_ttl_key()
+    key = _cache_policy_key()
     monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda k: ("stable",))
     monkeypatch.setattr(routes, "_active_stream_ids", lambda: set())
 
     routes._session_list_cache_set(key, _session_cache_payload("idle"))
-    _age_cache_entry(key, routes._SESSIONS_CACHE_TTL_SECONDS + 0.5)
+    _age_cache_entry(key, 5.5)
     payload, fresh = routes._session_list_cache_get(key)
-    assert payload is None and fresh is False
+    assert fresh is True
+    assert payload == _session_cache_payload("idle")
+
+    routes._session_list_cache_set(key, _session_cache_payload("expired"))
+    _age_cache_entry(key, 30.1)
+    payload, fresh = routes._session_list_cache_get(key)
+    assert payload is None
+    assert fresh is False
