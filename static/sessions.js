@@ -2988,6 +2988,14 @@ function _parseLazyTailPayload(payload, requestedSid, options) {
   if (!windowState || typeof windowState !== 'object' || Array.isArray(windowState)) return null;
   if (windowState.schema !== 'lazy_tail_v1') return null;
   if (!['ready','reconnecting','legacy_required','stale'].includes(windowState.state)) return null;
+  if (!Object.prototype.hasOwnProperty.call(windowState, 'status_reason')) return null;
+  if (
+    windowState.status_reason !== null &&
+    (
+      typeof windowState.status_reason !== 'string' ||
+      !/^[a-z0-9][a-z0-9_.:-]{0,127}$/.test(windowState.status_reason)
+    )
+  ) return null;
   if (String(payload.requested_session_id || '') !== String(requestedSid || '')) return null;
   if (!String(payload.canonical_session_id || '').trim()) return null;
   // A 50-visible-row page may contain its bounded non-counting tool results

@@ -310,6 +310,42 @@ console.log(JSON.stringify(
     assert result is None
 
 
+def test_lazy_tail_parser_rejects_malformed_fallback_status_reason():
+    parser = _function_source(SESSIONS, "_parseLazyTailPayload")
+    result = _node(
+        parser
+        + """
+const base={
+ requested_session_id:'requested',canonical_session_id:'canonical',
+ messages:[],runtime_snapshot:null,
+ conversation_window:{schema:'lazy_tail_v1',state:'legacy_required',source:'state_db',
+ visible_count:0,has_older:false,older_cursor:null,newest_message_id:null,
+ active_stream_id:null,reconnect_token:null,exact_total_available:false,
+ status_reason:'tool_pair_outside_closure'}
+};
+const missing={...base,conversation_window:{...base.conversation_window}};
+delete missing.conversation_window.status_reason;
+const objectReason={...base,conversation_window:{
+  ...base.conversation_window,status_reason:{secret:'not-a-code'}
+}};
+const oversized={...base,conversation_window:{
+  ...base.conversation_window,status_reason:'x'.repeat(129)
+}};
+const displayText={...base,conversation_window:{
+  ...base.conversation_window,status_reason:'Not a sanitized reason'
+}};
+console.log(JSON.stringify([
+  _parseLazyTailPayload(missing,'requested',{requireMetadata:true}),
+  _parseLazyTailPayload(objectReason,'requested',{requireMetadata:true}),
+  _parseLazyTailPayload(oversized,'requested',{requireMetadata:true}),
+  _parseLazyTailPayload(displayText,'requested',{requireMetadata:true})
+]));
+"""
+    )
+
+    assert result == [None, None, None, None]
+
+
 def test_lazy_tail_load_decision_retries_once_then_recovers():
     decision = _function_source(SESSIONS, "_lazyTailLoadDecision")
     result = _node(
