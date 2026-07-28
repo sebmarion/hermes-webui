@@ -237,7 +237,7 @@ def test_load_session_uses_lazy_route_and_has_explicit_legacy_only():
     load = _function_source(SESSIONS, "loadSession")
     explicit = _function_source(SESSIONS, "loadCompleteLegacyTranscript")
 
-    assert "/api/session-window?session_id=${encodeURIComponent(sid)}&msg_limit=30&resolve_model=0" in load
+    assert "/api/session-window?session_id=${encodeURIComponent(sid)}&msg_limit=5&resolve_model=0" in load
     assert "window.__HERMES_CONFIG__.lazyTailV1===true" in load
     assert "forceLegacyMessagePaging" in explicit
     assert "forceLegacyMessagePaging:true,completeLegacyTranscript:true" in explicit
@@ -245,14 +245,14 @@ def test_load_session_uses_lazy_route_and_has_explicit_legacy_only():
     assert "if(!_useLazyTail) _resolveSessionModelForDisplaySoon(sid)" in SESSIONS
 
 
-def test_lazy_older_path_uses_50_and_opaque_cursor():
+def test_lazy_older_path_uses_single_visible_turn_and_opaque_cursor():
     older = _function_source(SESSIONS, "_loadOlderMessages")
     lazy_start = older.index("if (_messagePaging.mode === 'lazy_tail_v1')")
     legacy_start = older.index("if (_messagePaging.mode === 'cursor_v1')")
     lazy = older[lazy_start:legacy_start]
 
     assert "/api/session-window" in lazy
-    assert "msg_limit=50" in lazy
+    assert "msg_limit=1" in lazy
     assert "older_cursor=${encodeURIComponent(requestedCursor)}" in lazy
     assert "/api/session?" not in lazy
 
