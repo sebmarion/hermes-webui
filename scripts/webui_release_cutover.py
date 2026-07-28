@@ -428,6 +428,7 @@ def transform_gateway_launchd_target(
     release_identity: dict,
     managed_routing_environment: dict[str, str],
     release_transaction_id: str,
+    allow_managed_cli_symlink: bool = False,
 ) -> dict:
     """Bind the gateway to the same sealed Agent/runtime as managed WebUI."""
     if not isinstance(plist, dict) or plist.get("Label") != expected_label:
@@ -454,6 +455,7 @@ def transform_gateway_launchd_target(
         managed_cli_shim,
         label="managed Hermes CLI shim",
         executable=True,
+        allow_leaf_symlink=allow_managed_cli_symlink,
     )
     required_identity = {
         "build_id",
@@ -16269,6 +16271,7 @@ def _attest_managed_gateway_binding(
         release_identity=identity,
         managed_routing_environment=routing,
         release_transaction_id=release_transaction_id,
+        allow_managed_cli_symlink=True,
     )
     selector_generation = int(identity["selector_generation"])
     pair_id = release_selector.release_pair_id(

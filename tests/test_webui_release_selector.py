@@ -2027,6 +2027,67 @@ def test_gateway_launchd_transform_rebinds_exact_managed_gateway_shape(tmp_path)
     )
 
 
+def test_gateway_launchd_transform_allows_attested_public_cli_symlink(tmp_path):
+    release = _managed_release(tmp_path)
+    identity = {
+        **selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=release["selector_path"],
+        ),
+        "selector_generation": 8,
+    }
+    prior_shim = tmp_path / "control" / "hermes-prior"
+    immutable_shim = tmp_path / "control" / "hermes-candidate"
+    public_cli = tmp_path / "bin" / "hermes"
+    _write(prior_shim, "#!/bin/sh\nexit 0\n")
+    _write(immutable_shim, "#!/bin/sh\nexit 0\n")
+    public_cli.parent.mkdir(exist_ok=True)
+    public_cli.symlink_to(immutable_shim)
+    _chmod(prior_shim, 0o555)
+    _chmod(immutable_shim, 0o555)
+    original = {
+        "Label": "ai.hermes.gateway",
+        "ProgramArguments": [
+            str(prior_shim),
+            "gateway",
+            "run",
+            "--replace",
+        ],
+    }
+    routing = {
+        "HERMES_WEBUI_DEFAULT_PROVIDER": "openai-codex",
+        "HERMES_WEBUI_DEFAULT_MODEL": "gpt-5.5",
+        "HERMES_WEBUI_HOST": "127.0.0.1",
+        "HERMES_WEBUI_PORT": "8787",
+    }
+
+    with pytest.raises(ValueError, match="managed Hermes CLI shim must not be a symlink"):
+        cutover.transform_gateway_launchd_target(
+            original,
+            expected_label="ai.hermes.gateway",
+            expected_old_program=str(prior_shim),
+            managed_cli_shim=str(public_cli),
+            release_identity=identity,
+            managed_routing_environment=routing,
+            release_transaction_id="managed-release-transaction-0000000001",
+        )
+
+    transformed = cutover.transform_gateway_launchd_target(
+        original,
+        expected_label="ai.hermes.gateway",
+        expected_old_program=str(prior_shim),
+        managed_cli_shim=str(public_cli),
+        release_identity=identity,
+        managed_routing_environment=routing,
+        release_transaction_id="managed-release-transaction-0000000001",
+        allow_managed_cli_symlink=True,
+    )
+
+    assert transformed["ProgramArguments"][0] == str(public_cli)
+
+
 @pytest.mark.parametrize(
     "managed_arguments",
     [
