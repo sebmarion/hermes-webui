@@ -176,6 +176,61 @@ def test_lazy_tail_metadata_preserves_non_transcript_session_state(monkeypatch):
     assert "message_count" not in metadata
 
 
+def test_lazy_tail_metadata_uses_targeted_state_metadata_without_sidecar(
+    monkeypatch,
+):
+    import api.routes as routes
+
+    resolution = SimpleNamespace(
+        canonical_id="canonical",
+        canonical_row={"source": "webui"},
+    )
+    targeted = {
+        "session_id": "canonical",
+        "title": "State-only task",
+        "workspace": "/workspace",
+        "model": "model",
+        "model_provider": None,
+        "profile": "default",
+        "source": "webui",
+        "source_tag": "webui",
+        "is_cli_session": False,
+        "messages": [{"role": "user", "content": "must not leak"}],
+        "message_count": 504,
+    }
+    monkeypatch.setattr(
+        routes,
+        "_shared_session_sidecar",
+        lambda _sid, metadata_only=False: None,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_targeted_cli_metadata_for_resolution",
+        lambda _resolution: dict(targeted),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_apply_resolution_metadata_to_payload",
+        lambda raw, _resolution: raw,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_is_subagent_child_session_id",
+        lambda _sid: False,
+    )
+
+    metadata = routes._lazy_tail_session_metadata("default", resolution)
+
+    assert metadata["session_id"] == "canonical"
+    assert metadata["title"] == "State-only task"
+    assert metadata["workspace"] == "/workspace"
+    assert metadata["read_only"] is False
+    assert metadata["is_cli_session"] is False
+    assert metadata["pending_attachments"] == []
+    assert "messages" not in metadata
+    assert "message_count" not in metadata
+
+
 def test_lazy_tail_metadata_fails_closed_without_read_only(monkeypatch):
     import api.routes as routes
 

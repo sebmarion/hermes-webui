@@ -12500,27 +12500,42 @@ def _lazy_tail_session_metadata(profile: str, resolution) -> dict | None:
     except Exception:
         return None
     if session is None:
-        return None
-    session_profile = getattr(session, "profile", None)
-    if not _profiles_match(session_profile, profile):
-        return None
-    try:
-        raw = session.compact()
-    except Exception:
-        return None
-    if _session_requires_cli_metadata_lookup(session):
-        cli_meta = _targeted_cli_metadata_for_resolution(resolution)
-        if cli_meta and _session_source_is_webui(cli_meta):
-            raw = _reconcile_session_detail_source_flags(raw, cli_meta)
-        elif cli_meta and _is_messaging_session_record(cli_meta):
-            raw = _merge_cli_sidebar_metadata(raw, cli_meta)
+        raw = _targeted_cli_metadata_for_resolution(resolution)
+        if not raw or not _profiles_match(raw.get("profile"), profile):
+            return None
+        state_source = str(
+            (getattr(resolution, "canonical_row", {}) or {}).get("source") or ""
+        )
+        claimable, _reason = _is_claimable_cli_source(
+            raw,
+            state_db_source=state_source,
+        )
+        raw["read_only"] = bool(raw.get("read_only")) or not claimable
+        raw["is_cli_session"] = bool(raw.get("is_cli_session"))
+        raw["pending_attachments"] = []
+        raw["pending_started_at"] = None
+        raw["pending_user_source"] = None
+    else:
+        session_profile = getattr(session, "profile", None)
+        if not _profiles_match(session_profile, profile):
+            return None
+        try:
+            raw = session.compact()
+        except Exception:
+            return None
+        if _session_requires_cli_metadata_lookup(session):
+            cli_meta = _targeted_cli_metadata_for_resolution(resolution)
+            if cli_meta and _session_source_is_webui(cli_meta):
+                raw = _reconcile_session_detail_source_flags(raw, cli_meta)
+            elif cli_meta and _is_messaging_session_record(cli_meta):
+                raw = _merge_cli_sidebar_metadata(raw, cli_meta)
+        raw["pending_attachments"] = (
+            getattr(session, "pending_attachments", []) or []
+        )
+        raw["pending_started_at"] = getattr(session, "pending_started_at", None)
+        raw["pending_user_source"] = getattr(session, "pending_user_source", None)
     raw = _apply_resolution_metadata_to_payload(raw, resolution)
     raw["session_id"] = canonical_id
-    raw["pending_attachments"] = (
-        getattr(session, "pending_attachments", []) or []
-    )
-    raw["pending_started_at"] = getattr(session, "pending_started_at", None)
-    raw["pending_user_source"] = getattr(session, "pending_user_source", None)
     if (
         str(
             raw.get("source_tag")
