@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from types import MappingProxyType
 
@@ -1094,6 +1095,104 @@ def test_large_tool_result_uses_bounded_representation(tmp_path, monkeypatch):
     assert projected_tool_lengths == [4097]
     assert bytes_read_by_field["content"] <= paging._TOOL_CONTENT_PROJECTION_BYTES
     assert page.closure_serialized_bytes <= 512 * 1024
+
+
+def test_batched_tool_calls_with_bounded_pairing_metadata_remain_pageable(
+    tmp_path,
+):
+    from api.session_message_paging import read_state_db_message_page
+
+    db = tmp_path / "state.db"
+    _make_db(db)
+    calls = [
+        {
+            "id": f"call_{index:024d}",
+            "call_id": f"call_{index:024d}",
+            "response_item_id": f"item_{index:024d}",
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "arguments": json.dumps({"command": "x" * 128}),
+            },
+        }
+        for index in range(9)
+    ]
+    serialized_calls = json.dumps(calls)
+    assert 1024 < len(serialized_calls) <= 4096
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp, tool_calls) "
+            "VALUES (1, 'tip', 'assistant', '', 1, ?)",
+            (serialized_calls,),
+        )
+        conn.executemany(
+            "INSERT INTO messages("
+            "id, session_id, role, content, timestamp, tool_call_id"
+            ") VALUES (?, 'tip', 'tool', 'ok', ?, ?)",
+            (
+                (index + 2, index + 2, call["id"])
+                for index, call in enumerate(calls)
+            ),
+        )
+
+    page = read_state_db_message_page(
+        db_path=db,
+        resolution=_resolution(db),
+        visible_limit=10,
+        cursor=None,
+    )
+
+    assert page.mode == "cursor_v1"
+    assert page.fallback_reason is None
+    assert page.tool_pair_status == "complete"
+
+
+def test_large_realistic_tool_batch_stays_within_pairing_budget(tmp_path):
+    from api.session_message_paging import read_state_db_message_page
+
+    db = tmp_path / "state.db"
+    _make_db(db)
+    calls = [
+        {
+            "id": f"call_{index:024d}",
+            "call_id": f"call_{index:024d}",
+            "response_item_id": f"item_{index:024d}",
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "arguments": json.dumps({"command": "x" * 2048}),
+            },
+        }
+        for index in range(9)
+    ]
+    serialized_calls = json.dumps(calls)
+    assert 16 * 1024 < len(serialized_calls) <= 32 * 1024
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp, tool_calls) "
+            "VALUES (1, 'tip', 'assistant', '', 1, ?)",
+            (serialized_calls,),
+        )
+        conn.executemany(
+            "INSERT INTO messages("
+            "id, session_id, role, content, timestamp, tool_call_id"
+            ") VALUES (?, 'tip', 'tool', 'ok', ?, ?)",
+            (
+                (index + 2, index + 2, call["id"])
+                for index, call in enumerate(calls)
+            ),
+        )
+
+    page = read_state_db_message_page(
+        db_path=db,
+        resolution=_resolution(db),
+        visible_limit=10,
+        cursor=None,
+    )
+
+    assert page.mode == "cursor_v1"
+    assert page.fallback_reason is None
+    assert page.tool_pair_status == "complete"
 
 
 def test_oversized_pairing_metadata_uses_only_bounded_blob_reads(

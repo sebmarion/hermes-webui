@@ -1719,7 +1719,7 @@ async function loadSession(sid){
   let data;
   try {
     if (_useLazyTail) {
-      data = await api(`/api/session-window?session_id=${encodeURIComponent(sid)}&msg_limit=30&resolve_model=0`);
+      data = await api(`/api/session-window?session_id=${encodeURIComponent(sid)}&msg_limit=5&resolve_model=0`);
     } else if (_useBoundedInitialMessagePaging) {
       data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${_INITIAL_MSG_LIMIT}&message_paging=cursor_v1`);
     } else {
@@ -3838,7 +3838,7 @@ async function _loadOlderMessages() {
     const pageStartedAt = Date.now();
     try {
       const data = await api(
-        `/api/session-window?session_id=${encodeURIComponent(sid)}&msg_limit=50&resolve_model=0&older_cursor=${encodeURIComponent(requestedCursor)}`,
+        `/api/session-window?session_id=${encodeURIComponent(sid)}&msg_limit=1&resolve_model=0&older_cursor=${encodeURIComponent(requestedCursor)}`,
         {timeoutMs:120000}
       );
       const parsed = _parseLazyTailPayload(data, sid);
