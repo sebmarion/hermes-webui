@@ -89,6 +89,12 @@ def _extract_function(source: str, name: str) -> str:
 
 LOAD_SESSION_SRC = _extract_function(SESSIONS_SRC, "loadSession")
 ENSURE_MESSAGES_LOADED_SRC = _extract_function(SESSIONS_SRC, "_ensureMessagesLoaded")
+PARSE_LAZY_TAIL_PAYLOAD_SRC = _extract_function(
+    SESSIONS_SRC, "_parseLazyTailPayload"
+)
+LAZY_TAIL_LOAD_DECISION_SRC = _extract_function(
+    SESSIONS_SRC, "_lazyTailLoadDecision"
+)
 
 
 def _normalise_ws(s: str) -> str:
@@ -115,8 +121,11 @@ def test_loadsession_has_generation_token_and_forwards_to_ensure_messages_loaded
         "loadSession() should check ownership in multiple await/catch paths, "
         "including stale _ensureMessagesLoaded catch branches"
     )
-    ensure_call = _normalise_ws("await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});")
-    assert ensure_call in norm, (
+    ensure_call_prefix = _normalise_ws(
+        "await _ensureMessagesLoaded(sid, "
+        "{force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration,"
+    )
+    assert norm.count(ensure_call_prefix) >= 2, (
         "loadSession() must pass generation into _ensureMessagesLoaded() for stale-owner checks"
     )
     assert (
@@ -187,6 +196,7 @@ function snapshotState() {
     visibleCacheClears,
     liveCardClears,
     toolSyncCalls,
+    renderCalls,
   };
 }
 
@@ -292,7 +302,7 @@ function createEnvironment() {
   globalThis._renderPendingPromptsForActiveSession = () => {};
   globalThis._restoreComposerDraft = () => {};
   globalThis.renderSessionArtifacts = () => {};
-  globalThis.renderMessages = () => {};
+  globalThis.renderMessages = () => { renderCalls += 1; };
   globalThis._checkAndShowHandoffHint = () => {};
   globalThis._hideHandoffHint = () => {};
   globalThis._isMessagingSession = () => true;
@@ -339,6 +349,7 @@ function createEnvironment() {
   visibleCacheClears = 0;
   liveCardClears = 0;
   toolSyncCalls = 0;
+  renderCalls = 0;
   toastCalls = [];
 }
 
@@ -347,11 +358,14 @@ let clearHintCalls = 0;
 let visibleCacheClears = 0;
 let liveCardClears = 0;
 let toolSyncCalls = 0;
+let renderCalls = 0;
 let toastCalls = [];
 
 // Source under test
 __LOAD_SESSION_SRC__
 __ENSURE_MESSAGES_LOADED_SRC__
+__PARSE_LAZY_TAIL_PAYLOAD_SRC__
+__LAZY_TAIL_LOAD_DECISION_SRC__
 
 async function waitForQueued(apiHost, url) {
   const target = String(url);
@@ -608,12 +622,83 @@ async function runBoundedSameSessionForceReloads() {
   };
 }
 
+async function runLazyTailAutomaticLegacyRender() {
+  createEnvironment();
+  window.__HERMES_CONFIG__ = { lazyTailV1: true };
+  window._boundedConversationBrowser = false;
+  const apiHost = makeHarness();
+  globalThis.apiHost = apiHost;
+  globalThis.api = apiHost.api;
+  const fallback = {
+    requested_session_id: 'sid-atlas',
+    canonical_session_id: 'sid-atlas',
+    messages: [],
+    runtime_snapshot: null,
+    conversation_window: {
+      schema: 'lazy_tail_v1',
+      state: 'legacy_required',
+      source: 'state_db',
+      visible_count: 0,
+      has_older: false,
+      older_cursor: null,
+      newest_message_id: null,
+      active_stream_id: null,
+      reconnect_token: null,
+      exact_total_available: false,
+      status_reason: 'tool_pair_outside_closure',
+    },
+  };
+  const fastOne = apiHost.enqueue(
+    '/api/session-window?session_id=sid-atlas&msg_limit=5&resolve_model=0'
+  );
+  const fastTwo = apiHost.enqueue(
+    '/api/session-window?session_id=sid-atlas&msg_limit=5&resolve_model=0'
+  );
+  const legacyMeta = apiHost.enqueue(
+    '/api/session?session_id=sid-atlas&messages=0&resolve_model=0'
+  );
+  const legacyMessages = apiHost.enqueue(
+    '/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1'
+  );
+
+  const loading = loadSession('sid-atlas');
+  await waitForQueued(apiHost, fastOne.url);
+  fastOne._resolve(fallback);
+  await waitForQueued(apiHost, fastTwo.url);
+  fastTwo._resolve(fallback);
+  await waitForQueued(apiHost, legacyMeta.url);
+  legacyMeta._resolve(API_ATLAS_META);
+  await waitForQueued(apiHost, legacyMessages.url);
+  legacyMessages._resolve({
+    session: {
+      ...API_ATLAS_MSGS.session,
+      _messages_truncated: false,
+      _messages_offset: 0,
+      messages: [
+        { role: 'user', content: 'legacy question' },
+        { role: 'assistant', content: 'legacy answer' },
+      ],
+    },
+  });
+  await loading;
+
+  return {
+    scenario: 'lazy-tail-automatic-legacy-render',
+    finalSid: S.session && S.session.session_id,
+    messages: S.messages.map((message) => message.content),
+    apiCalls: apiHost.apiCalls.slice(),
+    renderCalls,
+    loadingSid: _loadingSessionId,
+  };
+}
+
 async function runAll() {
   return {
     crossSessionOrdering: await runCrossSessionOrdering(),
     observedIdleCrossSessionOrdering: await runObservedIdleCrossSessionOrdering(),
     staleIdleCatch: await runStaleRejectedIdleCatch(),
     boundedSameSessionForceReloads: await runBoundedSameSessionForceReloads(),
+    lazyTailAutomaticLegacyRender: await runLazyTailAutomaticLegacyRender(),
   };
 }
 
@@ -648,6 +733,10 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior():
         "__LOAD_SESSION_SRC__", LOAD_SESSION_SRC
     ).replace(
         "__ENSURE_MESSAGES_LOADED_SRC__", ENSURE_MESSAGES_LOADED_SRC
+    ).replace(
+        "__PARSE_LAZY_TAIL_PAYLOAD_SRC__", PARSE_LAZY_TAIL_PAYLOAD_SRC
+    ).replace(
+        "__LAZY_TAIL_LOAD_DECISION_SRC__", LAZY_TAIL_LOAD_DECISION_SRC
     )
     body = _run_node(script)
 
@@ -655,6 +744,7 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior():
     stale = body["staleIdleCatch"]
     observed = body["observedIdleCrossSessionOrdering"]
     bounded_force = body["boundedSameSessionForceReloads"]
+    automatic_legacy = body["lazyTailAutomaticLegacyRender"]
 
     def _assert_atlas_wins(session_result, *, label):
         assert session_result["finalSid"] == "sid-atlas", f"{label}: stale overlap should end on Atlas session"
@@ -728,6 +818,20 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior():
     assert bounded_force["restartCalls"] == [
         "/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=30&message_paging=cursor_v1",
     ], "the explicit cursor restart is the only same-session force reload that may renegotiate cursor paging"
+
+    assert automatic_legacy == {
+        "scenario": "lazy-tail-automatic-legacy-render",
+        "finalSid": "sid-atlas",
+        "messages": ["legacy question", "legacy answer"],
+        "apiCalls": [
+            "/api/session-window?session_id=sid-atlas&msg_limit=5&resolve_model=0",
+            "/api/session-window?session_id=sid-atlas&msg_limit=5&resolve_model=0",
+            "/api/session?session_id=sid-atlas&messages=0&resolve_model=0",
+            "/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1",
+        ],
+        "renderCalls": 1,
+        "loadingSid": None,
+    }
 
     assert cross["loadingSid"] is None, "load marker should be cleared after successful completion"
     assert stale["loadingSid"] is None, "load marker should be cleared after stale reject + re-owner completion"

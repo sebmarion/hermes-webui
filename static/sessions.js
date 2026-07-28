@@ -1759,11 +1759,24 @@ async function loadSession(sid){
         _rearmActiveSessionStream();
         return false;
       }
-      _showLazyTailRecovery(sid, 'The fast task window could not be loaded.');
-      _clearSameSessionForceReloadHint(sid);
+      if (!_acceptResult()) {
+        if (_isCurrentLoad()) _loadingSessionId = null;
+        _rearmActiveSessionStream();
+        return false;
+      }
       if (_isCurrentLoad()) _loadingSessionId = null;
-      _rearmActiveSessionStream();
-      return false;
+      if (typeof recordLazyTailEvent === 'function') {
+        recordLazyTailEvent('lazy_tail_legacy_automatic',{
+          session_id:sid,
+          state:'legacy_required',
+          reason:'fast_window_request_failed',
+        });
+      }
+      return loadSession(sid,{
+        ...opts,
+        force:true,
+        forceLegacyMessagePaging:true,
+      });
     }
     const _msgInner = $('msgInner');
     // Stale-load guard (Codex): a newer loadSession() may have started while this
@@ -1845,7 +1858,7 @@ async function loadSession(sid){
   // No self-heal: 401 is transient auth expiry — the session still exists
   // server-side. Clearing localStorage would wipe the saved session id and
   // send users to empty state after re-login (#4028 follow-up).
-  if (!data) {
+  if (data === undefined || (!_useLazyTail && !data)) {
     _clearSameSessionForceReloadHint(sid);
     if (_isCurrentLoad()) _loadingSessionId = null;
     // #2971: re-arm the still-displayed session's stream (defensive — harmless
@@ -1888,12 +1901,25 @@ async function loadSession(sid){
         lazyTailRestartAttempted:true,
       });
     }
-    if (lazyTailDecision.action === 'recover') {
-      _showLazyTailRecovery(sid, lazyTailDecision.reason);
-      _clearSameSessionForceReloadHint(sid);
+    if (lazyTailDecision.action === 'legacy') {
+      if (!_isCurrentLoad() || !_acceptResult()) {
+        if (_isCurrentLoad()) _loadingSessionId = null;
+        _rearmActiveSessionStream();
+        return false;
+      }
       if (_isCurrentLoad()) _loadingSessionId = null;
-      _rearmActiveSessionStream();
-      return false;
+      if (typeof recordLazyTailEvent === 'function') {
+        recordLazyTailEvent('lazy_tail_legacy_automatic',{
+          session_id:sid,
+          state:'legacy_required',
+          reason:lazyTailDecision.reason,
+        });
+      }
+      return loadSession(sid,{
+        ...opts,
+        force:true,
+        forceLegacyMessagePaging:true,
+      });
     }
     data = {
       ...data,
@@ -3060,7 +3086,7 @@ function _lazyTailLoadDecision(parsed, options) {
   options = options || {};
   if (!parsed) {
     return {
-      action: 'recover',
+      action: 'legacy',
       reason: 'The server returned an invalid fast task window.',
     };
   }
@@ -3071,7 +3097,7 @@ function _lazyTailLoadDecision(parsed, options) {
   if (!options.lazyTailRestartAttempted) {
     return {action: 'retry', reason};
   }
-  return {action: 'recover', reason};
+  return {action: 'legacy', reason};
 }
 
 function _lazyTailSessionEnvelope(parsed) {

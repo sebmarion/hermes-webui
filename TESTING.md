@@ -297,10 +297,18 @@ checkpoint acknowledgment arrives. Force an invalid or stale cursor and verify
 there is one bounded restart followed by a visible recovery action. If the
 initial fast window returns a typed `legacy_required` or `stale` state, verify
 the browser retries the bounded fast-window request exactly once. A repeated
-typed fallback must show its sanitized status reason and the existing recovery
-action. The old complete-history route may run only after clicking “Load
-complete legacy transcript”; that explicit action can take time for very large
-tasks and must never start automatically.
+typed fallback must automatically replace the failed window with one bounded
+legacy tail so selecting a task always renders its content without rebuilding
+the complete transcript. Malformed fast payloads and fast-window request
+failures use the same single terminal legacy attempt; they must never loop back
+into the fast path. Complete legacy history remains an explicit user action.
+
+When the current page's tool pairs are already complete, an unrelated hidden
+tool row is the next-page sentinel and must not start another closure
+obligation. Verify that the initial response remains `lazy_tail_v1`, its
+inclusive cursor returns that unrelated row and its partner on continuation,
+and the two pages contain no gaps or duplicate message IDs. Incomplete or
+ambiguous pairs within the current page remain fail-closed.
 
 For rollout timings, collect 40 warm and 20 process-cold opens and record every
 initial and older-page duration. No `/api/session-window` request may exceed
