@@ -219,6 +219,51 @@ cross-session ownership, and the one-restart-then-legacy policy. Keep
 `HERMES_WEBUI_BOUNDED_CONVERSATION_BROWSER` unset in production until proof-v1
 capability and the durable zero-difference evidence threshold are both present.
 
+### Release-lite lazy task opening
+
+The release-lite path reads only the newest 30 settled messages from `state.db`
+when a task opens, then requests older history in opaque 50-message pages as the
+reader scrolls upward. It deliberately does not calculate an exact total.
+
+Run its focused server, browser, paging, and live-handoff contracts with:
+
+```bash
+./scripts/test.sh \
+  tests/test_release_lite_session_window.py \
+  tests/test_release_lite_session_window_route.py \
+  tests/test_release_lite_session_window_browser.py \
+  tests/test_release_lite_reconnect_handoff.py \
+  tests/test_release_lite_observability.py \
+  tests/test_release_lite_session_window_performance.py \
+  tests/test_client_event_diagnostics.py \
+  tests/test_state_db_message_cursor_reader.py \
+  tests/test_session_cursor_paging_route.py \
+  tests/test_stream_offline_gap_recovery.py \
+  tests/test_run_journal_routes.py -q
+```
+
+Both gates default off and should be enabled independently:
+
+```bash
+HERMES_WEBUI_LAZY_TAIL_V1=1
+HERMES_WEBUI_LAZY_TAIL_BROWSER_V1=1
+```
+
+For manual verification, use isolated `HERMES_HOME` and
+`HERMES_WEBUI_STATE_DIR`. Open a large task and verify the newest response
+paints first, five upward-scroll pages preserve the first visible row, and an
+active task stays labeled “Reconnecting to latest turn” until the signed
+checkpoint acknowledgment arrives. Force an invalid or stale cursor and verify
+there is one bounded restart followed by a visible recovery action. The old
+complete-history route may run only after clicking “Load complete legacy
+transcript”; that explicit action can take time for very large tasks.
+
+For rollout timings, collect 40 warm and 20 process-cold opens and record every
+initial and older-page duration. No `/api/session-window` request may exceed
+five seconds, and server diagnostics must remain bounded to counts, durations,
+state/reason codes, and opaque IDs—never transcript, commands, paths, arguments,
+or tool output.
+
 
 `tests/test_static_js_runtime_lint.py` runs this automatically when eslint is present
 and **skips gracefully** (clear message) when it isn't — so environments without the

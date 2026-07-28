@@ -21,7 +21,11 @@ def test_stream_status_exposes_replay_summary():
 
 def test_dead_stream_sse_replays_journal_before_404_fallback():
     handler_pos = ROUTES_SRC.index("def _handle_sse_stream")
-    block = ROUTES_SRC[handler_pos : handler_pos + 1800]
+    handler_end = ROUTES_SRC.index(
+        "def _handle_session_run_journal_stream_for_session",
+        handler_pos,
+    )
+    block = ROUTES_SRC[handler_pos:handler_end]
 
     assert "find_run_summary(stream_id)" in block
     assert "stream not found" in block

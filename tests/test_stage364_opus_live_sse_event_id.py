@@ -81,12 +81,21 @@ def test_sse_handler_reads_event_id_from_side_channel():
     and pass it to _sse_with_id when present."""
     handler_idx = ROUTES_PY.find("def _handle_sse_stream(handler, parsed):")
     assert handler_idx != -1, "_handle_sse_stream not found"
-    handler_body = ROUTES_PY[handler_idx:handler_idx + 4000]
+    handler_end = ROUTES_PY.find("\ndef ", handler_idx + 1)
+    handler_body = ROUTES_PY[
+        handler_idx : handler_end if handler_end != -1 else len(ROUTES_PY)
+    ]
     assert "STREAM_LAST_EVENT_ID.get(stream_id)" in handler_body, (
         "_handle_sse_stream must read STREAM_LAST_EVENT_ID[stream_id] to "
         "get the event_id for emit"
     )
-    assert "_sse_with_id(handler, event, data, event_id)" in handler_body, (
+    event_id_branch = handler_body[
+        handler_body.index("if event_id:") : handler_body.index(
+            "\n            else:",
+            handler_body.index("if event_id:"),
+        )
+    ]
+    assert "_sse_with_id(" in event_id_branch and "event_id," in event_id_branch, (
         "_handle_sse_stream must call _sse_with_id when event_id is set"
     )
 

@@ -165,6 +165,7 @@ class RequestDiagnostics:
             # the watchdog entry would never register and the structured
             # log would never fire.
             ("GET", "/api/session"),
+            ("GET", "/api/session-window"),
         }:
             return None
         return cls(method, clean_path, logger=logger, print_fn=print_fn)

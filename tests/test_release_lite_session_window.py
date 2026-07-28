@@ -57,6 +57,13 @@ def _ready_dependencies():
         encode_older_cursor=lambda **_kwargs: "opaque-older-token",
         decode_older_cursor=lambda **_kwargs: None,
         capture_runtime=lambda _profile, _canonical_id: None,
+        capture_metadata=lambda _profile, _resolution: {
+            "session_id": "canonical",
+            "read_only": False,
+            "model_provider": "provider",
+            "enabled_toolsets": ["terminal"],
+            "composer_draft": {"text": "draft", "files": []},
+        },
     )
 
 
@@ -128,8 +135,59 @@ def test_build_session_window_returns_bounded_ready_shape():
     assert payload["requested_session_id"] == "requested"
     assert payload["canonical_session_id"] == "canonical"
     assert payload["runtime_snapshot"] is None
+    assert payload["session_metadata"]["read_only"] is False
+    assert payload["session_metadata"]["model_provider"] == "provider"
     assert "message_count" not in payload
     assert len(payload["messages"]) == 30
+
+
+def test_build_session_window_accepts_real_tool_pair_closure_page(tmp_path):
+    from api.session_message_paging import read_state_db_message_page
+    from tests.test_state_db_message_cursor_reader import _make_db, _resolution
+
+    db = tmp_path / "state.db"
+    _make_db(db)
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp, tool_calls) "
+            "VALUES (10, 'tip', 'assistant', '', 10, ?)",
+            ('[{"id":"call-1","type":"function"}]',),
+        )
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp) "
+            "VALUES (11, 'tip', 'assistant', 'visible boundary', 11)"
+        )
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp, tool_call_id) "
+            "VALUES (12, 'tip', 'tool', 'result', 12, 'call-1')"
+        )
+
+    resolution = _resolution(db)
+    deps = replace(
+        _ready_dependencies(),
+        state_db_path=lambda _profile: db,
+        resolve_shared_session=lambda _path, _sid: resolution,
+        read_state_db_message_page=read_state_db_message_page,
+        capture_metadata=lambda _profile, _resolution: {
+            "session_id": "tip",
+            "read_only": False,
+            "model_provider": "provider",
+        },
+    )
+
+    payload = build_session_window(
+        SessionWindowRequest("root", 1, None, False),
+        deps=deps,
+    )
+
+    assert payload["conversation_window"]["state"] == "ready"
+    assert [
+        message["_state_db_message_id"]
+        for message in payload["messages"]
+    ] == [10, 11, 12]
+    assert payload["conversation_window"]["visible_count"] == 3
 
 
 def test_bounded_reader_metrics_stay_within_release_lite_limits():
@@ -158,6 +216,32 @@ def test_bounded_reader_metrics_stay_within_release_lite_limits():
             "handoff_retry_count": 0,
         }
     ]
+
+
+def test_typed_failure_diagnostic_preserves_only_known_reason_codes():
+    diagnostics = []
+    deps = replace(
+        _ready_dependencies(),
+        read_state_db_message_page=lambda **_kwargs: SimpleNamespace(
+            mode="legacy",
+            fallback_reason="secret arbitrary failure text",
+        ),
+        diagnostic_sink=diagnostics.append,
+    )
+
+    payload = build_session_window(
+        SessionWindowRequest("requested", 30, None, False),
+        deps=deps,
+    )
+
+    assert payload["conversation_window"]["state"] == "legacy_required"
+    assert diagnostics == [
+        {
+            "state": "legacy_required",
+            "reason": "unknown",
+        }
+    ]
+    assert "secret" not in repr(diagnostics)
 
 
 def test_lineage_cycle_fails_closed_without_reading_messages():
