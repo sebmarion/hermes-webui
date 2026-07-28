@@ -113,6 +113,51 @@ console.log(JSON.stringify({
     }
 
 
+def test_lazy_tail_payload_accepts_bounded_tool_closure_rows():
+    parser = _function_source(SESSIONS, "_parseLazyTailPayload")
+    result = _node(
+        parser
+        + """
+const messages=[
+  {role:'user',content:'start'},
+  {role:'assistant',content:'',tool_calls:[{id:'call-1'}]},
+  ...Array.from({length:26},(_,i)=>({role:'tool',content:String(i),tool_call_id:`call-${i+1}`})),
+  {role:'assistant',content:'latest'},
+  {role:'user',content:'continue'},
+  {role:'assistant',content:'done'},
+  {role:'tool',content:'closure',tool_call_id:'call-final'}
+];
+const payload={
+  requested_session_id:'requested',
+  canonical_session_id:'canonical',
+  session_metadata:{
+    session_id:'canonical',read_only:false,model_provider:'provider'
+  },
+  messages,
+  runtime_snapshot:null,
+  conversation_window:{
+    schema:'lazy_tail_v1',state:'ready',source:'state_db',
+    visible_count:5,has_older:true,older_cursor:'opaque',
+    newest_message_id:'latest',active_stream_id:null,reconnect_token:null,
+    exact_total_available:false,status_reason:null
+  }
+};
+const parsed=_parseLazyTailPayload(payload,'requested',{requireMetadata:true});
+console.log(JSON.stringify({
+  accepted:!!parsed,
+  visibleCount:parsed&&parsed.window.visible_count,
+  rowCount:parsed&&parsed.payload.messages.length
+}));
+"""
+    )
+
+    assert result == {
+        "accepted": True,
+        "visibleCount": 5,
+        "rowCount": 32,
+    }
+
+
 def test_lazy_tail_envelope_preserves_authoritative_behavior_metadata():
     helpers = "\n".join(
         _function_source(SESSIONS, name)

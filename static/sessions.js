@@ -2986,7 +2986,12 @@ function _parseLazyTailPayload(payload, requestedSid, options) {
   // A 50-visible-row page may contain its bounded non-counting tool results
   // plus up to 64 closure rows needed to keep call/result render units intact.
   if (!Array.isArray(payload.messages) || payload.messages.length > 178) return null;
-  if (!Number.isSafeInteger(windowState.visible_count) || windowState.visible_count !== payload.messages.length) return null;
+  if (
+    !Number.isSafeInteger(windowState.visible_count) ||
+    windowState.visible_count < 0 ||
+    windowState.visible_count > 100 ||
+    windowState.visible_count > payload.messages.length
+  ) return null;
   if (typeof windowState.has_older !== 'boolean') return null;
   if (windowState.older_cursor !== null && typeof windowState.older_cursor !== 'string') return null;
   if (windowState.has_older && !windowState.older_cursor) return null;
