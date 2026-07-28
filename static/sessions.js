@@ -1712,7 +1712,11 @@ async function loadSession(sid){
     window.__HERMES_CONFIG__ &&
     window.__HERMES_CONFIG__.lazyTailV1===true &&
     !opts.forceLegacyMessagePaging &&
-    (!sameSessionForceReload || !!opts.cursorRestartAttempted)
+    (
+      !sameSessionForceReload ||
+      !!opts.cursorRestartAttempted ||
+      !!opts.lazyTailRestartAttempted
+    )
   );
   const _lazyTailLoadStartedAt = _useLazyTail ? Date.now() : null;
   const _hasInitialMessageData = _useLazyTail || _useBoundedInitialMessagePaging;
@@ -1875,14 +1879,17 @@ async function loadSession(sid){
       sid,
       {requireMetadata:true}
     );
-    if (
-      !parsedLazyTail ||
-      !['ready','reconnecting'].includes(parsedLazyTail.window.state)
-    ) {
-      const reason = parsedLazyTail
-        ? (parsedLazyTail.window.status_reason || parsedLazyTail.window.state)
-        : 'The server returned an invalid fast task window.';
-      _showLazyTailRecovery(sid, reason);
+    const lazyTailDecision = _lazyTailLoadDecision(parsedLazyTail, opts);
+    if (lazyTailDecision.action === 'retry') {
+      if (_isCurrentLoad()) _loadingSessionId = null;
+      return loadSession(sid, {
+        ...opts,
+        force:true,
+        lazyTailRestartAttempted:true,
+      });
+    }
+    if (lazyTailDecision.action === 'recover') {
+      _showLazyTailRecovery(sid, lazyTailDecision.reason);
       _clearSameSessionForceReloadHint(sid);
       if (_isCurrentLoad()) _loadingSessionId = null;
       _rearmActiveSessionStream();
@@ -3016,11 +3023,21 @@ function _parseLazyTailPayload(payload, requestedSid, options) {
     if (snapshot !== null) return null;
   }
   const metadata = payload.session_metadata;
-  if (options.requireMetadata) {
+  const hasMetadata = Object.prototype.hasOwnProperty.call(
+    payload,
+    'session_metadata'
+  );
+  const metadataRequired = (
+    !!options.requireMetadata &&
+    ['ready','reconnecting'].includes(windowState.state)
+  );
+  if (hasMetadata) {
     if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
     if (String(metadata.session_id || '') !== String(payload.canonical_session_id || '')) return null;
     if (typeof metadata.read_only !== 'boolean') return null;
     if (metadata.model_provider !== null && typeof metadata.model_provider !== 'string') return null;
+  } else if (metadataRequired) {
+    return null;
   }
   return {
     sourceMode: 'lazy_tail_v1',
@@ -3029,6 +3046,24 @@ function _parseLazyTailPayload(payload, requestedSid, options) {
     runtimeSnapshot: snapshot,
     sessionMetadata: metadata,
   };
+}
+
+function _lazyTailLoadDecision(parsed, options) {
+  options = options || {};
+  if (!parsed) {
+    return {
+      action: 'recover',
+      reason: 'The server returned an invalid fast task window.',
+    };
+  }
+  if (['ready','reconnecting'].includes(parsed.window.state)) {
+    return {action: 'adopt', reason: null};
+  }
+  const reason = parsed.window.status_reason || parsed.window.state;
+  if (!options.lazyTailRestartAttempted) {
+    return {action: 'retry', reason};
+  }
+  return {action: 'recover', reason};
 }
 
 function _lazyTailSessionEnvelope(parsed) {

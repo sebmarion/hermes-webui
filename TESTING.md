@@ -294,9 +294,13 @@ For manual verification, use isolated `HERMES_HOME` and
 paints first, five upward-scroll pages preserve the first visible row, and an
 active task stays labeled “Reconnecting to latest turn” until the signed
 checkpoint acknowledgment arrives. Force an invalid or stale cursor and verify
-there is one bounded restart followed by a visible recovery action. The old
-complete-history route may run only after clicking “Load complete legacy
-transcript”; that explicit action can take time for very large tasks.
+there is one bounded restart followed by a visible recovery action. If the
+initial fast window returns a typed `legacy_required` or `stale` state, verify
+the browser retries the bounded fast-window request exactly once. A repeated
+typed fallback must show its sanitized status reason and the existing recovery
+action. The old complete-history route may run only after clicking “Load
+complete legacy transcript”; that explicit action can take time for very large
+tasks and must never start automatically.
 
 For rollout timings, collect 40 warm and 20 process-cold opens and record every
 initial and older-page duration. No `/api/session-window` request may exceed
