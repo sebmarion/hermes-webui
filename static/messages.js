@@ -8260,6 +8260,7 @@ function _syncClarifyCollapseButton(card) {
 }
 
 let _clarifyResizeListenerReady = false;
+let _clarifyResponseVisibilityTimer = null;
 
 function _clarifyMessagesNearBottom(messages) {
   if (!messages) return false;
@@ -8298,6 +8299,39 @@ function _syncClarifyTranscriptSpace(card, opts) {
   setTimeout(measure, 420);
 }
 
+function _ensureClarifyResponseVisible(card, opts) {
+  opts = opts || {};
+  if (!card || !card.classList.contains("visible") || card.classList.contains("collapsed")) return;
+  const inner = card.querySelector(".clarify-inner");
+  const response = card.querySelector(".clarify-response");
+  if (!inner || !response) return;
+  const reveal = () => {
+    if (!card.classList.contains("visible") || card.classList.contains("collapsed")) return;
+    const cardRect = card.getBoundingClientRect();
+    const innerRect = inner.getBoundingClientRect();
+    const responseRect = response.getBoundingClientRect();
+    const gap = 8;
+    const visibleTop = Math.max(cardRect.top, innerRect.top);
+    const visibleBottom = Math.min(cardRect.bottom, innerRect.bottom);
+    const below = responseRect.bottom - (visibleBottom - gap);
+    const above = (visibleTop + gap) - responseRect.top;
+    if (below > 0) {
+      inner.scrollTop += Math.ceil(below);
+    } else if (above > 0) {
+      inner.scrollTop = Math.max(0, inner.scrollTop - Math.ceil(above));
+    }
+  };
+  if (opts.immediate) reveal();
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(reveal);
+  if (opts.settle) {
+    clearTimeout(_clarifyResponseVisibilityTimer);
+    _clarifyResponseVisibilityTimer = setTimeout(() => {
+      _clarifyResponseVisibilityTimer = null;
+      reveal();
+    }, 240);
+  }
+}
+
 function _ensureClarifyResizeListener() {
   if (_clarifyResizeListenerReady || typeof window === "undefined") return;
   _clarifyResizeListenerReady = true;
@@ -8305,6 +8339,7 @@ function _ensureClarifyResizeListener() {
     const card = $("clarifyCard");
     if (card && card.classList.contains("visible")) {
       _syncClarifyTranscriptSpace(card, {immediate: true});
+      _ensureClarifyResponseVisible(card, {immediate: true, settle: true});
     }
   }, {passive: true});
 }
@@ -8316,6 +8351,7 @@ function toggleClarifyCardCollapsed(forceCollapsed) {
   card.classList.toggle("collapsed", collapsed);
   _syncClarifyCollapseButton(card);
   _syncClarifyTranscriptSpace(card, {immediate: true});
+  _ensureClarifyResponseVisible(card, {immediate: true, settle: true});
 }
 
 function _clearClarifyHideTimer() {
@@ -8561,6 +8597,7 @@ function showClarifyCard(pending) {
   if (input && !sameClarify && document.activeElement !== $('msg')) {
     input.focus({preventScroll: true});
   }
+  if (!sameClarify) _ensureClarifyResponseVisible(card, {immediate: true, settle: true});
   if (typeof syncTopbar === 'function') syncTopbar();
 }
 

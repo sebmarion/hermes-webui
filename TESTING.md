@@ -68,7 +68,7 @@ without ruff aren't blocked, while CI (which installs ruff) enforces it. The
 diff-scoped gate runs as the `lint` job in `.github/workflows/tests.yml` and is
 also part of the maintainer pre-release pre-gate.
 
-## Automated browser smoke (runtime brick-class gate)
+## Automated browser smoke (runtime and critical-layout gate)
 
 The ESLint guard above catches `const`-reassign / import-assign statically. The
 **browser smoke** catches the same brick class *dynamically* — plus anything else
@@ -77,21 +77,32 @@ that throws only when a real browser executes the page (e.g. a `function X(){}` 
 
 `tests/browser_smoke.py` boots the real `server.py` (agent-free, on an ephemeral
 port, with an isolated temp state dir) and loads the key pages in headless
-Chromium, failing if **any** console error or uncaught JS exception fires on load.
-It runs in CI (`.github/workflows/browser-smoke.yml`) on every PR and push to
-master, and locally:
+Chromium. It fails if **any** console error or uncaught JS exception fires on
+load, and it exercises pinned critical-layout invariants that require real
+browser geometry. The clarification-card check renders a deliberately tall
+prompt at wide, laptop, breakpoint, and phone sizes, including a live
+desktop-to-phone resize. At the reported `1262x535` failure size, the heading,
+question, hint, response field, and submit control must all remain visible
+together. At every size, the response controls must stay inside the visible
+card scrollport and win hit-testing above the composer, queue, and terminal
+flyouts.
+
+The smoke runs in CI (`.github/workflows/browser-smoke.yml`) on every PR and push
+to master, and locally:
 
 ```bash
 pip install playwright && python -m playwright install chromium
 python tests/browser_smoke.py
 ```
 
+Set `SMOKE_BROWSER_EXECUTABLE` to an existing Chromium-compatible executable
+when the Playwright package is installed but its managed browser is unavailable.
+
 It is intentionally **credential-free**: it strips every `*_API_KEY` from the
 environment before launching the server, needs no secrets, and does not drive a
-real model (it verifies the app *loads and initializes* cleanly — the brick class
-that breaks the page for everyone). A full chat golden-path E2E (send → stream →
-render → switch → reload) lives in the maintainer's private QA harness, which has
-the agent + a mock LLM provider available.
+real model. A full chat golden-path E2E (send → stream → render → switch →
+reload) lives in the maintainer's private QA harness, which has the agent + a
+mock LLM provider available.
 
 ### Standing-goal continuation recovery gate
 
