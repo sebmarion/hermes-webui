@@ -12400,12 +12400,12 @@ def _render_index_shell_base() -> str:
 
 
 def _lazy_tail_server_enabled() -> bool:
-    return str(os.environ.get("HERMES_WEBUI_LAZY_TAIL_V1", "")).strip() == "1"
+    return str(os.environ.get("HERMES_WEBUI_LAZY_TAIL_V1", "1")).strip() == "1"
 
 
 def _lazy_tail_browser_enabled() -> bool:
     return (
-        str(os.environ.get("HERMES_WEBUI_LAZY_TAIL_BROWSER_V1", "")).strip()
+        str(os.environ.get("HERMES_WEBUI_LAZY_TAIL_BROWSER_V1", "1")).strip()
         == "1"
     )
 

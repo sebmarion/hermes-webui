@@ -24,9 +24,11 @@ def _route_capture(monkeypatch):
     return routes, captured
 
 
-def test_session_window_route_is_404_when_server_gate_is_off(monkeypatch):
+def test_session_window_route_is_404_when_server_gate_is_explicitly_disabled(
+    monkeypatch,
+):
     routes, captured = _route_capture(monkeypatch)
-    monkeypatch.delenv("HERMES_WEBUI_LAZY_TAIL_V1", raising=False)
+    monkeypatch.setenv("HERMES_WEBUI_LAZY_TAIL_V1", "0")
 
     routes.handle_get(
         SimpleNamespace(),
@@ -42,7 +44,7 @@ def test_session_window_route_returns_lazy_contract_without_legacy_fallback(
     import api.session_window as session_window
 
     routes, captured = _route_capture(monkeypatch)
-    monkeypatch.setenv("HERMES_WEBUI_LAZY_TAIL_V1", "1")
+    monkeypatch.delenv("HERMES_WEBUI_LAZY_TAIL_V1", raising=False)
     request_seen = []
     payload = {
         "requested_session_id": "requested",
@@ -284,11 +286,11 @@ def test_app_shell_injects_independent_literal_browser_gate(monkeypatch):
 
     monkeypatch.setattr(routes, "_INDEX_SHELL_CACHE", {})
     monkeypatch.delenv("HERMES_WEBUI_LAZY_TAIL_BROWSER_V1", raising=False)
-    off = routes._render_index_shell_base()
-    assert "lazyTailV1:false" in off
-    assert "__LAZY_TAIL_BROWSER_V1__" not in off
+    default_on = routes._render_index_shell_base()
+    assert "lazyTailV1:true" in default_on
+    assert "__LAZY_TAIL_BROWSER_V1__" not in default_on
 
     monkeypatch.setattr(routes, "_INDEX_SHELL_CACHE", {})
-    monkeypatch.setenv("HERMES_WEBUI_LAZY_TAIL_BROWSER_V1", "1")
-    on = routes._render_index_shell_base()
-    assert "lazyTailV1:true" in on
+    monkeypatch.setenv("HERMES_WEBUI_LAZY_TAIL_BROWSER_V1", "0")
+    disabled = routes._render_index_shell_base()
+    assert "lazyTailV1:false" in disabled
