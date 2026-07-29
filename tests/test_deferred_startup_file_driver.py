@@ -26,6 +26,7 @@ from deferred_startup_replay import (
 
 
 TRANSACTION_ID = "startup-file-driver-" + ("x" * 32)
+PROCESS_EPOCH = "startup-file-driver-process-epoch-" + ("e" * 32)
 
 
 def _receipt(
@@ -60,8 +61,32 @@ def _journal_payload(
     steps: dict,
     previous_sha256: str = "0" * 64,
 ) -> dict:
+    next_generation = 1
+    attempt_steps = {}
+    for step_name, record in steps.items():
+        if type(record) is dict and record.get("intent") is True:
+            attempt = {
+                "attempt": 1,
+                "process_epoch": PROCESS_EPOCH,
+                "prior_completion_absent_policy": "deny",
+                "intent": {"generation": next_generation},
+            }
+            next_generation += 1
+            if "completion" in record:
+                completion = dict(record["completion"])
+                completion["generation"] = next_generation
+                attempt["completion"] = completion
+                next_generation += 1
+            elif "indeterminate" in record:
+                indeterminate = dict(record["indeterminate"])
+                indeterminate["generation"] = next_generation
+                attempt["indeterminate"] = indeterminate
+                next_generation += 1
+            attempt_steps[step_name] = {"attempts": [attempt]}
+        else:
+            attempt_steps[step_name] = record
     return {
-        "version": 1,
+        "version": 2,
         "generation": generation,
         "previous_sha256": previous_sha256,
         "transaction_id": TRANSACTION_ID,
@@ -69,7 +94,7 @@ def _journal_payload(
             "version": deferred_release_manifest.MANIFEST_VERSION,
             "sha256": deferred_release_manifest.deferred_release_manifest_sha256(),
         },
-        "steps": steps,
+        "steps": attempt_steps,
     }
 
 
@@ -99,10 +124,11 @@ def _driver(path: Path, **kwargs):
 
 def _record_completed_step(path: str, step_name: str) -> None:
     driver = _driver(Path(path))
-    driver.record_intent(TRANSACTION_ID, _receipt(), step_name)
+    driver.record_intent(TRANSACTION_ID, _receipt(), PROCESS_EPOCH, step_name)
     driver.record_completion(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         step_name,
         recovered=False,
     )
@@ -113,15 +139,17 @@ def _extend_journal_multiple_generations(path: str) -> None:
     driver.record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
     driver.record_completion(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
         recovered=False,
     )
-    driver.record_intent(TRANSACTION_ID, _receipt(), "plugins")
+    driver.record_intent(TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "plugins")
 
 
 def _exit_after_temp_fsync(path: str) -> None:
@@ -143,6 +171,7 @@ def _exit_after_temp_fsync(path: str) -> None:
     driver.record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
 
@@ -163,6 +192,7 @@ def _exit_at_publish_point(path: str, crash_point: str) -> None:
     driver.record_completion(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
         recovered=False,
     )
@@ -176,6 +206,7 @@ def test_file_driver_persists_exact_schema_and_reconstructs_state(tmp_path):
         driver.read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
         == DeferredStartupStepState()
@@ -184,11 +215,13 @@ def test_file_driver_persists_exact_schema_and_reconstructs_state(tmp_path):
     driver.record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
     driver.record_completion(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
         recovered=True,
     )
@@ -214,8 +247,9 @@ def test_file_driver_persists_exact_schema_and_reconstructs_state(tmp_path):
     assert _driver(path).read_step_state(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
-    ) == DeferredStartupStepState(intent=True, completion=True)
+    ) == DeferredStartupStepState(attempt_number=1, intent=True, completion=True)
 
 
 def test_file_driver_survives_real_replay_restart_without_duplicate_mutation(
@@ -248,6 +282,7 @@ def test_file_driver_survives_real_replay_restart_without_duplicate_mutation(
         replay_deferred_startup(
             transaction_id=TRANSACTION_ID,
             manifest_receipt=_receipt(),
+            process_epoch=PROCESS_EPOCH,
             steps=(step(),),
             driver=_driver(path),
             crash_hook=crash_after_intent,
@@ -256,6 +291,7 @@ def test_file_driver_survives_real_replay_restart_without_duplicate_mutation(
     result = replay_deferred_startup(
         transaction_id=TRANSACTION_ID,
         manifest_receipt=_receipt(),
+        process_epoch=PROCESS_EPOCH,
         steps=(step(),),
         driver=_driver(path),
     )
@@ -273,7 +309,9 @@ def test_file_driver_rejects_stale_journal_binding(tmp_path, binding):
 
     path = _private_journal_path(tmp_path)
     driver = _driver(path)
-    driver.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
+    driver.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
 
     transaction_id = TRANSACTION_ID
     receipt = _receipt()
@@ -313,8 +351,8 @@ def test_file_driver_preserves_all_steps_across_interprocess_writers(tmp_path):
     assert [process.exitcode for process in processes] == [0] * len(processes)
     driver = _driver(path)
     assert all(
-        driver.read_step_state(TRANSACTION_ID, _receipt(), step_name)
-        == DeferredStartupStepState(intent=True, completion=True)
+        driver.read_step_state(TRANSACTION_ID, _receipt(), PROCESS_EPOCH, step_name)
+        == DeferredStartupStepState(attempt_number=1, intent=True, completion=True)
         for step_name in step_names
     )
 
@@ -324,17 +362,23 @@ def test_file_driver_transitions_are_write_once_and_idempotent(tmp_path):
 
     path = _private_journal_path(tmp_path)
     driver = _driver(path)
-    driver.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
-    driver.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
+    driver.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
+    driver.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
     driver.record_completion(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
         recovered=False,
     )
     driver.record_completion(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
         recovered=False,
     )
@@ -343,6 +387,7 @@ def test_file_driver_transitions_are_write_once_and_idempotent(tmp_path):
         driver.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             recovered=True,
         )
@@ -350,6 +395,7 @@ def test_file_driver_transitions_are_write_once_and_idempotent(tmp_path):
         driver.record_indeterminate(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             reason="ambiguous",
         )
@@ -357,6 +403,7 @@ def test_file_driver_transitions_are_write_once_and_idempotent(tmp_path):
         driver.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "plugins",
             recovered=False,
         )
@@ -384,6 +431,7 @@ def test_file_driver_fails_closed_on_partial_or_corrupt_journal(
         _driver(path).read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
 
@@ -398,6 +446,7 @@ def test_file_driver_enforces_size_and_private_metadata(tmp_path):
         _driver(path, max_bytes=1024).read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
 
@@ -432,10 +481,10 @@ def test_file_driver_rejects_relative_dotdot_and_symlinked_ancestor(tmp_path):
 @pytest.mark.parametrize(
     ("crash_point", "expected_state"),
     (
-        ("after-temp-fsync", DeferredStartupStepState(intent=True)),
+        ("after-temp-fsync", DeferredStartupStepState(attempt_number=1, intent=True)),
         (
             "after-publish",
-            DeferredStartupStepState(intent=True, completion=True),
+            DeferredStartupStepState(attempt_number=1, intent=True, completion=True),
         ),
     ),
 )
@@ -457,6 +506,7 @@ def test_file_driver_reconstructs_after_atomic_write_crash(
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
 
@@ -474,6 +524,7 @@ def test_file_driver_reconstructs_after_atomic_write_crash(
         crashing_driver.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             recovered=False,
         )
@@ -482,6 +533,7 @@ def test_file_driver_reconstructs_after_atomic_write_crash(
         _driver(path).read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
         == expected_state
@@ -493,13 +545,16 @@ def test_file_driver_rejects_sensitive_reason_values(tmp_path):
 
     path = _private_journal_path(tmp_path)
     driver = _driver(path)
-    driver.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
+    driver.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
 
     for reason in ("authorization", "fence_token", "bearer-secret"):
         with pytest.raises(DeferredStartupFileDriverError, match="sensitive"):
             driver.record_indeterminate(
                 TRANSACTION_ID,
                 _receipt(),
+                PROCESS_EPOCH,
                 "credential_permissions",
                 reason=reason,
             )
@@ -514,6 +569,7 @@ def test_file_driver_rejects_sensitive_step_keys(tmp_path, step_name):
         _driver(path).record_intent(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             step_name,
         )
 
@@ -526,7 +582,9 @@ def test_file_driver_fails_closed_when_path_is_replaced_during_parse(
 
     path = _private_journal_path(tmp_path)
     driver = _driver(path)
-    driver.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
+    driver.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
     original_loads = file_driver.json.loads
 
     def replace_then_parse(payload, *args, **kwargs):
@@ -544,6 +602,7 @@ def test_file_driver_fails_closed_when_path_is_replaced_during_parse(
         driver.read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
 
@@ -563,6 +622,7 @@ def test_file_driver_rejects_direct_symlink_hardlink_and_unsafe_lock(tmp_path):
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
     hardlink = path.with_name("hardlink")
@@ -620,6 +680,7 @@ def test_file_driver_rejects_duplicate_keys_and_non_exact_scalar_types(
         _driver(path).read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
 
@@ -673,6 +734,7 @@ def test_file_driver_fsyncs_temp_and_uses_no_clobber_publish(
     driver.record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
 
@@ -729,6 +791,7 @@ def test_file_driver_fails_closed_on_replacement_after_atomic_replace(
         driver.record_intent(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
 
@@ -745,7 +808,9 @@ def test_file_driver_rejects_replaced_parent_identity(tmp_path):
 
     path = _private_journal_path(tmp_path)
     driver = _driver(path)
-    driver.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
+    driver.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
     original_parent = path.parent.with_name("original-private")
     path.parent.rename(original_parent)
     path.parent.mkdir(mode=0o700)
@@ -757,6 +822,7 @@ def test_file_driver_rejects_replaced_parent_identity(tmp_path):
         driver.read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
 
@@ -766,11 +832,14 @@ def test_file_driver_rejects_rollback_to_earlier_valid_generation(tmp_path):
 
     path = _private_journal_path(tmp_path)
     driver = _driver(path)
-    driver.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
+    driver.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
     earlier = path.read_bytes()
     driver.record_completion(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
         recovered=False,
     )
@@ -784,6 +853,7 @@ def test_file_driver_rejects_rollback_to_earlier_valid_generation(tmp_path):
         driver.read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
 
@@ -793,9 +863,20 @@ def test_file_driver_rejects_same_generation_with_different_content(tmp_path):
 
     path = _private_journal_path(tmp_path)
     driver = _driver(path)
-    driver.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
+    driver.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
     forked = json.loads(path.read_bytes())
-    forked["steps"]["plugins"] = {"intent": True}
+    forked["steps"]["plugins"] = {
+        "attempts": [
+            {
+                "attempt": 1,
+                "process_epoch": PROCESS_EPOCH + "-fork",
+                "prior_completion_absent_policy": "deny",
+                "intent": {"generation": 1},
+            },
+        ],
+    }
     path.write_text(json.dumps(forked, sort_keys=True, separators=(",", ":")) + "\n")
     os.chmod(path, 0o600)
 
@@ -803,6 +884,7 @@ def test_file_driver_rejects_same_generation_with_different_content(tmp_path):
         driver.read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
 
@@ -823,16 +905,19 @@ def test_file_driver_accepts_other_process_monotonic_generation_extension(
     assert original.read_step_state(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
-    ) == DeferredStartupStepState(intent=True, completion=True)
+    ) == DeferredStartupStepState(attempt_number=1, intent=True, completion=True)
     assert original.read_step_state(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "plugins",
-    ) == DeferredStartupStepState(intent=True)
+    ) == DeferredStartupStepState(attempt_number=1, intent=True)
     original.record_completion(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "plugins",
         recovered=False,
     )
@@ -842,10 +927,13 @@ def test_file_driver_accepts_other_process_monotonic_generation_extension(
 def test_file_driver_reconstruction_binds_latest_generation(tmp_path):
     path = _private_journal_path(tmp_path)
     first = _driver(path)
-    first.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
+    first.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
     first.record_completion(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
         recovered=True,
     )
@@ -855,8 +943,9 @@ def test_file_driver_reconstruction_binds_latest_generation(tmp_path):
     assert reconstructed.read_step_state(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
-    ) == DeferredStartupStepState(intent=True, completion=True)
+    ) == DeferredStartupStepState(attempt_number=1, intent=True, completion=True)
     assert json.loads(path.read_bytes())["generation"] == 2
 
 
@@ -866,10 +955,11 @@ def test_file_driver_serializes_threads_through_one_driver(tmp_path):
     step_names = tuple(f"thread_step_{index}" for index in range(8))
 
     def complete(step_name):
-        driver.record_intent(TRANSACTION_ID, _receipt(), step_name)
+        driver.record_intent(TRANSACTION_ID, _receipt(), PROCESS_EPOCH, step_name)
         driver.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             step_name,
             recovered=False,
         )
@@ -879,8 +969,8 @@ def test_file_driver_serializes_threads_through_one_driver(tmp_path):
 
     assert json.loads(path.read_bytes())["generation"] == 16
     assert all(
-        driver.read_step_state(TRANSACTION_ID, _receipt(), step_name)
-        == DeferredStartupStepState(intent=True, completion=True)
+        driver.read_step_state(TRANSACTION_ID, _receipt(), PROCESS_EPOCH, step_name)
+        == DeferredStartupStepState(attempt_number=1, intent=True, completion=True)
         for step_name in step_names
     )
 
@@ -930,7 +1020,10 @@ def test_file_driver_rejects_impossible_initial_generation_topology(
     )
     os.chmod(path, 0o600)
 
-    with pytest.raises(DeferredStartupFileDriverError, match="generation.*topology"):
+    with pytest.raises(
+        DeferredStartupFileDriverError,
+        match="generation.*topology|step record",
+    ):
         _driver(path)
 
 
@@ -959,17 +1052,23 @@ def test_file_driver_rejects_later_generation_jump_without_exact_state_count(
 
     path = _private_journal_path(tmp_path)
     driver = _driver(path)
-    driver.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
+    driver.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
     tampered = json.loads(path.read_bytes())
     tampered["generation"] += generation_delta
     tampered["steps"].update(added_steps)
     path.write_text(json.dumps(tampered, sort_keys=True, separators=(",", ":")) + "\n")
     os.chmod(path, 0o600)
 
-    with pytest.raises(DeferredStartupFileDriverError, match="generation.*topology"):
+    with pytest.raises(
+        DeferredStartupFileDriverError,
+        match="generation.*topology|step record",
+    ):
         driver.read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
 
@@ -982,7 +1081,9 @@ def test_file_driver_rejects_in_place_rewrite_during_parse(
 
     path = _private_journal_path(tmp_path)
     driver = _driver(path)
-    driver.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
+    driver.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
     original_loads = file_driver.json.loads
 
     def rewrite_then_parse(payload, *args, **kwargs):
@@ -998,6 +1099,7 @@ def test_file_driver_rejects_in_place_rewrite_during_parse(
         driver.read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
 
@@ -1013,6 +1115,7 @@ def test_file_driver_rejects_in_place_rewrite_before_replace(tmp_path):
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
 
@@ -1034,6 +1137,7 @@ def test_file_driver_rejects_in_place_rewrite_before_replace(tmp_path):
         racing.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             recovered=False,
         )
@@ -1044,11 +1148,14 @@ def test_file_driver_rejects_old_snapshot_after_full_reconstruction(tmp_path):
 
     path = _private_journal_path(tmp_path)
     driver = _driver(path)
-    driver.record_intent(TRANSACTION_ID, _receipt(), "credential_permissions")
+    driver.record_intent(
+        TRANSACTION_ID, _receipt(), PROCESS_EPOCH, "credential_permissions"
+    )
     old_journal = path.read_bytes()
     driver.record_completion(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
         recovered=False,
     )
@@ -1067,6 +1174,7 @@ def test_file_driver_rejects_anchor_hash_mismatch(tmp_path):
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
     anchor_path = path.with_name(path.name + ".anchor")
@@ -1092,6 +1200,7 @@ def test_file_driver_recovers_exact_journal_ahead_of_anchor(
         _driver(path).record_intent(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
 
@@ -1109,17 +1218,21 @@ def test_file_driver_recovers_exact_journal_ahead_of_anchor(
         transition = lambda: crashing.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             recovered=False,
         )
-        expected = DeferredStartupStepState(intent=True, completion=True)
+        expected = DeferredStartupStepState(
+            attempt_number=1, intent=True, completion=True
+        )
     else:
         transition = lambda: crashing.record_intent(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
-        expected = DeferredStartupStepState(intent=True)
+        expected = DeferredStartupStepState(attempt_number=1, intent=True)
 
     with pytest.raises(DeferredStartupCrash, match="after-journal-before-anchor"):
         transition()
@@ -1129,6 +1242,7 @@ def test_file_driver_recovers_exact_journal_ahead_of_anchor(
         reconstructed.read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
         == expected
@@ -1159,6 +1273,7 @@ def test_file_driver_real_crash_leaves_temp_then_reconstructs_and_cleans(
         reconstructed.read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
         == DeferredStartupStepState()
@@ -1195,6 +1310,7 @@ def test_file_driver_writes_exact_canonical_journal_and_anchor_bytes(tmp_path):
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
     empty = _journal_payload(generation=0, steps={})
@@ -1205,7 +1321,7 @@ def test_file_driver_writes_exact_canonical_journal_and_anchor_bytes(tmp_path):
     )
     expected_journal_bytes = _canonical_json_bytes(journal) + b"\n"
     expected_anchor = {
-        "version": 1,
+        "version": 2,
         "transaction_id": TRANSACTION_ID,
         "manifest_receipt": {
             "version": deferred_release_manifest.MANIFEST_VERSION,
@@ -1233,6 +1349,7 @@ def test_file_driver_never_overwrites_replacement_after_validation_before_displa
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
     replacement_bytes = b"newer replacement must survive"
@@ -1254,6 +1371,7 @@ def test_file_driver_never_overwrites_replacement_after_validation_before_displa
         racing.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             recovered=False,
         )
@@ -1270,6 +1388,7 @@ def test_file_driver_recovers_exact_old_state_after_crash_after_displacement(
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
 
@@ -1287,6 +1406,7 @@ def test_file_driver_recovers_exact_old_state_after_crash_after_displacement(
         crashing.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             recovered=False,
         )
@@ -1294,8 +1414,9 @@ def test_file_driver_recovers_exact_old_state_after_crash_after_displacement(
     assert _driver(path).read_step_state(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
-    ) == DeferredStartupStepState(intent=True)
+    ) == DeferredStartupStepState(attempt_number=1, intent=True)
 
 
 def test_file_driver_publish_is_no_clobber_and_preserves_intervening_target(tmp_path):
@@ -1308,6 +1429,7 @@ def test_file_driver_publish_is_no_clobber_and_preserves_intervening_target(tmp_
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
     replacement_bytes = b"intervening target must survive"
@@ -1327,6 +1449,7 @@ def test_file_driver_publish_is_no_clobber_and_preserves_intervening_target(tmp_
         racing.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             recovered=False,
         )
@@ -1341,6 +1464,7 @@ def test_file_driver_recovers_exact_new_state_after_crash_after_publish(tmp_path
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
 
@@ -1358,6 +1482,7 @@ def test_file_driver_recovers_exact_new_state_after_crash_after_publish(tmp_path
         crashing.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             recovered=False,
         )
@@ -1365,8 +1490,9 @@ def test_file_driver_recovers_exact_new_state_after_crash_after_publish(tmp_path
     assert _driver(path).read_step_state(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
-    ) == DeferredStartupStepState(intent=True, completion=True)
+    ) == DeferredStartupStepState(attempt_number=1, intent=True, completion=True)
 
 
 def test_orphan_cleanup_never_deletes_replacement_installed_after_open(
@@ -1404,12 +1530,15 @@ def test_orphan_cleanup_never_deletes_replacement_installed_after_open(
 @pytest.mark.parametrize(
     ("crash_point", "expected_state"),
     (
-        ("before-displacement", DeferredStartupStepState(intent=True)),
-        ("after-displacement", DeferredStartupStepState(intent=True)),
-        ("before-publish", DeferredStartupStepState(intent=True)),
+        (
+            "before-displacement",
+            DeferredStartupStepState(attempt_number=1, intent=True),
+        ),
+        ("after-displacement", DeferredStartupStepState(attempt_number=1, intent=True)),
+        ("before-publish", DeferredStartupStepState(attempt_number=1, intent=True)),
         (
             "after-publish",
-            DeferredStartupStepState(intent=True, completion=True),
+            DeferredStartupStepState(attempt_number=1, intent=True, completion=True),
         ),
     ),
 )
@@ -1422,6 +1551,7 @@ def test_file_driver_abrupt_publish_crash_recovers_exact_old_or_new_state(
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
     script = """
@@ -1439,6 +1569,7 @@ receipt = DeferredStartupManifestReceipt(
     sha256=deferred_release_manifest.deferred_release_manifest_sha256(),
 )
 crash_point = sys.argv[3]
+process_epoch = sys.argv[4]
 def crash(observed):
     if observed == crash_point:
         os._exit(74)
@@ -1451,6 +1582,7 @@ driver = DeferredStartupFileDriver(
 driver.record_completion(
     transaction_id,
     receipt,
+    process_epoch,
     "credential_permissions",
     recovered=False,
 )
@@ -1463,6 +1595,7 @@ driver.record_completion(
             str(path),
             TRANSACTION_ID,
             crash_point,
+            PROCESS_EPOCH,
         ],
         check=False,
     )
@@ -1473,6 +1606,7 @@ driver.record_completion(
         reconstructed.read_step_state(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
         )
         == expected_state
@@ -1492,6 +1626,7 @@ def test_file_driver_rejects_two_link_backup_when_target_is_absent(tmp_path):
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
 
@@ -1509,6 +1644,7 @@ def test_file_driver_rejects_two_link_backup_when_target_is_absent(tmp_path):
         crashing.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             recovered=False,
         )
@@ -1536,6 +1672,7 @@ def test_file_driver_attestation_receipt_has_exact_immutable_schema(tmp_path):
     driver.record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
 
@@ -1544,7 +1681,7 @@ def test_file_driver_attestation_receipt_has_exact_immutable_schema(tmp_path):
     anchor = json.loads(path.with_name(path.name + ".anchor").read_bytes())
     parent_status = path.parent.stat()
     expected = {
-        "schema_version": 1,
+        "schema_version": 2,
         "transaction_id": TRANSACTION_ID,
         "manifest_receipt": {
             "version": deferred_release_manifest.MANIFEST_VERSION,
@@ -1561,6 +1698,13 @@ def test_file_driver_attestation_receipt_has_exact_immutable_schema(tmp_path):
         "anchor": {
             "generation": 1,
             "sha256": _canonical_sha256(anchor),
+        },
+        "attempt_topology": {
+            "latest_process_epoch": PROCESS_EPOCH,
+            "attempt_count": 1,
+            "sha256": hashlib.sha256(
+                _canonical_json_bytes(journal["steps"])
+            ).hexdigest(),
         },
         "status": "stable-parent-consistent",
     }
@@ -1583,12 +1727,14 @@ def test_file_driver_attestation_advances_reconstructs_and_hashes_canonically(
     driver.record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
     intent = driver.attestation_receipt()
     driver.record_completion(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
         recovered=False,
     )
@@ -1638,6 +1784,7 @@ def test_file_driver_attestation_rejects_inconsistent_anchor(tmp_path):
     driver.record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
     anchor_path = path.with_name(path.name + ".anchor")
@@ -1662,6 +1809,7 @@ def test_file_driver_reclassifies_interrupted_backup_quarantine_before_cleanup(
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
 
@@ -1679,6 +1827,7 @@ def test_file_driver_reclassifies_interrupted_backup_quarantine_before_cleanup(
         crashing.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             recovered=False,
         )
@@ -1692,8 +1841,9 @@ def test_file_driver_reclassifies_interrupted_backup_quarantine_before_cleanup(
     assert reconstructed.read_step_state(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
-    ) == DeferredStartupStepState(intent=True, completion=True)
+    ) == DeferredStartupStepState(attempt_number=1, intent=True, completion=True)
     assert not quarantine.exists()
 
 
@@ -1706,6 +1856,7 @@ def test_file_driver_replays_repeated_crash_between_restore_link_and_backup_unli
     _driver(path).record_intent(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
     )
 
@@ -1723,6 +1874,7 @@ def test_file_driver_replays_repeated_crash_between_restore_link_and_backup_unli
         crashing.record_completion(
             TRANSACTION_ID,
             _receipt(),
+            PROCESS_EPOCH,
             "credential_permissions",
             recovered=False,
         )
@@ -1771,8 +1923,9 @@ DeferredStartupFileDriver(
     assert reconstructed.read_step_state(
         TRANSACTION_ID,
         _receipt(),
+        PROCESS_EPOCH,
         "credential_permissions",
-    ) == DeferredStartupStepState(intent=True)
+    ) == DeferredStartupStepState(attempt_number=1, intent=True)
     assert not any(
         child.name.endswith((".tmp", ".bak", ".qtn")) for child in path.parent.iterdir()
     )

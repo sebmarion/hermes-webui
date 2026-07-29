@@ -30,11 +30,12 @@ from deferred_startup_replay import (
     DeferredStartupBindingError,
     DeferredStartupManifestReceipt,
     DeferredStartupStepState,
+    PriorCompletionAbsentPolicy,
 )
 
 
-JOURNAL_VERSION = 1
-ANCHOR_VERSION = 1
+JOURNAL_VERSION = 2
+ANCHOR_VERSION = 2
 DEFAULT_MAX_BYTES = 1024 * 1024
 MAX_CONFIGURABLE_BYTES = 4 * 1024 * 1024
 MAX_RECOVERY_ARTIFACTS = 32
@@ -48,6 +49,7 @@ AFTER_REPLACE = AFTER_PUBLISH
 AFTER_JOURNAL_BEFORE_ANCHOR = "after-journal-before-anchor"
 
 _TRANSACTION_ID_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
+_PROCESS_EPOCH_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _STEP_NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _REASON_RE = re.compile(r"[a-z][a-z0-9-]{0,127}")
@@ -88,6 +90,9 @@ class DeferredStartupFileAttestation:
     journal_sha256: str
     anchor_generation: int
     anchor_sha256: str
+    latest_process_epoch: str | None
+    attempt_count: int
+    attempt_topology_sha256: str
     status: str
 
     def as_dict(self) -> dict:
@@ -111,6 +116,11 @@ class DeferredStartupFileAttestation:
             "anchor": {
                 "generation": self.anchor_generation,
                 "sha256": self.anchor_sha256,
+            },
+            "attempt_topology": {
+                "latest_process_epoch": self.latest_process_epoch,
+                "attempt_count": self.attempt_count,
+                "sha256": self.attempt_topology_sha256,
             },
             "status": self.status,
         }
@@ -249,7 +259,7 @@ class DeferredStartupFileDriver:
                 ).hexdigest()
             self._accept_observed_journal(journal)
             return DeferredStartupFileAttestation(
-                schema_version=1,
+                schema_version=2,
                 transaction_id=self._transaction_id,
                 manifest_version=self._manifest_receipt.version,
                 manifest_sha256=self._manifest_receipt.sha256,
@@ -259,6 +269,11 @@ class DeferredStartupFileDriver:
                 journal_sha256=journal_sha256,
                 anchor_generation=anchor["generation"],
                 anchor_sha256=anchor_sha256,
+                latest_process_epoch=self._latest_process_epoch(journal),
+                attempt_count=self._attempt_count(journal),
+                attempt_topology_sha256=hashlib.sha256(
+                    self._canonical_journal_bytes(journal["steps"])
+                ).hexdigest(),
                 status="stable-parent-consistent",
             )
 
@@ -266,11 +281,21 @@ class DeferredStartupFileDriver:
         self,
         transaction_id: str,
         manifest_receipt: DeferredStartupManifestReceipt,
+        process_epoch: str,
         step_name: str,
+        *,
+        prior_completion_absent_policy: PriorCompletionAbsentPolicy = (
+            PriorCompletionAbsentPolicy.DENY
+        ),
     ) -> DeferredStartupStepState:
-        step_name = self._validate_call(
+        if type(prior_completion_absent_policy) is not PriorCompletionAbsentPolicy:
+            raise DeferredStartupFileDriverError(
+                "startup journal step policy is invalid"
+            )
+        process_epoch, step_name = self._validate_call(
             transaction_id,
             manifest_receipt,
+            process_epoch,
             step_name,
         )
         with self._state_lock:
@@ -283,31 +308,82 @@ class DeferredStartupFileDriver:
                 )
             self._accept_observed_journal(journal)
             record = journal["steps"].get(step_name)
-            if record is None:
-                return DeferredStartupStepState()
+            attempts = [] if record is None else record["attempts"]
+            current = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if attempt["process_epoch"] == process_epoch
+                ),
+                None,
+            )
+            prior = [
+                attempt
+                for attempt in attempts
+                if attempt["process_epoch"] != process_epoch
+            ]
+            prior_completion = any("completion" in attempt for attempt in prior)
+            prior_indeterminate = any("indeterminate" in attempt for attempt in prior)
+            prior_unresolved = any(
+                "completion" not in attempt and "indeterminate" not in attempt
+                for attempt in prior
+            )
+            if current is None:
+                return DeferredStartupStepState(
+                    prior_completion=prior_completion,
+                    prior_indeterminate=prior_indeterminate,
+                    prior_unresolved=prior_unresolved,
+                )
+            if (
+                current["prior_completion_absent_policy"]
+                != prior_completion_absent_policy.value
+            ):
+                raise DeferredStartupFileDriverError(
+                    "startup journal process epoch policy binding does not match"
+                )
+            if current is not attempts[-1]:
+                raise DeferredStartupFileDriverError(
+                    "startup stale process epoch is not the newest attempt"
+                )
             return DeferredStartupStepState(
+                attempt_number=current["attempt"],
                 intent=True,
-                completion="completion" in record,
-                indeterminate="indeterminate" in record,
+                completion="completion" in current,
+                indeterminate="indeterminate" in current,
+                prior_completion=prior_completion,
+                prior_indeterminate=prior_indeterminate,
+                prior_unresolved=prior_unresolved,
             )
 
     def record_intent(
         self,
         transaction_id: str,
         manifest_receipt: DeferredStartupManifestReceipt,
+        process_epoch: str,
         step_name: str,
+        *,
+        prior_completion_absent_policy: PriorCompletionAbsentPolicy = (
+            PriorCompletionAbsentPolicy.DENY
+        ),
     ) -> None:
+        if type(prior_completion_absent_policy) is not PriorCompletionAbsentPolicy:
+            raise DeferredStartupFileDriverError(
+                "startup journal step policy is invalid"
+            )
         self._transition(
             transaction_id,
             manifest_receipt,
+            process_epoch,
             step_name,
-            {"intent": True},
+            "intent",
+            {"policy": prior_completion_absent_policy.value},
         )
 
     def record_completion(
         self,
         transaction_id: str,
         manifest_receipt: DeferredStartupManifestReceipt,
+        process_epoch: str,
         step_name: str,
         *,
         recovered: bool,
@@ -319,14 +395,17 @@ class DeferredStartupFileDriver:
         self._transition(
             transaction_id,
             manifest_receipt,
+            process_epoch,
             step_name,
-            {"intent": True, "completion": {"recovered": recovered}},
+            "completion",
+            {"recovered": recovered},
         )
 
     def record_indeterminate(
         self,
         transaction_id: str,
         manifest_receipt: DeferredStartupManifestReceipt,
+        process_epoch: str,
         step_name: str,
         *,
         reason: str,
@@ -342,20 +421,25 @@ class DeferredStartupFileDriver:
         self._transition(
             transaction_id,
             manifest_receipt,
+            process_epoch,
             step_name,
-            {"intent": True, "indeterminate": {"reason": reason}},
+            "indeterminate",
+            {"reason": reason},
         )
 
     def _transition(
         self,
         transaction_id: str,
         manifest_receipt: DeferredStartupManifestReceipt,
+        process_epoch: str,
         step_name: str,
-        proposed: dict,
+        transition: str,
+        payload: dict | None,
     ) -> None:
-        step_name = self._validate_call(
+        process_epoch, step_name = self._validate_call(
             transaction_id,
             manifest_receipt,
+            process_epoch,
             step_name,
         )
         with self._state_lock:
@@ -367,25 +451,81 @@ class DeferredStartupFileDriver:
                     fingerprint,
                 )
                 self._accept_observed_journal(journal)
-                existing = journal["steps"].get(step_name)
-                if existing is not None:
-                    if proposed == {"intent": True}:
+                previous_sha256 = self._journal_sha256(journal)
+                record = journal["steps"].setdefault(
+                    step_name,
+                    {"attempts": []},
+                )
+                attempts = record["attempts"]
+                current = next(
+                    (
+                        attempt
+                        for attempt in attempts
+                        if attempt["process_epoch"] == process_epoch
+                    ),
+                    None,
+                )
+                if transition == "intent":
+                    if current is not None:
+                        if (
+                            current["prior_completion_absent_policy"]
+                            != payload["policy"]
+                        ):
+                            raise DeferredStartupFileDriverError(
+                                "startup process epoch has a conflicting policy"
+                            )
+                        if current is not attempts[-1]:
+                            raise DeferredStartupFileDriverError(
+                                "startup stale process epoch is not the newest attempt"
+                            )
+                        if "completion" in current or "indeterminate" in current:
+                            raise DeferredStartupFileDriverError(
+                                "startup terminal process epoch cannot be reused"
+                            )
                         return
-                    if existing == proposed:
-                        return
-                    if existing == {"intent": True}:
-                        pass
-                    else:
-                        raise DeferredStartupFileDriverError(
-                            "startup step already has a conflicting receipt"
-                        )
-                elif proposed != {"intent": True}:
+                    proposed = {
+                        "attempt": len(attempts) + 1,
+                        "process_epoch": process_epoch,
+                        "prior_completion_absent_policy": payload["policy"],
+                        "intent": {"generation": journal["generation"] + 1},
+                    }
+                    attempts.append(proposed)
+                elif current is None:
                     raise DeferredStartupFileDriverError(
                         "startup step transition has no durable intent"
                     )
-                journal["previous_sha256"] = self._journal_sha256(journal)
-                journal["steps"][step_name] = proposed
+                elif current is not attempts[-1]:
+                    raise DeferredStartupFileDriverError(
+                        "startup stale process epoch is not the newest attempt"
+                    )
+                elif "completion" in current or "indeterminate" in current:
+                    existing_payload = current.get(transition)
+                    if existing_payload is not None and all(
+                        existing_payload.get(key) == value
+                        for key, value in (payload or {}).items()
+                    ):
+                        return
+                    raise DeferredStartupFileDriverError(
+                        "startup step already has a conflicting receipt"
+                    )
+                else:
+                    proposed = dict(payload or {})
+                    proposed["generation"] = journal["generation"] + 1
+                    current[transition] = proposed
+                journal["previous_sha256"] = previous_sha256
                 journal["generation"] += 1
+                validated_candidate = self._validate_journal(journal)
+                candidate_steps = tuple(
+                    (name, self._freeze(record))
+                    for name, record in sorted(validated_candidate["steps"].items())
+                )
+                if not self._is_monotonic_step_extension(
+                    self._last_steps,
+                    candidate_steps,
+                ):
+                    raise DeferredStartupFileDriverError(
+                        "startup journal candidate is not a monotonic extension"
+                    )
                 self._write_unlocked(parent_fd, journal, fingerprint)
                 self._inject_crash(AFTER_JOURNAL_BEFORE_ANCHOR)
                 self._write_anchor_unlocked(parent_fd, journal)
@@ -395,8 +535,9 @@ class DeferredStartupFileDriver:
         self,
         transaction_id: object,
         manifest_receipt: object,
+        process_epoch: object,
         step_name: object,
-    ) -> str:
+    ) -> tuple[str, str]:
         if transaction_id != self._transaction_id:
             raise DeferredStartupFileDriverError(
                 "startup journal transaction binding does not match"
@@ -408,19 +549,28 @@ class DeferredStartupFileDriver:
             raise DeferredStartupFileDriverError(
                 "startup journal manifest binding does not match"
             )
+        process_epoch = self._validate_process_epoch(process_epoch)
         if type(step_name) is not str or _STEP_NAME_RE.fullmatch(step_name) is None:
             raise DeferredStartupFileDriverError("startup journal step name is invalid")
         if step_name.strip().lower() in _SENSITIVE_JOURNAL_KEYS:
             raise DeferredStartupFileDriverError(
                 "startup journal step name is sensitive"
             )
-        return step_name
+        return process_epoch, step_name
 
     @staticmethod
     def _validate_transaction_id(value: object) -> str:
         if type(value) is not str or _TRANSACTION_ID_RE.fullmatch(value) is None:
             raise DeferredStartupFileDriverError(
                 "startup journal transaction id is invalid"
+            )
+        return value
+
+    @staticmethod
+    def _validate_process_epoch(value: object) -> str:
+        if type(value) is not str or _PROCESS_EPOCH_RE.fullmatch(value) is None:
+            raise DeferredStartupFileDriverError(
+                "startup journal process epoch is invalid"
             )
         return value
 
@@ -1545,49 +1695,145 @@ class DeferredStartupFileDriver:
                 "startup journal schema or binding is invalid"
             )
         validated_steps: dict[str, dict] = {}
+        observed_generations: set[int] = set()
         for step_name, record in raw["steps"].items():
             if (
                 type(step_name) is not str
                 or _STEP_NAME_RE.fullmatch(step_name) is None
                 or step_name.strip().lower() in _SENSITIVE_JOURNAL_KEYS
                 or type(record) is not dict
-                or record.get("intent") is not True
-                or set(record)
-                not in (
-                    {"intent"},
-                    {"intent", "completion"},
-                    {"intent", "indeterminate"},
-                )
+                or set(record) != {"attempts"}
+                or type(record.get("attempts")) is not list
             ):
                 raise DeferredStartupFileDriverError(
                     "startup journal step record is invalid"
                 )
-            if "completion" in record and (
-                type(record["completion"]) is not dict
-                or set(record["completion"]) != {"recovered"}
-                or type(record["completion"]["recovered"]) is not bool
+            attempts: list[dict] = []
+            process_epochs: set[str] = set()
+            prior_indeterminate = False
+            for expected_attempt, attempt in enumerate(
+                record["attempts"],
+                start=1,
             ):
+                if prior_indeterminate:
+                    raise DeferredStartupFileDriverError(
+                        "startup journal has an attempt after indeterminate state"
+                    )
+                if (
+                    type(attempt) is not dict
+                    or set(attempt)
+                    not in (
+                        {
+                            "attempt",
+                            "process_epoch",
+                            "prior_completion_absent_policy",
+                            "intent",
+                        },
+                        {
+                            "attempt",
+                            "process_epoch",
+                            "prior_completion_absent_policy",
+                            "intent",
+                            "completion",
+                        },
+                        {
+                            "attempt",
+                            "process_epoch",
+                            "prior_completion_absent_policy",
+                            "intent",
+                            "indeterminate",
+                        },
+                    )
+                    or type(attempt.get("attempt")) is not int
+                    or isinstance(attempt.get("attempt"), bool)
+                    or attempt["attempt"] != expected_attempt
+                    or type(attempt.get("process_epoch")) is not str
+                    or _PROCESS_EPOCH_RE.fullmatch(attempt["process_epoch"]) is None
+                    or attempt["process_epoch"] in process_epochs
+                    or type(attempt.get("prior_completion_absent_policy")) is not str
+                    or attempt["prior_completion_absent_policy"]
+                    not in {policy.value for policy in PriorCompletionAbsentPolicy}
+                    or type(attempt.get("intent")) is not dict
+                    or set(attempt["intent"]) != {"generation"}
+                    or type(attempt["intent"].get("generation")) is not int
+                    or isinstance(attempt["intent"].get("generation"), bool)
+                    or attempt["intent"]["generation"] < 1
+                ):
+                    raise DeferredStartupFileDriverError(
+                        "startup journal attempt topology is invalid"
+                    )
+                process_epochs.add(attempt["process_epoch"])
+                intent_generation = attempt["intent"]["generation"]
+                if intent_generation in observed_generations:
+                    raise DeferredStartupFileDriverError(
+                        "startup journal attempt generation is duplicated"
+                    )
+                observed_generations.add(intent_generation)
+                if "completion" in attempt:
+                    completion = attempt["completion"]
+                    if (
+                        type(completion) is not dict
+                        or set(completion) != {"recovered", "generation"}
+                        or type(completion["recovered"]) is not bool
+                        or type(completion["generation"]) is not int
+                        or isinstance(completion["generation"], bool)
+                        or completion["generation"] <= intent_generation
+                        or completion["generation"] in observed_generations
+                    ):
+                        raise DeferredStartupFileDriverError(
+                            "startup journal completion receipt is invalid"
+                        )
+                    observed_generations.add(completion["generation"])
+                if "indeterminate" in attempt:
+                    indeterminate = attempt["indeterminate"]
+                    if (
+                        type(indeterminate) is not dict
+                        or set(indeterminate) != {"reason", "generation"}
+                        or type(indeterminate["reason"]) is not str
+                        or _REASON_RE.fullmatch(indeterminate["reason"]) is None
+                        or self._contains_sensitive_value(indeterminate["reason"])
+                        or type(indeterminate["generation"]) is not int
+                        or isinstance(indeterminate["generation"], bool)
+                        or indeterminate["generation"] <= intent_generation
+                        or indeterminate["generation"] in observed_generations
+                    ):
+                        raise DeferredStartupFileDriverError(
+                            "startup journal indeterminate receipt is invalid"
+                        )
+                    observed_generations.add(indeterminate["generation"])
+                    prior_indeterminate = True
+                attempts.append(attempt)
+            if not attempts:
                 raise DeferredStartupFileDriverError(
-                    "startup journal completion receipt is invalid"
+                    "startup journal step attempts are empty"
                 )
-            if "indeterminate" in record and (
-                type(record["indeterminate"]) is not dict
-                or set(record["indeterminate"]) != {"reason"}
-                or type(record["indeterminate"]["reason"]) is not str
-                or _REASON_RE.fullmatch(record["indeterminate"]["reason"]) is None
-                or self._contains_sensitive_value(record["indeterminate"]["reason"])
-            ):
-                raise DeferredStartupFileDriverError(
-                    "startup journal indeterminate receipt is invalid"
-                )
-            validated_steps[step_name] = record
-        expected_generation = sum(
-            1 + int("completion" in record or "indeterminate" in record)
-            for record in validated_steps.values()
-        )
+            for index, attempt in enumerate(attempts):
+                if index > 0 and (
+                    attempt["intent"]["generation"]
+                    <= attempts[index - 1]["intent"]["generation"]
+                ):
+                    raise DeferredStartupFileDriverError(
+                        "startup journal attempt generations are reordered"
+                    )
+                if index + 1 < len(attempts):
+                    terminal = attempt.get("completion") or attempt.get("indeterminate")
+                    if (
+                        terminal is not None
+                        and terminal["generation"]
+                        >= attempts[index + 1]["intent"]["generation"]
+                    ):
+                        raise DeferredStartupFileDriverError(
+                            "startup journal terminal generation follows a newer attempt"
+                        )
+            validated_steps[step_name] = {"attempts": attempts}
+        expected_generation = len(observed_generations)
         if raw["generation"] != expected_generation:
             raise DeferredStartupFileDriverError(
                 "startup journal generation does not match step topology"
+            )
+        if observed_generations != set(range(1, expected_generation + 1)):
+            raise DeferredStartupFileDriverError(
+                "startup journal attempt generations are reordered or missing"
             )
         if raw["generation"] == 0 and raw["previous_sha256"] != "0" * 64:
             raise DeferredStartupFileDriverError(
@@ -1776,28 +2022,81 @@ class DeferredStartupFileDriver:
         current: tuple[tuple[str, object], ...],
     ) -> bool:
         current_by_name = dict(current)
-        frozen_intent = (("intent", True),)
         for step_name, previous_record in previous:
             current_record = current_by_name.get(step_name)
             if current_record is None:
                 return False
             if current_record == previous_record:
                 continue
-            current_fields = (
-                dict(current_record) if isinstance(current_record, tuple) else {}
-            )
-            if (
-                previous_record == frozen_intent
-                and current_fields.get("intent") is True
-                and set(current_fields)
-                in (
-                    {"intent", "completion"},
-                    {"intent", "indeterminate"},
-                )
+            if not isinstance(previous_record, tuple) or not isinstance(
+                current_record,
+                tuple,
             ):
-                continue
-            return False
+                return False
+            previous_attempts = dict(previous_record).get("attempts")
+            current_attempts = dict(current_record).get("attempts")
+            if not isinstance(previous_attempts, tuple) or not isinstance(
+                current_attempts,
+                tuple,
+            ):
+                return False
+            if len(current_attempts) < len(previous_attempts):
+                return False
+            for index, previous_attempt in enumerate(previous_attempts):
+                current_attempt = current_attempts[index]
+                if current_attempt == previous_attempt:
+                    continue
+                if index != len(previous_attempts) - 1:
+                    return False
+                previous_fields = dict(previous_attempt)
+                current_fields = dict(current_attempt)
+                if set(previous_fields) != {
+                    "attempt",
+                    "process_epoch",
+                    "prior_completion_absent_policy",
+                    "intent",
+                }:
+                    return False
+                if any(
+                    current_fields.get(key) != value
+                    for key, value in previous_fields.items()
+                ):
+                    return False
+                if set(current_fields) not in (
+                    {
+                        "attempt",
+                        "process_epoch",
+                        "prior_completion_absent_policy",
+                        "intent",
+                        "completion",
+                    },
+                    {
+                        "attempt",
+                        "process_epoch",
+                        "prior_completion_absent_policy",
+                        "intent",
+                        "indeterminate",
+                    },
+                ):
+                    return False
         return True
+
+    @staticmethod
+    def _attempt_count(journal: dict) -> int:
+        return sum(len(record["attempts"]) for record in journal["steps"].values())
+
+    @staticmethod
+    def _latest_process_epoch(journal: dict) -> str | None:
+        latest: tuple[int, str] | None = None
+        for record in journal["steps"].values():
+            for attempt in record["attempts"]:
+                candidate = (
+                    attempt["intent"]["generation"],
+                    attempt["process_epoch"],
+                )
+                if latest is None or candidate[0] > latest[0]:
+                    latest = candidate
+        return None if latest is None else latest[1]
 
     @staticmethod
     def _canonical_journal_bytes(journal: dict) -> bytes:

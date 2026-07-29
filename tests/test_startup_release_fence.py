@@ -20,6 +20,7 @@ from api import config
 
 
 TRANSACTION_ID = "startup-transaction-" + ("x" * 32)
+PROCESS_EPOCH = "startup-process-epoch-" + ("e" * 32)
 IDENTITY = {"pid": 123, "started_at": 456.0, "instance_id": "candidate-a"}
 
 EXPECTED_DEFERRED_RELEASE_DESCRIPTORS = [
@@ -169,11 +170,12 @@ class _InMemoryDeferredStartupDriver:
         self.indeterminate_error = indeterminate_error
 
     @staticmethod
-    def _key(transaction_id, manifest_receipt, step_name):
+    def _key(transaction_id, manifest_receipt, process_epoch, step_name):
         return (
             transaction_id,
             manifest_receipt.version,
             manifest_receipt.sha256,
+            process_epoch,
             step_name,
         )
 
@@ -186,57 +188,95 @@ class _InMemoryDeferredStartupDriver:
         transaction_id=None,
         version=None,
         sha256=None,
+        process_epoch=PROCESS_EPOCH,
     ):
+        if state.intent and state.attempt_number == 0:
+            from dataclasses import replace
+
+            state = replace(state, attempt_number=1)
         key = (
             transaction_id or manifest_receipt.transaction_id,
             manifest_receipt.version if version is None else version,
             manifest_receipt.sha256 if sha256 is None else sha256,
+            process_epoch,
             step_name,
         )
         self.backing[key] = state
 
-    def state(self, manifest_receipt, step_name):
+    def state(self, manifest_receipt, step_name, process_epoch=PROCESS_EPOCH):
         return self.backing[
             self._key(
                 manifest_receipt.transaction_id,
                 manifest_receipt,
+                process_epoch,
                 step_name,
             )
         ]
 
-    def read_step_state(self, transaction_id, manifest_receipt, step_name):
+    def read_step_state(
+        self,
+        transaction_id,
+        manifest_receipt,
+        process_epoch,
+        step_name,
+        *,
+        prior_completion_absent_policy,
+    ):
         from deferred_startup_replay import DeferredStartupStepState
 
         self.events.append(("read", transaction_id, step_name))
         return self.backing.get(
-            self._key(transaction_id, manifest_receipt, step_name),
+            self._key(
+                transaction_id,
+                manifest_receipt,
+                process_epoch,
+                step_name,
+            ),
             DeferredStartupStepState(),
         )
 
-    def record_intent(self, transaction_id, manifest_receipt, step_name):
+    def record_intent(
+        self,
+        transaction_id,
+        manifest_receipt,
+        process_epoch,
+        step_name,
+        *,
+        prior_completion_absent_policy,
+    ):
         from deferred_startup_replay import DeferredStartupStepState
 
         self.events.append(("intent", transaction_id, step_name))
         self.backing[
-            self._key(transaction_id, manifest_receipt, step_name)
-        ] = DeferredStartupStepState(intent=True)
+            self._key(
+                transaction_id,
+                manifest_receipt,
+                process_epoch,
+                step_name,
+            )
+        ] = DeferredStartupStepState(attempt_number=1, intent=True)
 
     def record_completion(
         self,
         transaction_id,
         manifest_receipt,
+        process_epoch,
         step_name,
         *,
         recovered,
     ):
         from deferred_startup_replay import DeferredStartupStepState
 
-        self.events.append(
-            ("completion", transaction_id, step_name, recovered)
-        )
+        self.events.append(("completion", transaction_id, step_name, recovered))
         self.backing[
-            self._key(transaction_id, manifest_receipt, step_name)
+            self._key(
+                transaction_id,
+                manifest_receipt,
+                process_epoch,
+                step_name,
+            )
         ] = DeferredStartupStepState(
+            attempt_number=1,
             intent=True,
             completion=True,
         )
@@ -245,20 +285,25 @@ class _InMemoryDeferredStartupDriver:
         self,
         transaction_id,
         manifest_receipt,
+        process_epoch,
         step_name,
         *,
         reason,
     ):
         from deferred_startup_replay import DeferredStartupStepState
 
-        self.events.append(
-            ("indeterminate", transaction_id, step_name, reason)
-        )
+        self.events.append(("indeterminate", transaction_id, step_name, reason))
         if self.indeterminate_error is not None:
             raise self.indeterminate_error
         self.backing[
-            self._key(transaction_id, manifest_receipt, step_name)
+            self._key(
+                transaction_id,
+                manifest_receipt,
+                process_epoch,
+                step_name,
+            )
         ] = DeferredStartupStepState(
+            attempt_number=1,
             intent=True,
             indeterminate=True,
         )
@@ -313,6 +358,7 @@ def test_deferred_startup_replay_records_intent_before_mutation_and_completion_a
     result = replay_deferred_startup(
         transaction_id=TRANSACTION_ID,
         manifest_receipt=_canonical_deferred_startup_receipt(),
+        process_epoch=PROCESS_EPOCH,
         steps=(
             DeferredStartupStep(
                 name="one",
@@ -366,6 +412,7 @@ def test_deferred_startup_replay_crash_hooks_leave_only_durable_boundaries(
         replay_deferred_startup(
             transaction_id=TRANSACTION_ID,
             manifest_receipt=_canonical_deferred_startup_receipt(),
+            process_epoch=PROCESS_EPOCH,
             steps=(
                 DeferredStartupStep(
                     name="one",
@@ -401,6 +448,7 @@ def test_deferred_startup_replay_recovers_completed_intent_without_reexecution()
     replay_deferred_startup(
         transaction_id=TRANSACTION_ID,
         manifest_receipt=receipt,
+        process_epoch=PROCESS_EPOCH,
         steps=(
             DeferredStartupStep(
                 name="one",
@@ -443,6 +491,7 @@ def test_deferred_startup_replay_retries_proved_absent_intent_under_same_intent(
     replay_deferred_startup(
         transaction_id=TRANSACTION_ID,
         manifest_receipt=receipt,
+        process_epoch=PROCESS_EPOCH,
         steps=(
             DeferredStartupStep(
                 name="one",
@@ -497,6 +546,7 @@ def test_deferred_startup_replay_marks_uncertain_intent_indeterminate(
         replay_deferred_startup(
             transaction_id=TRANSACTION_ID,
             manifest_receipt=receipt,
+            process_epoch=PROCESS_EPOCH,
             steps=(
                 DeferredStartupStep(
                     name="one",
@@ -546,6 +596,7 @@ def test_deferred_startup_replay_never_reruns_completed_step_and_fails_on_drift(
         replay_deferred_startup(
             transaction_id=TRANSACTION_ID,
             manifest_receipt=receipt,
+            process_epoch=PROCESS_EPOCH,
             steps=(
                 DeferredStartupStep(
                     name="one",
@@ -557,7 +608,8 @@ def test_deferred_startup_replay_never_reruns_completed_step_and_fails_on_drift(
         )
 
     assert mutations == []
-    assert driver.state(receipt, "one").indeterminate is True
+    assert driver.state(receipt, "one").completion is True
+    assert driver.state(receipt, "one").indeterminate is False
 
 
 def test_deferred_startup_replay_durable_indeterminate_fails_without_reconciliation():
@@ -585,12 +637,15 @@ def test_deferred_startup_replay_durable_indeterminate_fails_without_reconciliat
         replay_deferred_startup(
             transaction_id=TRANSACTION_ID,
             manifest_receipt=receipt,
+            process_epoch=PROCESS_EPOCH,
             steps=(
                 DeferredStartupStep(
                     name="one",
                     mutator=lambda: None,
-                    reconciler=lambda: reconciliations.append("called")
-                    or Reconciliation.PROVED_COMPLETE,
+                    reconciler=lambda: (
+                        reconciliations.append("called")
+                        or Reconciliation.PROVED_COMPLETE
+                    ),
                 ),
             ),
             driver=driver,
@@ -624,6 +679,7 @@ def test_deferred_startup_replay_preserves_indeterminate_when_recording_it_fails
         replay_deferred_startup(
             transaction_id=TRANSACTION_ID,
             manifest_receipt=receipt,
+            process_epoch=PROCESS_EPOCH,
             steps=(
                 DeferredStartupStep(
                     name="one",
@@ -673,6 +729,7 @@ def test_deferred_startup_driver_isolates_stale_receipts_by_full_binding(
     replay_deferred_startup(
         transaction_id=TRANSACTION_ID,
         manifest_receipt=receipt,
+        process_epoch=PROCESS_EPOCH,
         steps=(
             DeferredStartupStep(
                 name="one",
@@ -737,6 +794,7 @@ def test_deferred_startup_restart_reconstructs_driver_and_steps_without_duplicat
         replay_deferred_startup(
             transaction_id=TRANSACTION_ID,
             manifest_receipt=receipt,
+            process_epoch=PROCESS_EPOCH,
             steps=make_steps(),
             driver=_InMemoryDeferredStartupDriver(backing),
             crash_hook=crash_hook,
@@ -745,6 +803,7 @@ def test_deferred_startup_restart_reconstructs_driver_and_steps_without_duplicat
     result = replay_deferred_startup(
         transaction_id=TRANSACTION_ID,
         manifest_receipt=receipt,
+        process_epoch=PROCESS_EPOCH,
         steps=make_steps(),
         driver=_InMemoryDeferredStartupDriver(backing),
     )
@@ -768,12 +827,18 @@ def test_deferred_startup_restart_fails_closed_on_partial_completion_write():
             self,
             transaction_id,
             manifest_receipt,
+            process_epoch,
             step_name,
             *,
             recovered,
         ):
             self.backing[
-                self._key(transaction_id, manifest_receipt, step_name)
+                self._key(
+                    transaction_id,
+                    manifest_receipt,
+                    process_epoch,
+                    step_name,
+                )
             ] = {"intent": True, "completion": "partial"}
             raise DeferredStartupCrash("partial completion write")
 
@@ -801,6 +866,7 @@ def test_deferred_startup_restart_fails_closed_on_partial_completion_write():
         replay_deferred_startup(
             transaction_id=TRANSACTION_ID,
             manifest_receipt=receipt,
+            process_epoch=PROCESS_EPOCH,
             steps=(make_step(),),
             driver=PartialCompletionDriver(backing),
         )
@@ -809,6 +875,7 @@ def test_deferred_startup_restart_fails_closed_on_partial_completion_write():
         replay_deferred_startup(
             transaction_id=TRANSACTION_ID,
             manifest_receipt=receipt,
+            process_epoch=PROCESS_EPOCH,
             steps=(make_step(),),
             driver=_InMemoryDeferredStartupDriver(backing),
         )
@@ -851,6 +918,7 @@ def test_deferred_startup_replay_rejects_binding_mismatch_before_driver_or_mutat
         replay_deferred_startup(
             transaction_id=transaction_id,
             manifest_receipt=receipt,
+            process_epoch=PROCESS_EPOCH,
             steps=(
                 DeferredStartupStep(
                     name="one",
@@ -1022,8 +1090,7 @@ def test_deferred_release_manifest_conditional_startup_subset():
     assert normal_names == [
         descriptor["name"]
         for descriptor in EXPECTED_DEFERRED_RELEASE_DESCRIPTORS
-        if descriptor["owner"] == "webui_server"
-        and descriptor["condition"] == "always"
+        if descriptor["owner"] == "webui_server" and descriptor["condition"] == "always"
     ]
     assert fenced_names == [
         descriptor["name"]
@@ -1045,8 +1112,7 @@ def test_server_deferred_startup_mapping_matches_canonical_subset(
     expected_normal = [
         descriptor["name"]
         for descriptor in EXPECTED_DEFERRED_RELEASE_DESCRIPTORS
-        if descriptor["owner"] == "webui_server"
-        and descriptor["condition"] == "always"
+        if descriptor["owner"] == "webui_server" and descriptor["condition"] == "always"
     ]
     expected_fenced = [
         descriptor["name"]
@@ -1481,9 +1547,7 @@ def test_signed_process_identity_binds_startup_selector_and_paired_artifacts():
         "startup_transaction_id": TRANSACTION_ID,
     }
 
-    identity = release_control.current_release_process_identity(
-        build_identity=build
-    )
+    identity = release_control.current_release_process_identity(build_identity=build)
 
     for key in (
         "commit",
@@ -1858,6 +1922,7 @@ def test_managed_startup_indeterminate_latch_rejects_second_accept_before_callba
             self,
             transaction_id,
             manifest_receipt,
+            process_epoch,
             step_name,
             *,
             reason,
@@ -1868,6 +1933,7 @@ def test_managed_startup_indeterminate_latch_rejects_second_accept_before_callba
             return super().record_indeterminate(
                 transaction_id,
                 manifest_receipt,
+                process_epoch,
                 step_name,
                 reason=reason,
             )
@@ -1952,9 +2018,7 @@ def test_managed_deferred_start_includes_detached_continuation_recovery(
     assert names.index("startup_profile_state") < names.index("provider_model_seed")
     assert names.index("provider_model_seed") < names.index("startup_configuration")
     assert names.index("startup_configuration") < names.index("session_recovery")
-    assert names.index("session_recovery") < names.index(
-        "process_completion_recovery"
-    )
+    assert names.index("session_recovery") < names.index("process_completion_recovery")
     assert names.index("process_completion_recovery") < names.index(
         "async_delegation_recovery"
     )
@@ -2029,8 +2093,9 @@ def test_async_delegation_recovery_runs_once_inside_signed_accept(
         sys.modules,
         "tools.async_delegation",
         SimpleNamespace(
-            recover_async_delegations=lambda: calls.append("recover")
-            or {"queued": 2, "lost": 1}
+            recover_async_delegations=lambda: (
+                calls.append("recover") or {"queued": 2, "lost": 1}
+            )
         ),
     )
     monkeypatch.setattr(server, "_DEFERRED_STARTUP_COMPLETED", set())
@@ -2333,10 +2398,13 @@ def test_zero_pending_continuation_recovery_accepts_without_mutation(
     )
 
     assert accepted["state"] == "open"
-    assert driver.state(
-        _canonical_deferred_startup_receipt(),
-        step_name,
-    ).completion is True
+    assert (
+        driver.state(
+            _canonical_deferred_startup_receipt(),
+            step_name,
+        ).completion
+        is True
+    )
     assert server._DEFERRED_STARTUP_COMPLETED == set()
     assert recovery_calls == []
 
@@ -2438,13 +2506,16 @@ def test_startup_fence_request_allowlist_is_health_and_loopback_control_only(
 
     assert server._startup_request_allowed("GET", "/health") is True
     assert (
-        server._startup_request_allowed("POST", "/api/internal/release-control")
-        is True
+        server._startup_request_allowed("POST", "/api/internal/release-control") is True
     )
-    assert server._startup_request_allowed("GET", "/api/internal/release-control") is False
+    assert (
+        server._startup_request_allowed("GET", "/api/internal/release-control") is False
+    )
     assert server._startup_request_allowed("GET", "/") is False
     assert server._startup_request_allowed("GET", "/api/sessions") is False
-    assert server._startup_request_allowed("POST", "/api/internal/recovery/start") is False
+    assert (
+        server._startup_request_allowed("POST", "/api/internal/recovery/start") is False
+    )
     assert server._startup_request_allowed("OPTIONS", "/health") is False
 
 
@@ -2459,7 +2530,9 @@ def test_startup_fence_blocks_get_and_write_handlers_before_route_dispatch(
     monkeypatch.setattr(server, "reset_trusted_auth_request_state", lambda *_a: None)
     monkeypatch.setattr(server, "clear_request_profile", lambda: None)
     monkeypatch.setattr(server, "get_profile_cookie", lambda *_a: None)
-    monkeypatch.setattr(server, "j", lambda _h, payload, status=200: responses.append((status, payload)))
+    monkeypatch.setattr(
+        server, "j", lambda _h, payload, status=200: responses.append((status, payload))
+    )
     _select_managed_candidate(monkeypatch)
 
     get_handler = object.__new__(server.Handler)
@@ -2551,7 +2624,9 @@ def test_pair_gate_does_not_defer_deep_health_after_startup_acceptance(
     monkeypatch.setattr(routes, "_stream_runtime_diagnostics", lambda: {})
     monkeypatch.setattr(routes, "all_sessions", lambda: ["session-a"])
     monkeypatch.setattr(routes, "load_projects", lambda **_kwargs: {"project-a": {}})
-    monkeypatch.setattr(routes, "_active_state_db_path", lambda: tmp_path / "missing.db")
+    monkeypatch.setattr(
+        routes, "_active_state_db_path", lambda: tmp_path / "missing.db"
+    )
 
     checks, healthy = routes._deep_health_checks(
         stream_check={"status": "ok", "active_streams": 0}
@@ -2603,9 +2678,7 @@ def test_fresh_managed_import_and_prepare_do_not_mutate_state_before_accept(
             "HERMES_WEBUI_STATE_DIR": str(state_dir),
             "HERMES_WEBUI_TEST_STATE_DIR": str(state_dir),
             "HERMES_WEBUI_DEFAULT_WORKSPACE": str(workspace),
-            "HERMES_WEBUI_AGENT_DIR": os.path.join(
-                os.path.dirname(repo_root), "agent"
-            ),
+            "HERMES_WEBUI_AGENT_DIR": os.path.join(os.path.dirname(repo_root), "agent"),
             "HERMES_WEBUI_RELEASE_PATH": repo_root,
             "HERMES_WEBUI_LAUNCH_MODE": "selector",
             "HERMES_WEBUI_MANIFEST_SHA256": "a" * 64,

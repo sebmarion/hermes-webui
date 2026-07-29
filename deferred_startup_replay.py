@@ -11,6 +11,7 @@ import deferred_release_manifest
 
 
 _TRANSACTION_ID_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
+_PROCESS_EPOCH_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
 _STEP_NAME_RE = re.compile(r"[a-z][a-z0-9_]*")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -46,6 +47,13 @@ class Reconciliation(str, Enum):
     AMBIGUOUS = "ambiguous"
 
 
+class PriorCompletionAbsentPolicy(str, Enum):
+    """Whether a new process epoch may recreate a vanished completed effect."""
+
+    DENY = "deny"
+    ALLOW_RERUN = "allow-rerun"
+
+
 @dataclass(frozen=True, slots=True)
 class DeferredStartupManifestReceipt:
     transaction_id: str
@@ -55,9 +63,13 @@ class DeferredStartupManifestReceipt:
 
 @dataclass(frozen=True, slots=True)
 class DeferredStartupStepState:
+    attempt_number: int = 0
     intent: bool = False
     completion: bool = False
     indeterminate: bool = False
+    prior_completion: bool = False
+    prior_indeterminate: bool = False
+    prior_unresolved: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +77,9 @@ class DeferredStartupStep:
     name: str
     mutator: Callable[[], object]
     reconciler: Callable[[], Reconciliation]
+    prior_completion_absent_policy: PriorCompletionAbsentPolicy = (
+        PriorCompletionAbsentPolicy.DENY
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,20 +94,27 @@ class DeferredStartupDurableDriver(Protocol):
         self,
         transaction_id: str,
         manifest_receipt: DeferredStartupManifestReceipt,
+        process_epoch: str,
         step_name: str,
+        *,
+        prior_completion_absent_policy: PriorCompletionAbsentPolicy,
     ) -> DeferredStartupStepState: ...
 
     def record_intent(
         self,
         transaction_id: str,
         manifest_receipt: DeferredStartupManifestReceipt,
+        process_epoch: str,
         step_name: str,
+        *,
+        prior_completion_absent_policy: PriorCompletionAbsentPolicy,
     ) -> None: ...
 
     def record_completion(
         self,
         transaction_id: str,
         manifest_receipt: DeferredStartupManifestReceipt,
+        process_epoch: str,
         step_name: str,
         *,
         recovered: bool,
@@ -102,6 +124,7 @@ class DeferredStartupDurableDriver(Protocol):
         self,
         transaction_id: str,
         manifest_receipt: DeferredStartupManifestReceipt,
+        process_epoch: str,
         step_name: str,
         *,
         reason: str,
@@ -114,13 +137,24 @@ CrashHook = Callable[[str, str], None]
 def _validate_binding(
     transaction_id: object,
     manifest_receipt: object,
+    process_epoch: object,
     steps: object,
-) -> tuple[str, DeferredStartupManifestReceipt, tuple[DeferredStartupStep, ...]]:
+) -> tuple[
+    str,
+    DeferredStartupManifestReceipt,
+    str,
+    tuple[DeferredStartupStep, ...],
+]:
     if (
         type(transaction_id) is not str
         or _TRANSACTION_ID_RE.fullmatch(transaction_id) is None
     ):
         raise DeferredStartupBindingError("startup transaction id is invalid")
+    if (
+        type(process_epoch) is not str
+        or _PROCESS_EPOCH_RE.fullmatch(process_epoch) is None
+    ):
+        raise DeferredStartupBindingError("startup process epoch is invalid")
     if type(manifest_receipt) is not DeferredStartupManifestReceipt:
         raise DeferredStartupBindingError("startup manifest receipt is invalid")
     if (
@@ -146,11 +180,13 @@ def _validate_binding(
             or _STEP_NAME_RE.fullmatch(step.name) is None
             or not callable(step.mutator)
             or not callable(step.reconciler)
+            or type(step.prior_completion_absent_policy)
+            is not PriorCompletionAbsentPolicy
             or step.name in names
         ):
             raise DeferredStartupBindingError("startup step definitions are invalid")
         names.add(step.name)
-    return transaction_id, manifest_receipt, steps
+    return transaction_id, manifest_receipt, process_epoch, steps
 
 
 def _validate_state(value: object) -> DeferredStartupStepState:
@@ -158,7 +194,22 @@ def _validate_state(value: object) -> DeferredStartupStepState:
         raise DeferredStartupBindingError("durable startup step state is invalid")
     if not all(
         type(flag) is bool
-        for flag in (value.intent, value.completion, value.indeterminate)
+        for flag in (
+            value.intent,
+            value.completion,
+            value.indeterminate,
+            value.prior_completion,
+            value.prior_indeterminate,
+            value.prior_unresolved,
+        )
+    ):
+        raise DeferredStartupBindingError("durable startup step state is invalid")
+    if (
+        type(value.attempt_number) is not int
+        or isinstance(value.attempt_number, bool)
+        or value.attempt_number < 0
+        or (value.intent and value.attempt_number < 1)
+        or (not value.intent and value.attempt_number != 0)
     ):
         raise DeferredStartupBindingError("durable startup step state is invalid")
     if (value.completion or value.indeterminate) and not value.intent:
@@ -173,34 +224,42 @@ def _reconcile(
     *,
     transaction_id: str,
     manifest_receipt: DeferredStartupManifestReceipt,
+    process_epoch: str,
     driver: DeferredStartupDurableDriver,
 ) -> Reconciliation:
+    result, reason, cause = _probe_reconciliation(step)
+    if result is None:
+        _mark_indeterminate(
+            transaction_id=transaction_id,
+            manifest_receipt=manifest_receipt,
+            process_epoch=process_epoch,
+            driver=driver,
+            step_name=step.name,
+            reason=reason,
+            cause=cause,
+        )
+    return result
+
+
+def _probe_reconciliation(
+    step: DeferredStartupStep,
+) -> tuple[Reconciliation | None, str, Exception | None]:
+    """Probe without writing, for a new epoch that has no intent yet."""
+
     try:
         result = step.reconciler()
     except Exception as exc:
-        _mark_indeterminate(
-            transaction_id=transaction_id,
-            manifest_receipt=manifest_receipt,
-            driver=driver,
-            step_name=step.name,
-            reason="reconciler-failed",
-            cause=exc,
-        )
+        return None, "reconciler-failed", exc
     if type(result) is not Reconciliation:
-        _mark_indeterminate(
-            transaction_id=transaction_id,
-            manifest_receipt=manifest_receipt,
-            driver=driver,
-            step_name=step.name,
-            reason="invalid-reconciliation",
-        )
-    return result
+        return None, "invalid-reconciliation", None
+    return result, result.value, None
 
 
 def _mark_indeterminate(
     *,
     transaction_id: str,
     manifest_receipt: DeferredStartupManifestReceipt,
+    process_epoch: str,
     driver: DeferredStartupDurableDriver,
     step_name: str,
     reason: str,
@@ -213,6 +272,7 @@ def _mark_indeterminate(
         driver.record_indeterminate(
             transaction_id,
             manifest_receipt,
+            process_epoch,
             step_name,
             reason=reason,
         )
@@ -228,6 +288,7 @@ def _mutate_and_prove(
     *,
     transaction_id: str,
     manifest_receipt: DeferredStartupManifestReceipt,
+    process_epoch: str,
     driver: DeferredStartupDurableDriver,
     crash_hook: CrashHook | None,
 ) -> None:
@@ -243,12 +304,14 @@ def _mutate_and_prove(
         step,
         transaction_id=transaction_id,
         manifest_receipt=manifest_receipt,
+        process_epoch=process_epoch,
         driver=driver,
     )
     if result is Reconciliation.PROVED_COMPLETE:
         driver.record_completion(
             transaction_id,
             manifest_receipt,
+            process_epoch,
             step.name,
             recovered=False,
         )
@@ -260,6 +323,7 @@ def _mutate_and_prove(
     _mark_indeterminate(
         transaction_id=transaction_id,
         manifest_receipt=manifest_receipt,
+        process_epoch=process_epoch,
         driver=driver,
         step_name=step.name,
         reason=result.value,
@@ -270,14 +334,16 @@ def replay_deferred_startup(
     *,
     transaction_id: str,
     manifest_receipt: DeferredStartupManifestReceipt,
+    process_epoch: str,
     steps: tuple[DeferredStartupStep, ...],
     driver: DeferredStartupDurableDriver,
     crash_hook: CrashHook | None = None,
 ) -> DeferredStartupReplayResult:
     """Reconcile and execute ordered startup steps behind durable intent."""
-    transaction_id, manifest_receipt, steps = _validate_binding(
+    transaction_id, manifest_receipt, process_epoch, steps = _validate_binding(
         transaction_id,
         manifest_receipt,
+        process_epoch,
         steps,
     )
     completed: list[str] = []
@@ -286,7 +352,9 @@ def replay_deferred_startup(
             driver.read_step_state(
                 transaction_id,
                 manifest_receipt,
+                process_epoch,
                 step.name,
+                prior_completion_absent_policy=(step.prior_completion_absent_policy),
             )
         )
         if state.indeterminate:
@@ -298,35 +366,53 @@ def replay_deferred_startup(
                 step,
                 transaction_id=transaction_id,
                 manifest_receipt=manifest_receipt,
+                process_epoch=process_epoch,
                 driver=driver,
             )
             if result is not Reconciliation.PROVED_COMPLETE:
-                _mark_indeterminate(
-                    transaction_id=transaction_id,
-                    manifest_receipt=manifest_receipt,
-                    driver=driver,
-                    step_name=step.name,
-                    reason=f"completed-{result.value}",
+                raise DeferredStartupIndeterminateError(
+                    f"deferred startup step is indeterminate: {step.name}"
                 )
         elif state.intent:
             result = _reconcile(
                 step,
                 transaction_id=transaction_id,
                 manifest_receipt=manifest_receipt,
+                process_epoch=process_epoch,
                 driver=driver,
             )
             if result is Reconciliation.PROVED_COMPLETE:
                 driver.record_completion(
                     transaction_id,
                     manifest_receipt,
+                    process_epoch,
                     step.name,
                     recovered=True,
                 )
             elif result is Reconciliation.PROVED_ABSENT:
+                if (
+                    (state.prior_completion or state.prior_unresolved)
+                    and step.prior_completion_absent_policy
+                    is not PriorCompletionAbsentPolicy.ALLOW_RERUN
+                ):
+                    denied_reason = (
+                        "prior-completion-absent-policy-denied"
+                        if state.prior_completion
+                        else "prior-intent-absent-policy-denied"
+                    )
+                    _mark_indeterminate(
+                        transaction_id=transaction_id,
+                        manifest_receipt=manifest_receipt,
+                        process_epoch=process_epoch,
+                        driver=driver,
+                        step_name=step.name,
+                        reason=denied_reason,
+                    )
                 _mutate_and_prove(
                     step,
                     transaction_id=transaction_id,
                     manifest_receipt=manifest_receipt,
+                    process_epoch=process_epoch,
                     driver=driver,
                     crash_hook=crash_hook,
                 )
@@ -334,6 +420,76 @@ def replay_deferred_startup(
                 _mark_indeterminate(
                     transaction_id=transaction_id,
                     manifest_receipt=manifest_receipt,
+                    process_epoch=process_epoch,
+                    driver=driver,
+                    step_name=step.name,
+                    reason=result.value,
+                )
+        elif state.prior_indeterminate:
+            raise DeferredStartupIndeterminateError(
+                f"deferred startup step is indeterminate: {step.name}"
+            )
+        elif state.prior_completion or state.prior_unresolved:
+            result, failure_reason, failure_cause = _probe_reconciliation(step)
+            driver.record_intent(
+                transaction_id,
+                manifest_receipt,
+                process_epoch,
+                step.name,
+                prior_completion_absent_policy=(step.prior_completion_absent_policy),
+            )
+            if crash_hook is not None:
+                crash_hook(AFTER_INTENT, step.name)
+            if result is None:
+                _mark_indeterminate(
+                    transaction_id=transaction_id,
+                    manifest_receipt=manifest_receipt,
+                    process_epoch=process_epoch,
+                    driver=driver,
+                    step_name=step.name,
+                    reason=failure_reason,
+                    cause=failure_cause,
+                )
+            if result is Reconciliation.PROVED_COMPLETE:
+                driver.record_completion(
+                    transaction_id,
+                    manifest_receipt,
+                    process_epoch,
+                    step.name,
+                    recovered=True,
+                )
+            elif result is Reconciliation.PROVED_ABSENT:
+                if (
+                    (state.prior_completion or state.prior_unresolved)
+                    and step.prior_completion_absent_policy
+                    is not PriorCompletionAbsentPolicy.ALLOW_RERUN
+                ):
+                    denied_reason = (
+                        "prior-completion-absent-policy-denied"
+                        if state.prior_completion
+                        else "prior-intent-absent-policy-denied"
+                    )
+                    _mark_indeterminate(
+                        transaction_id=transaction_id,
+                        manifest_receipt=manifest_receipt,
+                        process_epoch=process_epoch,
+                        driver=driver,
+                        step_name=step.name,
+                        reason=denied_reason,
+                    )
+                _mutate_and_prove(
+                    step,
+                    transaction_id=transaction_id,
+                    manifest_receipt=manifest_receipt,
+                    process_epoch=process_epoch,
+                    driver=driver,
+                    crash_hook=crash_hook,
+                )
+            else:
+                _mark_indeterminate(
+                    transaction_id=transaction_id,
+                    manifest_receipt=manifest_receipt,
+                    process_epoch=process_epoch,
                     driver=driver,
                     step_name=step.name,
                     reason=result.value,
@@ -342,7 +498,9 @@ def replay_deferred_startup(
             driver.record_intent(
                 transaction_id,
                 manifest_receipt,
+                process_epoch,
                 step.name,
+                prior_completion_absent_policy=(step.prior_completion_absent_policy),
             )
             if crash_hook is not None:
                 crash_hook(AFTER_INTENT, step.name)
@@ -350,6 +508,7 @@ def replay_deferred_startup(
                 step,
                 transaction_id=transaction_id,
                 manifest_receipt=manifest_receipt,
+                process_epoch=process_epoch,
                 driver=driver,
                 crash_hook=crash_hook,
             )
