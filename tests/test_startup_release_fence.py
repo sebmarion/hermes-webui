@@ -162,6 +162,709 @@ def _manifest_as_dict(manifest):
     }
 
 
+class _InMemoryDeferredStartupDriver:
+    def __init__(self, backing=None, *, indeterminate_error=None):
+        self.backing = backing if backing is not None else {}
+        self.events = []
+        self.indeterminate_error = indeterminate_error
+
+    @staticmethod
+    def _key(transaction_id, manifest_receipt, step_name):
+        return (
+            transaction_id,
+            manifest_receipt.version,
+            manifest_receipt.sha256,
+            step_name,
+        )
+
+    def seed_state(
+        self,
+        manifest_receipt,
+        step_name,
+        state,
+        *,
+        transaction_id=None,
+        version=None,
+        sha256=None,
+    ):
+        key = (
+            transaction_id or manifest_receipt.transaction_id,
+            manifest_receipt.version if version is None else version,
+            manifest_receipt.sha256 if sha256 is None else sha256,
+            step_name,
+        )
+        self.backing[key] = state
+
+    def state(self, manifest_receipt, step_name):
+        return self.backing[
+            self._key(
+                manifest_receipt.transaction_id,
+                manifest_receipt,
+                step_name,
+            )
+        ]
+
+    def read_step_state(self, transaction_id, manifest_receipt, step_name):
+        from deferred_startup_replay import DeferredStartupStepState
+
+        self.events.append(("read", transaction_id, step_name))
+        return self.backing.get(
+            self._key(transaction_id, manifest_receipt, step_name),
+            DeferredStartupStepState(),
+        )
+
+    def record_intent(self, transaction_id, manifest_receipt, step_name):
+        from deferred_startup_replay import DeferredStartupStepState
+
+        self.events.append(("intent", transaction_id, step_name))
+        self.backing[
+            self._key(transaction_id, manifest_receipt, step_name)
+        ] = DeferredStartupStepState(intent=True)
+
+    def record_completion(
+        self,
+        transaction_id,
+        manifest_receipt,
+        step_name,
+        *,
+        recovered,
+    ):
+        from deferred_startup_replay import DeferredStartupStepState
+
+        self.events.append(
+            ("completion", transaction_id, step_name, recovered)
+        )
+        self.backing[
+            self._key(transaction_id, manifest_receipt, step_name)
+        ] = DeferredStartupStepState(
+            intent=True,
+            completion=True,
+        )
+
+    def record_indeterminate(
+        self,
+        transaction_id,
+        manifest_receipt,
+        step_name,
+        *,
+        reason,
+    ):
+        from deferred_startup_replay import DeferredStartupStepState
+
+        self.events.append(
+            ("indeterminate", transaction_id, step_name, reason)
+        )
+        if self.indeterminate_error is not None:
+            raise self.indeterminate_error
+        self.backing[
+            self._key(transaction_id, manifest_receipt, step_name)
+        ] = DeferredStartupStepState(
+            intent=True,
+            indeterminate=True,
+        )
+
+
+def _canonical_deferred_startup_receipt():
+    import deferred_release_manifest as release_manifest
+    from deferred_startup_replay import DeferredStartupManifestReceipt
+
+    return DeferredStartupManifestReceipt(
+        transaction_id=TRANSACTION_ID,
+        version=release_manifest.MANIFEST_VERSION,
+        sha256=release_manifest.deferred_release_manifest_sha256(),
+    )
+
+
+def _configure_test_managed_replay(monkeypatch, server):
+    from deferred_startup_replay import DeferredStartupStep, Reconciliation
+
+    canonical_steps = server._deferred_startup_steps()
+    replay_steps = tuple(
+        DeferredStartupStep(
+            name=name,
+            mutator=mutator,
+            reconciler=lambda: Reconciliation.PROVED_COMPLETE,
+        )
+        for name, mutator in canonical_steps
+    )
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_DRIVER", None)
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_STEPS", None)
+    driver = _InMemoryDeferredStartupDriver()
+    server.configure_managed_deferred_startup_replay(
+        driver=driver,
+        steps=replay_steps,
+    )
+    return driver
+
+
+def test_deferred_startup_replay_records_intent_before_mutation_and_completion_after_proof():
+    from deferred_startup_replay import (
+        DeferredStartupStep,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    driver = _InMemoryDeferredStartupDriver()
+    observed = []
+
+    def mutate():
+        observed.append(tuple(event[0] for event in driver.events))
+
+    result = replay_deferred_startup(
+        transaction_id=TRANSACTION_ID,
+        manifest_receipt=_canonical_deferred_startup_receipt(),
+        steps=(
+            DeferredStartupStep(
+                name="one",
+                mutator=mutate,
+                reconciler=lambda: Reconciliation.PROVED_COMPLETE,
+            ),
+        ),
+        driver=driver,
+    )
+
+    assert observed == [("read", "intent")]
+    assert [event[0] for event in driver.events] == [
+        "read",
+        "intent",
+        "completion",
+    ]
+    assert result.completed == ("one",)
+
+
+@pytest.mark.parametrize(
+    ("crash_point", "expected_events"),
+    (
+        ("after-intent", ("read", "intent")),
+        ("after-mutation-before-completion", ("read", "intent")),
+        (
+            "after-completion-before-next",
+            ("read", "intent", "completion"),
+        ),
+    ),
+)
+def test_deferred_startup_replay_crash_hooks_leave_only_durable_boundaries(
+    crash_point,
+    expected_events,
+):
+    from deferred_startup_replay import (
+        DeferredStartupCrash,
+        DeferredStartupStep,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    driver = _InMemoryDeferredStartupDriver()
+    mutations = []
+
+    def crash_hook(point, step_name):
+        assert step_name == "one"
+        if point == crash_point:
+            raise DeferredStartupCrash(point)
+
+    with pytest.raises(DeferredStartupCrash, match=crash_point):
+        replay_deferred_startup(
+            transaction_id=TRANSACTION_ID,
+            manifest_receipt=_canonical_deferred_startup_receipt(),
+            steps=(
+                DeferredStartupStep(
+                    name="one",
+                    mutator=lambda: mutations.append("one"),
+                    reconciler=lambda: Reconciliation.PROVED_COMPLETE,
+                ),
+            ),
+            driver=driver,
+            crash_hook=crash_hook,
+        )
+
+    assert tuple(event[0] for event in driver.events) == expected_events
+    assert mutations == ([] if crash_point == "after-intent" else ["one"])
+
+
+def test_deferred_startup_replay_recovers_completed_intent_without_reexecution():
+    from deferred_startup_replay import (
+        DeferredStartupStep,
+        DeferredStartupStepState,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    driver = _InMemoryDeferredStartupDriver()
+    receipt = _canonical_deferred_startup_receipt()
+    driver.seed_state(
+        receipt,
+        "one",
+        DeferredStartupStepState(intent=True),
+    )
+    mutations = []
+
+    replay_deferred_startup(
+        transaction_id=TRANSACTION_ID,
+        manifest_receipt=receipt,
+        steps=(
+            DeferredStartupStep(
+                name="one",
+                mutator=lambda: mutations.append("one"),
+                reconciler=lambda: Reconciliation.PROVED_COMPLETE,
+            ),
+        ),
+        driver=driver,
+    )
+
+    assert mutations == []
+    assert driver.events[-1] == (
+        "completion",
+        TRANSACTION_ID,
+        "one",
+        True,
+    )
+
+
+def test_deferred_startup_replay_retries_proved_absent_intent_under_same_intent():
+    from deferred_startup_replay import (
+        DeferredStartupStep,
+        DeferredStartupStepState,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    driver = _InMemoryDeferredStartupDriver()
+    receipt = _canonical_deferred_startup_receipt()
+    driver.seed_state(
+        receipt,
+        "one",
+        DeferredStartupStepState(intent=True),
+    )
+    reconciliations = iter(
+        (Reconciliation.PROVED_ABSENT, Reconciliation.PROVED_COMPLETE)
+    )
+    mutations = []
+
+    replay_deferred_startup(
+        transaction_id=TRANSACTION_ID,
+        manifest_receipt=receipt,
+        steps=(
+            DeferredStartupStep(
+                name="one",
+                mutator=lambda: mutations.append("one"),
+                reconciler=lambda: next(reconciliations),
+            ),
+        ),
+        driver=driver,
+    )
+
+    assert mutations == ["one"]
+    assert [event[0] for event in driver.events].count("intent") == 0
+    assert driver.events[-1] == (
+        "completion",
+        TRANSACTION_ID,
+        "one",
+        False,
+    )
+
+
+@pytest.mark.parametrize(
+    "reconciliation",
+    (
+        pytest.param("partial", id="partial"),
+        pytest.param("ambiguous", id="ambiguous"),
+    ),
+)
+def test_deferred_startup_replay_marks_uncertain_intent_indeterminate(
+    reconciliation,
+):
+    from deferred_startup_replay import (
+        DeferredStartupIndeterminateError,
+        DeferredStartupStep,
+        DeferredStartupStepState,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    driver = _InMemoryDeferredStartupDriver()
+    receipt = _canonical_deferred_startup_receipt()
+    driver.seed_state(
+        receipt,
+        "one",
+        DeferredStartupStepState(intent=True),
+    )
+    mutations = []
+
+    with pytest.raises(
+        DeferredStartupIndeterminateError,
+        match="one",
+    ):
+        replay_deferred_startup(
+            transaction_id=TRANSACTION_ID,
+            manifest_receipt=receipt,
+            steps=(
+                DeferredStartupStep(
+                    name="one",
+                    mutator=lambda: mutations.append("one"),
+                    reconciler=lambda: Reconciliation(reconciliation),
+                ),
+            ),
+            driver=driver,
+        )
+
+    assert mutations == []
+    assert driver.state(receipt, "one").indeterminate is True
+
+
+@pytest.mark.parametrize(
+    "reconciliation",
+    (
+        "proved-absent",
+        "partial",
+        "ambiguous",
+    ),
+)
+def test_deferred_startup_replay_never_reruns_completed_step_and_fails_on_drift(
+    reconciliation,
+):
+    from deferred_startup_replay import (
+        DeferredStartupIndeterminateError,
+        DeferredStartupStep,
+        DeferredStartupStepState,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    driver = _InMemoryDeferredStartupDriver()
+    receipt = _canonical_deferred_startup_receipt()
+    driver.seed_state(
+        receipt,
+        "one",
+        DeferredStartupStepState(
+            intent=True,
+            completion=True,
+        ),
+    )
+    mutations = []
+
+    with pytest.raises(DeferredStartupIndeterminateError, match="one"):
+        replay_deferred_startup(
+            transaction_id=TRANSACTION_ID,
+            manifest_receipt=receipt,
+            steps=(
+                DeferredStartupStep(
+                    name="one",
+                    mutator=lambda: mutations.append("one"),
+                    reconciler=lambda: Reconciliation(reconciliation),
+                ),
+            ),
+            driver=driver,
+        )
+
+    assert mutations == []
+    assert driver.state(receipt, "one").indeterminate is True
+
+
+def test_deferred_startup_replay_durable_indeterminate_fails_without_reconciliation():
+    from deferred_startup_replay import (
+        DeferredStartupIndeterminateError,
+        DeferredStartupStep,
+        DeferredStartupStepState,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    driver = _InMemoryDeferredStartupDriver()
+    receipt = _canonical_deferred_startup_receipt()
+    driver.seed_state(
+        receipt,
+        "one",
+        DeferredStartupStepState(
+            intent=True,
+            indeterminate=True,
+        ),
+    )
+    reconciliations = []
+
+    with pytest.raises(DeferredStartupIndeterminateError, match="one"):
+        replay_deferred_startup(
+            transaction_id=TRANSACTION_ID,
+            manifest_receipt=receipt,
+            steps=(
+                DeferredStartupStep(
+                    name="one",
+                    mutator=lambda: None,
+                    reconciler=lambda: reconciliations.append("called")
+                    or Reconciliation.PROVED_COMPLETE,
+                ),
+            ),
+            driver=driver,
+        )
+
+    assert reconciliations == []
+
+
+def test_deferred_startup_replay_preserves_indeterminate_when_recording_it_fails():
+    from deferred_startup_replay import (
+        DeferredStartupIndeterminateError,
+        DeferredStartupStep,
+        DeferredStartupStepState,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    write_error = RuntimeError("synthetic indeterminate write failure")
+    driver = _InMemoryDeferredStartupDriver(
+        indeterminate_error=write_error,
+    )
+    receipt = _canonical_deferred_startup_receipt()
+    driver.seed_state(
+        receipt,
+        "one",
+        DeferredStartupStepState(intent=True),
+    )
+    mutations = []
+
+    with pytest.raises(DeferredStartupIndeterminateError, match="one") as caught:
+        replay_deferred_startup(
+            transaction_id=TRANSACTION_ID,
+            manifest_receipt=receipt,
+            steps=(
+                DeferredStartupStep(
+                    name="one",
+                    mutator=lambda: mutations.append("one"),
+                    reconciler=lambda: Reconciliation.PARTIAL,
+                ),
+            ),
+            driver=driver,
+        )
+
+    assert caught.value.__cause__ is write_error
+    assert mutations == []
+
+
+@pytest.mark.parametrize(
+    "stale_binding",
+    ("transaction", "version", "digest"),
+)
+def test_deferred_startup_driver_isolates_stale_receipts_by_full_binding(
+    stale_binding,
+):
+    from deferred_startup_replay import (
+        DeferredStartupStep,
+        DeferredStartupStepState,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    backing = {}
+    driver = _InMemoryDeferredStartupDriver(backing)
+    receipt = _canonical_deferred_startup_receipt()
+    seed_kwargs = {}
+    if stale_binding == "transaction":
+        seed_kwargs["transaction_id"] = "stale-transaction-" + ("s" * 32)
+    elif stale_binding == "version":
+        seed_kwargs["version"] = receipt.version + 1
+    else:
+        seed_kwargs["sha256"] = "f" * 64
+    driver.seed_state(
+        receipt,
+        "one",
+        DeferredStartupStepState(intent=True, completion=True),
+        **seed_kwargs,
+    )
+    mutations = []
+
+    replay_deferred_startup(
+        transaction_id=TRANSACTION_ID,
+        manifest_receipt=receipt,
+        steps=(
+            DeferredStartupStep(
+                name="one",
+                mutator=lambda: mutations.append("one"),
+                reconciler=lambda: Reconciliation.PROVED_COMPLETE,
+            ),
+        ),
+        driver=driver,
+    )
+
+    assert mutations == ["one"]
+    assert driver.state(receipt, "one").completion is True
+    assert len(backing) == 2
+
+
+@pytest.mark.parametrize(
+    "crash_point",
+    (
+        "after-intent",
+        "after-mutation-before-completion",
+        "after-completion-before-next",
+    ),
+)
+def test_deferred_startup_restart_reconstructs_driver_and_steps_without_duplicates(
+    crash_point,
+):
+    from deferred_startup_replay import (
+        DeferredStartupCrash,
+        DeferredStartupStep,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    backing = {}
+    effects = set()
+    mutation_counts = {"one": 0, "two": 0}
+    receipt = _canonical_deferred_startup_receipt()
+
+    def make_steps():
+        def make_step(name):
+            def mutate():
+                mutation_counts[name] += 1
+                effects.add(name)
+
+            return DeferredStartupStep(
+                name=name,
+                mutator=mutate,
+                reconciler=lambda: (
+                    Reconciliation.PROVED_COMPLETE
+                    if name in effects
+                    else Reconciliation.PROVED_ABSENT
+                ),
+            )
+
+        return tuple(make_step(name) for name in ("one", "two"))
+
+    def crash_hook(point, step_name):
+        if point == crash_point and step_name == "one":
+            raise DeferredStartupCrash(point)
+
+    with pytest.raises(DeferredStartupCrash, match=crash_point):
+        replay_deferred_startup(
+            transaction_id=TRANSACTION_ID,
+            manifest_receipt=receipt,
+            steps=make_steps(),
+            driver=_InMemoryDeferredStartupDriver(backing),
+            crash_hook=crash_hook,
+        )
+
+    result = replay_deferred_startup(
+        transaction_id=TRANSACTION_ID,
+        manifest_receipt=receipt,
+        steps=make_steps(),
+        driver=_InMemoryDeferredStartupDriver(backing),
+    )
+
+    assert result.completed == ("one", "two")
+    assert mutation_counts == {"one": 1, "two": 1}
+    assert effects == {"one", "two"}
+
+
+def test_deferred_startup_restart_fails_closed_on_partial_completion_write():
+    from deferred_startup_replay import (
+        DeferredStartupBindingError,
+        DeferredStartupCrash,
+        DeferredStartupStep,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    class PartialCompletionDriver(_InMemoryDeferredStartupDriver):
+        def record_completion(
+            self,
+            transaction_id,
+            manifest_receipt,
+            step_name,
+            *,
+            recovered,
+        ):
+            self.backing[
+                self._key(transaction_id, manifest_receipt, step_name)
+            ] = {"intent": True, "completion": "partial"}
+            raise DeferredStartupCrash("partial completion write")
+
+    backing = {}
+    effects = set()
+    mutation_count = [0]
+    receipt = _canonical_deferred_startup_receipt()
+
+    def make_step():
+        def mutate():
+            mutation_count[0] += 1
+            effects.add("one")
+
+        return DeferredStartupStep(
+            name="one",
+            mutator=mutate,
+            reconciler=lambda: (
+                Reconciliation.PROVED_COMPLETE
+                if "one" in effects
+                else Reconciliation.PROVED_ABSENT
+            ),
+        )
+
+    with pytest.raises(DeferredStartupCrash, match="partial completion write"):
+        replay_deferred_startup(
+            transaction_id=TRANSACTION_ID,
+            manifest_receipt=receipt,
+            steps=(make_step(),),
+            driver=PartialCompletionDriver(backing),
+        )
+
+    with pytest.raises(DeferredStartupBindingError):
+        replay_deferred_startup(
+            transaction_id=TRANSACTION_ID,
+            manifest_receipt=receipt,
+            steps=(make_step(),),
+            driver=_InMemoryDeferredStartupDriver(backing),
+        )
+
+    assert mutation_count == [1]
+
+
+@pytest.mark.parametrize("mismatch", ("transaction", "version", "digest"))
+def test_deferred_startup_replay_rejects_binding_mismatch_before_driver_or_mutation(
+    mismatch,
+):
+    from deferred_startup_replay import (
+        DeferredStartupBindingError,
+        DeferredStartupManifestReceipt,
+        DeferredStartupStep,
+        Reconciliation,
+        replay_deferred_startup,
+    )
+
+    driver = _InMemoryDeferredStartupDriver()
+    mutations = []
+    transaction_id = TRANSACTION_ID
+    receipt = _canonical_deferred_startup_receipt()
+    if mismatch == "transaction":
+        transaction_id = "different-transaction-" + ("z" * 32)
+    elif mismatch == "version":
+        receipt = DeferredStartupManifestReceipt(
+            transaction_id=receipt.transaction_id,
+            version=receipt.version + 1,
+            sha256=receipt.sha256,
+        )
+    else:
+        receipt = DeferredStartupManifestReceipt(
+            transaction_id=receipt.transaction_id,
+            version=receipt.version,
+            sha256="0" * 64,
+        )
+
+    with pytest.raises(DeferredStartupBindingError):
+        replay_deferred_startup(
+            transaction_id=transaction_id,
+            manifest_receipt=receipt,
+            steps=(
+                DeferredStartupStep(
+                    name="one",
+                    mutator=lambda: mutations.append("one"),
+                    reconciler=lambda: Reconciliation.PROVED_COMPLETE,
+                ),
+            ),
+            driver=driver,
+        )
+
+    assert driver.events == []
+    assert mutations == []
+
+
 def test_deferred_release_manifest_is_exact_versioned_and_immutable():
     release_manifest = importlib.import_module("deferred_release_manifest")
 
@@ -517,7 +1220,9 @@ def test_exact_startup_transaction_accepts_once_and_opens_admission(
 ):
     calls = []
     _select_managed_candidate(monkeypatch)
-    config.configure_startup_acceptor(lambda: calls.append("started"))
+    config.configure_startup_acceptor(
+        lambda transaction_id: calls.append(transaction_id)
+    )
     fenced = _claim_startup_fence()
 
     accepted = config.accept_startup_run_admission(
@@ -533,7 +1238,7 @@ def test_exact_startup_transaction_accepts_once_and_opens_admission(
 
     assert accepted["state"] == "open"
     assert repeated["state"] == "open"
-    assert calls == ["started"]
+    assert calls == [TRANSACTION_ID]
     reservation = config.reserve_run_admission(kind="post-accept")
     assert config.release_run_admission(reservation) is True
 
@@ -543,7 +1248,7 @@ def test_wrong_startup_transaction_or_identity_cannot_accept(
     isolated_startup_admission,
 ):
     _select_managed_candidate(monkeypatch)
-    config.configure_startup_acceptor(lambda: None)
+    config.configure_startup_acceptor(lambda _transaction_id: None)
     fenced = _claim_startup_fence()
 
     with pytest.raises(config.RunAdmissionConflict):
@@ -567,7 +1272,7 @@ def test_failed_deferred_start_keeps_startup_fenced_and_can_retry(
 ):
     attempts = []
 
-    def flaky_start():
+    def flaky_start(_transaction_id):
         attempts.append("attempt")
         if len(attempts) == 1:
             raise RuntimeError("synthetic deferred failure")
@@ -601,7 +1306,7 @@ def test_startup_acceptor_has_scoped_admission_for_deferred_recovery(
 ):
     reservations = []
 
-    def schedule_recovery():
+    def schedule_recovery(_transaction_id):
         reservation = config.reserve_run_admission(kind="startup-recovery")
         reservations.append(reservation)
         config.release_run_admission(reservation)
@@ -629,7 +1334,7 @@ def test_deferred_recovery_worker_inherits_scoped_startup_admission(
     nested_done = threading.Event()
     errors = []
 
-    def schedule_recovery():
+    def schedule_recovery(_transaction_id):
         def recovery_worker():
             try:
                 reservation = config.reserve_run_admission(
@@ -680,7 +1385,9 @@ def test_signed_release_control_fence_and_accept_are_transaction_bound(
         lambda **_kwargs: dict(IDENTITY),
     )
     _select_managed_candidate(monkeypatch)
-    config.configure_startup_acceptor(lambda: calls.append("started"))
+    config.configure_startup_acceptor(
+        lambda transaction_id: calls.append(transaction_id)
+    )
 
     fenced = release_control.execute_release_control(
         {
@@ -705,7 +1412,7 @@ def test_signed_release_control_fence_and_accept_are_transaction_bound(
     assert accepted["transaction_id"] == TRANSACTION_ID
     assert accepted["identity"] == IDENTITY
     assert len(accepted["attestation"]) == 64
-    assert calls == ["started"]
+    assert calls == [TRANSACTION_ID]
 
 
 def test_startup_release_auth_never_generates_a_missing_signing_key(
@@ -796,29 +1503,21 @@ def test_signed_process_identity_binds_startup_selector_and_paired_artifacts():
         assert identity[key] == build[key]
 
 
-def test_server_defers_mutators_until_accept_and_retries_only_incomplete_steps(
+def test_managed_startup_accept_fails_closed_without_durable_replay_configuration(
     monkeypatch,
     isolated_startup_admission,
 ):
     import server
 
     calls = []
-    second_attempts = [0]
-
-    def first():
-        calls.append("first")
-
-    def flaky_second():
-        calls.append("second")
-        second_attempts[0] += 1
-        if second_attempts[0] == 1:
-            raise RuntimeError("synthetic second-step failure")
 
     monkeypatch.setattr(server, "_DEFERRED_STARTUP_COMPLETED", set())
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_DRIVER", None)
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_STEPS", None)
     monkeypatch.setattr(
         server,
         "_deferred_startup_steps",
-        lambda: (("first", first), ("second", flaky_second)),
+        lambda: (("first", lambda: calls.append("first")),),
     )
     _select_managed_candidate(monkeypatch)
 
@@ -826,21 +1525,411 @@ def test_server_defers_mutators_until_accept_and_retries_only_incomplete_steps(
     assert calls == []
     fenced = _claim_startup_fence()
 
-    with pytest.raises(config.RunAdmissionBusy):
+    with pytest.raises(config.RunAdmissionBusy, match="deferred startup failed"):
         config.accept_startup_run_admission(
             fenced["token"],
             expected_identity=IDENTITY,
             transaction_id=TRANSACTION_ID,
         )
-    assert calls == ["first", "second"]
+    assert calls == []
+    assert config.run_admission_snapshot()["state"] == "startup-fenced"
 
-    config.accept_startup_run_admission(
+
+def test_server_managed_startup_uses_transaction_bound_durable_replay(
+    monkeypatch,
+    isolated_startup_admission,
+):
+    import server
+    from deferred_startup_replay import DeferredStartupStep, Reconciliation
+
+    driver = _InMemoryDeferredStartupDriver()
+    external = set()
+
+    def first():
+        external.add("first")
+
+    def second():
+        external.add("second")
+
+    canonical_steps = (("first", first), ("second", second))
+    replay_steps = tuple(
+        DeferredStartupStep(
+            name=name,
+            mutator=mutator,
+            reconciler=lambda name=name: (
+                Reconciliation.PROVED_COMPLETE
+                if name in external
+                else Reconciliation.PROVED_ABSENT
+            ),
+        )
+        for name, mutator in canonical_steps
+    )
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_COMPLETED", set())
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_DRIVER", None)
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_STEPS", None)
+    monkeypatch.setattr(server, "_deferred_startup_steps", lambda: canonical_steps)
+    server.configure_managed_deferred_startup_replay(
+        driver=driver,
+        steps=replay_steps,
+    )
+    _select_managed_candidate(monkeypatch)
+
+    assert server._prepare_startup_mutators() == "deferred"
+    fenced = _claim_startup_fence()
+    accepted = config.accept_startup_run_admission(
         fenced["token"],
         expected_identity=IDENTITY,
         transaction_id=TRANSACTION_ID,
     )
-    assert calls == ["first", "second", "second"]
-    assert server._DEFERRED_STARTUP_COMPLETED == {"first", "second"}
+
+    assert accepted["state"] == "open"
+    assert external == {"first", "second"}
+    assert {
+        event[1]
+        for event in driver.events
+        if event[0] in {"read", "intent", "completion"}
+    } == {TRANSACTION_ID}
+    assert server._DEFERRED_STARTUP_COMPLETED == set()
+
+
+def test_server_replay_configuration_is_one_shot_and_exactly_idempotent(
+    monkeypatch,
+):
+    import server
+    from deferred_startup_replay import DeferredStartupStep, Reconciliation
+
+    def first():
+        return None
+
+    steps = (
+        DeferredStartupStep(
+            name="first",
+            mutator=first,
+            reconciler=lambda: Reconciliation.PROVED_COMPLETE,
+        ),
+    )
+    driver = _InMemoryDeferredStartupDriver()
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_DRIVER", None)
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_STEPS", None)
+
+    server.configure_managed_deferred_startup_replay(
+        driver=driver,
+        steps=steps,
+    )
+    server.configure_managed_deferred_startup_replay(
+        driver=driver,
+        steps=steps,
+    )
+
+    with pytest.raises(RuntimeError, match="already configured"):
+        server.configure_managed_deferred_startup_replay(
+            driver=_InMemoryDeferredStartupDriver(),
+            steps=steps,
+        )
+    with pytest.raises(RuntimeError, match="already configured"):
+        server.configure_managed_deferred_startup_replay(
+            driver=driver,
+            steps=(
+                DeferredStartupStep(
+                    name="first",
+                    mutator=first,
+                    reconciler=lambda: Reconciliation.PROVED_COMPLETE,
+                ),
+            ),
+        )
+
+    assert server._DEFERRED_STARTUP_REPLAY_DRIVER is driver
+    assert server._DEFERRED_STARTUP_REPLAY_STEPS is steps
+
+
+def test_server_replay_configuration_cannot_overwrite_active_replay(
+    monkeypatch,
+):
+    import server
+    from deferred_startup_replay import DeferredStartupStep, Reconciliation
+
+    entered = threading.Event()
+    release = threading.Event()
+    external = set()
+    run_errors = []
+    configure_errors = []
+    configure_done = threading.Event()
+
+    def first():
+        entered.set()
+        assert release.wait(2.0)
+        external.add("first")
+
+    canonical_steps = (("first", first),)
+    steps = (
+        DeferredStartupStep(
+            name="first",
+            mutator=first,
+            reconciler=lambda: (
+                Reconciliation.PROVED_COMPLETE
+                if "first" in external
+                else Reconciliation.PROVED_ABSENT
+            ),
+        ),
+    )
+    original_driver = _InMemoryDeferredStartupDriver()
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_DRIVER", None)
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_STEPS", None)
+    monkeypatch.setattr(server, "_deferred_startup_steps", lambda: canonical_steps)
+    server.configure_managed_deferred_startup_replay(
+        driver=original_driver,
+        steps=steps,
+    )
+
+    def run_replay():
+        try:
+            server._run_managed_deferred_startup(TRANSACTION_ID)
+        except Exception as exc:
+            run_errors.append(exc)
+
+    def overwrite_configuration():
+        try:
+            server.configure_managed_deferred_startup_replay(
+                driver=_InMemoryDeferredStartupDriver(),
+                steps=steps,
+            )
+        except Exception as exc:
+            configure_errors.append(exc)
+        finally:
+            configure_done.set()
+
+    replay_thread = threading.Thread(target=run_replay)
+    replay_thread.start()
+    assert entered.wait(2.0)
+    configure_thread = threading.Thread(target=overwrite_configuration)
+    configure_thread.start()
+    assert configure_done.wait(0.1) is False
+
+    release.set()
+    replay_thread.join(timeout=2.0)
+    configure_thread.join(timeout=2.0)
+
+    assert replay_thread.is_alive() is False
+    assert configure_thread.is_alive() is False
+    assert run_errors == []
+    assert len(configure_errors) == 1
+    assert isinstance(configure_errors[0], RuntimeError)
+    assert server._DEFERRED_STARTUP_REPLAY_DRIVER is original_driver
+
+
+def test_managed_startup_indeterminate_is_non_retryable_and_stays_fenced(
+    monkeypatch,
+    isolated_startup_admission,
+):
+    import server
+    from deferred_startup_replay import (
+        DeferredStartupStep,
+        DeferredStartupStepState,
+        Reconciliation,
+    )
+
+    driver = _InMemoryDeferredStartupDriver()
+    receipt = _canonical_deferred_startup_receipt()
+    driver.seed_state(
+        receipt,
+        "first",
+        DeferredStartupStepState(intent=True),
+    )
+    mutations = []
+
+    def first():
+        mutations.append("first")
+
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_COMPLETED", set())
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_DRIVER", None)
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_STEPS", None)
+    monkeypatch.setattr(
+        server,
+        "_deferred_startup_steps",
+        lambda: (("first", first),),
+    )
+    server.configure_managed_deferred_startup_replay(
+        driver=driver,
+        steps=(
+            DeferredStartupStep(
+                name="first",
+                mutator=first,
+                reconciler=lambda: Reconciliation.PARTIAL,
+            ),
+        ),
+    )
+    _select_managed_candidate(monkeypatch)
+    assert server._prepare_startup_mutators() == "deferred"
+    fenced = _claim_startup_fence()
+
+    with pytest.raises(config.RunAdmissionStartupIndeterminate):
+        config.accept_startup_run_admission(
+            fenced["token"],
+            expected_identity=IDENTITY,
+            transaction_id=TRANSACTION_ID,
+        )
+
+    snapshot = config.run_admission_snapshot()
+    assert snapshot["state"] == "startup-fenced"
+    assert snapshot["startup_error"] == "deferred_startup_indeterminate"
+    assert driver.state(receipt, "first").indeterminate is True
+    assert mutations == []
+
+
+def test_managed_startup_indeterminate_write_failure_stays_terminal_and_fenced(
+    monkeypatch,
+    isolated_startup_admission,
+):
+    import server
+    from deferred_startup_replay import (
+        DeferredStartupStep,
+        DeferredStartupStepState,
+        Reconciliation,
+    )
+
+    write_error = RuntimeError("synthetic indeterminate write failure")
+    driver = _InMemoryDeferredStartupDriver(
+        indeterminate_error=write_error,
+    )
+    receipt = _canonical_deferred_startup_receipt()
+    driver.seed_state(
+        receipt,
+        "first",
+        DeferredStartupStepState(intent=True),
+    )
+    mutations = []
+
+    def first():
+        mutations.append("first")
+
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_COMPLETED", set())
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_DRIVER", None)
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_STEPS", None)
+    monkeypatch.setattr(
+        server,
+        "_deferred_startup_steps",
+        lambda: (("first", first),),
+    )
+    server.configure_managed_deferred_startup_replay(
+        driver=driver,
+        steps=(
+            DeferredStartupStep(
+                name="first",
+                mutator=first,
+                reconciler=lambda: Reconciliation.PARTIAL,
+            ),
+        ),
+    )
+    _select_managed_candidate(monkeypatch)
+    assert server._prepare_startup_mutators() == "deferred"
+    fenced = _claim_startup_fence()
+
+    with pytest.raises(config.RunAdmissionStartupIndeterminate) as caught:
+        config.accept_startup_run_admission(
+            fenced["token"],
+            expected_identity=IDENTITY,
+            transaction_id=TRANSACTION_ID,
+        )
+
+    snapshot = config.run_admission_snapshot()
+    assert snapshot["state"] == "startup-fenced"
+    assert snapshot["startup_error"] == "deferred_startup_indeterminate"
+    assert isinstance(caught.value.__cause__, Exception)
+    assert mutations == []
+
+
+def test_managed_startup_indeterminate_latch_rejects_second_accept_before_callback(
+    monkeypatch,
+    isolated_startup_admission,
+):
+    import server
+    from deferred_startup_replay import (
+        DeferredStartupStep,
+        DeferredStartupStepState,
+        Reconciliation,
+    )
+
+    class FailFirstIndeterminateDriver(_InMemoryDeferredStartupDriver):
+        def __init__(self):
+            super().__init__()
+            self.indeterminate_attempts = 0
+
+        def record_indeterminate(
+            self,
+            transaction_id,
+            manifest_receipt,
+            step_name,
+            *,
+            reason,
+        ):
+            self.indeterminate_attempts += 1
+            if self.indeterminate_attempts == 1:
+                raise RuntimeError("synthetic first indeterminate write failure")
+            return super().record_indeterminate(
+                transaction_id,
+                manifest_receipt,
+                step_name,
+                reason=reason,
+            )
+
+    driver = FailFirstIndeterminateDriver()
+    receipt = _canonical_deferred_startup_receipt()
+    driver.seed_state(
+        receipt,
+        "first",
+        DeferredStartupStepState(intent=True),
+    )
+    reconciliation_calls = []
+
+    def reconcile():
+        reconciliation_calls.append("called")
+        if len(reconciliation_calls) == 1:
+            return Reconciliation.PARTIAL
+        return Reconciliation.PROVED_COMPLETE
+
+    def first():
+        raise AssertionError("indeterminate startup must not mutate")
+
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_COMPLETED", set())
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_DRIVER", None)
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_STEPS", None)
+    monkeypatch.setattr(
+        server,
+        "_deferred_startup_steps",
+        lambda: (("first", first),),
+    )
+    server.configure_managed_deferred_startup_replay(
+        driver=driver,
+        steps=(
+            DeferredStartupStep(
+                name="first",
+                mutator=first,
+                reconciler=reconcile,
+            ),
+        ),
+    )
+    _select_managed_candidate(monkeypatch)
+    assert server._prepare_startup_mutators() == "deferred"
+    fenced = _claim_startup_fence()
+
+    with pytest.raises(config.RunAdmissionStartupIndeterminate):
+        config.accept_startup_run_admission(
+            fenced["token"],
+            expected_identity=IDENTITY,
+            transaction_id=TRANSACTION_ID,
+        )
+    with pytest.raises(config.RunAdmissionStartupIndeterminate):
+        config.accept_startup_run_admission(
+            fenced["token"],
+            expected_identity=IDENTITY,
+            transaction_id=TRANSACTION_ID,
+        )
+
+    snapshot = config.run_admission_snapshot()
+    assert snapshot["state"] == "startup-fenced"
+    assert snapshot["startup_error"] == "deferred_startup_indeterminate"
+    assert reconciliation_calls == ["called"]
+    assert driver.indeterminate_attempts == 1
 
 
 def test_managed_deferred_start_includes_detached_continuation_recovery(
@@ -908,6 +1997,7 @@ def test_process_completion_recovery_runs_once_inside_signed_accept(
             ),
         ),
     )
+    _configure_test_managed_replay(monkeypatch, server)
     _select_managed_candidate(monkeypatch)
     assert server._prepare_startup_mutators() == "deferred"
     fenced = _claim_startup_fence()
@@ -954,6 +2044,7 @@ def test_async_delegation_recovery_runs_once_inside_signed_accept(
             ),
         ),
     )
+    _configure_test_managed_replay(monkeypatch, server)
     _select_managed_candidate(monkeypatch)
     assert server._prepare_startup_mutators() == "deferred"
     fenced = _claim_startup_fence()
@@ -1008,6 +2099,7 @@ def test_managed_accept_waits_for_one_shot_recovery_terminal_success(
             ),
         ),
     )
+    _configure_test_managed_replay(monkeypatch, server)
     _select_managed_candidate(monkeypatch)
     assert server._prepare_startup_mutators() == "deferred"
     fenced = _claim_startup_fence()
@@ -1067,6 +2159,7 @@ def test_failed_one_shot_recovery_keeps_managed_startup_fenced(
             ),
         ),
     )
+    _configure_test_managed_replay(monkeypatch, server)
     _select_managed_candidate(monkeypatch)
     assert server._prepare_startup_mutators() == "deferred"
     fenced = _claim_startup_fence()
@@ -1161,6 +2254,7 @@ def test_pending_continuation_recovery_rejects_accept_without_launching_turn(
         "_deferred_startup_steps",
         lambda: ((step_name, getattr(server, server_recovery)),),
     )
+    _configure_test_managed_replay(monkeypatch, server)
     _select_managed_candidate(monkeypatch)
     assert server._prepare_startup_mutators() == "deferred"
     fenced = _claim_startup_fence()
@@ -1227,6 +2321,7 @@ def test_zero_pending_continuation_recovery_accepts_without_mutation(
         "_deferred_startup_steps",
         lambda: ((step_name, getattr(server, server_recovery)),),
     )
+    driver = _configure_test_managed_replay(monkeypatch, server)
     _select_managed_candidate(monkeypatch)
     assert server._prepare_startup_mutators() == "deferred"
     fenced = _claim_startup_fence()
@@ -1238,7 +2333,11 @@ def test_zero_pending_continuation_recovery_accepts_without_mutation(
     )
 
     assert accepted["state"] == "open"
-    assert server._DEFERRED_STARTUP_COMPLETED == {step_name}
+    assert driver.state(
+        _canonical_deferred_startup_receipt(),
+        step_name,
+    ).completion is True
+    assert server._DEFERRED_STARTUP_COMPLETED == set()
     assert recovery_calls == []
 
 
@@ -1306,7 +2405,9 @@ def test_deferred_startup_configuration_commits_once_only_during_accept(
         config.apply_deferred_startup_configuration()
     assert settings_file.exists() is False
 
-    config.configure_startup_acceptor(config.apply_deferred_startup_configuration)
+    config.configure_startup_acceptor(
+        lambda _transaction_id: config.apply_deferred_startup_configuration()
+    )
     fenced = _claim_startup_fence()
     accepted = config.accept_startup_run_admission(
         fenced["token"],

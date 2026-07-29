@@ -123,6 +123,12 @@ from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
 from api.crash_visibility import install_crash_visibility
 import deferred_release_manifest as release_manifest
+from deferred_startup_replay import (
+    DeferredStartupIndeterminateError,
+    DeferredStartupManifestReceipt,
+    DeferredStartupStep,
+    replay_deferred_startup,
+)
 
 
 _STARTUP_FENCE_ALLOWED_REQUESTS = {
@@ -613,6 +619,35 @@ def _abort_if_already_serving(host: str, port: int) -> None:
 
 _DEFERRED_STARTUP_LOCK = threading.Lock()
 _DEFERRED_STARTUP_COMPLETED: set[str] = set()
+_DEFERRED_STARTUP_REPLAY_DRIVER = None
+_DEFERRED_STARTUP_REPLAY_STEPS: tuple[DeferredStartupStep, ...] | None = None
+
+
+def configure_managed_deferred_startup_replay(*, driver, steps) -> None:
+    """Install the durable managed-startup seam supplied by release wiring."""
+    global _DEFERRED_STARTUP_REPLAY_DRIVER, _DEFERRED_STARTUP_REPLAY_STEPS
+    required_callbacks = (
+        "read_step_state",
+        "record_intent",
+        "record_completion",
+        "record_indeterminate",
+    )
+    if not all(callable(getattr(driver, name, None)) for name in required_callbacks):
+        raise TypeError("durable deferred startup driver is invalid")
+    if type(steps) is not tuple or not all(
+        type(step) is DeferredStartupStep for step in steps
+    ):
+        raise TypeError("durable deferred startup steps are invalid")
+    with _DEFERRED_STARTUP_LOCK:
+        existing_driver = _DEFERRED_STARTUP_REPLAY_DRIVER
+        existing_steps = _DEFERRED_STARTUP_REPLAY_STEPS
+        if existing_driver is None and existing_steps is None:
+            _DEFERRED_STARTUP_REPLAY_DRIVER = driver
+            _DEFERRED_STARTUP_REPLAY_STEPS = steps
+            return
+        if existing_driver is driver and existing_steps is steps:
+            return
+        raise RuntimeError("durable deferred startup replay is already configured")
 
 
 def _materialize_internal_recovery_key() -> None:
@@ -861,10 +896,43 @@ def _run_deferred_startup_mutators() -> dict:
         }
 
 
+def _run_managed_deferred_startup(transaction_id: str) -> dict:
+    """Replay configured managed steps under durable transaction receipts."""
+    with _DEFERRED_STARTUP_LOCK:
+        driver = _DEFERRED_STARTUP_REPLAY_DRIVER
+        steps = _DEFERRED_STARTUP_REPLAY_STEPS
+        if driver is None or steps is None:
+            raise RuntimeError("durable deferred startup replay is not configured")
+        canonical_steps = _deferred_startup_steps()
+        if tuple((step.name, step.mutator) for step in steps) != canonical_steps:
+            raise RuntimeError("durable deferred startup step mapping changed")
+        receipt = DeferredStartupManifestReceipt(
+            transaction_id=transaction_id,
+            version=release_manifest.MANIFEST_VERSION,
+            sha256=release_manifest.deferred_release_manifest_sha256(),
+        )
+        try:
+            result = replay_deferred_startup(
+                transaction_id=transaction_id,
+                manifest_receipt=receipt,
+                steps=steps,
+                driver=driver,
+            )
+        except DeferredStartupIndeterminateError as exc:
+            raise api_config.RunAdmissionStartupIndeterminate(
+                "deferred startup is indeterminate; candidate remains fenced"
+            ) from exc
+        return {
+            "status": "started",
+            "transaction_id": result.transaction_id,
+            "completed": list(result.completed),
+        }
+
+
 def _prepare_startup_mutators() -> str:
     """Run normal startup now, or register it behind a managed startup fence."""
-    api_config.configure_startup_acceptor(_run_deferred_startup_mutators)
     if api_config.startup_run_admission_is_closed():
+        api_config.configure_startup_acceptor(_run_managed_deferred_startup)
         return "deferred"
     _run_deferred_startup_mutators()
     return "started"

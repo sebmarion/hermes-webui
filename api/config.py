@@ -9268,6 +9268,10 @@ class RunAdmissionBusy(RunAdmissionError):
     """Admitted or running work still prevents a safe process exit."""
 
 
+class RunAdmissionStartupIndeterminate(RunAdmissionConflict):
+    """Deferred startup cannot be proved safe to retry or accept."""
+
+
 def _normalize_run_admission_identity(identity: dict) -> dict:
     if not isinstance(identity, dict) or not identity:
         raise RunAdmissionIdentityMismatch("release process identity is missing")
@@ -9727,7 +9731,7 @@ def _install_agent_startup_home_guard() -> None:
 
 
 def configure_startup_acceptor(acceptor) -> None:
-    """Register the one process-local deferred-start callback."""
+    """Register the deferred-start callback that receives the exact transaction."""
     global _RUN_ADMISSION_STARTUP_ACCEPTOR
     if not callable(acceptor):
         raise TypeError("startup acceptor must be callable")
@@ -9981,6 +9985,10 @@ def accept_startup_run_admission(
             normalized_identity,
             requested_transaction,
         )
+        if _RUN_ADMISSION_STARTUP_ERROR == "deferred_startup_indeterminate":
+            raise RunAdmissionStartupIndeterminate(
+                "deferred startup remains indeterminate; explicit repair is required"
+            )
         acceptor = _RUN_ADMISSION_STARTUP_ACCEPTOR
         if not callable(acceptor):
             raise RunAdmissionBusy("deferred startup is not configured")
@@ -9996,7 +10004,20 @@ def accept_startup_run_admission(
     _RUN_ADMISSION_LOCAL.startup_acceptor_transaction = requested_transaction
     try:
         try:
-            acceptor()
+            acceptor(requested_transaction)
+        except RunAdmissionStartupIndeterminate:
+            with ACTIVE_RUNS_LOCK:
+                if (
+                    _RUN_ADMISSION_STATE == "startup-accepting"
+                    and _RUN_ADMISSION_TRANSACTION_ID == requested_transaction
+                    and _RUN_ADMISSION_EXPECTED_IDENTITY == normalized_identity
+                ):
+                    _RUN_ADMISSION_STATE = "startup-fenced"
+                    _RUN_ADMISSION_GENERATION += 1
+                    _RUN_ADMISSION_STARTUP_ERROR = (
+                        "deferred_startup_indeterminate"
+                    )
+            raise
         except Exception as exc:
             with ACTIVE_RUNS_LOCK:
                 if (
