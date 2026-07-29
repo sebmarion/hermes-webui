@@ -6,19 +6,31 @@ password in Settings, registering passkeys, or configuring native OIDC SSO.
 import hashlib
 import hmac
 import http.cookies
+import errno
 import json
 import logging
 import os
 import re
 import secrets
+import stat
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from api.config import STATE_DIR, get_config, load_settings
 
 logger = logging.getLogger(__name__)
+
+_MANAGED_KEY_OPEN_DIR_FD = os.open in os.supports_dir_fd
+_MANAGED_KEY_STAT_DIR_FD = os.stat in os.supports_dir_fd
+_MANAGED_KEY_STAT_NOFOLLOW = os.stat in os.supports_follow_symlinks
+_MANAGED_KEY_LINK_DIR_FD = os.link in os.supports_dir_fd
+_MANAGED_KEY_UNLINK_DIR_FD = os.unlink in os.supports_dir_fd
+_MANAGED_KEY_QUARANTINE = ".signing_key.quarantine"
+_MANAGED_KEY_QUARANTINE_BYTES = b"managed-signing-key-publication-v1\n"
 
 
 # Default session TTL — 30 days. Kept as a module-level constant for backwards
@@ -350,6 +362,754 @@ def _load_key(filename: str) -> bytes:
 
 _PBKDF2_KEY_CACHE: bytes | None = None
 _SIGNING_KEY_CACHE: bytes | None = None
+_MANAGED_SIGNING_KEY_LOCK = threading.Lock()
+
+
+class ManagedSigningKeyError(RuntimeError):
+    """A managed signing-key postcondition could not be proven."""
+
+
+class ManagedSigningKeyVerificationOutcome(str, Enum):
+    PROVED_COMPLETE = "proved-complete"
+    PROVED_ABSENT = "proved-absent"
+    PARTIAL = "partial"
+    AMBIGUOUS = "ambiguous"
+
+
+@dataclass(frozen=True)
+class ManagedSigningKeyPersistenceReceipt:
+    key_path: str
+    durable: bool
+    created: bool
+
+
+@dataclass(frozen=True)
+class ManagedSigningKeyCacheReceipt:
+    key_path: str
+    cache_loaded: bool
+
+
+@dataclass(frozen=True)
+class ManagedSigningKeyVerification:
+    outcome: ManagedSigningKeyVerificationOutcome
+    reason: str | None
+    persistence: ManagedSigningKeyPersistenceReceipt | None
+    cache: ManagedSigningKeyCacheReceipt | None
+
+
+@dataclass(frozen=True)
+class _ManagedSigningKeyPaths:
+    state_dir: str
+    key_path: str
+
+
+def _managed_signing_key_paths() -> _ManagedSigningKeyPaths:
+    state_dir = os.path.abspath(os.fspath(STATE_DIR))
+    return _ManagedSigningKeyPaths(
+        state_dir=state_dir,
+        key_path=os.path.join(state_dir, ".signing_key"),
+    )
+
+
+def _managed_key_same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _managed_key_validate_parent(value: os.stat_result) -> None:
+    if not stat.S_ISDIR(value.st_mode):
+        raise ManagedSigningKeyError("managed signing-key parent is not a directory")
+    if hasattr(os, "getuid") and value.st_uid != os.getuid():
+        raise ManagedSigningKeyError("managed signing-key parent has the wrong owner")
+    if stat.S_IMODE(value.st_mode) & 0o077:
+        raise ManagedSigningKeyError("managed signing-key parent is not owner-only")
+
+
+def _managed_key_validate_file(value: os.stat_result) -> None:
+    if not stat.S_ISREG(value.st_mode):
+        raise ManagedSigningKeyError("managed signing key is not a regular file")
+    if hasattr(os, "getuid") and value.st_uid != os.getuid():
+        raise ManagedSigningKeyError("managed signing key has the wrong owner")
+    if value.st_nlink != 1:
+        raise ManagedSigningKeyError("managed signing key has an unsafe link count")
+    if stat.S_IMODE(value.st_mode) != 0o600:
+        raise ManagedSigningKeyError("managed signing key mode is not 0600")
+    if value.st_size != 32:
+        raise ManagedSigningKeyError("managed signing key is not exactly 32 bytes")
+
+
+def _managed_key_stat_signature(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IMODE(value.st_mode),
+        value.st_uid,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _managed_key_require_primitives() -> None:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise ManagedSigningKeyError("managed signing key requires O_NOFOLLOW")
+    if not all(
+        (
+            _MANAGED_KEY_OPEN_DIR_FD,
+            _MANAGED_KEY_STAT_DIR_FD,
+            _MANAGED_KEY_STAT_NOFOLLOW,
+            _MANAGED_KEY_LINK_DIR_FD,
+            _MANAGED_KEY_UNLINK_DIR_FD,
+        )
+    ):
+        raise ManagedSigningKeyError(
+            "managed signing key requires no-follow dir_fd filesystem primitives"
+        )
+
+
+def _managed_key_open_parent(
+    paths: _ManagedSigningKeyPaths,
+) -> tuple[int, os.stat_result]:
+    _managed_key_require_primitives()
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    parent_fd: int | None = None
+    try:
+        path_stat = os.stat(paths.state_dir, follow_symlinks=False)
+        parent_fd = os.open(paths.state_dir, flags)
+        try:
+            fd_stat = os.fstat(parent_fd)
+        except BaseException:
+            os.close(parent_fd)
+            parent_fd = None
+            raise
+    except OSError as exc:
+        raise ManagedSigningKeyError(
+            "managed signing-key parent could not be opened safely"
+        ) from exc
+    try:
+        _managed_key_validate_parent(path_stat)
+        _managed_key_validate_parent(fd_stat)
+        if not _managed_key_same_inode(path_stat, fd_stat):
+            raise ManagedSigningKeyError(
+                "managed signing-key parent identity changed while opening"
+            )
+        return parent_fd, fd_stat
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _managed_key_confirm_parent(
+    paths: _ManagedSigningKeyPaths,
+    parent_stat: os.stat_result,
+) -> None:
+    try:
+        current = os.stat(paths.state_dir, follow_symlinks=False)
+    except OSError as exc:
+        raise ManagedSigningKeyError(
+            "managed signing-key parent identity could not be rechecked"
+        ) from exc
+    _managed_key_validate_parent(current)
+    if not _managed_key_same_inode(parent_stat, current):
+        raise ManagedSigningKeyError(
+            "managed signing-key parent identity changed during operation"
+        )
+
+
+def _managed_key_open_existing(parent_fd: int) -> int | None:
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        return os.open(".signing_key", flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return None
+        raise ManagedSigningKeyError(
+            "managed signing key could not be opened safely"
+        ) from exc
+
+
+def _managed_key_entry_stat(parent_fd: int) -> os.stat_result:
+    try:
+        return os.stat(".signing_key", dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise ManagedSigningKeyError(
+            "managed signing key identity could not be verified"
+        ) from exc
+
+
+def _managed_key_read_pass(fd: int) -> bytes:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError as exc:
+        raise ManagedSigningKeyError(
+            "managed signing key could not be reread safely"
+        ) from exc
+    chunks: list[bytes] = []
+    length = 0
+    while length <= 32:
+        try:
+            chunk = os.read(fd, 33 - length)
+        except OSError as exc:
+            raise ManagedSigningKeyError(
+                "managed signing key could not be read safely"
+            ) from exc
+        if not chunk:
+            break
+        chunks.append(chunk)
+        length += len(chunk)
+    return b"".join(chunks)
+
+
+def _managed_key_read_fd_stable(fd: int) -> tuple[bytes, os.stat_result]:
+    try:
+        before = os.fstat(fd)
+        first = _managed_key_read_pass(fd)
+        middle = os.fstat(fd)
+        second = _managed_key_read_pass(fd)
+        after = os.fstat(fd)
+    except OSError as exc:
+        raise ManagedSigningKeyError(
+            "managed signing key could not be inspected safely"
+        ) from exc
+    signature = _managed_key_stat_signature(before)
+    if (
+        signature != _managed_key_stat_signature(middle)
+        or signature != _managed_key_stat_signature(after)
+        or first != second
+    ):
+        raise ManagedSigningKeyError(
+            "managed signing key contents or metadata changed during read"
+        )
+    if len(first) != 32:
+        raise ManagedSigningKeyError(
+            "managed signing key is not exactly 32 bytes"
+        )
+    return first, after
+
+
+def _managed_key_read_existing(parent_fd: int) -> bytes | None:
+    key_fd = _managed_key_open_existing(parent_fd)
+    if key_fd is None:
+        return None
+    try:
+        before = os.fstat(key_fd)
+        entry_before = _managed_key_entry_stat(parent_fd)
+        if not _managed_key_same_inode(before, entry_before):
+            raise ManagedSigningKeyError(
+                "managed signing key identity changed while opening"
+            )
+        _managed_key_validate_file(before)
+        _managed_key_validate_file(entry_before)
+        raw, after = _managed_key_read_fd_stable(key_fd)
+        entry_after = _managed_key_entry_stat(parent_fd)
+        if (
+            not _managed_key_same_inode(before, after)
+            or not _managed_key_same_inode(after, entry_after)
+            or _managed_key_stat_signature(after)
+            != _managed_key_stat_signature(entry_after)
+        ):
+            raise ManagedSigningKeyError(
+                "managed signing key identity changed during read"
+            )
+        _managed_key_validate_file(after)
+        _managed_key_validate_file(entry_after)
+        return raw
+    except OSError as exc:
+        raise ManagedSigningKeyError(
+            "managed signing key could not be read safely"
+        ) from exc
+    finally:
+        os.close(key_fd)
+
+
+def _managed_key_confirm_absent(parent_fd: int) -> None:
+    try:
+        os.stat(".signing_key", dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return
+        raise ManagedSigningKeyError(
+            "managed signing-key absence could not be rechecked"
+        ) from exc
+    raise ManagedSigningKeyError(
+        "managed signing key appeared during absence verification"
+    )
+
+
+def _managed_key_assert_no_quarantine(parent_fd: int) -> None:
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        quarantine_fd = os.open(_MANAGED_KEY_QUARANTINE, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return
+        raise ManagedSigningKeyError(
+            "managed signing-key quarantine state is unsafe"
+        ) from exc
+    try:
+        value = os.fstat(quarantine_fd)
+        if (
+            not stat.S_ISREG(value.st_mode)
+            or (hasattr(os, "getuid") and value.st_uid != os.getuid())
+            or value.st_nlink != 1
+            or stat.S_IMODE(value.st_mode) != 0o600
+        ):
+            raise ManagedSigningKeyError(
+                "managed signing-key quarantine state is unsafe"
+            )
+    finally:
+        os.close(quarantine_fd)
+    raise ManagedSigningKeyError(
+        "managed signing-key durable quarantine requires explicit repair"
+    )
+
+
+def _managed_key_create_quarantine(parent_fd: int) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    quarantine_fd: int | None = None
+    try:
+        quarantine_fd = os.open(
+            _MANAGED_KEY_QUARANTINE,
+            flags,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        os.fchmod(quarantine_fd, 0o600)
+        _managed_key_write_all(quarantine_fd, _MANAGED_KEY_QUARANTINE_BYTES)
+        os.fsync(quarantine_fd)
+        value = os.fstat(quarantine_fd)
+        if (
+            not stat.S_ISREG(value.st_mode)
+            or value.st_nlink != 1
+            or stat.S_IMODE(value.st_mode) != 0o600
+            or value.st_size != len(_MANAGED_KEY_QUARANTINE_BYTES)
+        ):
+            raise ManagedSigningKeyError(
+                "managed signing-key quarantine could not be verified"
+            )
+        os.fsync(parent_fd)
+    except FileExistsError as exc:
+        raise ManagedSigningKeyError(
+            "managed signing-key durable quarantine requires explicit repair"
+        ) from exc
+    except OSError as exc:
+        raise ManagedSigningKeyError(
+            "managed signing-key quarantine persistence failed"
+        ) from exc
+    finally:
+        if quarantine_fd is not None:
+            os.close(quarantine_fd)
+
+
+def _managed_key_clear_quarantine(parent_fd: int) -> None:
+    try:
+        os.unlink(_MANAGED_KEY_QUARANTINE, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except OSError as exc:
+        raise ManagedSigningKeyError(
+            "managed signing-key quarantine cleanup failed"
+        ) from exc
+
+
+def _managed_key_write_all(fd: int, raw: bytes) -> None:
+    offset = 0
+    while offset < len(raw):
+        try:
+            written = os.write(fd, raw[offset:])
+        except OSError as exc:
+            raise ManagedSigningKeyError(
+                "managed signing-key temporary file write failed"
+            ) from exc
+        if written <= 0:
+            raise ManagedSigningKeyError(
+                "managed signing-key temporary file write failed"
+            )
+        offset += written
+
+
+def _managed_key_create(
+    parent_fd: int,
+    paths: _ManagedSigningKeyPaths,
+) -> tuple[bytes, bool]:
+    raw = secrets.token_bytes(32)
+    temp_name = f".signing_key.tmp-{secrets.token_hex(16)}"
+    temp_fd: int | None = None
+    temp_exists = False
+    published = False
+    try:
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            temp_fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+            temp_exists = True
+            os.fchmod(temp_fd, 0o600)
+            _managed_key_write_all(temp_fd, raw)
+            os.fsync(temp_fd)
+            temp_stat = os.fstat(temp_fd)
+        except OSError as exc:
+            raise ManagedSigningKeyError(
+                "managed signing-key temporary persistence failed"
+            ) from exc
+        _managed_key_validate_file(temp_stat)
+
+        try:
+            named_temp_stat = os.stat(
+                temp_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ManagedSigningKeyError(
+                "managed signing-key named temporary identity is unavailable"
+            ) from exc
+        if (
+            not _managed_key_same_inode(temp_stat, named_temp_stat)
+            or _managed_key_stat_signature(temp_stat)
+            != _managed_key_stat_signature(named_temp_stat)
+        ):
+            raise ManagedSigningKeyError(
+                "managed signing-key named temporary identity changed"
+            )
+        temp_raw, live_temp_stat = _managed_key_read_fd_stable(temp_fd)
+        try:
+            named_temp_stat = os.stat(
+                temp_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ManagedSigningKeyError(
+                "managed signing-key named temporary identity changed"
+            ) from exc
+        if (
+            not hmac.compare_digest(temp_raw, raw)
+            or _managed_key_stat_signature(live_temp_stat)
+            != _managed_key_stat_signature(named_temp_stat)
+        ):
+            raise ManagedSigningKeyError(
+                "managed signing-key named temporary contents changed"
+            )
+
+        _managed_key_create_quarantine(parent_fd)
+
+        try:
+            os.link(
+                temp_name,
+                ".signing_key",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            published = True
+        except FileExistsError:
+            published = False
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                published = False
+            else:
+                raise ManagedSigningKeyError(
+                    "managed signing-key no-replace publish failed"
+                ) from exc
+
+        if published:
+            published_stat = _managed_key_entry_stat(parent_fd)
+            live_temp_stat = os.fstat(temp_fd)
+            if (
+                not _managed_key_same_inode(temp_stat, live_temp_stat)
+                or not _managed_key_same_inode(live_temp_stat, published_stat)
+            ):
+                raise ManagedSigningKeyError(
+                    "managed signing-key publication identity mismatch"
+                )
+            if (
+                not stat.S_ISREG(live_temp_stat.st_mode)
+                or live_temp_stat.st_uid != temp_stat.st_uid
+                or stat.S_IMODE(live_temp_stat.st_mode) != 0o600
+                or live_temp_stat.st_size != 32
+                or live_temp_stat.st_nlink != 2
+            ):
+                raise ManagedSigningKeyError(
+                    "managed signing-key publication metadata mismatch"
+                )
+            published_raw, reread_temp_stat = _managed_key_read_fd_stable(temp_fd)
+            published_stat = _managed_key_entry_stat(parent_fd)
+            try:
+                named_temp_stat = os.stat(
+                    temp_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ManagedSigningKeyError(
+                    "managed signing-key publication source disappeared"
+                ) from exc
+            if (
+                not hmac.compare_digest(published_raw, raw)
+                or not _managed_key_same_inode(reread_temp_stat, published_stat)
+                or not _managed_key_same_inode(reread_temp_stat, named_temp_stat)
+                or _managed_key_stat_signature(reread_temp_stat)
+                != _managed_key_stat_signature(published_stat)
+                or _managed_key_stat_signature(reread_temp_stat)
+                != _managed_key_stat_signature(named_temp_stat)
+            ):
+                raise ManagedSigningKeyError(
+                    "managed signing-key publication contents changed"
+                )
+
+        try:
+            os.unlink(temp_name, dir_fd=parent_fd)
+            temp_exists = False
+        except OSError as exc:
+            raise ManagedSigningKeyError(
+                "managed signing-key temporary cleanup failed"
+            ) from exc
+        try:
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise ManagedSigningKeyError(
+                "managed signing-key parent fsync failed"
+            ) from exc
+
+        if published:
+            published_stat = _managed_key_entry_stat(parent_fd)
+            published_raw, live_temp_stat = _managed_key_read_fd_stable(temp_fd)
+            if not _managed_key_same_inode(live_temp_stat, published_stat):
+                raise ManagedSigningKeyError(
+                    "managed signing-key publication identity changed"
+                )
+            _managed_key_validate_file(live_temp_stat)
+            _managed_key_validate_file(published_stat)
+            if (
+                not hmac.compare_digest(published_raw, raw)
+                or _managed_key_stat_signature(live_temp_stat)
+                != _managed_key_stat_signature(published_stat)
+            ):
+                raise ManagedSigningKeyError(
+                    "managed signing-key publication contents are unverified"
+                )
+
+        winner = _managed_key_read_existing(parent_fd)
+        if winner is None:
+            raise ManagedSigningKeyError(
+                "managed signing-key publication is missing"
+            )
+        if published and not hmac.compare_digest(winner, raw):
+            raise ManagedSigningKeyError(
+                "managed signing-key publication identity mismatch"
+            )
+        _managed_key_confirm_parent(paths, os.fstat(parent_fd))
+        _managed_key_clear_quarantine(parent_fd)
+        return winner, published
+    except ManagedSigningKeyError:
+        raise
+    except OSError as exc:
+        raise ManagedSigningKeyError(
+            "managed signing-key persistence failed"
+        ) from exc
+    finally:
+        if temp_fd is not None:
+            os.close(temp_fd)
+        if temp_exists:
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+
+
+def strict_persist_signing_key() -> ManagedSigningKeyPersistenceReceipt:
+    """Durably persist or adopt the exact managed recovery signing key."""
+
+    paths = _managed_signing_key_paths()
+    with _MANAGED_SIGNING_KEY_LOCK:
+        parent_fd, parent_stat = _managed_key_open_parent(paths)
+        try:
+            _managed_key_assert_no_quarantine(parent_fd)
+            raw = _managed_key_read_existing(parent_fd)
+            created = False
+            if raw is None:
+                raw, created = _managed_key_create(parent_fd, paths)
+            _managed_key_confirm_parent(paths, parent_stat)
+            confirmed = _managed_key_read_existing(parent_fd)
+            _managed_key_confirm_parent(paths, parent_stat)
+            if (
+                confirmed is None
+                or len(raw) != 32
+                or not hmac.compare_digest(raw, confirmed)
+            ):
+                raise ManagedSigningKeyError(
+                    "managed signing-key durable postcondition failed"
+                )
+            _managed_key_assert_no_quarantine(parent_fd)
+            return ManagedSigningKeyPersistenceReceipt(
+                key_path=paths.key_path,
+                durable=True,
+                created=created,
+            )
+        finally:
+            os.close(parent_fd)
+
+
+def strict_load_signing_key_cache() -> ManagedSigningKeyCacheReceipt:
+    """Load the verified durable key into the current-process cache."""
+
+    global _SIGNING_KEY_CACHE
+    paths = _managed_signing_key_paths()
+    with _MANAGED_SIGNING_KEY_LOCK:
+        parent_fd, parent_stat = _managed_key_open_parent(paths)
+        try:
+            _managed_key_assert_no_quarantine(parent_fd)
+            raw = _managed_key_read_existing(parent_fd)
+            if raw is None:
+                raise ManagedSigningKeyError(
+                    "managed signing-key durable file is absent"
+                )
+            current = _SIGNING_KEY_CACHE
+            if current is not None and (
+                not isinstance(current, bytes)
+                or len(current) != 32
+                or not hmac.compare_digest(current, raw)
+            ):
+                raise ManagedSigningKeyError(
+                    "managed signing-key cache does not match durable file"
+                )
+            _managed_key_confirm_parent(paths, parent_stat)
+            confirmed = _managed_key_read_existing(parent_fd)
+            _managed_key_confirm_parent(paths, parent_stat)
+            if confirmed is None or not hmac.compare_digest(raw, confirmed):
+                raise ManagedSigningKeyError(
+                    "managed signing-key durable file changed before cache load"
+                )
+            _managed_key_assert_no_quarantine(parent_fd)
+            _SIGNING_KEY_CACHE = confirmed
+            if not hmac.compare_digest(_SIGNING_KEY_CACHE, confirmed):
+                raise ManagedSigningKeyError(
+                    "managed signing-key cache postcondition failed"
+                )
+            return ManagedSigningKeyCacheReceipt(
+                key_path=paths.key_path,
+                cache_loaded=True,
+            )
+        finally:
+            os.close(parent_fd)
+
+
+def verify_strict_signing_key() -> ManagedSigningKeyVerification:
+    """Mutation-free verification of durable and process-cache postconditions."""
+
+    paths = _managed_signing_key_paths()
+    with _MANAGED_SIGNING_KEY_LOCK:
+        try:
+            parent_fd, parent_stat = _managed_key_open_parent(paths)
+            try:
+                _managed_key_assert_no_quarantine(parent_fd)
+                raw = _managed_key_read_existing(parent_fd)
+                if raw is None:
+                    _managed_key_confirm_absent(parent_fd)
+                _managed_key_confirm_parent(paths, parent_stat)
+                _managed_key_assert_no_quarantine(parent_fd)
+                confirmed = _managed_key_read_existing(parent_fd)
+                if raw is None:
+                    if confirmed is not None:
+                        raise ManagedSigningKeyError(
+                            "managed signing key appeared during absence verification"
+                        )
+                    _managed_key_confirm_absent(parent_fd)
+                elif confirmed is None or not hmac.compare_digest(raw, confirmed):
+                    raise ManagedSigningKeyError(
+                        "managed signing key changed during verification"
+                    )
+                _managed_key_confirm_parent(paths, parent_stat)
+            finally:
+                os.close(parent_fd)
+        except ManagedSigningKeyError:
+            return ManagedSigningKeyVerification(
+                ManagedSigningKeyVerificationOutcome.AMBIGUOUS,
+                "unsafe_durable_file",
+                None,
+                None,
+            )
+
+        current = _SIGNING_KEY_CACHE
+        if raw is None:
+            if current is None:
+                return ManagedSigningKeyVerification(
+                    ManagedSigningKeyVerificationOutcome.PROVED_ABSENT,
+                    "durable_file_absent",
+                    None,
+                    None,
+                )
+            return ManagedSigningKeyVerification(
+                ManagedSigningKeyVerificationOutcome.AMBIGUOUS,
+                "cache_without_durable_file",
+                None,
+                None,
+            )
+
+        persistence = ManagedSigningKeyPersistenceReceipt(
+            key_path=paths.key_path,
+            durable=True,
+            created=False,
+        )
+        if current is None:
+            return ManagedSigningKeyVerification(
+                ManagedSigningKeyVerificationOutcome.PARTIAL,
+                "durable_file_cache_absent",
+                persistence,
+                None,
+            )
+        if (
+            not isinstance(current, bytes)
+            or len(current) != 32
+            or not hmac.compare_digest(current, raw)
+        ):
+            return ManagedSigningKeyVerification(
+                ManagedSigningKeyVerificationOutcome.AMBIGUOUS,
+                "cache_mismatch",
+                persistence,
+                None,
+            )
+        cache = ManagedSigningKeyCacheReceipt(
+            key_path=paths.key_path,
+            cache_loaded=True,
+        )
+        return ManagedSigningKeyVerification(
+            ManagedSigningKeyVerificationOutcome.PROVED_COMPLETE,
+            None,
+            persistence,
+            cache,
+        )
 
 
 def _pbkdf2_key() -> bytes:
