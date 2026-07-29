@@ -7,6 +7,7 @@ import argparse
 import ctypes
 import copy
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import hmac
@@ -3787,10 +3788,6 @@ _CUTOVER_PLAN_REQUIRED = {
     "expected_candidate_identity_json",
     "last_good_identity_json",
     "last_good_gateway_identity_json",
-    "last_good_origin_journal",
-    "last_good_origin_journal_sha256",
-    "last_good_gateway_origin_journal",
-    "last_good_gateway_origin_journal_sha256",
     "installed_plist",
     "bootstrap_rollback_plist",
     "managed_plist",
@@ -3807,6 +3804,16 @@ _CUTOVER_PLAN_REQUIRED = {
     "cli_link",
     "cli_old_target",
     "cli_shim_dir",
+}
+_LAST_GOOD_ORIGIN_JOURNAL_PLAN_KEYS = {
+    "last_good_origin_journal",
+    "last_good_origin_journal_sha256",
+    "last_good_gateway_origin_journal",
+    "last_good_gateway_origin_journal_sha256",
+}
+_LAST_GOOD_SPLIT_ADOPTION_PLAN_KEYS = {
+    "last_good_split_adoption_receipt",
+    "last_good_split_adoption_receipt_sha256",
 }
 _BOOTSTRAP_GATEWAY_PLAN_KEYS = {
     "gateway_installed_plist",
@@ -3849,6 +3856,8 @@ _BOOTSTRAP_LEGACY_BOUNDARY_PLAN_KEYS = {
 _CUTOVER_PLAN_OPTIONAL = {
     "timeout_seconds",
     "interval_seconds",
+    *_LAST_GOOD_ORIGIN_JOURNAL_PLAN_KEYS,
+    *_LAST_GOOD_SPLIT_ADOPTION_PLAN_KEYS,
     *_BOOTSTRAP_GATEWAY_PLAN_KEYS,
     *_BOOTSTRAP_WATCHDOG_PLAN_KEYS,
     *_BOOTSTRAP_WATCHDOG_SCHEDULER_PLAN_KEYS,
@@ -3865,6 +3874,7 @@ _CUTOVER_PLAN_PATH_KEYS = {
     "last_good_gateway_identity_json",
     "last_good_origin_journal",
     "last_good_gateway_origin_journal",
+    "last_good_split_adoption_receipt",
     "installed_plist",
     "bootstrap_rollback_plist",
     "managed_plist",
@@ -4055,22 +4065,263 @@ def _read_sealed_origin_journal(
     return _validated_transaction_journal(raw, str(transaction_id))
 
 
+def _read_sealed_split_adoption_receipt(
+    path: str,
+    *,
+    expected_sha256: object,
+    trusted_root: Path,
+    webui_identity: dict,
+    gateway_identity: dict,
+) -> dict:
+    """Read one sealed historical observation of an exact live split pair."""
+    receipt_path = Path(path)
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", str(expected_sha256 or ""))
+        or not trusted_root.is_absolute()
+        or Path(os.path.abspath(trusted_root)) != trusted_root
+        or not receipt_path.is_absolute()
+        or Path(os.path.abspath(receipt_path)) != receipt_path
+        or not receipt_path.is_relative_to(trusted_root)
+    ):
+        raise ReleaseBuildError("last-good adoption receipt binding is invalid")
+    current = Path(trusted_root.anchor)
+    for part in trusted_root.parts[1:]:
+        current /= part
+        try:
+            opened = os.lstat(current)
+        except OSError as exc:
+            raise ReleaseBuildError(
+                "last-good adoption receipt root is unreadable"
+            ) from exc
+        if stat.S_ISLNK(opened.st_mode) or not stat.S_ISDIR(opened.st_mode):
+            raise ReleaseBuildError("last-good adoption receipt root is unsafe")
+    if trusted_root.stat().st_uid != os.getuid() or trusted_root.stat().st_mode & 0o022:
+        raise ReleaseBuildError("last-good adoption receipt root is unsafe")
+    current = trusted_root
+    for part in receipt_path.relative_to(trusted_root).parts[:-1]:
+        current /= part
+        try:
+            opened = os.lstat(current)
+        except OSError as exc:
+            raise ReleaseBuildError(
+                "last-good adoption receipt root is unreadable"
+            ) from exc
+        if (
+            stat.S_ISLNK(opened.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_mode & 0o022
+        ):
+            raise ReleaseBuildError("last-good adoption receipt root is unsafe")
+    try:
+        descriptor = os.open(
+            receipt_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            payload = handle.read(4 * 1024 * 1024 + 1)
+    except OSError as exc:
+        raise ReleaseBuildError("last-good adoption receipt is unreadable") from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != os.getuid()
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or len(payload) > 4 * 1024 * 1024
+        or hashlib.sha256(payload).hexdigest() != expected_sha256
+    ):
+        raise ReleaseBuildError("last-good adoption receipt identity is invalid")
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+        result: dict = {}
+        for key, value in pairs:
+            if key in result:
+                raise ReleaseBuildError(
+                    "last-good adoption receipt has duplicate keys"
+                )
+            result[key] = value
+        return result
+
+    try:
+        raw = json.loads(payload, object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseBuildError(
+            "last-good adoption receipt JSON is invalid"
+        ) from exc
+    if (
+        not isinstance(raw, dict)
+        or set(raw)
+        != {
+            "schema",
+            "version",
+            "adoption_id",
+            "created_at",
+            "selector",
+            "webui",
+            "gateway",
+            "shared_identity_sha256",
+        }
+        or raw.get("schema") != "hermes.last_good_split_adoption.v1"
+        or raw.get("version") != 1
+        or not _TRANSACTION_ID.fullmatch(str(raw.get("adoption_id") or ""))
+        or not re.fullmatch(
+            r"[0-9a-f]{64}", str(raw.get("shared_identity_sha256") or "")
+        )
+        or _journal_contains_sensitive_value(raw)
+    ):
+        raise ReleaseBuildError("last-good adoption receipt schema is invalid")
+    timestamp = str(raw.get("created_at") or "")
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise ReleaseBuildError(
+            "last-good adoption receipt timestamp is invalid"
+        ) from exc
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or parsed.astimezone(timezone.utc).isoformat() != timestamp
+    ):
+        raise ReleaseBuildError(
+            "last-good adoption receipt timestamp is not canonical UTC"
+        )
+    canonical = json.dumps(
+        raw,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if canonical != payload:
+        raise ReleaseBuildError("last-good adoption receipt is not canonical")
+    selector = raw.get("selector")
+    selector_state = (
+        selector.get("state") if isinstance(selector, dict) else None
+    )
+    if (
+        not isinstance(selector, dict)
+        or set(selector) != {"state", "state_sha256"}
+        or not isinstance(selector_state, dict)
+        or selector.get("state_sha256")
+        != _canonical_journal_value_sha256(selector_state)
+        or selector_state.get("current") != webui_identity.get("build_id")
+        or selector_state.get("last_good") != webui_identity.get("build_id")
+        or selector_state.get("candidate") is not None
+        or selector_state.get("pending_transaction_id") is not None
+        or selector_state.get("generation")
+        != int(webui_identity.get("selector_generation", -1)) + 1
+    ):
+        raise ReleaseBuildError(
+            "last-good adoption receipt selector authority is invalid"
+        )
+    for name, expected_identity, admission in (
+        ("webui", webui_identity, "open"),
+        ("gateway", gateway_identity, "accepting_new_work"),
+    ):
+        component = raw.get(name)
+        if (
+            not isinstance(component, dict)
+            or set(component) != {"identity", "identity_sha256", "live_binding"}
+            or component.get("identity") != expected_identity
+            or component.get("identity_sha256")
+            != _canonical_journal_value_sha256(expected_identity)
+        ):
+            raise ReleaseBuildError(
+                f"last-good adoption receipt {name} identity changed"
+            )
+        binding = component.get("live_binding")
+        if (
+            not isinstance(binding, dict)
+            or set(binding)
+            != {
+                "listener_pid",
+                "pid_start_token",
+                "admission_state",
+                "evidence",
+                "binding_sha256",
+            }
+            or isinstance(binding.get("listener_pid"), bool)
+            or not isinstance(binding.get("listener_pid"), int)
+            or binding["listener_pid"] <= 1
+            or not str(binding.get("pid_start_token") or "")
+            or binding.get("admission_state") != admission
+            or not isinstance(binding.get("evidence"), dict)
+            or binding.get("binding_sha256")
+            != _canonical_journal_value_sha256(binding.get("evidence"))
+            or binding["evidence"].get("listener_pid")
+            != binding["listener_pid"]
+            or binding["evidence"].get("pid_start_token")
+            != binding["pid_start_token"]
+        ):
+            raise ReleaseBuildError(
+                f"last-good adoption receipt {name} live binding is invalid"
+            )
+        observed_admission = (
+            binding["evidence"].get("deep_health", {}).get("admission", {}).get(
+                "state"
+            )
+            if name == "webui"
+            else binding["evidence"].get("health", {}).get("drain", {}).get(
+                "admission", {}
+            ).get("state")
+        )
+        if observed_admission != admission:
+            raise ReleaseBuildError(
+                f"last-good adoption receipt {name} live binding is invalid"
+            )
+    shared_identity = {
+        key: webui_identity.get(key)
+        for key in sorted(_LAST_GOOD_SHARED_IDENTITY_KEYS)
+    }
+    if (
+        raw["shared_identity_sha256"]
+        != _canonical_journal_value_sha256(shared_identity)
+    ):
+        raise ReleaseBuildError(
+            "last-good adoption receipt shared identity changed"
+        )
+    return raw
+
+
 def _attest_last_good_identity_split(
     *,
     webui_identity: dict,
     gateway_identity: dict,
-    webui_origin_journal: str,
-    webui_origin_sha256: object,
-    gateway_origin_journal: str,
-    gateway_origin_sha256: object,
     trusted_root: Path,
     selector_path: str,
+    webui_origin_journal: str | None = None,
+    webui_origin_sha256: object = None,
+    gateway_origin_journal: str | None = None,
+    gateway_origin_sha256: object = None,
+    adoption_receipt: str | None = None,
+    adoption_receipt_sha256: object = None,
 ) -> MappingProxyType:
     """Purely attest independently sealed WebUI and gateway last-good identities."""
+    journal_presence = tuple(
+        value is not None
+        for value in (
+            webui_origin_journal,
+            webui_origin_sha256,
+            gateway_origin_journal,
+            gateway_origin_sha256,
+        )
+    )
+    adoption_presence = (
+        adoption_receipt is not None,
+        adoption_receipt_sha256 is not None,
+    )
+    journal_mode = all(journal_presence)
+    adoption_mode = all(adoption_presence)
+    if (
+        any(journal_presence) != journal_mode
+        or any(adoption_presence) != adoption_mode
+        or journal_mode == adoption_mode
+    ):
+        raise ReleaseBuildError("last-good provenance mode is invalid")
     evidence = {}
-    for name, identity, journal_path, journal_sha256 in (
-        ("WebUI", webui_identity, webui_origin_journal, webui_origin_sha256),
-        ("gateway", gateway_identity, gateway_origin_journal, gateway_origin_sha256),
+    for name, identity in (
+        ("WebUI", webui_identity),
+        ("gateway", gateway_identity),
     ):
         label = f"last-good {name}"
         if (
@@ -4081,20 +4332,41 @@ def _attest_last_good_identity_split(
         ):
             raise ReleaseBuildError(f"{label} provenance is invalid")
         _attest_expected_release_identity(identity, selector_path=selector_path, label=label)
-        journal = _read_sealed_origin_journal(
-            journal_path,
-            expected_sha256=journal_sha256,
-            transaction_id=identity.get("startup_transaction_id"),
-            trusted_root=trusted_root,
-            label=label,
-        )
-        if any(
-            journal["expected_candidate_identity"].get(key) != identity.get(key)
-            for key in _LAST_GOOD_ORIGIN_IDENTITY_KEYS
-        ):
-            raise ReleaseBuildError(f"{label} origin journal identity changed")
         evidence[name.lower()] = MappingProxyType(
             {"identity": MappingProxyType(copy.deepcopy(identity))}
+        )
+    if journal_mode:
+        for name, identity, journal_path, journal_sha256 in (
+            ("WebUI", webui_identity, webui_origin_journal, webui_origin_sha256),
+            ("gateway", gateway_identity, gateway_origin_journal, gateway_origin_sha256),
+        ):
+            label = f"last-good {name}"
+            journal = _read_sealed_origin_journal(
+                str(journal_path),
+                expected_sha256=journal_sha256,
+                transaction_id=identity.get("startup_transaction_id"),
+                trusted_root=trusted_root,
+                label=label,
+            )
+            if any(
+                journal["expected_candidate_identity"].get(key) != identity.get(key)
+                for key in _LAST_GOOD_ORIGIN_IDENTITY_KEYS
+            ):
+                raise ReleaseBuildError(f"{label} origin journal identity changed")
+    else:
+        receipt = _read_sealed_split_adoption_receipt(
+            str(adoption_receipt),
+            expected_sha256=adoption_receipt_sha256,
+            trusted_root=trusted_root,
+            webui_identity=webui_identity,
+            gateway_identity=gateway_identity,
+        )
+        evidence["provenance"] = MappingProxyType(
+            {
+                "kind": "live-split-adoption",
+                "adoption_id": receipt["adoption_id"],
+                "receipt_sha256": str(adoption_receipt_sha256),
+            }
         )
     if any(
         webui_identity.get(key) != gateway_identity.get(key)
@@ -4113,6 +4385,18 @@ def _load_cutover_plan(path: Path | str) -> dict:
         or keys - _CUTOVER_PLAN_REQUIRED - _CUTOVER_PLAN_OPTIONAL
     ):
         raise ReleaseBuildError("cutover plan schema is invalid")
+    origin_keys = keys.intersection(_LAST_GOOD_ORIGIN_JOURNAL_PLAN_KEYS)
+    adoption_keys = keys.intersection(_LAST_GOOD_SPLIT_ADOPTION_PLAN_KEYS)
+    if (
+        origin_keys
+        and origin_keys != _LAST_GOOD_ORIGIN_JOURNAL_PLAN_KEYS
+    ) or (
+        adoption_keys
+        and adoption_keys != _LAST_GOOD_SPLIT_ADOPTION_PLAN_KEYS
+    ):
+        raise ReleaseBuildError("cutover plan provenance schema is invalid")
+    if bool(origin_keys) == bool(adoption_keys):
+        raise ReleaseBuildError("last-good provenance mode is invalid")
     transaction_id = str(raw.get("transaction_id") or "")
     if not _TRANSACTION_ID.fullmatch(transaction_id):
         raise ReleaseBuildError("cutover plan transaction identity is invalid")
@@ -4377,15 +4661,29 @@ def _load_cutover_plan(path: Path | str) -> dict:
         selector_path=plan["selector_path"],
         label="candidate",
     )
+    provenance_arguments = (
+        {
+            "webui_origin_journal": plan["last_good_origin_journal"],
+            "webui_origin_sha256": plan["last_good_origin_journal_sha256"],
+            "gateway_origin_journal": plan["last_good_gateway_origin_journal"],
+            "gateway_origin_sha256": plan[
+                "last_good_gateway_origin_journal_sha256"
+            ],
+        }
+        if origin_keys
+        else {
+            "adoption_receipt": plan["last_good_split_adoption_receipt"],
+            "adoption_receipt_sha256": plan[
+                "last_good_split_adoption_receipt_sha256"
+            ],
+        }
+    )
     attestation = _attest_last_good_identity_split(
         webui_identity=last_good,
         gateway_identity=last_good_gateway,
-        webui_origin_journal=plan["last_good_origin_journal"],
-        webui_origin_sha256=plan["last_good_origin_journal_sha256"],
-        gateway_origin_journal=plan["last_good_gateway_origin_journal"],
-        gateway_origin_sha256=plan["last_good_gateway_origin_journal_sha256"],
         trusted_root=Path(plan["transaction_journal"]).parent,
         selector_path=plan["selector_path"],
+        **provenance_arguments,
     )
     plan["expected_candidate_identity"] = candidate
     plan["last_good_identity"] = last_good
@@ -6671,17 +6969,29 @@ def _reconcile_cutover_journal(
 
 def _preflight_last_good_identity_split(plan: dict) -> MappingProxyType:
     """Read-only, repeatable proof of the independently sealed last-good pair."""
+    provenance_arguments = (
+        {
+            "webui_origin_journal": plan["last_good_origin_journal"],
+            "webui_origin_sha256": plan["last_good_origin_journal_sha256"],
+            "gateway_origin_journal": plan["last_good_gateway_origin_journal"],
+            "gateway_origin_sha256": plan[
+                "last_good_gateway_origin_journal_sha256"
+            ],
+        }
+        if _LAST_GOOD_ORIGIN_JOURNAL_PLAN_KEYS.issubset(plan)
+        else {
+            "adoption_receipt": plan["last_good_split_adoption_receipt"],
+            "adoption_receipt_sha256": plan[
+                "last_good_split_adoption_receipt_sha256"
+            ],
+        }
+    )
     return _attest_last_good_identity_split(
         webui_identity=plan["last_good_identity"],
         gateway_identity=plan["last_good_gateway_identity"],
-        webui_origin_journal=plan["last_good_origin_journal"],
-        webui_origin_sha256=plan["last_good_origin_journal_sha256"],
-        gateway_origin_journal=plan["last_good_gateway_origin_journal"],
-        gateway_origin_sha256=plan[
-            "last_good_gateway_origin_journal_sha256"
-        ],
         trusted_root=Path(plan["transaction_journal"]).parent,
         selector_path=plan["selector_path"],
+        **provenance_arguments,
     )
 
 
@@ -6862,10 +7172,6 @@ def _canonical_journal_value_sha256(value: object) -> str:
 _BOOTSTRAP_SPLIT_PROVENANCE_PLAN_KEYS = {
     "last_good_identity",
     "last_good_gateway_identity",
-    "last_good_origin_journal",
-    "last_good_origin_journal_sha256",
-    "last_good_gateway_origin_journal",
-    "last_good_gateway_origin_journal_sha256",
     "transaction_journal",
     "selector_path",
 }
@@ -6885,9 +7191,9 @@ def _bootstrap_split_provenance_receipt(
         dict,
     ):
         raise ReleaseBuildError("bootstrap split provenance evidence is invalid")
-    return {
-        "schema": "hermes.bootstrap_split_provenance.v1",
-        "webui": {
+    provenance = evidence.get("provenance")
+    if provenance is None:
+        webui = {
             "identity": copy.deepcopy(webui_identity),
             "origin_transaction_id": webui_identity.get(
                 "startup_transaction_id"
@@ -6895,8 +7201,8 @@ def _bootstrap_split_provenance_receipt(
             "origin_journal_sha256": plan[
                 "last_good_origin_journal_sha256"
             ],
-        },
-        "gateway": {
+        }
+        gateway = {
             "identity": copy.deepcopy(gateway_identity),
             "origin_transaction_id": gateway_identity.get(
                 "startup_transaction_id"
@@ -6904,10 +7210,30 @@ def _bootstrap_split_provenance_receipt(
             "origin_journal_sha256": plan[
                 "last_good_gateway_origin_journal_sha256"
             ],
-        },
+        }
+        provenance_receipt = None
+    elif (
+        isinstance(provenance, dict)
+        and set(provenance) == {"kind", "adoption_id", "receipt_sha256"}
+        and provenance.get("kind") == "live-split-adoption"
+        and provenance.get("receipt_sha256")
+        == plan.get("last_good_split_adoption_receipt_sha256")
+    ):
+        webui = {"identity": copy.deepcopy(webui_identity)}
+        gateway = {"identity": copy.deepcopy(gateway_identity)}
+        provenance_receipt = copy.deepcopy(provenance)
+    else:
+        raise ReleaseBuildError("bootstrap split provenance source is invalid")
+    receipt = {
+        "schema": "hermes.bootstrap_split_provenance.v1",
+        "webui": webui,
+        "gateway": gateway,
         "split_evidence": evidence,
         "split_evidence_sha256": _canonical_journal_value_sha256(evidence),
     }
+    if provenance_receipt is not None:
+        receipt["provenance"] = provenance_receipt
+    return receipt
 
 
 def _validate_bootstrap_split_provenance(
@@ -16855,20 +17181,399 @@ def _probe_managed_webui_binding(plan: dict, identity: dict) -> dict | None:
     signed_identity = binding.get("signed_identity")
     if not isinstance(signed_identity, dict):
         raise DrainIdentityMismatch("managed WebUI signed identity is missing")
-    promoted_expected = {
-        key: value
-        for key, value in identity.items()
-        if key not in {"selector_generation", "startup_fenced", "startup_transaction_id"}
-    }
-    if not _promoted_candidate_identity_matches(signed_identity, promoted_expected):
+    if not _candidate_identity_matches(signed_identity, identity):
         raise DrainIdentityMismatch("managed WebUI identity does not match release")
     return _require_candidate_binding(
         binding,
         candidate_identity=signed_identity,
-        expected_candidate_identity=promoted_expected,
+        expected_candidate_identity=identity,
         admission_state="open",
         require_full_health=True,
     )
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish one same-filesystem file without replacing a target."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_raw = os.fsencode(source)
+    destination_raw = os.fsencode(destination)
+    if sys.platform == "darwin":
+        rename = getattr(libc, "renamex_np", None)
+        if rename is None:
+            raise ReleaseBuildError("atomic no-replace rename is unavailable")
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(source_raw, destination_raw, 0x00000004)
+    elif sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        if rename is None:
+            raise ReleaseBuildError("atomic no-replace rename is unavailable")
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(-100, source_raw, -100, destination_raw, 0x00000001)
+    else:
+        raise ReleaseBuildError("atomic no-replace rename is unsupported")
+    if result == 0:
+        return
+    error = ctypes.get_errno()
+    if error == errno.EEXIST:
+        raise FileExistsError(destination)
+    raise OSError(error, os.strerror(error), str(destination))
+
+
+def _write_exclusive_private_json(
+    path: Path,
+    value: dict,
+    *,
+    label: str,
+) -> tuple[int, int]:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise ReleaseBuildError(f"{label} cannot be created safely")
+    temporary = path.parent / (
+        f".{path.name}.{secrets.token_hex(16)}.adoption-tmp"
+    )
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | nofollow
+            | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+    except OSError as exc:
+        raise ReleaseBuildError(f"{label} temporary cannot be created") from exc
+    try:
+        os.set_inheritable(descriptor, False)
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        opened = os.fstat(descriptor)
+    except BaseException:
+        opened = os.fstat(descriptor)
+        os.close(descriptor)
+        _unlink_exact_created_adoption_file(
+            temporary,
+            (opened.st_dev, opened.st_ino),
+        )
+        raise
+    else:
+        os.close(descriptor)
+    try:
+        _rename_noreplace(temporary, path)
+    except FileExistsError as exc:
+        _unlink_exact_created_adoption_file(
+            temporary,
+            (opened.st_dev, opened.st_ino),
+        )
+        raise ReleaseBuildError(f"{label} already exists") from exc
+    except BaseException:
+        _unlink_exact_created_adoption_file(
+            temporary,
+            (opened.st_dev, opened.st_ino),
+        )
+        raise
+    _fsync_directory(path.parent)
+    return opened.st_dev, opened.st_ino
+
+
+def _read_exact_private_json_for_adoption(
+    path: Path,
+    expected: dict,
+    *,
+    label: str,
+) -> tuple[int, int]:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        with os.fdopen(descriptor, "rb") as handle:
+            payload = handle.read(4 * 1024 * 1024 + 1)
+    except OSError as exc:
+        raise ReleaseBuildError(f"{label} cannot be recovered") from exc
+    expected_payload = json.dumps(
+        expected,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != os.getuid()
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or payload != expected_payload
+    ):
+        raise ReleaseBuildError(f"{label} conflicts with adoption")
+    return opened.st_dev, opened.st_ino
+
+
+def _unlink_exact_created_adoption_file(
+    path: Path,
+    identity: tuple[int, int],
+) -> None:
+    try:
+        current = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        stat.S_ISREG(current.st_mode)
+        and current.st_dev == identity[0]
+        and current.st_ino == identity[1]
+        and current.st_uid == os.getuid()
+        and current.st_nlink == 1
+        and stat.S_IMODE(current.st_mode) == 0o600
+    ):
+        path.unlink()
+
+
+def create_live_split_adoption(
+    plan: dict,
+    *,
+    webui_identity: dict,
+    gateway_identity: dict,
+    webui_identity_path: Path | str,
+    gateway_identity_path: Path | str,
+    adoption_receipt_path: Path | str,
+    adoption_id: str,
+    created_at: str | None = None,
+) -> dict:
+    """Seal one explicit, double-observed live split as historical provenance."""
+    paths = tuple(
+        Path(value)
+        for value in (
+            webui_identity_path,
+            gateway_identity_path,
+            adoption_receipt_path,
+        )
+    )
+    if len(set(paths)) != 3:
+        raise ReleaseBuildError("live split adoption output paths are duplicated")
+    parent = paths[0].parent
+    try:
+        parent_stat = parent.stat()
+    except OSError as exc:
+        raise ReleaseBuildError("live split adoption root is unavailable") from exc
+    if (
+        any(
+            not path.is_absolute()
+            or Path(os.path.abspath(path)) != path
+            or path.parent != parent
+            or path.is_symlink()
+            for path in paths
+        )
+        or parent.resolve(strict=True) != parent
+        or parent_stat.st_uid != os.getuid()
+        or not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_mode & 0o022
+    ):
+        raise ReleaseBuildError("live split adoption output path is unsafe")
+    if not _TRANSACTION_ID.fullmatch(str(adoption_id or "")):
+        raise ReleaseBuildError("live split adoption identity is invalid")
+    timestamp = created_at or datetime.now(timezone.utc).isoformat()
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise ReleaseBuildError("live split adoption timestamp is invalid") from exc
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or parsed.astimezone(timezone.utc).isoformat() != timestamp
+    ):
+        raise ReleaseBuildError(
+            "live split adoption timestamp is not canonical UTC"
+        )
+    for name, identity in (
+        ("WebUI", webui_identity),
+        ("gateway", gateway_identity),
+    ):
+        if (
+            not isinstance(identity.get("selector_generation"), int)
+            or isinstance(identity.get("selector_generation"), bool)
+            or identity["selector_generation"] <= 0
+        ):
+            raise ReleaseBuildError(
+                f"last-good {name} adoption identity is invalid"
+            )
+        _attest_expected_release_identity(
+            identity,
+            selector_path=str(identity.get("selector_path") or ""),
+            label=f"last-good {name}",
+        )
+    if (
+        webui_identity.get("startup_fenced") is not True
+        or not _TRANSACTION_ID.fullmatch(
+            str(webui_identity.get("startup_transaction_id") or "")
+        )
+    ):
+        raise ReleaseBuildError(
+            "last-good WebUI startup identity is not retained"
+        )
+    if any(
+        webui_identity.get(key) != gateway_identity.get(key)
+        for key in _LAST_GOOD_SHARED_IDENTITY_KEYS
+    ):
+        raise ReleaseBuildError("last-good shared runtime identity changed")
+
+    selector_before = release_selector.read_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+    )
+    if (
+        not isinstance(selector_before, dict)
+        or selector_before.get("current") != webui_identity["build_id"]
+        or selector_before.get("last_good") != webui_identity["build_id"]
+        or selector_before.get("candidate") is not None
+        or selector_before.get("pending_transaction_id") is not None
+        or selector_before.get("generation")
+        != webui_identity["selector_generation"] + 1
+    ):
+        raise ReleaseBuildError(
+            "live split selector authority is not idle on adopted build"
+        )
+    webui_before = _probe_managed_webui_binding(plan, webui_identity)
+    if webui_before is None:
+        raise DrainIdentityMismatch("managed WebUI is absent during adoption")
+    gateway_before = _attest_managed_gateway_binding(
+        plan,
+        gateway_identity,
+        expected_admission="accepting_new_work",
+    )
+    webui_after = _probe_managed_webui_binding(plan, webui_identity)
+    if webui_after is None:
+        raise DrainIdentityMismatch("managed WebUI is absent during adoption")
+    gateway_after = _attest_managed_gateway_binding(
+        plan,
+        gateway_identity,
+        expected_admission="accepting_new_work",
+    )
+    selector_after = release_selector.read_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+    )
+    copied_bindings = [
+        _journal_copy_of_immutable_evidence(value)
+        for value in (
+            webui_before,
+            gateway_before,
+            webui_after,
+            gateway_after,
+        )
+    ]
+    if (
+        selector_before != selector_after
+        or copied_bindings[0] != copied_bindings[2]
+        or copied_bindings[1] != copied_bindings[3]
+    ):
+        raise DrainIdentityMismatch(
+            "live split process or selector changed during adoption"
+        )
+    webui_admission = webui_before.get("deep_health", {}).get("admission", {})
+    if webui_admission.get("state") != "open":
+        raise ReleaseBuildError("live split WebUI admission is not open")
+
+    def live_binding(value: dict, admission_state: str) -> dict:
+        try:
+            listener_pid = int(value["listener_pid"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise DrainIdentityMismatch(
+                "live split process binding is invalid"
+            ) from exc
+        start = str(value.get("pid_start_token") or "")
+        if listener_pid <= 1 or not start:
+            raise DrainIdentityMismatch("live split process binding is invalid")
+        return {
+            "listener_pid": listener_pid,
+            "pid_start_token": start,
+            "admission_state": admission_state,
+            "evidence": _journal_copy_of_immutable_evidence(value),
+            "binding_sha256": _canonical_journal_value_sha256(
+                _journal_copy_of_immutable_evidence(value)
+            ),
+        }
+
+    shared_identity = {
+        key: webui_identity.get(key)
+        for key in sorted(_LAST_GOOD_SHARED_IDENTITY_KEYS)
+    }
+    receipt = {
+        "schema": "hermes.last_good_split_adoption.v1",
+        "version": 1,
+        "adoption_id": adoption_id,
+        "created_at": timestamp,
+        "selector": {
+            "state": copy.deepcopy(selector_before),
+            "state_sha256": _canonical_journal_value_sha256(selector_before),
+        },
+        "webui": {
+            "identity": copy.deepcopy(webui_identity),
+            "identity_sha256": _canonical_journal_value_sha256(webui_identity),
+            "live_binding": live_binding(webui_before, "open"),
+        },
+        "gateway": {
+            "identity": copy.deepcopy(gateway_identity),
+            "identity_sha256": _canonical_journal_value_sha256(gateway_identity),
+            "live_binding": live_binding(
+                gateway_before,
+                "accepting_new_work",
+            ),
+        },
+        "shared_identity_sha256": _canonical_journal_value_sha256(
+            shared_identity
+        ),
+    }
+    for path, value, label in (
+        (paths[0], webui_identity, "last-good WebUI identity"),
+        (paths[1], gateway_identity, "last-good gateway identity"),
+        (paths[2], receipt, "last-good adoption receipt"),
+    ):
+        if os.path.lexists(path):
+            _read_exact_private_json_for_adoption(
+                path,
+                value,
+                label=label,
+            )
+        else:
+            _write_exclusive_private_json(
+                path,
+                value,
+                label=label,
+            )
+    _fsync_directory(parent)
+    receipt_sha256 = sha256_file(paths[2])
+    _read_sealed_split_adoption_receipt(
+        str(paths[2]),
+        expected_sha256=receipt_sha256,
+        trusted_root=parent,
+        webui_identity=webui_identity,
+        gateway_identity=gateway_identity,
+    )
+    return {
+        "last_good_identity_json": str(paths[0]),
+        "last_good_gateway_identity_json": str(paths[1]),
+        "last_good_split_adoption_receipt": str(paths[2]),
+        "last_good_split_adoption_receipt_sha256": receipt_sha256,
+    }
 
 
 def _probe_startup_fenced_webui_binding(

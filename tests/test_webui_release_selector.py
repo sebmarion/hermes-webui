@@ -3892,6 +3892,7 @@ def _real_sealed_last_good_split(tmp_path: Path) -> tuple[dict, dict, Path, str,
             **verified,
             "selector_generation": generation,
             "startup_transaction_id": transaction_id,
+            "startup_fenced": True,
             "launchd_label": "ai.hermes.webui",
         }
 
@@ -3926,6 +3927,645 @@ def test_last_good_split_attester_verifies_real_sealed_releases(tmp_path):
 
     assert evidence["webui"]["identity"]["build_id"] == "r75-webui"
     assert evidence["gateway"]["identity"]["build_id"] == "r72-gateway"
+
+
+def _write_split_adoption_receipt(
+    path: Path,
+    *,
+    webui: dict,
+    gateway: dict,
+    adoption_id: str = "adopt-live-split-000000000000001",
+) -> str:
+    identity_sha = lambda value: hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    shared = {
+        key: webui[key]
+        for key in sorted(cutover._LAST_GOOD_SHARED_IDENTITY_KEYS)
+    }
+    selector_state = {
+        "generation": 76,
+        "current": webui["build_id"],
+        "last_good": webui["build_id"],
+        "candidate": None,
+        "pending_transaction_id": None,
+    }
+    webui_binding = {
+        "listener_pid": 7501,
+        "pid_start_token": "webui-start",
+        "deep_health": {"admission": {"state": "open"}},
+    }
+    gateway_binding = {
+        "listener_pid": 7201,
+        "pid_start_token": "gateway-start",
+        "health": {
+            "drain": {"admission": {"state": "accepting_new_work"}}
+        },
+    }
+    payload = {
+        "schema": "hermes.last_good_split_adoption.v1",
+        "version": 1,
+        "adoption_id": adoption_id,
+        "created_at": "2026-07-30T10:00:00+00:00",
+        "selector": {
+            "state": selector_state,
+            "state_sha256": identity_sha(selector_state),
+        },
+        "webui": {
+            "identity": webui,
+            "identity_sha256": identity_sha(webui),
+            "live_binding": {
+                "listener_pid": 7501,
+                "pid_start_token": "webui-start",
+                "admission_state": "open",
+                "evidence": webui_binding,
+                "binding_sha256": identity_sha(webui_binding),
+            },
+        },
+        "gateway": {
+            "identity": gateway,
+            "identity_sha256": identity_sha(gateway),
+            "live_binding": {
+                "listener_pid": 7201,
+                "pid_start_token": "gateway-start",
+                "admission_state": "accepting_new_work",
+                "evidence": gateway_binding,
+                "binding_sha256": identity_sha(gateway_binding),
+            },
+        },
+        "shared_identity_sha256": identity_sha(shared),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    path.write_bytes(encoded)
+    path.chmod(0o600)
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def test_last_good_split_attester_accepts_sealed_live_split_adoption(tmp_path):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    receipt = root / "live-split-adoption.json"
+    receipt_sha256 = _write_split_adoption_receipt(
+        receipt,
+        webui=webui,
+        gateway=gateway,
+    )
+
+    evidence = cutover._attest_last_good_identity_split(
+        webui_identity=webui,
+        gateway_identity=gateway,
+        adoption_receipt=str(receipt),
+        adoption_receipt_sha256=receipt_sha256,
+        trusted_root=root,
+        selector_path=webui["selector_path"],
+    )
+
+    assert evidence["webui"]["identity"]["build_id"] == "r75-webui"
+    assert evidence["gateway"]["identity"]["build_id"] == "r72-gateway"
+    assert evidence["provenance"] == {
+        "kind": "live-split-adoption",
+        "adoption_id": "adopt-live-split-000000000000001",
+        "receipt_sha256": receipt_sha256,
+    }
+
+
+def test_load_cutover_plan_rejects_mixed_last_good_provenance_modes(
+    tmp_path,
+    monkeypatch,
+):
+    plan, webui, gateway = _last_good_split_plan(tmp_path)
+    root = Path(plan["transaction_journal"]).parent
+    receipt = root / "live-split-adoption.json"
+    plan["last_good_split_adoption_receipt"] = str(receipt)
+    plan["last_good_split_adoption_receipt_sha256"] = (
+        _write_split_adoption_receipt(receipt, webui=webui, gateway=gateway)
+    )
+    (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setattr(
+        cutover,
+        "_attest_expected_release_identity",
+        lambda identity, **_kwargs: identity,
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="last-good provenance mode is invalid",
+    ):
+        cutover._load_cutover_plan(root / "plan.json")
+
+
+def test_load_cutover_plan_accepts_live_split_adoption_and_tags_bootstrap(
+    tmp_path,
+    monkeypatch,
+):
+    plan, webui, gateway = _last_good_split_plan(tmp_path)
+    root = Path(plan["transaction_journal"]).parent
+    for key in cutover._LAST_GOOD_ORIGIN_JOURNAL_PLAN_KEYS:
+        plan.pop(key)
+    receipt = root / "live-split-adoption.json"
+    plan["last_good_split_adoption_receipt"] = str(receipt)
+    plan["last_good_split_adoption_receipt_sha256"] = (
+        _write_split_adoption_receipt(receipt, webui=webui, gateway=gateway)
+    )
+    (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setattr(
+        cutover,
+        "_attest_expected_release_identity",
+        lambda identity, **_kwargs: identity,
+    )
+
+    loaded = cutover._load_cutover_plan(root / "plan.json")
+    durable = cutover._bootstrap_split_provenance_receipt(
+        loaded,
+        loaded["last_good_origin_attestation"],
+    )
+
+    assert durable["provenance"] == {
+        "kind": "live-split-adoption",
+        "adoption_id": "adopt-live-split-000000000000001",
+        "receipt_sha256": plan[
+            "last_good_split_adoption_receipt_sha256"
+        ],
+    }
+    assert set(durable["webui"]) == {"identity"}
+    assert set(durable["gateway"]) == {"identity"}
+    assert "origin_transaction_id" not in durable["webui"]
+    assert "origin_journal_sha256" not in durable["gateway"]
+
+
+def test_sealed_live_split_adoption_rejects_changed_receipt(tmp_path):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    receipt = root / "live-split-adoption.json"
+    receipt_sha256 = _write_split_adoption_receipt(
+        receipt,
+        webui=webui,
+        gateway=gateway,
+    )
+    receipt.write_bytes(receipt.read_bytes() + b" ")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="adoption receipt identity is invalid",
+    ):
+        cutover._attest_last_good_identity_split(
+            webui_identity=webui,
+            gateway_identity=gateway,
+            adoption_receipt=str(receipt),
+            adoption_receipt_sha256=receipt_sha256,
+            trusted_root=root,
+            selector_path=webui["selector_path"],
+        )
+
+
+def test_last_good_split_attester_rejects_partial_mixed_provenance(tmp_path):
+    webui, gateway, root, webui_sha256, gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    receipt = root / "live-split-adoption.json"
+    receipt_sha256 = _write_split_adoption_receipt(
+        receipt,
+        webui=webui,
+        gateway=gateway,
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="provenance mode is invalid",
+    ):
+        cutover._attest_last_good_identity_split(
+            webui_identity=webui,
+            gateway_identity=gateway,
+            webui_origin_journal=str(root / "webui-origin.json"),
+            webui_origin_sha256=webui_sha256,
+            gateway_origin_journal=str(root / "gateway-origin.json"),
+            gateway_origin_sha256=None,
+            adoption_receipt=str(receipt),
+            adoption_receipt_sha256=receipt_sha256,
+            trusted_root=root,
+            selector_path=webui["selector_path"],
+        )
+
+
+def test_sealed_live_split_adoption_rejects_unverifiable_binding_digest(
+    tmp_path,
+):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    receipt = root / "live-split-adoption.json"
+    _write_split_adoption_receipt(receipt, webui=webui, gateway=gateway)
+    payload = json.loads(receipt.read_bytes())
+    payload["webui"]["live_binding"]["evidence"]["listener_pid"] = 9999
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    receipt.write_bytes(encoded)
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="live binding is invalid",
+    ):
+        cutover._attest_last_good_identity_split(
+            webui_identity=webui,
+            gateway_identity=gateway,
+            adoption_receipt=str(receipt),
+            adoption_receipt_sha256=hashlib.sha256(encoded).hexdigest(),
+            trusted_root=root,
+            selector_path=webui["selector_path"],
+        )
+
+
+def test_create_live_split_adoption_rejects_non_idle_selector_authority(
+    tmp_path,
+    monkeypatch,
+):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    plan = {
+        "selector_state": str(root / "selector-state.json"),
+        "selector_lock": str(root / "selector-state.lock"),
+    }
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: {
+            "generation": 76,
+            "current": "r75-webui",
+            "last_good": "r74-webui",
+            "candidate": None,
+            "pending_transaction_id": None,
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_probe_managed_webui_binding",
+        lambda *_args: pytest.fail("live process must not be probed"),
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="selector authority is not idle",
+    ):
+        cutover.create_live_split_adoption(
+            plan,
+            webui_identity=webui,
+            gateway_identity=gateway,
+            webui_identity_path=root / "adopted-webui.json",
+            gateway_identity_path=root / "adopted-gateway.json",
+            adoption_receipt_path=root / "live-split-adoption.json",
+            adoption_id="adopt-live-split-000000000000001",
+            created_at="2026-07-30T10:00:00+00:00",
+        )
+
+
+def test_create_live_split_adoption_writes_exact_files_after_double_check(
+    tmp_path,
+    monkeypatch,
+):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    plan = {
+        "selector_state": str(root / "selector-state.json"),
+        "selector_lock": str(root / "selector-state.lock"),
+    }
+    selector_reads = []
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: selector_reads.append("read")
+        or {
+            "generation": 76,
+            "current": "r75-webui",
+            "last_good": "r75-webui",
+            "candidate": None,
+            "pending_transaction_id": None,
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_probe_managed_webui_binding",
+        lambda _plan, _identity: {
+            "listener_pid": 7501,
+            "pid_start_token": "webui-start",
+            "deep_health": {"admission": {"state": "open"}},
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda _plan, _identity, **_kwargs: {
+            "listener_pid": 7201,
+            "pid_start_token": "gateway-start",
+            "health": {
+                "drain": {
+                    "admission": {"state": "accepting_new_work"}
+                }
+            },
+        },
+    )
+
+    result = cutover.create_live_split_adoption(
+        plan,
+        webui_identity=webui,
+        gateway_identity=gateway,
+        webui_identity_path=root / "adopted-webui.json",
+        gateway_identity_path=root / "adopted-gateway.json",
+        adoption_receipt_path=root / "live-split-adoption.json",
+        adoption_id="adopt-live-split-000000000000001",
+        created_at="2026-07-30T10:00:00+00:00",
+    )
+
+    assert selector_reads == ["read", "read"]
+    assert json.loads((root / "adopted-webui.json").read_bytes()) == webui
+    assert json.loads((root / "adopted-gateway.json").read_bytes()) == gateway
+    assert result == {
+        "last_good_identity_json": str(root / "adopted-webui.json"),
+        "last_good_gateway_identity_json": str(root / "adopted-gateway.json"),
+        "last_good_split_adoption_receipt": str(
+            root / "live-split-adoption.json"
+        ),
+        "last_good_split_adoption_receipt_sha256": _sha(
+            root / "live-split-adoption.json"
+        ),
+    }
+    for path in (
+        root / "adopted-webui.json",
+        root / "adopted-gateway.json",
+        root / "live-split-adoption.json",
+    ):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_create_live_split_adoption_rejects_process_drift_without_writes(
+    tmp_path,
+    monkeypatch,
+):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    plan = {
+        "selector_state": str(root / "selector-state.json"),
+        "selector_lock": str(root / "selector-state.lock"),
+    }
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: {
+            "generation": 76,
+            "current": "r75-webui",
+            "last_good": "r75-webui",
+            "candidate": None,
+            "pending_transaction_id": None,
+        },
+    )
+    starts = iter(("webui-before", "webui-after"))
+    monkeypatch.setattr(
+        cutover,
+        "_probe_managed_webui_binding",
+        lambda _plan, _identity: {
+            "listener_pid": 7501,
+            "pid_start_token": next(starts),
+            "deep_health": {"admission": {"state": "open"}},
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda _plan, _identity, **_kwargs: {
+            "listener_pid": 7201,
+            "pid_start_token": "gateway-start",
+            "health": {
+                "drain": {
+                    "admission": {"state": "accepting_new_work"}
+                }
+            },
+        },
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="changed during adoption",
+    ):
+        cutover.create_live_split_adoption(
+            plan,
+            webui_identity=webui,
+            gateway_identity=gateway,
+            webui_identity_path=root / "adopted-webui.json",
+            gateway_identity_path=root / "adopted-gateway.json",
+            adoption_receipt_path=root / "live-split-adoption.json",
+            adoption_id="adopt-live-split-000000000000001",
+            created_at="2026-07-30T10:00:00+00:00",
+        )
+
+    assert not (root / "adopted-webui.json").exists()
+    assert not (root / "adopted-gateway.json").exists()
+    assert not (root / "live-split-adoption.json").exists()
+
+
+def test_probe_managed_webui_binding_rejects_changed_startup_marker(monkeypatch):
+    identity = {
+        "build_id": "r75-webui",
+        "selector_generation": 75,
+        "startup_fenced": True,
+        "startup_transaction_id": "origin-transaction-000000000000001",
+    }
+    signed = {
+        **identity,
+        "startup_transaction_id": "other-transaction-0000000000000001",
+    }
+    plan = {
+        "listener_port": 8787,
+        "base_url": "http://127.0.0.1:8787",
+        "signing_key_file": "/tmp/release-control.key",
+        "transaction_id": "adopt-transaction-0000000000000001",
+        "timeout_seconds": 1,
+    }
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_job_pid", lambda *_args, **_kwargs: 41)
+    monkeypatch.setattr(cutover, "_read_release_control_key", lambda _path: b"k")
+    monkeypatch.setattr(
+        cutover,
+        "_release_control_client",
+        lambda *_args, **_kwargs: (
+            lambda: {},
+            lambda *_args, **_kwargs: {},
+            plan["transaction_id"],
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_collect_process_binding",
+        lambda *_args, **_kwargs: {"signed_identity": signed},
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="identity does not match",
+    ):
+        cutover._probe_managed_webui_binding(plan, identity)
+
+
+def _patch_live_split_adoption_probes(monkeypatch, build_id: str) -> None:
+    selector = {
+        "generation": 76,
+        "current": build_id,
+        "last_good": build_id,
+        "candidate": None,
+        "pending_transaction_id": None,
+    }
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: copy.deepcopy(selector),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_probe_managed_webui_binding",
+        lambda *_args: {
+            "listener_pid": 7501,
+            "pid_start_token": "webui-start",
+            "deep_health": {"admission": {"state": "open"}},
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda *_args, **_kwargs: {
+            "listener_pid": 7201,
+            "pid_start_token": "gateway-start",
+            "health": {
+                "drain": {
+                    "admission": {"state": "accepting_new_work"}
+                }
+            },
+        },
+    )
+
+
+def test_create_live_split_adoption_recovers_exact_receipt_last_partial(
+    tmp_path,
+    monkeypatch,
+):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    _patch_live_split_adoption_probes(monkeypatch, webui["build_id"])
+    webui_path = root / "adopted-webui.json"
+    gateway_path = root / "adopted-gateway.json"
+    for path, identity in ((webui_path, webui), (gateway_path, gateway)):
+        path.write_text(
+            json.dumps(
+                identity,
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+
+    result = cutover.create_live_split_adoption(
+        {
+            "selector_state": str(root / "selector-state.json"),
+            "selector_lock": str(root / "selector-state.lock"),
+        },
+        webui_identity=webui,
+        gateway_identity=gateway,
+        webui_identity_path=webui_path,
+        gateway_identity_path=gateway_path,
+        adoption_receipt_path=root / "live-split-adoption.json",
+        adoption_id="adopt-live-split-000000000000001",
+        created_at="2026-07-30T10:00:00+00:00",
+    )
+
+    assert Path(result["last_good_split_adoption_receipt"]).is_file()
+    assert json.loads(webui_path.read_bytes()) == webui
+    assert json.loads(gateway_path.read_bytes()) == gateway
+
+
+def test_create_live_split_adoption_cleanup_does_not_unlink_raced_file(
+    tmp_path,
+    monkeypatch,
+):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    _patch_live_split_adoption_probes(monkeypatch, webui["build_id"])
+    webui_path = root / "adopted-webui.json"
+    original_write = cutover._write_exclusive_private_json
+
+    def race_after_first_write(path, value, *, label):
+        if label == "last-good gateway identity":
+            webui_path.unlink()
+            webui_path.write_text('{"unrelated":true}', encoding="utf-8")
+            webui_path.chmod(0o600)
+            raise cutover.ReleaseBuildError("injected publication race")
+        return original_write(path, value, label=label)
+
+    monkeypatch.setattr(
+        cutover,
+        "_write_exclusive_private_json",
+        race_after_first_write,
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="injected publication race",
+    ):
+        cutover.create_live_split_adoption(
+            {
+                "selector_state": str(root / "selector-state.json"),
+                "selector_lock": str(root / "selector-state.lock"),
+            },
+            webui_identity=webui,
+            gateway_identity=gateway,
+            webui_identity_path=webui_path,
+            gateway_identity_path=root / "adopted-gateway.json",
+            adoption_receipt_path=root / "live-split-adoption.json",
+            adoption_id="adopt-live-split-000000000000001",
+            created_at="2026-07-30T10:00:00+00:00",
+        )
+
+    assert json.loads(webui_path.read_bytes()) == {"unrelated": True}
+    assert not (root / "adopted-gateway.json").exists()
+    assert not (root / "live-split-adoption.json").exists()
+
+
+def test_private_adoption_publish_is_atomic_noreplace_on_conflict(tmp_path):
+    destination = tmp_path / "identity.json"
+    destination.write_text('{"unrelated":true}', encoding="utf-8")
+    destination.chmod(0o600)
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="already exists",
+    ):
+        cutover._write_exclusive_private_json(
+            destination,
+            {"expected": True},
+            label="adoption identity",
+        )
+
+    assert destination.read_text(encoding="utf-8") == '{"unrelated":true}'
+    assert list(tmp_path.glob("*.adoption-tmp")) == []
 
 
 def test_last_good_split_attester_never_writes_selector_service_or_journal(
