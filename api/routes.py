@@ -15362,34 +15362,18 @@ def handle_get(handler, parsed) -> bool:
     # ── Plugin shared assets (e.g. /plugins/plugin.css) ──
     # Restricted to shared plugin assets only — no cross-plugin file access.
     if parsed.path.startswith("/plugins/"):
-        from api.plugins import _get_plugin_base
-        plugin_base = _get_plugin_base()
+        from api.plugins import serve_plugin_shared_static
         rel = parsed.path[len("/plugins/"):]
-        allowed = {"plugin.css"}
-        if rel not in allowed:
-            return False  # 404
-        safe = (plugin_base / rel).resolve()
-        try:
-            safe.relative_to(plugin_base.resolve())
-        except ValueError:
-            return False  # path traversal — 404
-        if safe.is_file():
-            import os as _os
-            data = safe.read_bytes()
-            ext = _os.path.splitext(rel.lower())[1]
-            ct = {
-                ".css": "text/css; charset=utf-8",
-                ".js": "application/javascript; charset=utf-8",
-                ".json": "application/json; charset=utf-8",
-                ".png": "image/png",
-                ".svg": "image/svg+xml",
-            }.get(ext, "application/octet-stream")
+        result = serve_plugin_shared_static(rel)
+        if result:
+            data, content_type = result
             handler.send_response(200)
-            handler.send_header("Content-Type", ct)
+            handler.send_header("Content-Type", content_type)
             handler.send_header("Content-Length", str(len(data)))
             handler.end_headers()
             handler.wfile.write(data)
             return True
+        return False
 
     # ── Plugin static assets ──
     if parsed.path.startswith("/dashboard-plugins/"):
@@ -15420,32 +15404,20 @@ def handle_get(handler, parsed) -> bool:
                 return True
 
     # ── Plugin pages (HTML shell) ──
-    from api.plugins import PLUGIN_MANIFESTS, _PLUGIN_STATIC_ROOTS
-    for name, manifest in PLUGIN_MANIFESTS.items():
+    from api.plugins import get_plugin_page_material, get_plugin_runtime_snapshot
+    plugin_runtime = get_plugin_runtime_snapshot()
+    for name, manifest in plugin_runtime.manifests.items():
         tab = manifest.get("tab", {})
         tab_path = tab.get("path", f"/{name}")
         if parsed.path == tab_path:
             # Server-side enable-gate (opt-in): a disabled plugin's page 404s.
             if not _dashboard_plugin_enabled(name):
                 return False
-            dashboard_dir = _PLUGIN_STATIC_ROOTS.get(name)
-            if dashboard_dir:
-                # 1) dashboard/dist/index.html (full SPA build)
-                index_html = dashboard_dir / "dist" / "index.html"
-                if index_html.is_file():
-                    data = index_html.read_bytes()
-                    handler.send_response(200)
-                    handler.send_header("Content-Type", "text/html; charset=utf-8")
-                    handler.send_header("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups")
-                    handler.send_header("Content-Length", str(len(data)))
-                    handler.end_headers()
-                    handler.wfile.write(data)
-                    return True
-                # 2) static/index.html in plugin root (content page for IIFE loader)
-                plugin_root = dashboard_dir.parent
-                static_html = plugin_root / "static" / "index.html"
-                if static_html.is_file():
-                    data = static_html.read_bytes()
+            page_material = get_plugin_page_material(name, plugin_runtime)
+            if page_material:
+                # 1/2) validated full SPA or static content page
+                if page_material.html is not None:
+                    data = page_material.html
                     handler.send_response(200)
                     handler.send_header("Content-Type", "text/html; charset=utf-8")
                     handler.send_header("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups")
@@ -15454,8 +15426,7 @@ def handle_get(handler, parsed) -> bool:
                     handler.wfile.write(data)
                     return True
                 # 3) Fallback: generate shell that loads the IIFE bundle
-                index_js = dashboard_dir / "dist" / "index.js"
-                if index_js.is_file():
+                if page_material.has_index_js:
                     import html
                     label = html.escape(manifest.get("label") or name)
                     css = html.escape(manifest.get("css", ""))
