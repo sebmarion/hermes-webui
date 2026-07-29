@@ -156,3 +156,61 @@ def test_retention_requires_split_attestation_before_gateway_binding():
         retention.TRANSACTION_PHASE_PREREQUISITES,
         label="managed journal",
     )["gateway_last_good_attested"] == gateway_receipt
+
+
+def test_retention_mirrors_bootstrap_rollback_claim_exclusion():
+    assert (
+        retention.TRANSACTION_PHASE_PREREQUISITES[
+            "bootstrap_rollback_claimed"
+        ]
+        == ()
+    )
+    with pytest.raises(retention.CleanupError, match="conflicting"):
+        retention.validate_phase_graph(
+            {
+                "pair_commit_intent": {},
+                "bootstrap_rollback_claimed": {},
+            },
+            {
+                "pair_commit_intent": (),
+                "bootstrap_rollback_claimed": (),
+            },
+            label="managed journal",
+        )
+
+
+def test_retention_accepts_verified_bootstrap_rollback_with_exact_claim(
+    monkeypatch,
+):
+    rollback_receipt = {
+        "build_id": "last-good",
+        "plist_sha256": "a" * 64,
+        "plist_mode": 0o600,
+        "cli_link_target": "/previous/hermes",
+        "state_snapshot_id": "snapshot-1",
+        "state_snapshot_sha256": "b" * 64,
+    }
+    monkeypatch.setattr(
+        retention,
+        "bootstrap_terminal_kind",
+        lambda _phases: "verified-bootstrap-rollback",
+    )
+    monkeypatch.setattr(
+        retention,
+        "managed_terminal_kind",
+        lambda _phases, _receipt: None,
+    )
+
+    terminal = retention.combined_terminal_kind(
+        bootstrap_phases={"rollback_verified": {}},
+        managed_phases={
+            "bootstrap_rollback_claimed": {
+                "rollback_receipt": rollback_receipt,
+            }
+        },
+        rollback_receipt=rollback_receipt,
+    )
+
+    assert terminal == (
+        "verified-bootstrap-rollback+bootstrap-rollback-claimed"
+    )

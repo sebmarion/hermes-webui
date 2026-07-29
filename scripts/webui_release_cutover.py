@@ -109,6 +109,10 @@ class ReleaseBuildError(RuntimeError):
     """The committed source cannot be materialized as an immutable release."""
 
 
+class BootstrapSplitProvenanceMismatch(ReleaseBuildError):
+    """Durable rollback provenance no longer matches its live origin."""
+
+
 class ListenerAbsent(DrainIdentityMismatch):
     """No process currently owns the probed listener."""
 
@@ -750,6 +754,7 @@ def _fsync_directory(path: Path) -> None:
 
 
 _TRANSACTION_PHASE_PREREQUISITES = {
+    "bootstrap_rollback_claimed": (),
     "staged": (),
     "plist_installed": ("staged",),
     "old_fenced": ("plist_installed",),
@@ -925,6 +930,46 @@ def _validated_transaction_journal(raw: object, transaction_id: str) -> dict:
             for prerequisite in _TRANSACTION_PHASE_PREREQUISITES[phase]
         ):
             raise ReleaseBuildError("transaction journal phase order is invalid")
+    rollback_claim = phases.get("bootstrap_rollback_claimed")
+    rollback_plist_mode = rollback_receipt.get("plist_mode")
+    if rollback_claim is not None and (
+        set(rollback_claim)
+        != {
+            "schema",
+            "bootstrap_transaction_id",
+            "split_provenance_sha256",
+            "split_evidence_sha256",
+            "rollback_receipt",
+        }
+        or rollback_claim.get("schema")
+        != "hermes.bootstrap_rollback_claim.v1"
+        or rollback_claim.get("bootstrap_transaction_id") != transaction_id
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(rollback_claim.get("split_provenance_sha256") or ""),
+        )
+        or not re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(rollback_claim.get("split_evidence_sha256") or ""),
+        )
+        or rollback_claim.get("rollback_receipt") != rollback_receipt
+        or isinstance(rollback_plist_mode, bool)
+        or not isinstance(rollback_plist_mode, int)
+        or rollback_plist_mode <= 0
+        or rollback_plist_mode != stat.S_IMODE(rollback_plist_mode)
+        or not str(rollback_receipt.get("cli_link_target") or "").strip()
+    ):
+        raise ReleaseBuildError(
+            "bootstrap rollback claim receipt is invalid"
+        )
+    if {
+        "pair_commit_intent",
+        "bootstrap_rollback_claimed",
+    } <= set(phases):
+        raise ReleaseBuildError(
+            "transaction journal has conflicting pair commit and "
+            "bootstrap rollback claim phases"
+        )
     return {
         "version": 1,
         "transaction_id": transaction_id,
@@ -1050,14 +1095,69 @@ def record_transaction_phase(
     phase: str,
     receipt: dict,
     crash_at: str | None = None,
+    initialize_if_absent: dict | None = None,
 ) -> dict:
     if phase not in _TRANSACTION_PHASE_PREREQUISITES:
         raise ReleaseBuildError("transaction journal phase is invalid")
     if not isinstance(receipt, dict) or _journal_contains_sensitive_value(receipt):
         raise ReleaseBuildError("transaction journal receipt contains sensitive data")
+    proposed = None
+    if initialize_if_absent is not None:
+        if (
+            not isinstance(initialize_if_absent, dict)
+            or set(initialize_if_absent)
+            != {"expected_candidate_identity", "rollback_receipt"}
+        ):
+            raise ReleaseBuildError(
+                "transaction journal initialization receipt is invalid"
+            )
+        proposed = _validated_transaction_journal(
+            {
+                "version": 1,
+                "transaction_id": transaction_id,
+                "expected_candidate_identity": copy.deepcopy(
+                    initialize_if_absent["expected_candidate_identity"]
+                ),
+                "rollback_receipt": copy.deepcopy(
+                    initialize_if_absent["rollback_receipt"]
+                ),
+                "phases": {},
+            },
+            transaction_id,
+        )
     journal_path, lock_path = _transaction_journal_paths(path)
     with _with_transaction_journal_lock(lock_path):
-        current = _read_transaction_journal_unlocked(journal_path, transaction_id)
+        if journal_path.exists():
+            current = _read_transaction_journal_unlocked(
+                journal_path,
+                transaction_id,
+            )
+            if proposed is not None and any(
+                current[key] != proposed[key]
+                for key in (
+                    "expected_candidate_identity",
+                    "rollback_receipt",
+                )
+            ):
+                raise ReleaseBuildError(
+                    "transaction journal already has another identity"
+                )
+        elif proposed is not None:
+            current = proposed
+        else:
+            current = _read_transaction_journal_unlocked(
+                journal_path,
+                transaction_id,
+            )
+        conflicting_phase = {
+            "pair_commit_intent": "bootstrap_rollback_claimed",
+            "bootstrap_rollback_claimed": "pair_commit_intent",
+        }.get(phase)
+        if conflicting_phase in current["phases"]:
+            raise ReleaseBuildError(
+                f"transaction phase {phase} conflicts with "
+                f"{conflicting_phase}"
+            )
         existing = current["phases"].get(phase)
         if existing is not None:
             if existing != receipt:
@@ -1075,6 +1175,7 @@ def record_transaction_phase(
                 "transaction phase prerequisites are missing: " + ", ".join(missing)
             )
         current["phases"][phase] = copy.deepcopy(receipt)
+        current = _validated_transaction_journal(current, transaction_id)
         _atomic_write_transaction_journal(
             journal_path,
             current,
@@ -6714,6 +6815,88 @@ def _canonical_journal_value_sha256(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+_BOOTSTRAP_SPLIT_PROVENANCE_PLAN_KEYS = {
+    "last_good_identity",
+    "last_good_gateway_identity",
+    "last_good_origin_journal",
+    "last_good_origin_journal_sha256",
+    "last_good_gateway_origin_journal",
+    "last_good_gateway_origin_journal_sha256",
+    "transaction_journal",
+    "selector_path",
+}
+
+
+def _bootstrap_split_provenance_receipt(
+    plan: dict,
+    last_good_origin_attestation: MappingProxyType,
+) -> dict:
+    evidence = _journal_copy_of_immutable_evidence(
+        last_good_origin_attestation
+    )
+    webui_identity = evidence.get("webui", {}).get("identity")
+    gateway_identity = evidence.get("gateway", {}).get("identity")
+    if not isinstance(webui_identity, dict) or not isinstance(
+        gateway_identity,
+        dict,
+    ):
+        raise ReleaseBuildError("bootstrap split provenance evidence is invalid")
+    return {
+        "schema": "hermes.bootstrap_split_provenance.v1",
+        "webui": {
+            "identity": copy.deepcopy(webui_identity),
+            "origin_transaction_id": webui_identity.get(
+                "startup_transaction_id"
+            ),
+            "origin_journal_sha256": plan[
+                "last_good_origin_journal_sha256"
+            ],
+        },
+        "gateway": {
+            "identity": copy.deepcopy(gateway_identity),
+            "origin_transaction_id": gateway_identity.get(
+                "startup_transaction_id"
+            ),
+            "origin_journal_sha256": plan[
+                "last_good_gateway_origin_journal_sha256"
+            ],
+        },
+        "split_evidence": evidence,
+        "split_evidence_sha256": _canonical_journal_value_sha256(evidence),
+    }
+
+
+def _validate_bootstrap_split_provenance(
+    plan: dict,
+    prepared: object,
+) -> dict:
+    try:
+        if not isinstance(prepared, dict):
+            raise ReleaseBuildError(
+                "prepared receipt is invalid"
+            )
+        durable = prepared.get("last_good_split_provenance")
+        if not isinstance(durable, dict):
+            raise ReleaseBuildError("receipt is missing")
+        attested = _preflight_last_good_identity_split(plan)
+        expected = _bootstrap_split_provenance_receipt(plan, attested)
+        if durable != expected:
+            raise DrainIdentityMismatch("receipt changed")
+        return copy.deepcopy(expected)
+    except BootstrapSplitProvenanceMismatch:
+        raise
+    except (
+        DrainIdentityMismatch,
+        ReleaseBuildError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise BootstrapSplitProvenanceMismatch(
+            f"bootstrap split provenance mismatch: {exc}"
+        ) from exc
+
+
 def _ensure_last_good_split_attested(
     plan: dict, journal: dict, *, last_good_origin_attestation: MappingProxyType
 ) -> dict:
@@ -9990,6 +10173,7 @@ def _watchdog_cron_restore_intent_receipt(
 
 
 def _prepared_bootstrap_receipt(plan: dict) -> dict:
+    split_attestation = _preflight_last_good_identity_split(plan)
     cli_link = Path(plan["cli_link"])
     if not cli_link.is_symlink():
         raise ReleaseBuildError("bootstrap Hermes CLI prior entry is not a symlink")
@@ -10034,6 +10218,12 @@ def _prepared_bootstrap_receipt(plan: dict) -> dict:
         "watchdog_candidate": watchdog_candidate,
         "watchdog_cron": _backup_crontab(plan),
         "pre_managed_controls": _capture_pre_managed_control_state(plan),
+        "last_good_split_provenance": (
+            _bootstrap_split_provenance_receipt(
+                plan,
+                split_attestation,
+            )
+        ),
     }
     if _watchdog_scheduler_backend(plan) == "hermes_internal":
         prepared["watchdog_cron"]["drain_intent"] = (
@@ -17877,6 +18067,8 @@ def _attest_restored_legacy_binding(
     prepared: dict,
     gateway: bool,
 ) -> dict:
+    if _BOOTSTRAP_SPLIT_PROVENANCE_PLAN_KEYS.issubset(plan):
+        _validate_bootstrap_split_provenance(plan, prepared)
     expected = prepared["gateway" if gateway else "legacy"]
     actual = _listener_process_receipt(
         plan,
@@ -17990,6 +18182,8 @@ def _restart_or_adopt_restored_legacy_pair(
             prepared=prepared,
             gateway=False,
         )
+    except BootstrapSplitProvenanceMismatch:
+        raise
     except (DrainIdentityMismatch, ReleaseBuildError):
         _bootout_job(plan, gateway=True, required=False)
         gateway_started = _bootstrap_job(
@@ -18175,23 +18369,105 @@ def _stop_bootstrap_pair_for_rollback(
     }
 
 
+def _claim_bootstrap_rollback(plan: dict, journal: dict) -> dict:
+    phases = journal.get("phases") if isinstance(journal, dict) else None
+    if not isinstance(phases, dict):
+        raise ReleaseBuildError("bootstrap rollback journal phases are invalid")
+    prepared = phases.get("prepared")
+    snapshot = phases.get("snapshot_created")
+    if not isinstance(prepared, dict) or not isinstance(snapshot, dict):
+        raise ReleaseBuildError(
+            "bootstrap rollback claim requires prepared split and snapshot"
+        )
+    provenance = prepared.get("last_good_split_provenance")
+    webui = provenance.get("webui") if isinstance(provenance, dict) else None
+    identity = webui.get("identity") if isinstance(webui, dict) else None
+    webui_plist = prepared.get("webui_plist")
+    plist_mode = (
+        webui_plist.get("resolved_mode")
+        if isinstance(webui_plist, dict)
+        else None
+    )
+    if (
+        isinstance(plist_mode, bool)
+        or not isinstance(plist_mode, int)
+        or plist_mode <= 0
+        or plist_mode != stat.S_IMODE(plist_mode)
+    ):
+        raise ReleaseBuildError(
+            "bootstrap rollback claim WebUI plist mode is invalid"
+        )
+    legacy = prepared.get("legacy")
+    legacy_cli = legacy.get("cli") if isinstance(legacy, dict) else None
+    cli_link_target = (
+        legacy_cli.get("link_target")
+        if isinstance(legacy_cli, dict)
+        else None
+    )
+    planned_cli_link_target = plan.get("cli_old_target")
+    if (
+        not isinstance(cli_link_target, str)
+        or not cli_link_target
+        or not isinstance(planned_cli_link_target, str)
+        or not planned_cli_link_target
+        or cli_link_target != planned_cli_link_target
+    ):
+        raise ReleaseBuildError(
+            "bootstrap rollback claim CLI link target is invalid"
+        )
+    rollback_receipt = {
+        "build_id": (
+            identity.get("build_id") if isinstance(identity, dict) else None
+        ),
+        "plist_sha256": (
+            webui_plist.get("sha256")
+            if isinstance(webui_plist, dict)
+            else None
+        ),
+        "plist_mode": plist_mode,
+        "cli_link_target": cli_link_target,
+        "state_snapshot_id": snapshot.get("state_snapshot_id"),
+        "state_snapshot_sha256": snapshot.get(
+            "state_snapshot_sha256"
+        ),
+    }
+    if not isinstance(provenance, dict):
+        raise ReleaseBuildError(
+            "bootstrap rollback claim split provenance is invalid"
+        )
+    claim = {
+        "schema": "hermes.bootstrap_rollback_claim.v1",
+        "bootstrap_transaction_id": plan["transaction_id"],
+        "split_provenance_sha256": _canonical_journal_value_sha256(
+            provenance
+        ),
+        "split_evidence_sha256": provenance.get(
+            "split_evidence_sha256"
+        ),
+        "rollback_receipt": copy.deepcopy(rollback_receipt),
+    }
+    return record_transaction_phase(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+        phase="bootstrap_rollback_claimed",
+        receipt=claim,
+        initialize_if_absent={
+            "expected_candidate_identity": copy.deepcopy(
+                plan["expected_candidate_identity"]
+            ),
+            "rollback_receipt": rollback_receipt,
+        },
+    )
+
+
 def _resume_bootstrap_rollback(plan: dict, journal: dict) -> dict:
     phases = journal["phases"]
+    _claim_bootstrap_rollback(plan, journal)
     prepared = _upgrade_internal_watchdog_prepared_receipt(
         plan,
         phases["prepared"],
     )
-    try:
-        cutover = read_transaction_journal(
-            plan["transaction_journal"],
-            transaction_id=plan["transaction_id"],
-        )
-    except ReleaseBuildError:
-        cutover = {"phases": {}}
-    if "pair_commit_intent" in cutover["phases"]:
-        raise ReleaseBuildError(
-            "snapshot rollback is forbidden after durable pair commit intent"
-        )
+    _validate_bootstrap_split_provenance(plan, prepared)
     if "rollback_gateway_stop_intent" not in phases:
         journal = _record_bootstrap_phase(
             plan,
@@ -18487,15 +18763,7 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
         prepared = _prepared_bootstrap_receipt(plan)
         journal = _record_bootstrap_phase(plan, "prepared", prepared)
     phases = journal["phases"]
-    cutover_pair_committed = False
-    try:
-        cutover_pair_committed = "pair_commit_intent" in read_transaction_journal(
-            plan["transaction_journal"],
-            transaction_id=plan["transaction_id"],
-        )["phases"]
-    except ReleaseBuildError:
-        cutover_pair_committed = False
-    if "rollback_started" in phases and not cutover_pair_committed:
+    if "rollback_started" in phases:
         rolled_back = _resume_bootstrap_rollback(plan, journal)
         return {
             "status": "rolled-back",
@@ -19570,19 +19838,6 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
     except Exception as original:
         bootstrap_now = _read_bootstrap_journal(plan)
         bootstrap_phases = bootstrap_now["phases"]
-        try:
-            durable_cutover = read_transaction_journal(
-                plan["transaction_journal"],
-                transaction_id=plan["transaction_id"],
-            )
-        except ReleaseBuildError:
-            durable_cutover = {"phases": {}}
-        if "pair_commit_intent" in durable_cutover["phases"]:
-            raise ReleaseBuildError(
-                "bootstrap crossed the durable pair-commit boundary; "
-                "snapshot rollback is forbidden and the same transaction "
-                "must be rerun to roll forward"
-            ) from original
         if _can_restore_legacy_before_snapshot_abort(bootstrap_phases):
             try:
                 abort_receipt = _restore_legacy_before_snapshot_abort(

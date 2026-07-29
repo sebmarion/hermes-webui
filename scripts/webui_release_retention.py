@@ -35,6 +35,7 @@ RETAIN_TERMINAL_COUNT = 1
 
 
 TRANSACTION_PHASE_PREREQUISITES: dict[str, tuple[str, ...]] = {
+    "bootstrap_rollback_claimed": (),
     "staged": (),
     "plist_installed": ("staged",),
     "old_fenced": ("plist_installed",),
@@ -567,6 +568,14 @@ def validate_phase_graph(
                 f"{label} phase prerequisites are missing for {phase}: "
                 + ",".join(missing)
             )
+    if {
+        "pair_commit_intent",
+        "bootstrap_rollback_claimed",
+    } <= set(validated):
+        raise CleanupError(
+            f"{label} has conflicting pair commit and bootstrap rollback "
+            "claim phases"
+        )
     return validated
 
 
@@ -716,6 +725,19 @@ def combined_terminal_kind(
         else None
     )
     if bootstrap_phases is not None and managed_phases is not None:
+        if (
+            bootstrap_kind == "verified-bootstrap-rollback"
+            and managed_kind is None
+            and set(managed_phases) == {"bootstrap_rollback_claimed"}
+            and managed_phases["bootstrap_rollback_claimed"].get(
+                "rollback_receipt"
+            )
+            == rollback_receipt
+        ):
+            return (
+                "verified-bootstrap-rollback"
+                "+bootstrap-rollback-claimed"
+            )
         if bootstrap_kind is None or managed_kind is None:
             return None
         return f"{bootstrap_kind}+{managed_kind}"
@@ -753,8 +775,43 @@ def validate_managed_journal(
         )
     ):
         raise CleanupError(f"transaction rollback receipt is invalid: {path}")
+    phases = journal.get("phases")
+    claim = (
+        phases.get("bootstrap_rollback_claimed")
+        if isinstance(phases, dict)
+        else None
+    )
+    receipt_plist_mode = receipt.get("plist_mode")
+    if claim is not None and (
+        set(claim)
+        != {
+            "schema",
+            "bootstrap_transaction_id",
+            "split_provenance_sha256",
+            "split_evidence_sha256",
+            "rollback_receipt",
+        }
+        or claim.get("schema") != "hermes.bootstrap_rollback_claim.v1"
+        or claim.get("bootstrap_transaction_id")
+        != journal["transaction_id"]
+        or not HEX64.fullmatch(
+            str(claim.get("split_provenance_sha256") or "")
+        )
+        or not HEX64.fullmatch(
+            str(claim.get("split_evidence_sha256") or "")
+        )
+        or claim.get("rollback_receipt") != receipt
+        or isinstance(receipt_plist_mode, bool)
+        or not isinstance(receipt_plist_mode, int)
+        or receipt_plist_mode <= 0
+        or receipt_plist_mode != stat.S_IMODE(receipt_plist_mode)
+        or not str(receipt.get("cli_link_target") or "").strip()
+    ):
+        raise CleanupError(
+            f"bootstrap rollback claim receipt is invalid: {path}"
+        )
     validate_phase_graph(
-        journal.get("phases"),
+        phases,
         TRANSACTION_PHASE_PREREQUISITES,
         label=f"managed journal {path.name}",
     )

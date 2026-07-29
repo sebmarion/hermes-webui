@@ -13688,6 +13688,1101 @@ def test_restart_or_adopt_restored_legacy_pair_adopts_exact_running_pair(
     }
 
 
+def _bootstrap_split_provenance_fixture(
+    tmp_path: Path,
+) -> tuple[dict, dict, dict]:
+    plan, webui, gateway = _last_good_split_plan(tmp_path)
+    plan["expected_candidate_identity"] = json.loads(
+        (
+            Path(plan["transaction_journal"]).parent / "candidate.json"
+        ).read_text(encoding="utf-8")
+    )
+    plan.update(
+        {
+            "last_good_identity": copy.deepcopy(webui),
+            "last_good_gateway_identity": copy.deepcopy(gateway),
+            "timeout_seconds": 0.1,
+            "interval_seconds": 0,
+            "watchdog_installed_script": str(
+                Path(plan["transaction_journal"]).parent / "watchdog.py"
+            ),
+            "watchdog_rollback_script": str(
+                Path(plan["transaction_journal"]).parent
+                / "watchdog.rollback.py"
+            ),
+            "gateway_installed_plist": str(
+                Path(plan["transaction_journal"]).parent
+                / "gateway.installed.plist"
+            ),
+            "gateway_rollback_plist": str(
+                Path(plan["transaction_journal"]).parent
+                / "gateway.rollback.plist"
+            ),
+        }
+    )
+    evidence = {
+        "webui": {"identity": copy.deepcopy(webui)},
+        "gateway": {"identity": copy.deepcopy(gateway)},
+    }
+    legacy = {
+        "pid": 51,
+        "pid_start_token": "restored-webui-start",
+        "command": "legacy-webui",
+        "comm": "python",
+        "program_arguments": ["/legacy/python", "/legacy/webui.py"],
+        "program_identity": {"sha256": "1" * 64},
+        "cwd": "/legacy/webui",
+        "source": {"commit": webui["commit"], "tree": webui["tree"]},
+        "routing_environment": {"HERMES_WEBUI_PORT": "8787"},
+        "cli": {
+            "sha256": "2" * 64,
+            "link_target": plan["cli_old_target"],
+        },
+    }
+    legacy_gateway = {
+        "pid": 52,
+        "pid_start_token": "restored-gateway-start",
+        "command": "legacy-gateway",
+        "comm": "python",
+        "program_arguments": ["/legacy/hermes", "gateway", "run"],
+        "program_identity": {"sha256": "3" * 64},
+        "cwd": "/legacy/gateway-workspace",
+    }
+    prepared = {
+        "legacy": legacy,
+        "gateway": legacy_gateway,
+        "webui_plist": {
+            "sha256": "6" * 64,
+            "resolved_mode": 0o600,
+        },
+        "gateway_plist": {"sha256": "7" * 64},
+        "watchdog": {"sha256": "8" * 64},
+        "watchdog_cron": {"crontab_sha256": "4" * 64},
+        "pre_managed_controls": {"status": "captured"},
+        "last_good_split_provenance": {
+            "schema": "hermes.bootstrap_split_provenance.v1",
+            "webui": {
+                "identity": copy.deepcopy(webui),
+                "origin_transaction_id": webui["startup_transaction_id"],
+                "origin_journal_sha256": plan[
+                    "last_good_origin_journal_sha256"
+                ],
+            },
+            "gateway": {
+                "identity": copy.deepcopy(gateway),
+                "origin_transaction_id": gateway["startup_transaction_id"],
+                "origin_journal_sha256": plan[
+                    "last_good_gateway_origin_journal_sha256"
+                ],
+            },
+            "split_evidence": evidence,
+            "split_evidence_sha256": _canonical_test_value_sha256(evidence),
+        },
+    }
+    return plan, prepared, evidence
+
+
+def _write_bootstrap_rollback_resume_journal(plan: dict, prepared: dict) -> None:
+    phases = {}
+    for phase in cutover._BOOTSTRAP_PHASE_PREREQUISITES:
+        if phase == "prepared":
+            phases[phase] = copy.deepcopy(prepared)
+        elif phase in {
+            "aborted_before_cutover",
+            "synthetic_state_quarantine_intent",
+            "synthetic_state_quarantined",
+            "ingress_gate_stopped",
+            "managed_pair_start_intent",
+            "legacy_dispatcher_lock_released",
+            "managed_pair_started",
+            "cutover_handed_off",
+            "watchdog_installed",
+            "watchdog_reconciled_once",
+            "watchdog_reconciled_twice",
+            "legacy_gateway_drain_cleared",
+            "candidate_pair_accepted",
+            "cli_candidate_activate_intent",
+            "cli_candidate_activated",
+            "watchdog_cron_restored",
+            "complete",
+        }:
+            continue
+        elif phase == "snapshot_created":
+            phases[phase] = {
+                "state_snapshot_id": "split-rollback-snapshot-0001",
+                "state_snapshot_sha256": "9" * 64,
+            }
+        else:
+            phases[phase] = {}
+        if phase == "rollback_synthetic_store_modes_restored":
+            break
+    path = cutover._bootstrap_journal_path(plan)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "transaction_id": plan["transaction_id"],
+                "phases": phases,
+            }
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
+def _write_early_bootstrap_rollback_journal(
+    plan: dict,
+    prepared: dict,
+) -> None:
+    phases = {}
+    snapshot_recorded = False
+    for phase in cutover._BOOTSTRAP_PHASE_PREREQUISITES:
+        if phase == "prepared":
+            phases[phase] = copy.deepcopy(prepared)
+        elif phase == "snapshot_created":
+            phases[phase] = {
+                "state_snapshot_id": "split-rollback-snapshot-0001",
+                "state_snapshot_sha256": "9" * 64,
+            }
+            snapshot_recorded = True
+        elif phase == "aborted_before_cutover":
+            continue
+        elif phase == "rollback_started":
+            phases[phase] = {"error_type": "ReleaseBuildError"}
+            break
+        elif snapshot_recorded:
+            continue
+        else:
+            phases[phase] = {}
+    path = cutover._bootstrap_journal_path(plan)
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "transaction_id": plan["transaction_id"],
+                "phases": phases,
+            }
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+
+def _install_bootstrap_split_rollback_fakes(
+    plan: dict,
+    prepared: dict,
+    monkeypatch,
+) -> list[str]:
+    attested_builds = []
+
+    def attest_identity(identity, **_kwargs):
+        attested_builds.append(identity["build_id"])
+        return identity
+
+    monkeypatch.setattr(
+        cutover,
+        "_attest_expected_release_identity",
+        attest_identity,
+    )
+    monkeypatch.setattr(cutover, "_require_bootstrap_extensions", lambda _plan: None)
+    monkeypatch.setattr(
+        cutover,
+        "_upgrade_internal_watchdog_prepared_receipt",
+        lambda _plan, receipt: copy.deepcopy(receipt),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_verify_legacy_dispatcher_lock",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_wait_for_legacy_kanban_quiescence",
+        lambda _plan: {"status": "quiescent"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_listener_process_receipt",
+        lambda _plan, *, gateway, require_git_source: {
+            **copy.deepcopy(prepared["gateway" if gateway else "legacy"]),
+            "pid": 52 if gateway else 51,
+            "pid_start_token": (
+                "restored-gateway-start"
+                if gateway
+                else "restored-webui-start"
+            ),
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_gateway_health_receipt",
+        lambda _plan: {"status": "ok"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_http_json",
+        lambda *_args, **_kwargs: {"status": "ok"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_watchdog_cron",
+        lambda _plan, receipt: copy.deepcopy(receipt["watchdog_cron"]),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_cron_receipt_matches_prepared",
+        lambda receipt, expected: (
+            receipt == expected["watchdog_cron"]
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_cron_watchdog_receipt",
+        lambda _plan: copy.deepcopy(prepared["watchdog_cron"]),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_file_identity_receipt",
+        lambda path: (
+            copy.deepcopy(prepared["legacy"]["cli"])
+            if str(path) == plan["cli_link"]
+            else {"sha256": "5" * 64}
+        ),
+    )
+    return attested_builds
+
+
+def _install_early_bootstrap_restoration_fakes(
+    plan: dict,
+    prepared: dict,
+    monkeypatch,
+) -> tuple[list[str], list[tuple]]:
+    attested_builds = _install_bootstrap_split_rollback_fakes(
+        plan,
+        prepared,
+        monkeypatch,
+    )
+    restoration_events = []
+    monkeypatch.setattr(
+        cutover,
+        "_rollback_gateway_stop_intent",
+        lambda *_args, **_kwargs: restoration_events.append(
+            ("gateway-stop-intent",)
+        )
+        or {"status": "not-running"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_stop_ingress_gate",
+        lambda _plan, receipt: restoration_events.append(
+            ("ingress-gate-stop", copy.deepcopy(receipt))
+        )
+        or {"status": "stopped"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_stop_bootstrap_pair_for_rollback",
+        lambda _plan, _journal, intent: restoration_events.append(
+            ("services-stop", copy.deepcopy(intent))
+        )
+        or {"status": "stopped"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_release_legacy_cron_tick_lock",
+        lambda _plan: restoration_events.append(("cron-tick-release",))
+        or {"status": "released"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_acquire_legacy_dispatcher_lock",
+        lambda _plan: restoration_events.append(("dispatcher-acquire",))
+        or {"status": "held"},
+    )
+
+    def restore_state(path, *, expected_snapshot_id, expected_manifest_sha256):
+        restoration_events.append(
+            (
+                "state-restore",
+                str(path),
+                expected_snapshot_id,
+                expected_manifest_sha256,
+            )
+        )
+        return {"status": "restored", "snapshot_id": expected_snapshot_id}
+
+    monkeypatch.setattr(
+        cutover,
+        "restore_state_snapshot_from_manifest",
+        restore_state,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_synthetic_quarantine_intent_receipt",
+        lambda _plan: {"status": "prepared"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_quarantine_synthetic_completion_stores",
+        lambda _plan, intent, *, state_restore: restoration_events.append(
+            (
+                "synthetic-requarantine",
+                copy.deepcopy(intent),
+                copy.deepcopy(state_restore),
+            )
+        )
+        or {"status": "quarantined"},
+    )
+
+    def restore_backup(backup, destination, receipt):
+        restoration_events.append(
+            (
+                "artifact-restore",
+                str(backup),
+                str(destination),
+                copy.deepcopy(receipt),
+            )
+        )
+        return {"status": "restored", "sha256": receipt["sha256"]}
+
+    monkeypatch.setattr(cutover, "_restore_exact_backup", restore_backup)
+    monkeypatch.setattr(
+        cutover,
+        "_restore_pre_managed_control_state",
+        lambda _plan, captured, staged: restoration_events.append(
+            (
+                "controls-restore",
+                copy.deepcopy(captured),
+                copy.deepcopy(staged),
+            )
+        )
+        or {"status": "restored"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_bootstrap_cli_link",
+        lambda _plan, receipt, phases: restoration_events.append(
+            (
+                "cli-restore",
+                copy.deepcopy(receipt["last_good_split_provenance"]),
+                sorted(phases),
+            )
+        )
+        or copy.deepcopy(receipt["legacy"]["cli"]),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_disabled_watchdog_cron",
+        lambda _plan, _prepared: {"status": "disabled"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_clear_legacy_gateway_drain_marker",
+        lambda _plan, intent: restoration_events.append(
+            ("gateway-drain-clear", copy.deepcopy(intent))
+        )
+        or {"status": "cleared"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_release_legacy_dispatcher_lock",
+        lambda _plan: restoration_events.append(("dispatcher-release",))
+        or {"status": "released"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_legacy_cron_tick_lock",
+        lambda _plan, intent, normalized, *, state_restore: (
+            restoration_events.append(
+                (
+                    "cron-tick-restore",
+                    copy.deepcopy(intent),
+                    copy.deepcopy(normalized),
+                    copy.deepcopy(state_restore),
+                )
+            )
+            or {"status": "restored"}
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restore_synthetic_completion_store_modes",
+        lambda _plan, intent, normalized, *, quarantined: (
+            restoration_events.append(
+                (
+                    "synthetic-modes-restore",
+                    copy.deepcopy(intent),
+                    copy.deepcopy(normalized),
+                    copy.deepcopy(quarantined),
+                )
+            )
+            or {"status": "restored"}
+        ),
+    )
+    original_restore_cron = cutover._restore_watchdog_cron
+    monkeypatch.setattr(
+        cutover,
+        "_restore_watchdog_cron",
+        lambda actual_plan, receipt: restoration_events.append(
+            ("watchdog-cron-restore", copy.deepcopy(receipt["watchdog_cron"]))
+        )
+        or original_restore_cron(actual_plan, receipt),
+    )
+    return attested_builds, restoration_events
+
+
+def test_prepared_bootstrap_receipt_binds_canonical_split_provenance(
+    tmp_path,
+    monkeypatch,
+):
+    plan, webui, gateway = _last_good_split_plan(tmp_path)
+    root = Path(plan["transaction_journal"]).parent
+    cli_link = Path(plan["cli_link"])
+    cli_link.symlink_to(plan["cli_old_target"])
+    plan.update(
+        {
+            "last_good_identity": webui,
+            "last_good_gateway_identity": gateway,
+            "watchdog_candidate_script": str(root / "watchdog-candidate.py"),
+            "watchdog_expected_sha256": "a" * 64,
+            "gateway_installed_plist": str(root / "gateway-installed.plist"),
+            "gateway_rollback_plist": str(root / "gateway-rollback.plist"),
+            "watchdog_installed_script": str(root / "watchdog-installed.py"),
+            "watchdog_rollback_script": str(root / "watchdog-rollback.py"),
+        }
+    )
+    evidence = MappingProxyType(
+        {
+            "webui": MappingProxyType(
+                {"identity": MappingProxyType(copy.deepcopy(webui))}
+            ),
+            "gateway": MappingProxyType(
+                {"identity": MappingProxyType(copy.deepcopy(gateway))}
+            ),
+        }
+    )
+    legacy = {
+        "program_arguments": [
+            plan["expected_old_interpreter"],
+            plan["expected_old_target"],
+        ]
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_preflight_last_good_identity_split",
+        lambda actual: evidence
+        if actual is plan
+        else pytest.fail("wrong plan"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_idle_health",
+        lambda _plan: {"status": "idle"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_process_receipt",
+        lambda _plan: copy.deepcopy(legacy),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_listener_process_receipt",
+        lambda *_args, **_kwargs: {"status": "gateway"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_file_identity_receipt",
+        lambda _path: {"sha256": "a" * 64},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_copy_exact_backup",
+        lambda source, destination: {
+            "source": str(source),
+            "destination": str(destination),
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_backup_crontab",
+        lambda _plan: {"status": "backed-up"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_capture_pre_managed_control_state",
+        lambda _plan: {"status": "captured"},
+    )
+
+    prepared = cutover._prepared_bootstrap_receipt(plan)
+
+    expected_evidence = {
+        "webui": {"identity": copy.deepcopy(webui)},
+        "gateway": {"identity": copy.deepcopy(gateway)},
+    }
+    assert prepared["last_good_split_provenance"] == {
+        "schema": "hermes.bootstrap_split_provenance.v1",
+        "webui": {
+            "identity": expected_evidence["webui"]["identity"],
+            "origin_transaction_id": expected_evidence["webui"][
+                "identity"
+            ]["startup_transaction_id"],
+            "origin_journal_sha256": plan[
+                "last_good_origin_journal_sha256"
+            ],
+        },
+        "gateway": {
+            "identity": expected_evidence["gateway"]["identity"],
+            "origin_transaction_id": expected_evidence["gateway"][
+                "identity"
+            ]["startup_transaction_id"],
+            "origin_journal_sha256": plan[
+                "last_good_gateway_origin_journal_sha256"
+            ],
+        },
+        "split_evidence": expected_evidence,
+        "split_evidence_sha256": _canonical_test_value_sha256(
+            expected_evidence
+        ),
+    }
+
+
+def test_bootstrap_rollback_resume_rebinds_exact_split_provenance(
+    tmp_path,
+    monkeypatch,
+):
+    plan, prepared, evidence = _bootstrap_split_provenance_fixture(tmp_path)
+    _write_bootstrap_rollback_resume_journal(plan, prepared)
+    attested_builds = _install_bootstrap_split_rollback_fakes(
+        plan,
+        prepared,
+        monkeypatch,
+    )
+
+    result = cutover._run_bootstrap_migration_plan(plan)
+
+    assert result["status"] == "rolled-back"
+    assert result["rollback"]["status"] == "verified"
+    assert attested_builds.count("r75-webui") == 3
+    assert attested_builds.count("r72-gateway") == 3
+    durable = cutover._read_bootstrap_journal(plan)["phases"]["prepared"][
+        "last_good_split_provenance"
+    ]
+    assert durable["webui"]["origin_transaction_id"] == (
+        "webui-origin-transaction-0000001"
+    )
+    assert durable["gateway"]["origin_transaction_id"] == (
+        "gateway-origin-transaction-00001"
+    )
+    assert durable["webui"]["origin_journal_sha256"] == plan[
+        "last_good_origin_journal_sha256"
+    ]
+    assert durable["gateway"]["origin_journal_sha256"] == plan[
+        "last_good_gateway_origin_journal_sha256"
+    ]
+    assert durable["split_evidence"] == evidence
+    assert durable["split_evidence_sha256"] == _canonical_test_value_sha256(
+        evidence
+    )
+
+
+def test_bootstrap_rollback_resume_restores_exact_split_from_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    plan, prepared, evidence = _bootstrap_split_provenance_fixture(tmp_path)
+    _write_early_bootstrap_rollback_journal(plan, prepared)
+    attested_builds, restoration_events = (
+        _install_early_bootstrap_restoration_fakes(
+            plan,
+            prepared,
+            monkeypatch,
+        )
+    )
+
+    result = cutover._run_bootstrap_migration_plan(plan)
+
+    assert result["status"] == "rolled-back"
+    cutover_journal = cutover.read_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+    )
+    claim = cutover_journal["phases"]["bootstrap_rollback_claimed"]
+    assert claim["bootstrap_transaction_id"] == plan["transaction_id"]
+    assert claim["split_provenance_sha256"] == _canonical_test_value_sha256(
+        prepared["last_good_split_provenance"]
+    )
+    assert cutover_journal["rollback_receipt"] == {
+        "build_id": "r75-webui",
+        "plist_sha256": "6" * 64,
+        "plist_mode": 0o600,
+        "cli_link_target": plan["cli_old_target"],
+        "state_snapshot_id": "split-rollback-snapshot-0001",
+        "state_snapshot_sha256": "9" * 64,
+    }
+    assert attested_builds.count("r75-webui") == 3
+    assert attested_builds.count("r72-gateway") == 3
+    assert (
+        "state-restore",
+        plan["snapshot_manifest"],
+        "split-rollback-snapshot-0001",
+        "9" * 64,
+    ) in restoration_events
+    artifact_restores = [
+        event for event in restoration_events if event[0] == "artifact-restore"
+    ]
+    assert artifact_restores == [
+        (
+            "artifact-restore",
+            plan["bootstrap_rollback_plist"],
+            plan["installed_plist"],
+            prepared["webui_plist"],
+        ),
+        (
+            "artifact-restore",
+            plan["gateway_rollback_plist"],
+            plan["gateway_installed_plist"],
+            prepared["gateway_plist"],
+        ),
+        (
+            "artifact-restore",
+            plan["watchdog_rollback_script"],
+            plan["watchdog_installed_script"],
+            prepared["watchdog"],
+        ),
+    ]
+    assert any(event[0] == "controls-restore" for event in restoration_events)
+    cli_restore = next(
+        event for event in restoration_events if event[0] == "cli-restore"
+    )
+    assert cli_restore[1]["split_evidence"] == evidence
+    assert cli_restore[1]["split_evidence_sha256"] == (
+        _canonical_test_value_sha256(evidence)
+    )
+    assert any(
+        event[0] == "watchdog-cron-restore"
+        and event[1] == prepared["watchdog_cron"]
+        for event in restoration_events
+    )
+    durable = cutover._read_bootstrap_journal(plan)["phases"]
+    assert durable["rollback_state_restored"] == {
+        "status": "restored",
+        "snapshot_id": "split-rollback-snapshot-0001",
+    }
+    assert durable["rollback_plists_restored"]["webui"]["sha256"] == (
+        prepared["webui_plist"]["sha256"]
+    )
+    assert durable["rollback_services_restarted"]["gateway_start"][
+        "status"
+    ] == "adopted-exact-restored-binding"
+    assert durable["rollback_services_restarted"]["webui_start"][
+        "status"
+    ] == "adopted-exact-restored-binding"
+
+
+def test_bootstrap_rollback_claim_survives_crash_and_resumes(
+    tmp_path,
+    monkeypatch,
+):
+    plan, prepared, _evidence = _bootstrap_split_provenance_fixture(tmp_path)
+    _write_early_bootstrap_rollback_journal(plan, prepared)
+    _attested, restoration_events = _install_early_bootstrap_restoration_fakes(
+        plan,
+        prepared,
+        monkeypatch,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_rollback_gateway_stop_intent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            cutover.InjectedCutoverCrash("after-bootstrap-rollback-claim")
+        ),
+    )
+
+    with pytest.raises(
+        cutover.InjectedCutoverCrash,
+        match="after-bootstrap-rollback-claim",
+    ):
+        cutover._run_bootstrap_migration_plan(plan)
+
+    claimed = cutover.read_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+    )
+    durable_claim = copy.deepcopy(
+        claimed["phases"]["bootstrap_rollback_claimed"]
+    )
+    assert restoration_events == []
+
+    monkeypatch.setattr(
+        cutover,
+        "_rollback_gateway_stop_intent",
+        lambda *_args, **_kwargs: {"status": "not-running"},
+    )
+    result = cutover._run_bootstrap_migration_plan(plan)
+
+    assert result["status"] == "rolled-back"
+    resumed = cutover.read_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+    )
+    assert resumed["phases"]["bootstrap_rollback_claimed"] == durable_claim
+
+
+def test_bootstrap_rollback_claim_adopts_normal_six_field_receipt(
+    tmp_path,
+    monkeypatch,
+):
+    plan, prepared, _evidence = _bootstrap_split_provenance_fixture(tmp_path)
+    _write_early_bootstrap_rollback_journal(plan, prepared)
+    snapshot = cutover._read_bootstrap_journal(plan)["phases"][
+        "snapshot_created"
+    ]
+    normal_receipt = {
+        "build_id": "r75-webui",
+        "plist_sha256": "6" * 64,
+        "plist_mode": 0o600,
+        "cli_link_target": plan["cli_old_target"],
+        "state_snapshot_id": snapshot["state_snapshot_id"],
+        "state_snapshot_sha256": snapshot["state_snapshot_sha256"],
+    }
+    cutover.initialize_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+        expected_candidate_identity=plan["expected_candidate_identity"],
+        rollback_receipt=normal_receipt,
+    )
+    _install_early_bootstrap_restoration_fakes(
+        plan,
+        prepared,
+        monkeypatch,
+    )
+
+    result = cutover._run_bootstrap_migration_plan(plan)
+
+    assert result["status"] == "rolled-back"
+    durable = cutover.read_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+    )
+    assert durable["rollback_receipt"] == normal_receipt
+    assert durable["phases"]["bootstrap_rollback_claimed"][
+        "rollback_receipt"
+    ] == normal_receipt
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing-plist-mode", "invalid-plist-mode", "cli-target-mismatch"),
+)
+def test_bootstrap_rollback_claim_rejects_inexact_receipt_authority(
+    tmp_path,
+    mutation,
+):
+    plan, prepared, _evidence = _bootstrap_split_provenance_fixture(tmp_path)
+    _write_early_bootstrap_rollback_journal(plan, prepared)
+    if mutation == "missing-plist-mode":
+        prepared["webui_plist"].pop("resolved_mode")
+    elif mutation == "invalid-plist-mode":
+        prepared["webui_plist"]["resolved_mode"] = 0o100600
+    else:
+        prepared["legacy"]["cli"]["link_target"] = "/wrong/hermes"
+    journal = cutover._read_bootstrap_journal(plan)
+    journal["phases"]["prepared"] = prepared
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="plist mode|CLI link target",
+    ):
+        cutover._claim_bootstrap_rollback(plan, journal)
+
+    assert not Path(plan["transaction_journal"]).exists()
+
+
+@pytest.mark.parametrize(
+    ("winner", "loser"),
+    [
+        ("pair_commit_intent", "bootstrap_rollback_claimed"),
+        ("bootstrap_rollback_claimed", "pair_commit_intent"),
+    ],
+)
+def test_pair_commit_and_bootstrap_rollback_claim_are_lock_exclusive(
+    tmp_path,
+    winner,
+    loser,
+):
+    journal_path = tmp_path / "transaction.json"
+    transaction_id = "candidate-cutover-transaction-00001"
+    rollback_receipt = {
+        "build_id": "last-good",
+        "plist_sha256": "a" * 64,
+        "plist_mode": 0o600,
+        "cli_link_target": "/previous/hermes",
+        "state_snapshot_id": "snapshot-1",
+        "state_snapshot_sha256": "b" * 64,
+    }
+    claim_receipt = {
+        "schema": "hermes.bootstrap_rollback_claim.v1",
+        "bootstrap_transaction_id": transaction_id,
+        "split_provenance_sha256": "c" * 64,
+        "split_evidence_sha256": "d" * 64,
+        "rollback_receipt": copy.deepcopy(rollback_receipt),
+    }
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity={"build_id": "candidate"},
+        rollback_receipt=rollback_receipt,
+    )
+    for phase in (
+        "staged",
+        "plist_installed",
+        "old_fenced",
+        "old_committed",
+        "selection_activated",
+        "old_stopped",
+        "replacement_proved",
+        "candidate_fenced_health_proved",
+        "pair_ready",
+    ):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt={"status": phase},
+        )
+
+    cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase=winner,
+        receipt=(
+            claim_receipt
+            if winner == "bootstrap_rollback_claimed"
+            else {"status": winner}
+        ),
+    )
+    with pytest.raises(cutover.ReleaseBuildError, match="conflicts with"):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=loser,
+            receipt=(
+                claim_receipt
+                if loser == "bootstrap_rollback_claimed"
+                else {"status": loser}
+            ),
+        )
+
+    journal = cutover.read_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+    )
+    assert winner in journal["phases"]
+    assert loser not in journal["phases"]
+
+
+def test_bootstrap_cross_substitution_fails_before_any_restoration(
+    tmp_path,
+    monkeypatch,
+):
+    plan, prepared, _evidence = _bootstrap_split_provenance_fixture(tmp_path)
+    provenance = prepared["last_good_split_provenance"]
+    provenance["gateway"] = copy.deepcopy(provenance["webui"])
+    provenance["split_evidence"]["gateway"] = copy.deepcopy(
+        provenance["split_evidence"]["webui"]
+    )
+    provenance["split_evidence_sha256"] = _canonical_test_value_sha256(
+        provenance["split_evidence"]
+    )
+    _write_early_bootstrap_rollback_journal(plan, prepared)
+    _attested, restoration_events = _install_early_bootstrap_restoration_fakes(
+        plan,
+        prepared,
+        monkeypatch,
+    )
+
+    with pytest.raises(
+        cutover.BootstrapSplitProvenanceMismatch,
+        match="split provenance",
+    ):
+        cutover._run_bootstrap_migration_plan(plan)
+
+    assert restoration_events == []
+
+
+@pytest.mark.parametrize("invalid_journal", ("corrupt", "wrong-transaction"))
+def test_bootstrap_rollback_existing_invalid_cutover_journal_fails_closed(
+    tmp_path,
+    monkeypatch,
+    invalid_journal,
+):
+    plan, prepared, _evidence = _bootstrap_split_provenance_fixture(tmp_path)
+    _write_bootstrap_rollback_resume_journal(plan, prepared)
+    journal_path = Path(plan["transaction_journal"])
+    if invalid_journal == "corrupt":
+        journal_path.write_text("{not-json", encoding="utf-8")
+        journal_path.chmod(0o600)
+    else:
+        cutover.initialize_transaction_journal(
+            journal_path,
+            transaction_id="wrong-cutover-transaction-0000001",
+            expected_candidate_identity={"build_id": "candidate"},
+            rollback_receipt={
+                "build_id": "last-good",
+                "plist_sha256": "a" * 64,
+                "state_snapshot_id": "snapshot-0000000000000001",
+                "state_snapshot_sha256": "b" * 64,
+            },
+        )
+    monkeypatch.setattr(cutover, "_require_bootstrap_extensions", lambda _plan: None)
+    monkeypatch.setattr(
+        cutover,
+        "_upgrade_internal_watchdog_prepared_receipt",
+        lambda _plan, receipt: receipt,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_validate_bootstrap_split_provenance",
+        lambda *_args: pytest.fail(
+            "invalid cutover journal must fail before provenance or restoration"
+        ),
+    )
+
+    with pytest.raises(cutover.ReleaseBuildError, match="transaction journal"):
+        cutover._run_bootstrap_migration_plan(plan)
+
+
+@pytest.mark.parametrize("invalid_journal", ("corrupt", "wrong-transaction"))
+def test_bootstrap_rollback_resumer_rejects_existing_invalid_cutover_journal(
+    tmp_path,
+    monkeypatch,
+    invalid_journal,
+):
+    plan, prepared, _evidence = _bootstrap_split_provenance_fixture(tmp_path)
+    _write_early_bootstrap_rollback_journal(plan, prepared)
+    bootstrap_journal = cutover._read_bootstrap_journal(plan)
+    journal_path = Path(plan["transaction_journal"])
+    if invalid_journal == "corrupt":
+        journal_path.write_text("{not-json", encoding="utf-8")
+        journal_path.chmod(0o600)
+    else:
+        cutover.initialize_transaction_journal(
+            journal_path,
+            transaction_id="wrong-resume-transaction-000000001",
+            expected_candidate_identity={"build_id": "candidate"},
+            rollback_receipt={
+                "build_id": "last-good",
+                "plist_sha256": "a" * 64,
+                "state_snapshot_id": "snapshot-0000000000000001",
+                "state_snapshot_sha256": "b" * 64,
+            },
+        )
+    monkeypatch.setattr(
+        cutover,
+        "_upgrade_internal_watchdog_prepared_receipt",
+        lambda _plan, receipt: receipt,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_validate_bootstrap_split_provenance",
+        lambda *_args: pytest.fail(
+            "invalid cutover journal must fail before provenance or restoration"
+        ),
+    )
+
+    with pytest.raises(cutover.ReleaseBuildError, match="transaction journal"):
+        cutover._resume_bootstrap_rollback(plan, bootstrap_journal)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "cross-substitution", "digest-tamper"),
+)
+def test_bootstrap_rollback_resume_rejects_unbound_split_provenance(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    plan, prepared, _evidence = _bootstrap_split_provenance_fixture(tmp_path)
+    provenance = prepared["last_good_split_provenance"]
+    if mutation == "missing":
+        prepared.pop("last_good_split_provenance")
+    elif mutation == "cross-substitution":
+        provenance["gateway"] = copy.deepcopy(provenance["webui"])
+        provenance["split_evidence"]["gateway"] = copy.deepcopy(
+            provenance["split_evidence"]["webui"]
+        )
+        provenance["split_evidence_sha256"] = _canonical_test_value_sha256(
+            provenance["split_evidence"]
+        )
+    else:
+        provenance["split_evidence_sha256"] = "f" * 64
+    _write_bootstrap_rollback_resume_journal(plan, prepared)
+    _install_bootstrap_split_rollback_fakes(plan, prepared, monkeypatch)
+
+    with pytest.raises(
+        (cutover.ReleaseBuildError, cutover.DrainIdentityMismatch),
+        match="split provenance",
+    ):
+        cutover._run_bootstrap_migration_plan(plan)
+
+
+def test_bootstrap_split_provenance_does_not_replace_forward_only_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    plan, prepared, _evidence = _bootstrap_split_provenance_fixture(tmp_path)
+    _write_early_bootstrap_rollback_journal(plan, prepared)
+    journal = cutover._read_bootstrap_journal(plan)
+    snapshot = journal["phases"]["snapshot_created"]
+    cutover.initialize_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+        expected_candidate_identity=plan["expected_candidate_identity"],
+        rollback_receipt={
+            "build_id": prepared["last_good_split_provenance"]["webui"][
+                "identity"
+            ]["build_id"],
+            "plist_sha256": prepared["webui_plist"]["sha256"],
+            "plist_mode": prepared["webui_plist"]["resolved_mode"],
+            "cli_link_target": prepared["legacy"]["cli"]["link_target"],
+            "state_snapshot_id": snapshot["state_snapshot_id"],
+            "state_snapshot_sha256": snapshot["state_snapshot_sha256"],
+        },
+    )
+    for phase in (
+        "staged",
+        "plist_installed",
+        "old_fenced",
+        "old_committed",
+        "selection_activated",
+        "old_stopped",
+        "replacement_proved",
+        "candidate_fenced_health_proved",
+        "pair_ready",
+        "pair_commit_intent",
+    ):
+        cutover.record_transaction_phase(
+            plan["transaction_journal"],
+            transaction_id=plan["transaction_id"],
+            phase=phase,
+            receipt={"status": phase},
+        )
+    monkeypatch.setattr(
+        cutover,
+        "_preflight_last_good_identity_split",
+        lambda _plan: pytest.fail(
+            "post-boundary recovery must remain forward-only"
+        ),
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="bootstrap_rollback_claimed conflicts with pair_commit_intent",
+    ):
+        cutover._resume_bootstrap_rollback(plan, journal)
+
+
 def test_restored_legacy_gateway_allows_runtime_cwd_drift_only(monkeypatch):
     expected = {
         "command": "/legacy/python -m hermes_cli.main gateway run --replace",
@@ -13767,3 +14862,61 @@ def test_restart_or_adopt_restored_legacy_pair_does_not_restart_on_bug(
             {},
             prepared={"captured": "legacy-pair"},
         )
+
+
+def test_split_provenance_change_during_adoption_never_restarts_services(
+    tmp_path,
+    monkeypatch,
+):
+    plan, prepared, evidence = _bootstrap_split_provenance_fixture(tmp_path)
+    immutable_evidence = MappingProxyType(
+        {
+            name: MappingProxyType(
+                {
+                    "identity": MappingProxyType(
+                        copy.deepcopy(value["identity"])
+                    )
+                }
+            )
+            for name, value in evidence.items()
+        }
+    )
+    observations = iter(
+        [immutable_evidence, cutover.ReleaseBuildError("origin changed")]
+    )
+
+    def preflight(_plan):
+        observed = next(observations)
+        if isinstance(observed, Exception):
+            raise observed
+        return observed
+
+    mutations = []
+    monkeypatch.setattr(
+        cutover,
+        "_preflight_last_good_identity_split",
+        preflight,
+    )
+    cutover._validate_bootstrap_split_provenance(plan, prepared)
+    monkeypatch.setattr(
+        cutover,
+        "_bootout_job",
+        lambda *_args, **_kwargs: mutations.append("bootout"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_bootstrap_job",
+        lambda *_args, **_kwargs: mutations.append("bootstrap"),
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="bootstrap split provenance",
+    ) as raised:
+        cutover._restart_or_adopt_restored_legacy_pair(
+            plan,
+            prepared=prepared,
+        )
+
+    assert type(raised.value).__name__ == "BootstrapSplitProvenanceMismatch"
+    assert mutations == []
