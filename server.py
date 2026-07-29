@@ -1,7 +1,9 @@
 """Hermes Web UI server entry point."""
+import hashlib
 import logging
 import os
 import re
+import secrets
 import signal
 import socket
 import ssl
@@ -9,6 +11,8 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Ignore SIGPIPE so a dropped client only aborts that write, not the whole WebUI process.
@@ -102,6 +106,7 @@ logger = logging.getLogger(__name__)
 
 from api.auth import check_auth, reset_trusted_auth_request_state
 from api import config as api_config
+from api import process_identity as process_identity_api
 from api.config import (
     HOST,
     PORT,
@@ -621,6 +626,180 @@ _DEFERRED_STARTUP_LOCK = threading.Lock()
 _DEFERRED_STARTUP_COMPLETED: set[str] = set()
 _DEFERRED_STARTUP_REPLAY_DRIVER = None
 _DEFERRED_STARTUP_REPLAY_STEPS: tuple[DeferredStartupStep, ...] | None = None
+_DEFERRED_STARTUP_PROCESS_EPOCH_LOCK = threading.Lock()
+_DEFERRED_STARTUP_PROCESS_EPOCH: str | None = None
+_DEFERRED_STARTUP_PROCESS_EPOCH_DOMAIN = (
+    b"hermes-webui:managed-deferred-startup:process-epoch:v1\x00"
+)
+_DEFERRED_STARTUP_PROCESS_TOKEN_RECEIPT_DOMAIN = (
+    b"hermes-webui:managed-deferred-startup:start-token-receipt:v1\x00"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ManagedDeferredStartupProcessReceipt(Mapping[str, object]):
+    version: int
+    pid: int
+    process_epoch: str
+    process_start_token_sha256: str
+
+    def __getitem__(self, key: str) -> object:
+        if key == "version":
+            return self.version
+        if key == "pid":
+            return self.pid
+        if key == "process_epoch":
+            return self.process_epoch
+        if key == "process_start_token_sha256":
+            return self.process_start_token_sha256
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(
+            (
+                "version",
+                "pid",
+                "process_epoch",
+                "process_start_token_sha256",
+            )
+        )
+
+    def __len__(self) -> int:
+        return 4
+
+
+_DEFERRED_STARTUP_PROCESS_RECEIPT: (
+    _ManagedDeferredStartupProcessReceipt | None
+) = None
+
+
+def _reset_deferred_startup_process_state_after_fork() -> None:
+    global _DEFERRED_STARTUP_PROCESS_EPOCH_LOCK
+    global _DEFERRED_STARTUP_PROCESS_EPOCH
+    global _DEFERRED_STARTUP_PROCESS_RECEIPT
+    _DEFERRED_STARTUP_PROCESS_EPOCH_LOCK = threading.Lock()
+    _DEFERRED_STARTUP_PROCESS_EPOCH = None
+    _DEFERRED_STARTUP_PROCESS_RECEIPT = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_deferred_startup_process_state_after_fork)
+
+
+def _validate_deferred_startup_process_start_token(
+    value: object,
+    *,
+    pid: int,
+) -> str:
+    if (
+        type(pid) is not int
+        or isinstance(pid, bool)
+        or pid <= 1
+        or type(value) is not str
+        or not value
+        or len(value) > 256
+    ):
+        raise RuntimeError("managed startup process start token is unavailable")
+
+    def exact_positive_decimal(component: str, *, allow_zero: bool = False) -> int:
+        if not component.isascii() or not component.isdecimal():
+            raise RuntimeError("managed startup process start token is invalid")
+        parsed = int(component)
+        if str(parsed) != component or (parsed < 0 if allow_zero else parsed <= 0):
+            raise RuntimeError("managed startup process start token is invalid")
+        return parsed
+
+    parts = value.split(":")
+    if len(parts) == 3 and parts[0] == "procfs":
+        token_pid = exact_positive_decimal(parts[1])
+        exact_positive_decimal(parts[2])
+    elif len(parts) == 4 and parts[0] == "darwin-proc":
+        token_pid = exact_positive_decimal(parts[1])
+        exact_positive_decimal(parts[2])
+        microseconds = exact_positive_decimal(parts[3], allow_zero=True)
+        if microseconds >= 1_000_000:
+            raise RuntimeError("managed startup process start token is invalid")
+    else:
+        raise RuntimeError("managed startup process start token is invalid")
+    if token_pid != pid:
+        raise RuntimeError("managed startup process start token does not match pid")
+    return value
+
+
+def _derive_deferred_startup_process_epoch(
+    *,
+    process_start_token: object,
+    boot_nonce: object,
+    pid: int,
+) -> str:
+    token = _validate_deferred_startup_process_start_token(
+        process_start_token,
+        pid=pid,
+    )
+    if type(boot_nonce) is not bytes or len(boot_nonce) != 32:
+        raise RuntimeError("managed startup boot nonce is invalid")
+    token_bytes = token.encode("ascii")
+    canonical = (
+        _DEFERRED_STARTUP_PROCESS_EPOCH_DOMAIN
+        + len(token_bytes).to_bytes(4, "big")
+        + token_bytes
+        + boot_nonce
+    )
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _new_deferred_startup_boot_nonce() -> bytes:
+    return secrets.token_bytes(32)
+
+
+def _managed_deferred_startup_process_receipt() -> (
+    _ManagedDeferredStartupProcessReceipt
+):
+    global _DEFERRED_STARTUP_PROCESS_EPOCH
+    global _DEFERRED_STARTUP_PROCESS_RECEIPT
+    pid = os.getpid()
+    cached_receipt = _DEFERRED_STARTUP_PROCESS_RECEIPT
+    if cached_receipt is not None and cached_receipt.pid != pid:
+        _reset_deferred_startup_process_state_after_fork()
+    with _DEFERRED_STARTUP_PROCESS_EPOCH_LOCK:
+        pid = os.getpid()
+        cached_receipt = _DEFERRED_STARTUP_PROCESS_RECEIPT
+        if cached_receipt is not None and cached_receipt.pid != pid:
+            _DEFERRED_STARTUP_PROCESS_EPOCH = None
+            _DEFERRED_STARTUP_PROCESS_RECEIPT = None
+        if (
+            _DEFERRED_STARTUP_PROCESS_EPOCH is None
+            or _DEFERRED_STARTUP_PROCESS_RECEIPT is None
+        ):
+            token = process_identity_api.process_start_token(pid)
+            validated_token = _validate_deferred_startup_process_start_token(
+                token,
+                pid=pid,
+            )
+            epoch = _derive_deferred_startup_process_epoch(
+                process_start_token=validated_token,
+                boot_nonce=_new_deferred_startup_boot_nonce(),
+                pid=pid,
+            )
+            token_bytes = validated_token.encode("ascii")
+            token_receipt = hashlib.sha256(
+                _DEFERRED_STARTUP_PROCESS_TOKEN_RECEIPT_DOMAIN
+                + len(token_bytes).to_bytes(4, "big")
+                + token_bytes
+            ).hexdigest()
+            receipt = _ManagedDeferredStartupProcessReceipt(
+                version=1,
+                pid=pid,
+                process_epoch=epoch,
+                process_start_token_sha256=token_receipt,
+            )
+            _DEFERRED_STARTUP_PROCESS_EPOCH = epoch
+            _DEFERRED_STARTUP_PROCESS_RECEIPT = receipt
+        return replace(_DEFERRED_STARTUP_PROCESS_RECEIPT)
+
+
+def _managed_deferred_startup_process_epoch() -> str:
+    return _managed_deferred_startup_process_receipt().process_epoch
 
 
 def configure_managed_deferred_startup_replay(*, driver, steps) -> None:
@@ -915,6 +1094,7 @@ def _run_managed_deferred_startup(transaction_id: str) -> dict:
             result = replay_deferred_startup(
                 transaction_id=transaction_id,
                 manifest_receipt=receipt,
+                process_epoch=_managed_deferred_startup_process_epoch(),
                 steps=steps,
                 driver=driver,
             )

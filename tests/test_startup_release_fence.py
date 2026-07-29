@@ -7,6 +7,9 @@ import hmac
 import importlib
 import json
 import os
+import re
+import select
+import signal
 import subprocess
 import sys
 import threading
@@ -167,6 +170,7 @@ class _InMemoryDeferredStartupDriver:
     def __init__(self, backing=None, *, indeterminate_error=None):
         self.backing = backing if backing is not None else {}
         self.events = []
+        self.process_epochs = []
         self.indeterminate_error = indeterminate_error
 
     @staticmethod
@@ -224,6 +228,7 @@ class _InMemoryDeferredStartupDriver:
     ):
         from deferred_startup_replay import DeferredStartupStepState
 
+        self.process_epochs.append(process_epoch)
         self.events.append(("read", transaction_id, step_name))
         return self.backing.get(
             self._key(
@@ -246,6 +251,7 @@ class _InMemoryDeferredStartupDriver:
     ):
         from deferred_startup_replay import DeferredStartupStepState
 
+        self.process_epochs.append(process_epoch)
         self.events.append(("intent", transaction_id, step_name))
         self.backing[
             self._key(
@@ -267,6 +273,7 @@ class _InMemoryDeferredStartupDriver:
     ):
         from deferred_startup_replay import DeferredStartupStepState
 
+        self.process_epochs.append(process_epoch)
         self.events.append(("completion", transaction_id, step_name, recovered))
         self.backing[
             self._key(
@@ -292,6 +299,7 @@ class _InMemoryDeferredStartupDriver:
     ):
         from deferred_startup_replay import DeferredStartupStepState
 
+        self.process_epochs.append(process_epoch)
         self.events.append(("indeterminate", transaction_id, step_name, reason))
         if self.indeterminate_error is not None:
             raise self.indeterminate_error
@@ -1172,6 +1180,8 @@ def _tree_bytes_and_mtimes(root):
 
 @pytest.fixture
 def isolated_startup_admission(monkeypatch):
+    import server
+
     for key in (
         "HERMES_WEBUI_RELEASE_PATH",
         "HERMES_WEBUI_MANIFEST_SHA256",
@@ -1197,6 +1207,17 @@ def isolated_startup_admission(monkeypatch):
     monkeypatch.setattr(config, "_RUN_ADMISSION_STARTUP_ERROR", None, raising=False)
     monkeypatch.setattr(config, "_RUN_ADMISSION_STARTUP_ACCEPTOR", None, raising=False)
     monkeypatch.setattr(config, "_RUN_ADMISSION_LOCAL", threading.local())
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_PROCESS_EPOCH", PROCESS_EPOCH)
+    monkeypatch.setattr(
+        server,
+        "_DEFERRED_STARTUP_PROCESS_RECEIPT",
+        server._ManagedDeferredStartupProcessReceipt(
+            version=1,
+            pid=os.getpid(),
+            process_epoch=PROCESS_EPOCH,
+            process_start_token_sha256="0" * 64,
+        ),
+    )
     return monkeypatch
 
 
@@ -1599,6 +1620,237 @@ def test_managed_startup_accept_fails_closed_without_durable_replay_configuratio
     assert config.run_admission_snapshot()["state"] == "startup-fenced"
 
 
+def _valid_process_start_token(*, pid=None, ticks=123456):
+    return f"procfs:{os.getpid() if pid is None else pid}:{ticks}"
+
+
+def _reset_managed_process_epoch(monkeypatch, server):
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_PROCESS_EPOCH", None)
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_PROCESS_RECEIPT", None)
+
+
+def test_managed_process_epoch_is_stable_for_process_lifetime_and_secret_free(
+    monkeypatch,
+):
+    import server
+
+    _reset_managed_process_epoch(monkeypatch, server)
+    nonces = []
+    monkeypatch.setattr(
+        server.process_identity_api,
+        "process_start_token",
+        lambda pid: _valid_process_start_token(pid=pid),
+    )
+
+    def boot_nonce():
+        nonces.append("called")
+        return b"a" * 32
+
+    monkeypatch.setattr(server, "_new_deferred_startup_boot_nonce", boot_nonce)
+
+    first = server._managed_deferred_startup_process_receipt()
+    second = server._managed_deferred_startup_process_receipt()
+
+    assert first == second
+    assert first is not second
+    assert isinstance(first, server._ManagedDeferredStartupProcessReceipt)
+    with pytest.raises(FrozenInstanceError):
+        first.pid = first.pid + 1
+    assert re.fullmatch(r"[0-9a-f]{64}", first["process_epoch"])
+    assert re.fullmatch(r"[0-9a-f]{64}", first["process_start_token_sha256"])
+    assert first["pid"] == os.getpid()
+    assert set(first) == {
+        "version",
+        "pid",
+        "process_epoch",
+        "process_start_token_sha256",
+    }
+    assert "nonce" not in repr(first).lower()
+    assert _valid_process_start_token() not in repr(first)
+    assert nonces == ["called"]
+
+
+def _fork_managed_process_receipt(server, *, hold_parent_lock):
+    parent_receipt = server._managed_deferred_startup_process_receipt()
+    read_fd, write_fd = os.pipe()
+    child_pid = None
+    lock = server._DEFERRED_STARTUP_PROCESS_EPOCH_LOCK
+    if hold_parent_lock:
+        lock.acquire()
+    try:
+        child_pid = os.fork()
+        if child_pid == 0:
+            try:
+                os.close(read_fd)
+                receipt = server._managed_deferred_startup_process_receipt()
+                payload = json.dumps(
+                    {
+                        "pid": receipt.pid,
+                        "process_epoch": receipt.process_epoch,
+                    }
+                ).encode()
+                os.write(write_fd, payload)
+            except BaseException as exc:
+                os.write(
+                    write_fd,
+                    json.dumps(
+                        {
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    ).encode(),
+                )
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+
+        os.close(write_fd)
+        write_fd = -1
+        readable, _, _ = select.select([read_fd], [], [], 3)
+        if not readable:
+            os.kill(child_pid, signal.SIGKILL)
+            os.waitpid(child_pid, 0)
+            child_pid = None
+            pytest.fail("forked process hung while obtaining managed process receipt")
+        payload = os.read(read_fd, 4096)
+        waited_pid, status = os.waitpid(child_pid, 0)
+        child_pid = None
+        assert waited_pid > 0
+        assert os.waitstatus_to_exitcode(status) == 0
+        child_receipt = json.loads(payload)
+        assert "error" not in child_receipt
+        return parent_receipt, waited_pid, child_receipt
+    finally:
+        if hold_parent_lock:
+            lock.release()
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+        if child_pid is not None:
+            os.kill(child_pid, signal.SIGKILL)
+            os.waitpid(child_pid, 0)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
+@pytest.mark.parametrize("hold_parent_lock", (False, True))
+def test_managed_process_receipt_regenerates_after_actual_fork(
+    monkeypatch,
+    hold_parent_lock,
+):
+    import server
+
+    _reset_managed_process_epoch(monkeypatch, server)
+    monkeypatch.setattr(
+        server.process_identity_api,
+        "process_start_token",
+        lambda pid: _valid_process_start_token(pid=pid),
+    )
+    monkeypatch.setattr(
+        server,
+        "_new_deferred_startup_boot_nonce",
+        lambda: b"f" * 32,
+    )
+
+    parent, child_pid, child = _fork_managed_process_receipt(
+        server,
+        hold_parent_lock=hold_parent_lock,
+    )
+
+    assert parent.pid == os.getpid()
+    assert child["pid"] == child_pid
+    assert child["pid"] != parent.pid
+    assert child["process_epoch"] != parent.process_epoch
+
+
+def test_managed_process_receipt_rejects_cached_pid_mismatch(monkeypatch):
+    import server
+
+    _reset_managed_process_epoch(monkeypatch, server)
+    monkeypatch.setattr(
+        server.process_identity_api,
+        "process_start_token",
+        lambda pid: _valid_process_start_token(pid=pid),
+    )
+    monkeypatch.setattr(
+        server,
+        "_new_deferred_startup_boot_nonce",
+        lambda: b"r" * 32,
+    )
+    stale = server._ManagedDeferredStartupProcessReceipt(
+        version=1,
+        pid=os.getpid() + 1,
+        process_epoch="a" * 64,
+        process_start_token_sha256="b" * 64,
+    )
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_PROCESS_EPOCH", stale.process_epoch)
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_PROCESS_RECEIPT", stale)
+
+    current = server._managed_deferred_startup_process_receipt()
+
+    assert current.pid == os.getpid()
+    assert current.process_epoch != stale.process_epoch
+
+
+def test_managed_process_epoch_changes_with_boot_nonce_or_start_token():
+    import server
+
+    token = _valid_process_start_token(ticks=111)
+    same = server._derive_deferred_startup_process_epoch(
+        process_start_token=token,
+        boot_nonce=b"a" * 32,
+        pid=os.getpid(),
+    )
+    assert same == server._derive_deferred_startup_process_epoch(
+        process_start_token=token,
+        boot_nonce=b"a" * 32,
+        pid=os.getpid(),
+    )
+    assert same != server._derive_deferred_startup_process_epoch(
+        process_start_token=token,
+        boot_nonce=b"b" * 32,
+        pid=os.getpid(),
+    )
+    assert same != server._derive_deferred_startup_process_epoch(
+        process_start_token=_valid_process_start_token(ticks=112),
+        boot_nonce=b"a" * 32,
+        pid=os.getpid(),
+    )
+
+
+@pytest.mark.parametrize(
+    "token",
+    (
+        None,
+        "",
+        "procfs:123:456",
+        "procfs:not-a-pid:456",
+        "procfs:{pid}:0",
+        "darwin-proc:{pid}:1:1000000",
+        "unknown:{pid}:123",
+    ),
+)
+def test_managed_process_epoch_fails_closed_on_invalid_start_token(
+    monkeypatch,
+    token,
+):
+    import server
+
+    _reset_managed_process_epoch(monkeypatch, server)
+    rendered = token.format(pid=os.getpid()) if isinstance(token, str) else token
+    monkeypatch.setattr(
+        server.process_identity_api,
+        "process_start_token",
+        lambda _pid: rendered,
+    )
+    monkeypatch.setattr(
+        server,
+        "_new_deferred_startup_boot_nonce",
+        lambda: b"a" * 32,
+    )
+
+    with pytest.raises(RuntimeError, match="process start token"):
+        server._managed_deferred_startup_process_receipt()
+
+
 def test_server_managed_startup_uses_transaction_bound_durable_replay(
     monkeypatch,
     isolated_startup_admission,
@@ -1632,6 +1884,17 @@ def test_server_managed_startup_uses_transaction_bound_durable_replay(
     monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_DRIVER", None)
     monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_STEPS", None)
     monkeypatch.setattr(server, "_deferred_startup_steps", lambda: canonical_steps)
+    _reset_managed_process_epoch(monkeypatch, server)
+    monkeypatch.setattr(
+        server.process_identity_api,
+        "process_start_token",
+        lambda pid: _valid_process_start_token(pid=pid),
+    )
+    monkeypatch.setattr(
+        server,
+        "_new_deferred_startup_boot_nonce",
+        lambda: b"m" * 32,
+    )
     server.configure_managed_deferred_startup_replay(
         driver=driver,
         steps=replay_steps,
@@ -1653,7 +1916,118 @@ def test_server_managed_startup_uses_transaction_bound_durable_replay(
         for event in driver.events
         if event[0] in {"read", "intent", "completion"}
     } == {TRANSACTION_ID}
+    assert set(driver.process_epochs) == {
+        server._managed_deferred_startup_process_receipt()["process_epoch"]
+    }
     assert server._DEFERRED_STARTUP_COMPLETED == set()
+
+
+def test_server_managed_restart_preserves_history_across_distinct_process_epochs(
+    tmp_path,
+    monkeypatch,
+):
+    import deferred_release_manifest
+    import server
+    from deferred_startup_file_driver import DeferredStartupFileDriver
+    from deferred_startup_replay import (
+        DeferredStartupManifestReceipt,
+        DeferredStartupStep,
+        Reconciliation,
+    )
+
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    os.chmod(parent, 0o700)
+    path = parent / "deferred-startup.json"
+    receipt = DeferredStartupManifestReceipt(
+        transaction_id=TRANSACTION_ID,
+        version=deferred_release_manifest.MANIFEST_VERSION,
+        sha256=deferred_release_manifest.deferred_release_manifest_sha256(),
+    )
+    driver = DeferredStartupFileDriver(
+        path,
+        transaction_id=TRANSACTION_ID,
+        manifest_receipt=receipt,
+    )
+    effects = set()
+    mutations = []
+
+    def mutate():
+        mutations.append("first")
+        effects.add("first")
+
+    steps = (
+        DeferredStartupStep(
+            name="first",
+            mutator=mutate,
+            reconciler=lambda: (
+                Reconciliation.PROVED_COMPLETE
+                if "first" in effects
+                else Reconciliation.PROVED_ABSENT
+            ),
+        ),
+    )
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_DRIVER", None)
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_REPLAY_STEPS", None)
+    monkeypatch.setattr(server, "_deferred_startup_steps", lambda: (("first", mutate),))
+    _reset_managed_process_epoch(monkeypatch, server)
+    monkeypatch.setattr(
+        server.process_identity_api,
+        "process_start_token",
+        lambda pid: _valid_process_start_token(pid=pid),
+    )
+    nonces = iter((b"a" * 32, b"b" * 32))
+    monkeypatch.setattr(
+        server,
+        "_new_deferred_startup_boot_nonce",
+        lambda: next(nonces),
+    )
+    server.configure_managed_deferred_startup_replay(
+        driver=driver,
+        steps=steps,
+    )
+
+    server._run_managed_deferred_startup(TRANSACTION_ID)
+    epoch_one = server._managed_deferred_startup_process_receipt()["process_epoch"]
+    _reset_managed_process_epoch(monkeypatch, server)
+    server._run_managed_deferred_startup(TRANSACTION_ID)
+    epoch_two = server._managed_deferred_startup_process_receipt()["process_epoch"]
+
+    assert epoch_one != epoch_two
+    assert mutations == ["first"]
+    attempts = json.loads(path.read_bytes())["steps"]["first"]["attempts"]
+    assert [attempt["process_epoch"] for attempt in attempts] == [
+        epoch_one,
+        epoch_two,
+    ]
+    assert attempts[1]["completion"]["recovered"] is True
+
+
+def test_ordinary_unfenced_startup_never_requests_managed_process_epoch(
+    monkeypatch,
+):
+    import server
+
+    calls = []
+    monkeypatch.setattr(
+        server.api_config,
+        "startup_run_admission_is_closed",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_deferred_startup_mutators",
+        lambda: calls.append("ordinary") or {"status": "started"},
+    )
+    monkeypatch.setattr(
+        server,
+        "_managed_deferred_startup_process_epoch",
+        lambda: pytest.fail("ordinary startup must not request managed epoch"),
+        raising=False,
+    )
+
+    assert server._prepare_startup_mutators() == "started"
+    assert calls == ["ordinary"]
 
 
 def test_server_replay_configuration_is_one_shot_and_exactly_idempotent(
