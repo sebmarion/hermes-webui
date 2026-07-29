@@ -2025,6 +2025,16 @@ two separate activation boundaries in `scripts/webui_release_cutover.py`:
   between the live and journaled promoted selector, the expected post-promotion
   generation, and the sealed candidate release record. It never recreates a
   missing journal from an already-promoted selector.
+- Rollback payload retention runs synchronously after a successful managed
+  release, bootstrap migration, or selector-only promotion. It does not use a
+  cron job or background agent. Under the selector lock and every transaction
+  lock, it keeps the newest verified terminal rollback pair, removes older
+  terminal payloads and abandoned nonterminal payloads through a receipt-first
+  quarantine, and leaves manifests and transaction journals in place for
+  audit. Ambiguous manifests, journal graphs, ownership, paths, open files, or
+  selector activity fail closed without widening the deletion set. Retention
+  failure is reported in the accepted release result and does not pretend that
+  the already-durable promotion was rolled back.
 - Pair-open gateway attestation always uses the sealed release identity from
   the cutover plan. The signed WebUI process identity is intentionally slimmer
   and uses process-facing agent field names, so it remains the PID-bound

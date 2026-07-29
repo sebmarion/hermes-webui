@@ -1717,7 +1717,8 @@ runner:
 
 ```bash
 ./scripts/test.sh tests/test_release_first_activation_bridge.py \
-  tests/test_webui_release_selector.py -q
+  tests/test_webui_release_selector.py \
+  tests/test_webui_release_retention.py -q
 ```
 
 The bridge coverage includes immutable CLI staging, maintenance-gate crash
@@ -1731,6 +1732,13 @@ exact quarantine bytes, and rollback that never replays quarantined
 completions. These tests model cooperating writers on a bounded
 single-operator host; they do not assert exclusion of a malicious same-uid
 actor.
+
+Rolling-retention coverage proves that release and bootstrap success, plus
+selector-only promotion, invoke cleanup only after their durable transition;
+dry runs remain non-mutating. Policy tests retain exactly the newest verified
+terminal rollback pair, include abandoned nonterminal payloads in the next
+safe cleanup, reject ambiguous selector control paths, and refuse deletion
+when no verified rollback remains.
 
 Gateway retirement coverage also proves exact launchd override parsing,
 KeepAlive disable-before-SIGINT ordering, PID/start/listener/job rechecks,

@@ -11094,6 +11094,104 @@ def test_bootstrap_rollback_context_uses_exact_durable_legacy_receipts(
     }
 
 
+@pytest.mark.parametrize("command", ["release-commit", "bootstrap-migrate"])
+def test_successful_release_cli_runs_rolling_retention(monkeypatch, command):
+    plan = {
+        "selector_state": "/managed/selector/selector-state.json",
+        "selector_lock": "/managed/selector/selector-state.lock",
+    }
+    events = []
+    monkeypatch.setattr(cutover, "_load_cutover_plan", lambda _path: plan)
+    monkeypatch.setattr(
+        cutover,
+        "_run_release_commit_plan",
+        lambda actual, *, dry_run: events.append(("release", actual, dry_run))
+        or {"status": "accepted"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_run_bootstrap_migration_plan",
+        lambda actual, *, dry_run: events.append(("bootstrap", actual, dry_run))
+        or {"status": "accepted"},
+    )
+    monkeypatch.setattr(
+        cutover.release_retention,
+        "run_after_release",
+        lambda state, lock: events.append(("retention", state, lock))
+        or {"status": "completed", "deleted_payload_trees": 2},
+    )
+
+    result = cutover._run_cli(
+        SimpleNamespace(command=command, plan="/tmp/plan.json", dry_run=False)
+    )
+
+    assert result["status"] == "accepted"
+    assert result["rollback_retention"] == {
+        "status": "completed",
+        "deleted_payload_trees": 2,
+    }
+    assert events[-1] == (
+        "retention",
+        plan["selector_state"],
+        plan["selector_lock"],
+    )
+
+
+def test_release_cli_dry_run_does_not_mutate_rollback_retention(monkeypatch):
+    plan = {
+        "selector_state": "/managed/selector/selector-state.json",
+        "selector_lock": "/managed/selector/selector-state.lock",
+    }
+    monkeypatch.setattr(cutover, "_load_cutover_plan", lambda _path: plan)
+    monkeypatch.setattr(
+        cutover,
+        "_run_release_commit_plan",
+        lambda _actual, *, dry_run: {"status": "dry-run", "dry_run": dry_run},
+    )
+    monkeypatch.setattr(
+        cutover.release_retention,
+        "run_after_release",
+        lambda *_args: pytest.fail("dry-run must not clean rollback payloads"),
+    )
+
+    result = cutover._run_cli(
+        SimpleNamespace(command="release-commit", plan="/tmp/plan.json", dry_run=True)
+    )
+
+    assert result == {"status": "dry-run", "dry_run": True}
+
+
+def test_state_promote_runs_rolling_retention_after_durable_transition(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "update_selector_state",
+        lambda *args, **kwargs: events.append(("promote", args, kwargs))
+        or {"generation": 42},
+    )
+    monkeypatch.setattr(
+        cutover.release_retention,
+        "run_after_release",
+        lambda state, lock: events.append(("retention", state, lock))
+        or {"status": "completed"},
+    )
+
+    result = cutover._run_cli(
+        SimpleNamespace(
+            command="state-promote",
+            state="/managed/selector/selector-state.json",
+            lock="/managed/selector/selector-state.lock",
+            expected_generation=41,
+        )
+    )
+
+    assert result == {
+        "generation": 42,
+        "rollback_retention": {"status": "completed"},
+    }
+    assert [event[0] for event in events] == ["promote", "retention"]
+
+
 def test_release_commit_reports_watchdog_barrier_finish_failure(monkeypatch):
     monkeypatch.setattr(
         cutover,

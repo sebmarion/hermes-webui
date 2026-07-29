@@ -39,6 +39,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts import webui_release_selector as release_selector
+from scripts import webui_release_retention as release_retention
 from api.process_identity import process_start_token
 from api.state_sync import SESSION_ACTIVITY_TTL_SECONDS
 
@@ -19522,8 +19523,24 @@ def _run_cli(options: argparse.Namespace) -> dict:
         if options.command == "inspect-plan":
             return _inspect_cutover_plan(plan)
         if options.command == "bootstrap-migrate":
-            return _run_bootstrap_migration_plan(plan, dry_run=options.dry_run)
-        return _run_release_commit_plan(plan, dry_run=options.dry_run)
+            result = _run_bootstrap_migration_plan(
+                plan,
+                dry_run=options.dry_run,
+            )
+        else:
+            result = _run_release_commit_plan(
+                plan,
+                dry_run=options.dry_run,
+            )
+        if not options.dry_run and result.get("status") == "accepted":
+            result = {
+                **result,
+                "rollback_retention": release_retention.run_after_release(
+                    plan["selector_state"],
+                    plan["selector_lock"],
+                ),
+            }
+        return result
     if options.command == "build":
         return build_immutable_release(
             options.repo,
@@ -19584,12 +19601,27 @@ def _run_cli(options: argparse.Namespace) -> dict:
         "state-rollback": release_selector.rollback_to_last_good,
     }
     if options.command in transitions:
-        return release_selector.update_selector_state(
+        result = release_selector.update_selector_state(
             options.state,
             lock_path=options.lock,
             expected_generation=options.expected_generation,
             transition=transitions[options.command],
         )
+        if (
+            options.command == "state-promote"
+            and release_retention.is_managed_selector_control_pair(
+                options.state,
+                options.lock,
+            )
+        ):
+            result = {
+                **result,
+                "rollback_retention": release_retention.run_after_release(
+                    options.state,
+                    options.lock,
+                ),
+            }
+        return result
     if options.command == "state-show":
         return release_selector.read_selector_state(options.state, lock_path=options.lock)
     if options.command == "verify-release":
