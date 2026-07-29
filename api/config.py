@@ -10,6 +10,7 @@ Discovery order for all paths:
 """
 
 import collections
+from collections.abc import MutableMapping
 from contextlib import contextmanager
 import copy
 from datetime import datetime, timezone
@@ -1701,6 +1702,77 @@ def _provider_is_known_or_configured(
     )
 
 
+class _ProviderModelsCatalog(MutableMapping):
+    """Stable mapping identity with atomically replaceable managed snapshots.
+
+    Unmanaged startup and tests historically mutate the lists returned by this
+    mapping, so ordinary mapping operations deliberately retain that behavior.
+    Managed startup uses the narrow snapshot methods to replace the whole
+    dictionary reference without invalidating cached imports.
+    """
+
+    def __init__(self, initial: dict[str, list[dict]]) -> None:
+        self._snapshot = initial
+        self._mutation_lock = threading.RLock()
+
+    def __getitem__(self, key):
+        return self._snapshot[key]
+
+    def __setitem__(self, key, value) -> None:
+        with self._mutation_lock:
+            replacement = dict(self._snapshot)
+            replacement[key] = value
+            self._snapshot = replacement
+
+    def __delitem__(self, key) -> None:
+        with self._mutation_lock:
+            replacement = dict(self._snapshot)
+            del replacement[key]
+            self._snapshot = replacement
+
+    def __iter__(self):
+        return iter(tuple(self._snapshot))
+
+    def __len__(self) -> int:
+        return len(self._snapshot)
+
+    def get(self, key, default=None):
+        return self._snapshot.get(key, default)
+
+    def keys(self):
+        return self._snapshot.keys()
+
+    def items(self):
+        return self._snapshot.items()
+
+    def values(self):
+        return self._snapshot.values()
+
+    def copy(self):
+        return self._snapshot.copy()
+
+    def __repr__(self) -> str:
+        return repr(self._snapshot)
+
+    def __deepcopy__(self, memo):
+        return copy.deepcopy(self._snapshot, memo)
+
+    def _managed_provider_models_snapshot(self) -> dict[str, list[dict]]:
+        return self._snapshot
+
+    def _replace_managed_provider_models_snapshot(
+        self,
+        replacement: dict[str, list[dict]],
+    ) -> None:
+        if type(replacement) is not dict:
+            raise TypeError("provider-model replacement must be a dictionary")
+        with self._mutation_lock:
+            self._snapshot = replacement
+
+    def _reset_provider_models_lock_after_fork(self) -> None:
+        self._mutation_lock = threading.RLock()
+
+
 # Well-known models per provider (used to populate dropdown for direct API providers)
 _PROVIDER_MODELS = {
     "anthropic": [
@@ -1927,6 +1999,11 @@ _PROVIDER_MODELS = {
         {"id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",  "label": "Global Anthropic Claude Haiku 4.5"},
     ],
 }
+_PROVIDER_MODELS = _ProviderModelsCatalog(_PROVIDER_MODELS)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        after_in_child=_PROVIDER_MODELS._reset_provider_models_lock_after_fork
+    )
 
 
 def _seed_provider_models_from_core() -> None:
@@ -11124,34 +11201,66 @@ _DEFERRED_STARTUP_SETTINGS_TEXT: str | None = None
 _DEFERRED_STARTUP_CONFIG_LOCK = threading.Lock()
 
 
-def apply_startup_profile_state() -> dict:
-    """Apply process-global profile/env patches only when startup is admitted."""
+def apply_startup_profile_state():
+    """Apply the strict process-epoch-bound startup profile snapshot."""
     if not _startup_mutations_are_admitted():
         raise RunAdmissionClosed(
             "startup profile initialization requires signed acceptance"
         )
     try:
-        from api.profiles import init_profile_state
-    except ImportError:
-        return {"status": "unavailable"}
-    init_profile_state()
-    return {"status": "initialized"}
+        from api.managed_startup_profile import (
+            apply_managed_startup_profile_state,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict startup profile reconciler is unavailable"
+        ) from exc
+    return apply_managed_startup_profile_state()
 
 
-def seed_startup_provider_models() -> dict:
-    """Merge Agent provider models after managed startup is accepted."""
+def verify_startup_profile_state(receipt=None):
+    """Return the strict four-way startup profile verification result."""
+
+    try:
+        from api.managed_startup_profile import (
+            verify_managed_startup_profile_state,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict startup profile verifier is unavailable"
+        ) from exc
+    return verify_managed_startup_profile_state(receipt)
+
+
+def seed_startup_provider_models():
+    """Apply the strict process-epoch provider-model snapshot."""
     if not _startup_mutations_are_admitted():
         raise RunAdmissionClosed(
             "provider model seeding requires signed acceptance"
         )
     try:
-        _seed_provider_models_from_core()
-    except ImportError:
-        return {"status": "unavailable"}
-    except Exception:
-        logger.warning("provider-model seeder failed", exc_info=True)
-        return {"status": "failed"}
-    return {"status": "seeded"}
+        from managed_startup_provider_models import (
+            reconcile_managed_startup_provider_models,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict provider-model reconciler is unavailable"
+        ) from exc
+    return reconcile_managed_startup_provider_models()
+
+
+def verify_startup_provider_models(receipt=None):
+    """Return the strict four-way provider-model verification result."""
+
+    try:
+        from managed_startup_provider_models import (
+            verify_managed_startup_provider_models,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict provider-model verifier is unavailable"
+        ) from exc
+    return verify_managed_startup_provider_models(receipt)
 
 
 def apply_deferred_startup_configuration() -> dict:
