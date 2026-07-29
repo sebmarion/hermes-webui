@@ -107,9 +107,12 @@ Before the release transaction begins:
    task and require the deployment-specific pause marker before marking it
    paused. Atomically update the receipt after every steer and acknowledgement.
 6. Use a configurable `--pause-timeout` with a default of 300 seconds. If any
-   task does not acknowledge before that deadline, stop the deployment, resume
-   every task already paused, and report the exact non-acknowledging task. Do
-   not kill it automatically.
+   task does not acknowledge before that deadline, stop the deployment and
+   send an idempotent abort/resume message to every task in `steer-intent`,
+   `steer-sent`, or `acknowledged` state. Re-read and reconcile every such task
+   before closing the receipt, so a late acknowledgement cannot strand a task
+   after deployment abort. Report the exact non-acknowledging task and do not
+   kill it automatically.
 7. Immediately before `release-commit`, list local Codex tasks again. If a new
    task became active, add it to the receipt and run the same steer/wait
    protocol. Require two consecutive snapshots two seconds apart with no
@@ -208,12 +211,14 @@ On a pre-promotion failure, use the transaction's exact rollback. On a
 post-promotion retention failure, keep the accepted release, report retention
 failure, and do not pretend the release rolled back.
 
-For any other post-promotion identity or health failure, retry bounded
-verification without changing state. If neither the candidate pair nor an
-exact transaction-owned rollback reaches a verified terminal identity, mark
-the deployment `indeterminate`, keep the possibly steered tasks paused, and
-require operator recovery. Do not use selector-only rollback, do not claim the
-candidate is healthy, and do not resume tasks into an unverified runtime.
+For any other post-promotion identity or health failure, retry verification
+without changing state for a configurable
+`--post-promotion-verify-timeout`, defaulting to 120 seconds. If neither the
+candidate pair nor an exact transaction-owned rollback reaches a verified
+terminal identity, mark the deployment `indeterminate`, keep the possibly
+steered tasks paused, and require operator recovery. Do not use selector-only
+rollback, do not claim the candidate is healthy, and do not resume tasks into
+an unverified runtime.
 
 ## Future Release Interface
 
