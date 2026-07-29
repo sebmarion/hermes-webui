@@ -50,6 +50,11 @@ No upstream fetch, merge, rebase, or update is part of this policy.
 
 ### Stage 1: Immediate Consistent r76
 
+Create the initial authoritative local branches before planning:
+
+- WebUI `release/current` at `48a0b7f8`;
+- Agent `release/current` at `8fbefbe5`.
+
 Build and deploy a full paired r76 from:
 
 - WebUI `48a0b7f8`;
@@ -81,10 +86,14 @@ Raw process killing is not part of normal deployment.
 Before the release transaction begins:
 
 1. Generate a unique deployment ID.
-2. List Codex tasks and select tasks whose status is `active`, excluding the
-   deployment coordinator task.
+2. List every visible local Codex task across projects and select entries with
+   `kind=codex`, `hostId=local`, and `status=active`, excluding the deployment
+   coordinator task. ChatGPT conversations, remote-host tasks, idle tasks, and
+   unloaded tasks are outside this local Hermes restart boundary.
 3. Record each selected task's thread ID, host ID, title, project/cwd, and
-   pre-pause status in a deployment pause receipt.
+   pre-pause status in a deployment pause receipt. Persist that receipt
+   atomically as private `0600` data and fsync its parent before sending the
+   first steering message.
 4. Send each selected task a steering message:
 
    > Deployment `<id>` is preparing a Hermes restart. At your next safe
@@ -94,9 +103,16 @@ Before the release transaction begins:
 
 5. Wait for every selected task to yield or request attention. Re-read the
    task and require the deployment-specific pause marker before marking it
-   paused.
-6. If any task does not acknowledge within the bounded drain window, stop the
-   deployment and report the exact task. Do not kill it automatically.
+   paused. Atomically update the receipt after every steer and acknowledgement.
+6. Use a configurable `--pause-timeout` with a default of 300 seconds. If any
+   task does not acknowledge before that deadline, stop the deployment, resume
+   every task already paused, and report the exact non-acknowledging task. Do
+   not kill it automatically.
+7. Immediately before `release-commit`, list local Codex tasks again. If a new
+   task became active, add it to the receipt and run the same steer/wait
+   protocol. Require two consecutive snapshots two seconds apart with no
+   unpaused active task before entering the release transaction. Any new
+   active task observed before service shutdown reopens this gate.
 
 The release controller's existing activity drain remains authoritative for
 Hermes streams, delegations, processes, memory commits, OAuth work, terminal
@@ -108,22 +124,52 @@ Cloudflare tunnel, are outside the deployment target and remain running.
 
 ## Paused Task Resume Protocol
 
-After WebUI, gateway, Agent, selector, and rollback retention are verified:
+After either the new pair or the exact rollback pair reaches a verified
+terminal state:
 
 1. For each task recorded as paused, send:
 
-   > Deployment `<id>` is verified. Resume from your persisted checkpoint and
-   > revalidate any external/runtime assumptions that may have changed during
-   > the restart.
+   > Deployment `<id>` reached verified terminal state `<accepted|rolled-back>`.
+   > Resume from your persisted checkpoint and revalidate any external/runtime
+   > assumptions that may have changed during the restart.
 
 2. Preserve the task's existing model and reasoning settings.
 3. Take an immediate task snapshot to confirm the follow-up was accepted.
 4. Record the post-resume status in the same deployment receipt.
-5. A failure to resume one task does not roll back a healthy release, but it
-   must be reported with its thread ID and recovery action.
+5. A failure to resume one task does not roll back a healthy release or a
+   verified rollback, but it must be reported with its thread ID and recovery
+   action.
 
-Tasks that were idle, unloaded, archived, or created after the pause snapshot
-are not resumed by this deployment.
+Tasks that were idle, unloaded, or archived are not resumed by this
+deployment. Tasks created or activated during the pause window are captured by
+the final quiescence rescan and become normal pause/resume targets.
+
+A nonfatal post-promotion retention failure does not keep tasks paused. It is
+included in the resume message and deployment receipt as a warning.
+
+## Pause Receipt Durability and Recovery
+
+Pause receipts live below the private reliability root in
+`deployment-receipts/`. They contain task identity and lifecycle state but no
+prompt bodies, credentials, or model secrets.
+
+On coordinator startup, an incomplete receipt must be reconciled before a new
+deployment begins:
+
+- If no release transaction started, resume every acknowledged task and mark
+  the deployment aborted.
+- If the selector transaction is nonterminal, resume the existing release
+  transaction before steering or resuming tasks.
+- If the new release is durably accepted and its pair identity verifies,
+  resume paused tasks with the success message even when rolling retention
+  reported a nonfatal failure.
+- If exact rollback is durably verified, resume paused tasks with a rollback
+  message that tells them to revalidate runtime assumptions.
+- If neither the candidate nor rollback can be verified, keep the tasks
+  paused, report the receipt path and task IDs, and require operator recovery.
+
+Every receipt transition is an atomic replace followed by a parent-directory
+fsync so a coordinator crash cannot erase which tasks were paused.
 
 ## Paired Release Transaction
 
@@ -170,6 +216,24 @@ The command accepts no arbitrary production commit by default. An explicit
 recovery-only override must be separate and noisy. Low-level selector commands
 remain available for recovery but are not documented as the normal release
 path.
+
+## Delivery Boundaries
+
+Implementation is split into three independently verifiable deliverables:
+
+1. **r76 paired deployment:** establish initial `release/current` branches,
+   cooperatively pause active tasks using an operator-managed durable receipt,
+   deploy the proven r76 pair, verify one rollback, and resume tasks.
+2. **Local-history reconciliation and r77:** reconcile only Seb's local WebUI
+   and Agent histories into new tested `release/current` tips, then deploy and
+   verify the r77 pair.
+3. **Reusable release command:** encode plan generation, canonical-tip checks,
+   durable pause recovery, paired release, retention, and targeted resume in
+   one supported high-level interface.
+
+Each deliverable has its own tests, receipt, rollback boundary, and acceptance
+checkpoint. Failure in a later deliverable does not invalidate an already
+verified earlier release.
 
 ## Receipts and Audit
 
