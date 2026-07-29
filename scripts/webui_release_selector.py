@@ -1076,6 +1076,73 @@ def update_selector_state(
         for build_id, record in current["releases"].items():
             if proposed["releases"].get(build_id) != record:
                 raise SelectorError("selector release records are immutable")
+        if transition is activate_candidate and proposed == current:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            return current
+        proposed["generation"] = current["generation"] + 1
+        proposed = _validate_state(proposed)
+        _atomic_write_state(state_path, proposed, crash_at=crash_at)
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        return proposed
+
+
+def selector_state_sha256(state: dict) -> str:
+    """Digest one canonical validated selector-state value."""
+    canonical = _validate_state(copy.deepcopy(state))
+    return hashlib.sha256(
+        json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def prune_idle_selector_releases(
+    state_path: Path | str,
+    *,
+    lock_path: Path | str,
+    expected_generation: int,
+    expected_state_sha256: str,
+    expected_current: str,
+    expected_last_good: str,
+    crash_at: str | None = None,
+) -> dict:
+    """CAS an idle selector to exactly current plus one prior rollback."""
+    if not _SHA256.fullmatch(str(expected_state_sha256 or "")):
+        raise SelectorError("selector expected state digest is invalid")
+    state_path, lock_path = _state_lock_paths(state_path, lock_path)
+    with _with_lock(lock_path) as lock_handle:
+        current = _read_state_unlocked(state_path)
+        if current["generation"] != expected_generation:
+            raise SelectorError("selector state generation conflict")
+        if selector_state_sha256(current) != expected_state_sha256:
+            raise SelectorError("selector state digest conflict")
+        if current["candidate"] is not None or (
+            current["pending_transaction_id"] is not None
+        ):
+            raise SelectorError("selector must be idle before release pruning")
+        if (
+            current["current"] != expected_current
+            or current["last_good"] != expected_last_good
+            or expected_current not in current["releases"]
+            or expected_last_good not in current["releases"]
+        ):
+            raise SelectorError("selector protected release identity changed")
+        if expected_current == expected_last_good:
+            raise SelectorError(
+                "selector current and last-good releases must differ"
+            )
+        proposed = copy.deepcopy(current)
+        proposed["releases"] = {
+            expected_current: copy.deepcopy(
+                current["releases"][expected_current]
+            ),
+            expected_last_good: copy.deepcopy(
+                current["releases"][expected_last_good]
+            ),
+        }
+        proposed["bootstrap_fallback"] = expected_last_good
         proposed["generation"] = current["generation"] + 1
         proposed = _validate_state(proposed)
         _atomic_write_state(state_path, proposed, crash_at=crash_at)
@@ -1108,7 +1175,10 @@ def activate_candidate(state: dict) -> dict:
     transaction_id = str(next_state.get("pending_transaction_id") or "")
     if not _TRANSACTION_ID.fullmatch(transaction_id):
         raise SelectorError("selector candidate startup transaction is invalid")
-    next_state["current"] = next_state["candidate"]
+    prior_current = next_state["current"]
+    if prior_current != next_state["candidate"]:
+        next_state["last_good"] = prior_current
+        next_state["current"] = next_state["candidate"]
     return next_state
 
 
@@ -1117,7 +1187,6 @@ def promote_candidate(state: dict) -> dict:
     candidate = next_state.get("candidate")
     if candidate is None or next_state.get("current") != candidate:
         raise SelectorError("selector candidate is not active")
-    next_state["last_good"] = candidate
     next_state["candidate"] = None
     next_state["pending_transaction_id"] = None
     return next_state

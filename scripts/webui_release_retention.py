@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from scripts import webui_release_selector as release_selector
 
 _UNCONFIGURED_ROOT = Path("/__hermes_release_retention_unconfigured__")
 RELIABILITY_ROOT = _UNCONFIGURED_ROOT
@@ -1455,8 +1456,8 @@ def validate_selector_state(
         value = state.get(key)
         if not isinstance(value, str) or value not in releases:
             raise CleanupError(f"selector reference is invalid: {key}")
-    if state["current"] != state["last_good"]:
-        raise CleanupError("selector current and last-good releases disagree")
+    if state["current"] == state["last_good"]:
+        raise CleanupError("selector current and last-good releases must differ")
     for build_id, record in releases.items():
         if (
             not isinstance(build_id, str)
@@ -1502,7 +1503,7 @@ def lsof_open_rows(path: Path) -> list[str]:
     if lsof is None:
         raise CleanupError("lsof is unavailable")
     result = subprocess.run(
-        [lsof, "+D", str(path)],
+        [lsof, "+D", str(path)] if path.is_dir() else [lsof, str(path)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -2100,13 +2101,530 @@ def dry_run() -> dict[str, Any]:
     }
 
 
+def _accepted_release_journal(
+    transaction_id: str,
+    expected_current_build: str,
+) -> dict[str, Any]:
+    if release_selector._TRANSACTION_ID.fullmatch(transaction_id) is None:
+        raise CleanupError("accepted release transaction identity is invalid")
+    journals, _bootstraps = load_journals()
+    matches = [
+        journal
+        for journal in journals.values()
+        if journal["transaction_id"] == transaction_id
+    ]
+    if len(matches) != 1:
+        raise CleanupError("accepted release transaction journal is not exact")
+    journal = matches[0]
+    expected = journal["expected_candidate_identity"]
+    if expected.get("build_id") != expected_current_build:
+        raise CleanupError("accepted release current build is not journal-bound")
+    phases = journal["phases"]
+    if "pair_accepted" not in phases and "candidate_accepted" not in phases:
+        raise CleanupError("release transaction is not accepted")
+    return journal
+
+
+def _rolling_release_plan(
+    *,
+    accepted_transaction_id: str,
+    expected_current_build: str,
+) -> dict[str, Any]:
+    journal = _accepted_release_journal(
+        accepted_transaction_id,
+        expected_current_build,
+    )
+    state = release_selector.read_selector_state(
+        SELECTOR_STATE,
+        lock_path=SELECTOR_LOCK,
+    )
+    if state["current"] != expected_current_build:
+        raise CleanupError("selector current build changed after acceptance")
+    current = state["current"]
+    last_good = state["last_good"]
+    protected_builds = {current, last_good}
+    verified = {}
+    for build_id in (current, last_good):
+        record = state["releases"][build_id]
+        try:
+            identity = release_selector.verify_release(
+                SELECTOR_RELEASES / build_id,
+                release_root=SELECTOR_RELEASES,
+                expected_manifest_sha256=record["manifest_sha256"],
+                selector_path=None,
+                verify_selector_identity=False,
+            )
+        except release_selector.SelectorError as exc:
+            raise CleanupError(
+                f"protected release manifest is invalid: {build_id}: {exc}"
+            ) from exc
+        if (
+            identity["commit"] != record["commit"]
+            or identity["tree"] != record["tree"]
+        ):
+            raise CleanupError(
+                f"protected release record changed: {build_id}"
+            )
+        verified[build_id] = identity
+
+    candidates: list[dict[str, Any]] = []
+    unknown: list[str] = []
+    for build_id in sorted(set(state["releases"]) - protected_builds):
+        path = SELECTOR_RELEASES / build_id
+        record = state["releases"][build_id]
+        try:
+            identity = release_selector.verify_release(
+                path,
+                release_root=SELECTOR_RELEASES,
+                expected_manifest_sha256=record["manifest_sha256"],
+                selector_path=None,
+                verify_selector_identity=False,
+            )
+        except release_selector.SelectorError as exc:
+            raise CleanupError(
+                f"obsolete release manifest is invalid: {build_id}: {exc}"
+            ) from exc
+        if (
+            identity["commit"] != record["commit"]
+            or identity["tree"] != record["tree"]
+        ):
+            raise CleanupError(f"obsolete release record changed: {build_id}")
+        opened = path.stat()
+        candidates.append(
+            {
+                "kind": "webui-release",
+                "path": str(path),
+                "device": opened.st_dev,
+                "inode": opened.st_ino,
+            }
+        )
+    for path in sorted(SELECTOR_RELEASES.iterdir(), key=lambda item: item.name):
+        if path.name in state["releases"]:
+            continue
+        manifest_path = path / release_selector.MANIFEST_NAME
+        if path.is_dir() and not path.is_symlink() and manifest_path.is_file():
+            try:
+                manifest_sha256 = sha256_file(manifest_path)
+                identity = release_selector.verify_release(
+                    path,
+                    release_root=SELECTOR_RELEASES,
+                    expected_manifest_sha256=manifest_sha256,
+                    selector_path=None,
+                    verify_selector_identity=False,
+                )
+            except (OSError, release_selector.SelectorError):
+                unknown.append(str(path))
+                continue
+            if identity["build_id"] != path.name:
+                unknown.append(str(path))
+                continue
+            opened = path.stat()
+            candidates.append(
+                {
+                    "kind": "orphan-webui-release",
+                    "path": str(path),
+                    "device": opened.st_dev,
+                    "inode": opened.st_ino,
+                }
+            )
+        else:
+            unknown.append(str(path))
+
+    protected_artifacts = {
+        Path(identity[field])
+        for identity in verified.values()
+        for field in (
+            "agent_source_path",
+            "agent_source_manifest_path",
+            "runtime_path",
+            "runtime_manifest_path",
+        )
+    }
+    artifact_roots = {
+        Path(identity[field]).parent.parent
+        for identity in verified.values()
+        for field in ("agent_source_path", "runtime_path")
+    }
+    agent_roots = {
+        Path(identity["agent_source_path"]).parent.parent
+        for identity in verified.values()
+    }
+    runtime_roots = {
+        Path(identity["runtime_path"]).parent.parent
+        for identity in verified.values()
+    }
+    if len(agent_roots) != 1 or len(runtime_roots) != 1:
+        raise CleanupError("protected artifact roots are not exact")
+    if agent_roots & runtime_roots:
+        raise CleanupError("agent and runtime artifact roots are not distinct")
+    for root in sorted(artifact_roots, key=str):
+        artifact_kind = "agent" if root in agent_roots else "runtime"
+        snapshots = root / "snapshots"
+        manifests = root / "manifests"
+        require_owned_directory(snapshots, label="artifact snapshots root")
+        require_owned_directory(manifests, label="artifact manifests root")
+        for snapshot in sorted(snapshots.iterdir(), key=lambda item: item.name):
+            manifest = manifests / f"{snapshot.name}.json"
+            if snapshot in protected_artifacts:
+                continue
+            if (
+                HEX64.fullmatch(snapshot.name) is None
+                or not snapshot.is_dir()
+            ):
+                unknown.append(str(snapshot))
+                continue
+            if snapshot.is_symlink() or manifest.is_symlink():
+                raise CleanupError(
+                    f"recognized artifact is symlinked: {snapshot}"
+                )
+            if not manifest.is_file():
+                unknown.append(str(snapshot))
+                continue
+            try:
+                raw_manifest = manifest.read_bytes()
+                parsed_manifest = json.loads(raw_manifest)
+                if (
+                    not isinstance(parsed_manifest, dict)
+                    or hashlib.sha256(raw_manifest).hexdigest()
+                    != snapshot.name
+                ):
+                    raise ValueError("manifest identity mismatch")
+                if artifact_kind == "agent":
+                    release_selector.verify_agent_source(
+                        {
+                            "path": str(snapshot),
+                            "resolved_path": str(snapshot.resolve(strict=True)),
+                            "commit": parsed_manifest.get("commit"),
+                            "tree": parsed_manifest.get("tree"),
+                            "manifest_path": str(manifest),
+                            "manifest_sha256": snapshot.name,
+                        }
+                    )
+                else:
+                    interpreter_relative = parsed_manifest.get(
+                        "interpreter_relative_path"
+                    )
+                    site_relative = parsed_manifest.get(
+                        "site_packages_relative_path"
+                    )
+                    interpreter = snapshot / str(interpreter_relative)
+                    release_selector.verify_runtime(
+                        {
+                            "path": str(snapshot),
+                            "resolved_path": str(snapshot.resolve(strict=True)),
+                            "python_home_path": str(snapshot / "python-home"),
+                            "site_packages_path": str(snapshot / str(site_relative)),
+                            "interpreter_path": str(interpreter),
+                            "interpreter_resolved_path": str(
+                                interpreter.resolve(strict=True)
+                            ),
+                            "manifest_path": str(manifest),
+                            "manifest_sha256": snapshot.name,
+                        }
+                    )
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                json.JSONDecodeError,
+                release_selector.SelectorError,
+            ) as exc:
+                raise CleanupError(
+                    f"recognized {artifact_kind} artifact is malformed: "
+                    f"{snapshot}"
+                ) from exc
+            opened_snapshot = snapshot.stat()
+            opened_manifest = manifest.stat()
+            if (
+                opened_snapshot.st_uid != os.getuid()
+                or opened_manifest.st_uid != os.getuid()
+                or not stat.S_ISREG(opened_manifest.st_mode)
+                or opened_manifest.st_nlink != 1
+            ):
+                raise CleanupError(
+                    f"recognized artifact ownership is unsafe: {snapshot}"
+                )
+            candidates.extend(
+                (
+                    {
+                        "kind": "artifact-snapshot",
+                        "path": str(snapshot),
+                        "device": opened_snapshot.st_dev,
+                        "inode": opened_snapshot.st_ino,
+                    },
+                    {
+                        "kind": "artifact-manifest",
+                        "path": str(manifest),
+                        "device": opened_manifest.st_dev,
+                        "inode": opened_manifest.st_ino,
+                    },
+                )
+            )
+        for manifest in sorted(manifests.glob("*.json"), key=lambda item: item.name):
+            snapshot = snapshots / manifest.stem
+            if manifest in protected_artifacts or snapshot.exists():
+                continue
+            unknown.append(str(manifest))
+    canonical = {
+        "transaction_id": accepted_transaction_id,
+        "expected_current_build": expected_current_build,
+        "selector_generation": state["generation"],
+        "selector_state_sha256": release_selector.selector_state_sha256(state),
+        "current": current,
+        "last_good": last_good,
+        "bootstrap_fallback_identity": verified[last_good],
+        "release_records": state["releases"],
+        "protected_paths": sorted(
+            str(path)
+            for path in (
+                *(SELECTOR_RELEASES / build for build in protected_builds),
+                *protected_artifacts,
+            )
+        ),
+        "candidates": candidates,
+        "unknown_protected": sorted(set(unknown)),
+        "journal_path": journal["_path"],
+    }
+    canonical["plan_sha256"] = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return canonical
+
+
+def _apply_rolling_release_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    RECEIPTS_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    receipt_path = (
+        RECEIPTS_ROOT
+        / f"rolling-release-cleanup-{plan['transaction_id']}.json"
+    )
+    operations = [
+        {
+            "source": candidate["path"],
+            "destination": str(
+                Path(candidate["path"]).with_name(
+                    ".hermes-retention-quarantine-"
+                    f"{plan['transaction_id']}-{index:04d}-"
+                    f"{Path(candidate['path']).name}"
+                )
+            ),
+            "device": candidate["device"],
+            "inode": candidate["inode"],
+            "state": "intent",
+        }
+        for index, candidate in enumerate(plan["candidates"])
+    ]
+    if receipt_path.exists():
+        receipt = read_json_file(receipt_path, label="rolling cleanup receipt")
+        if (
+            receipt.get("version") != 1
+            or receipt.get("plan") != plan
+            or not isinstance(receipt.get("operations"), list)
+            or len(receipt["operations"]) != len(operations)
+        ):
+            raise CleanupError("rolling cleanup receipt changed")
+        for recorded, expected in zip(receipt["operations"], operations):
+            if (
+                not isinstance(recorded, dict)
+                or any(
+                    recorded.get(field) != expected[field]
+                    for field in (
+                        "source",
+                        "destination",
+                        "device",
+                        "inode",
+                    )
+                )
+                or recorded.get("state")
+                not in {"intent", "quarantined", "deleted"}
+            ):
+                raise CleanupError("rolling cleanup operation changed")
+        if receipt.get("status") == "completed":
+            return receipt
+    else:
+        receipt = {
+            "version": 1,
+            "status": "planned",
+            "plan": plan,
+            "operations": operations,
+        }
+        create_receipt(receipt_path, receipt)
+    resume_status = receipt.get("status")
+    deleting_intent = resume_status == "deleting"
+    if resume_status not in {
+        "planned",
+        "selector-pruned",
+        "quarantining",
+        "deleting",
+    }:
+        raise CleanupError("rolling cleanup receipt status is invalid")
+    for candidate in plan["candidates"]:
+        path = Path(candidate["path"])
+        if not path.exists():
+            continue
+        if lsof_open_rows(path):
+            raise CleanupError(
+                f"rolling retention candidate has open files: {candidate['path']}"
+            )
+    current_state = release_selector.read_selector_state(
+        SELECTOR_STATE, lock_path=SELECTOR_LOCK
+    )
+    if (
+        current_state["generation"] == plan["selector_generation"]
+        and release_selector.selector_state_sha256(current_state)
+        == plan["selector_state_sha256"]
+    ):
+        pruned = release_selector.prune_idle_selector_releases(
+            SELECTOR_STATE,
+            lock_path=SELECTOR_LOCK,
+            expected_generation=plan["selector_generation"],
+            expected_state_sha256=plan["selector_state_sha256"],
+            expected_current=plan["current"],
+            expected_last_good=plan["last_good"],
+        )
+    elif (
+        current_state["generation"] == plan["selector_generation"] + 1
+        and current_state["current"] == plan["current"]
+        and current_state["last_good"] == plan["last_good"]
+        and current_state["bootstrap_fallback"] == plan["last_good"]
+        and set(current_state["releases"])
+        == {plan["current"], plan["last_good"]}
+    ):
+        pruned = current_state
+    else:
+        raise CleanupError("selector changed outside rolling cleanup")
+    receipt["selector_after_prune"] = pruned
+    if not deleting_intent:
+        receipt["status"] = "selector-pruned"
+        atomic_receipt(receipt_path, receipt)
+        receipt["status"] = "quarantining"
+        atomic_receipt(receipt_path, receipt)
+        for operation in receipt["operations"]:
+            source = Path(operation["source"])
+            destination = Path(operation["destination"])
+            if source.exists() and not destination.exists():
+                opened = source.lstat()
+                if (
+                    stat.S_ISLNK(opened.st_mode)
+                    or opened.st_dev != operation["device"]
+                    or opened.st_ino != operation["inode"]
+                ):
+                    raise CleanupError(
+                        f"rolling retention candidate changed: {source}"
+                    )
+                os.replace(source, destination)
+            elif destination.exists() and not source.exists():
+                opened = destination.lstat()
+                if (
+                    stat.S_ISLNK(opened.st_mode)
+                    or opened.st_dev != operation["device"]
+                    or opened.st_ino != operation["inode"]
+                ):
+                    raise CleanupError(
+                        f"rolling quarantine identity changed: {destination}"
+                    )
+            elif source.exists() == destination.exists():
+                raise CleanupError(
+                    f"rolling quarantine state is ambiguous: {source}"
+                )
+            fsync_directory(source.parent)
+            operation["state"] = "quarantined"
+            atomic_receipt(receipt_path, receipt)
+        receipt["status"] = "deleting"
+        atomic_receipt(receipt_path, receipt)
+    else:
+        for operation in receipt["operations"]:
+            if operation["state"] not in {"quarantined", "deleted"}:
+                raise CleanupError(
+                    "rolling deleting receipt has an unquarantined operation"
+                )
+    for operation in receipt["operations"]:
+        source = Path(operation["source"])
+        destination = Path(operation["destination"])
+        source_exists = source.exists()
+        destination_exists = destination.exists()
+        if operation["state"] == "deleted":
+            if source_exists or destination_exists:
+                raise CleanupError(
+                    f"rolling deleted operation reappeared: {source}"
+                )
+            continue
+        if source_exists:
+            raise CleanupError(
+                f"rolling quarantined source reappeared: {source}"
+            )
+        if not destination.exists():
+            operation["state"] = "deleted"
+            atomic_receipt(receipt_path, receipt)
+            continue
+        if destination.is_dir():
+            remove_sealed_tree(destination)
+        else:
+            destination.unlink()
+        fsync_directory(destination.parent)
+        operation["state"] = "deleted"
+        atomic_receipt(receipt_path, receipt)
+    final_state = release_selector.read_selector_state(
+        SELECTOR_STATE,
+        lock_path=SELECTOR_LOCK,
+    )
+    if (
+        final_state["current"] != plan["current"]
+        or final_state["last_good"] != plan["last_good"]
+        or set(final_state["releases"])
+        != {plan["current"], plan["last_good"]}
+        or final_state["bootstrap_fallback"] != plan["last_good"]
+    ):
+        raise CleanupError("selector rolling-retention reverify failed")
+    for build_id in (plan["current"], plan["last_good"]):
+        record = final_state["releases"][build_id]
+        release_selector.verify_release(
+            SELECTOR_RELEASES / build_id,
+            release_root=SELECTOR_RELEASES,
+            expected_manifest_sha256=record["manifest_sha256"],
+            selector_path=None,
+            verify_selector_identity=False,
+        )
+    receipt["selector_final"] = final_state
+    receipt["status"] = "completed"
+    receipt["receipt_path"] = str(receipt_path)
+    atomic_receipt(receipt_path, receipt)
+    return receipt
+
+
 def run_after_release(
     selector_state: Path | str,
     selector_lock: Path | str,
+    *,
+    accepted_transaction_id: str,
+    expected_current_build: str,
 ) -> dict[str, Any]:
     """Apply the exact verified rolling plan after a durable release promotion."""
     try:
         configure_release_paths(release_paths(selector_state, selector_lock))
+        rolling_receipt_path = (
+            RECEIPTS_ROOT
+            / f"rolling-release-cleanup-{accepted_transaction_id}.json"
+        )
+        if rolling_receipt_path.exists():
+            prior = read_json_file(
+                rolling_receipt_path,
+                label="rolling cleanup receipt",
+            )
+            rolling_plan = prior.get("plan")
+            if (
+                not isinstance(rolling_plan, dict)
+                or rolling_plan.get("transaction_id")
+                != accepted_transaction_id
+                or rolling_plan.get("expected_current_build")
+                != expected_current_build
+            ):
+                raise CleanupError("rolling cleanup receipt binding changed")
+        else:
+            rolling_plan = _rolling_release_plan(
+                accepted_transaction_id=accepted_transaction_id,
+                expected_current_build=expected_current_build,
+            )
+        rolling_receipt = _apply_rolling_release_plan(rolling_plan)
         preview = dry_run()
         receipt = apply_cleanup(preview["plan_sha256"])
         retained = [
@@ -2121,6 +2639,9 @@ def run_after_release(
             "deleted_payload_trees": len(receipt.get("deleted", [])),
             "disk_free_delta_bytes": receipt.get("disk_free_delta_bytes", 0),
             "plan_sha256": receipt["plan_sha256"],
+            "rolling_release_receipt": rolling_receipt["receipt_path"],
+            "rolling_deleted": len(rolling_receipt["operations"]),
+            "unknown_legacy_artifacts": rolling_plan["unknown_protected"],
         }
     except Exception as exc:
         return {
@@ -2138,6 +2659,8 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--expected-plan-sha256")
     parser.add_argument("--after-release", action="store_true")
+    parser.add_argument("--accepted-transaction-id")
+    parser.add_argument("--expected-current-build")
     options = parser.parse_args()
     try:
         configure_release_paths(
@@ -2151,6 +2674,12 @@ def main() -> int:
             result = run_after_release(
                 options.selector_state,
                 options.selector_lock,
+                accepted_transaction_id=str(
+                    options.accepted_transaction_id or ""
+                ),
+                expected_current_build=str(
+                    options.expected_current_build or ""
+                ),
             )
         elif options.apply:
             result = apply_cleanup(str(options.expected_plan_sha256 or ""))

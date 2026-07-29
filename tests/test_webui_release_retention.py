@@ -97,10 +97,82 @@ def test_after_release_reports_failure_without_raising(tmp_path):
     result = retention.run_after_release(
         tmp_path / "selector-state.json",
         tmp_path / "selector-state.lock",
+        accepted_transaction_id="accepted-release-transaction-000001",
+        expected_current_build="candidate",
     )
 
     assert result["status"] == "failed"
     assert result["error"].startswith("CleanupError:")
+
+
+def test_rolling_cleanup_rejects_both_absent_before_deleting_intent(
+    tmp_path, monkeypatch
+):
+    transaction_id = "rolling-absence-before-delete-transaction-0001"
+    source = tmp_path / "obsolete-release"
+    source.mkdir()
+    opened = source.stat()
+    source.rmdir()
+    destination = source.with_name(
+        ".hermes-retention-quarantine-"
+        f"{transaction_id}-0000-{source.name}"
+    )
+    plan = {
+        "transaction_id": transaction_id,
+        "selector_generation": 0,
+        "selector_state_sha256": "a" * 64,
+        "current": "candidate",
+        "last_good": "base",
+        "candidates": [
+            {
+                "kind": "webui-release",
+                "path": str(source),
+                "device": opened.st_dev,
+                "inode": opened.st_ino,
+            }
+        ],
+    }
+    receipt_root = tmp_path / "receipts"
+    monkeypatch.setattr(retention, "RECEIPTS_ROOT", receipt_root)
+    monkeypatch.setattr(retention, "SELECTOR_STATE", tmp_path / "selector.json")
+    monkeypatch.setattr(retention, "SELECTOR_LOCK", tmp_path / "selector.lock")
+    monkeypatch.setattr(retention, "SELECTOR_RELEASES", tmp_path / "releases")
+    state = {
+        "generation": 1,
+        "current": "candidate",
+        "last_good": "base",
+        "bootstrap_fallback": "base",
+        "releases": {"candidate": {}, "base": {}},
+    }
+    monkeypatch.setattr(
+        retention.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: state,
+    )
+    receipt_root.mkdir(mode=0o700)
+    retention.create_receipt(
+        receipt_root / f"rolling-release-cleanup-{transaction_id}.json",
+        {
+            "version": 1,
+            "status": "quarantining",
+            "plan": plan,
+            "operations": [
+                {
+                    "source": str(source),
+                    "destination": str(destination),
+                    "device": opened.st_dev,
+                    "inode": opened.st_ino,
+                    "state": "intent",
+                }
+            ],
+        },
+    )
+
+    with pytest.raises(
+        retention.CleanupError,
+        match="rolling quarantine state is ambiguous",
+    ):
+        retention._apply_rolling_release_plan(plan)
 
 
 def test_retention_requires_split_attestation_before_gateway_binding():

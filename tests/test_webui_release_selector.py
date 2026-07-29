@@ -24,6 +24,7 @@ import pytest
 
 from api import build_identity
 from scripts import webui_release_cutover as cutover
+from scripts import webui_release_retention as retention
 from scripts import webui_release_selector as selector
 
 
@@ -519,6 +520,273 @@ def test_candidate_identity_match_projects_full_release_to_signed_process(tmp_pa
 
     actual["agent_manifest_sha256"] = "0" * 64
     assert not cutover._candidate_identity_matches(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("field", "changed"),
+    [
+        ("selector_generation", 188),
+        ("startup_fenced", False),
+        (
+            "startup_transaction_id",
+            "wrong-origin-transaction-20260729",
+        ),
+    ],
+)
+def test_last_good_webui_identity_requires_retained_startup_markers(
+    field,
+    changed,
+):
+    expected = {
+        "build_id": "r75-webui",
+        "commit": "a" * 40,
+        "manifest_sha256": "b" * 64,
+        "selector_generation": 187,
+        "startup_fenced": True,
+        "startup_transaction_id": (
+            "r75-clarify-composer-transition-20260729"
+        ),
+    }
+    actual = {
+        **expected,
+        "pid": 101,
+        "pid_start_token": "r75-start",
+    }
+
+    assert (
+        cutover._require_expected_last_good_webui_identity(actual, expected)
+        is actual
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="exact last-good WebUI",
+    ):
+        cutover._require_expected_last_good_webui_identity(
+            {**actual, field: changed},
+            expected,
+        )
+
+
+def test_release_control_rejects_modern_drained_wrong_old_before_mutation(
+    tmp_path,
+):
+    transaction_id = "wrong-old-webui-transaction-000001"
+    expected_candidate = {
+        "build_id": "candidate",
+        "launchd_label": "com.example.webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    expected_last_good = {
+        "build_id": "r75-webui",
+        "pid": 101,
+        "pid_start_token": "r75-start",
+    }
+    wrong_old = {
+        **expected_last_good,
+        "build_id": "r74-webui",
+    }
+    journal_path = tmp_path / "wrong-old-webui.json"
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=expected_candidate,
+        rollback_receipt={
+            "build_id": "r75-webui",
+            "plist_sha256": "a" * 64,
+            "state_snapshot_id": "pre-candidate-snapshot",
+            "state_snapshot_sha256": "b" * 64,
+        },
+    )
+    cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase="staged",
+        receipt={"generation": 1},
+    )
+    cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase="plist_installed",
+        receipt={"plist_sha256": "c" * 64},
+    )
+    inspection = {
+        "status": "inspected",
+        "transaction_id": transaction_id,
+        "identity": wrong_old,
+        "admission": {
+            "state": "fenced",
+            "active_runs": 0,
+            "reservations": 0,
+        },
+        "activity": {
+            "active_streams": 0,
+            "active_async_delegations": 0,
+            "async_delegations_available": True,
+            "active_background_memory_commits": 0,
+            "in_flight_memory_commits": 0,
+            "memory_commit_activity_available": True,
+            "pending_oauth_flows": 0,
+            "oauth_activity_available": True,
+            "active_terminals": 0,
+            "terminal_activity_available": True,
+            "running_processes": 0,
+            "finalizing_processes": 0,
+            "durable_undelivered_completions": 0,
+            "process_completion_activity_available": True,
+        },
+    }
+    mutations = []
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="exact last-good WebUI",
+    ):
+        cutover.run_release_control_cutover(
+            initial_inspection=inspection,
+            inspect_control=lambda: inspection,
+            send_control=lambda *_args: mutations.append("control"),
+            attest_selector_state=lambda: {
+                "status": "verified",
+                "transaction_id": transaction_id,
+                "current": "r75-webui",
+                "candidate": "candidate",
+                "pending_transaction_id": transaction_id,
+            },
+            attest_installed_plist=lambda: {
+                "status": "verified",
+                "launchd_label": "com.example.webui",
+                "plist_sha256": "c" * 64,
+            },
+            activate_selection=lambda: mutations.append("activate"),
+            promote_selection=lambda: mutations.append("promote"),
+            rollback_selection=lambda: mutations.append("rollback"),
+            restore_plist=lambda: mutations.append("restore-plist"),
+            stop_failed_candidate=lambda: mutations.append("stop"),
+            restore_state_snapshot=lambda: mutations.append("restore-state"),
+            restart_selection=lambda: mutations.append("restart"),
+            verify_rollback=lambda: mutations.append("verify"),
+            signal_process=lambda _identity: mutations.append("signal"),
+            wait_for_process_exit=lambda *_args: mutations.append("wait"),
+            inspect_candidate_binding=lambda _identity: {},
+            inspect_accepted_binding=lambda _identity: {},
+            expected_candidate_identity=expected_candidate,
+            expected_last_good_identity=expected_last_good,
+            transaction_id=transaction_id,
+            transaction_journal_path=journal_path,
+            timeout_seconds=2,
+            interval_seconds=0.01,
+        )
+
+    assert mutations == []
+    assert set(
+        cutover.read_transaction_journal(
+            journal_path,
+            transaction_id=transaction_id,
+        )["phases"]
+    ) == {"staged", "plist_installed"}
+
+
+def test_release_control_rejects_mismatched_durable_old_before_resume_mutation(
+    tmp_path,
+):
+    transaction_id = "wrong-resume-old-transaction-000001"
+    expected_candidate = {
+        "build_id": "candidate",
+        "launchd_label": "com.example.webui",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    expected_last_good = {
+        "build_id": "r75-webui",
+        "pid": 101,
+        "pid_start_token": "r75-start",
+    }
+    wrong_old = {
+        **expected_last_good,
+        "build_id": "r74-webui",
+    }
+    journal_path = tmp_path / "wrong-resume-old.json"
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=expected_candidate,
+        rollback_receipt={
+            "build_id": "r75-webui",
+            "plist_sha256": "a" * 64,
+            "state_snapshot_id": "pre-candidate-snapshot",
+            "state_snapshot_sha256": "b" * 64,
+        },
+    )
+    for phase, receipt in (
+        ("staged", {"generation": 1}),
+        ("plist_installed", {"plist_sha256": "c" * 64}),
+        (
+            "rollback_started",
+            {
+                "old_identity": wrong_old,
+                "failed_after_activation": False,
+                "old_process_exited": False,
+                "error_type": "InjectedCrash",
+            },
+        ),
+    ):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipt,
+        )
+    mutations = []
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="exact last-good WebUI",
+    ):
+        cutover.run_release_control_cutover(
+            initial_inspection=None,
+            inspect_control=lambda: mutations.append("inspect"),
+            send_control=lambda *_args: mutations.append("control"),
+            attest_selector_state=lambda: {
+                "status": "verified",
+                "transaction_id": transaction_id,
+                "current": "r75-webui",
+                "candidate": None,
+                "pending_transaction_id": None,
+            },
+            attest_installed_plist=lambda: {
+                "status": "verified",
+                "launchd_label": "com.example.webui",
+                "plist_sha256": "c" * 64,
+            },
+            activate_selection=lambda: mutations.append("activate"),
+            promote_selection=lambda: mutations.append("promote"),
+            rollback_selection=lambda: mutations.append("rollback"),
+            restore_plist=lambda: mutations.append("restore-plist"),
+            stop_failed_candidate=lambda: mutations.append("stop"),
+            restore_state_snapshot=lambda: mutations.append("restore-state"),
+            restart_selection=lambda: mutations.append("restart"),
+            verify_rollback=lambda: mutations.append("verify"),
+            signal_process=lambda _identity: mutations.append("signal"),
+            wait_for_process_exit=lambda *_args: mutations.append("wait"),
+            inspect_candidate_binding=lambda _identity: {},
+            inspect_accepted_binding=lambda _identity: {},
+            expected_candidate_identity=expected_candidate,
+            expected_last_good_identity=expected_last_good,
+            transaction_id=transaction_id,
+            transaction_journal_path=journal_path,
+            timeout_seconds=2,
+            interval_seconds=0.01,
+        )
+
+    assert mutations == []
+    assert set(
+        cutover.read_transaction_journal(
+            journal_path,
+            transaction_id=transaction_id,
+        )["phases"]
+    ) == {"staged", "plist_installed", "rollback_started"}
 
 
 def test_expected_release_identity_is_reverified_before_cutover(tmp_path):
@@ -1218,7 +1486,8 @@ def test_selector_state_lifecycle_and_immutable_bootstrap_fallback(tmp_path):
         expected_generation=2,
         transition=selector.promote_candidate,
     )
-    assert state["current"] == state["last_good"] == "candidate"
+    assert state["current"] == "candidate"
+    assert state["last_good"] == "base"
     assert state["candidate"] is None and state["bootstrap_fallback"] == "base"
     state = selector.update_selector_state(
         state_path,
@@ -1251,6 +1520,384 @@ def test_selector_state_lifecycle_and_immutable_bootstrap_fallback(tmp_path):
     assert state["current"] == "candidate"
     assert state["candidate"] is None
     assert state["bootstrap_fallback"] == "base"
+
+
+def test_idle_selector_prune_keeps_current_and_previous_rollback(tmp_path):
+    base = _managed_release(tmp_path, "base")
+    candidate = _managed_release(tmp_path, "candidate")
+    obsolete = _managed_release(tmp_path, "obsolete")
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    state = selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=base["release_root"],
+        bootstrap_build_id="base",
+        bootstrap_record=base["record"],
+    )
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=0,
+        transition=lambda current: selector.stage_candidate(
+            selector.stage_candidate(
+                current,
+                "obsolete",
+                obsolete["record"],
+                transaction_id="selector-prune-obsolete-transaction-0001",
+            ),
+            "candidate",
+            candidate["record"],
+            transaction_id="selector-prune-candidate-transaction-0001",
+        ),
+    )
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=1,
+        transition=selector.activate_candidate,
+    )
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=2,
+        transition=selector.promote_candidate,
+    )
+
+    pruned = selector.prune_idle_selector_releases(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=3,
+        expected_state_sha256=selector.selector_state_sha256(state),
+        expected_current="candidate",
+        expected_last_good="base",
+    )
+
+    assert pruned["generation"] == 4
+    assert set(pruned["releases"]) == {"candidate", "base"}
+    assert pruned["bootstrap_fallback"] == "base"
+    assert pruned["candidate"] is None
+    assert pruned["pending_transaction_id"] is None
+
+
+def test_idle_selector_prune_fails_closed_on_nonrolling_or_changed_state(
+    tmp_path,
+):
+    base = _managed_release(tmp_path, "base")
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    state = selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=base["release_root"],
+        bootstrap_build_id="base",
+        bootstrap_record=base["record"],
+    )
+
+    with pytest.raises(selector.SelectorError, match="must differ"):
+        selector.prune_idle_selector_releases(
+            state_path,
+            lock_path=lock_path,
+            expected_generation=0,
+            expected_state_sha256=selector.selector_state_sha256(state),
+            expected_current="base",
+            expected_last_good="base",
+        )
+    with pytest.raises(selector.SelectorError, match="digest"):
+        selector.prune_idle_selector_releases(
+            state_path,
+            lock_path=lock_path,
+            expected_generation=0,
+            expected_state_sha256="0" * 64,
+            expected_current="base",
+            expected_last_good="other",
+        )
+
+
+def test_replayed_candidate_activation_preserves_prior_last_good(tmp_path):
+    base = _managed_release(tmp_path, "base")
+    candidate = _managed_release(tmp_path, "candidate")
+    state_path = tmp_path / "selector.json"
+    lock_path = tmp_path / "selector.lock"
+    selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=base["release_root"],
+        bootstrap_build_id="base",
+        bootstrap_record=base["record"],
+    )
+    staged = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=0,
+        transition=lambda current: selector.stage_candidate(
+            current,
+            "candidate",
+            candidate["record"],
+            transaction_id="selector-replayed-activation-transaction-0001",
+        ),
+    )
+    activated = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=staged["generation"],
+        transition=selector.activate_candidate,
+    )
+    activated_bytes = state_path.read_bytes()
+    replayed = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=activated["generation"],
+        transition=selector.activate_candidate,
+    )
+
+    assert activated["last_good"] == "base"
+    assert replayed == activated
+    assert state_path.read_bytes() == activated_bytes
+
+
+def test_idle_selector_prune_after_replace_crash_is_durable_and_not_replayed(
+    tmp_path,
+):
+    base = _managed_release(tmp_path, "base")
+    candidate = _managed_release(tmp_path, "candidate")
+    state_path = tmp_path / "selector.json"
+    lock_path = state_path.with_suffix(".lock")
+    state = selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=base["release_root"],
+        bootstrap_build_id="base",
+        bootstrap_record=base["record"],
+    )
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=0,
+        transition=lambda current: selector.stage_candidate(
+            current,
+            "candidate",
+            candidate["record"],
+            transaction_id="selector-prune-crash-transaction-000001",
+        ),
+    )
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=1,
+        transition=selector.activate_candidate,
+    )
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=2,
+        transition=selector.promote_candidate,
+    )
+    digest = selector.selector_state_sha256(state)
+
+    with pytest.raises(selector.InjectedCrash):
+        selector.prune_idle_selector_releases(
+            state_path,
+            lock_path=lock_path,
+            expected_generation=3,
+            expected_state_sha256=digest,
+            expected_current="candidate",
+            expected_last_good="base",
+            crash_at="after_replace",
+        )
+
+    durable = selector.read_selector_state(state_path, lock_path=lock_path)
+    assert durable["generation"] == 4
+    assert durable["bootstrap_fallback"] == "base"
+    with pytest.raises(selector.SelectorError, match="generation conflict"):
+        selector.prune_idle_selector_releases(
+            state_path,
+            lock_path=lock_path,
+            expected_generation=3,
+            expected_state_sha256=digest,
+            expected_current="candidate",
+            expected_last_good="base",
+        )
+
+
+def test_rolling_retention_verifies_both_manifests_before_fallback_migration(
+    tmp_path, monkeypatch
+):
+    selector_root = tmp_path / "reliability" / "selector"
+    base = _managed_release(selector_root, "base")
+    candidate = _managed_release(selector_root, "candidate")
+    obsolete = _managed_release(selector_root, "obsolete")
+    orphan = _managed_release(selector_root, "orphan-valid")
+    state_path = selector_root / "selector-state.json"
+    lock_path = selector_root / "selector-state.lock"
+    state = selector.initialize_selector_state(
+        state_path,
+        lock_path=lock_path,
+        release_root=base["release_root"],
+        bootstrap_build_id="base",
+        bootstrap_record=base["record"],
+    )
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=0,
+        transition=lambda current: selector.stage_candidate(
+            selector.stage_candidate(
+                current,
+                "obsolete",
+                obsolete["record"],
+                transaction_id="rolling-obsolete-transaction-000001",
+            ),
+            "candidate",
+            candidate["record"],
+            transaction_id="rolling-accepted-transaction-000001",
+        ),
+    )
+    state = selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=1,
+        transition=selector.activate_candidate,
+    )
+    selector.update_selector_state(
+        state_path,
+        lock_path=lock_path,
+        expected_generation=2,
+        transition=selector.promote_candidate,
+    )
+    old_agent_manifest = copy.deepcopy(base["agent_source"]["manifest"])
+    old_agent_manifest["origin_url"] = (
+        "git@github.com:NousResearch/hermes-agent-obsolete.git"
+    )
+    old_agent_encoded = (
+        json.dumps(old_agent_manifest, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode()
+    old_agent_hash = hashlib.sha256(old_agent_encoded).hexdigest()
+    old_agent_snapshot = (
+        base["agent_source"]["release_root"] / "snapshots" / old_agent_hash
+    )
+    for source in base["agent_source"]["source_path"].rglob("*"):
+        relative = source.relative_to(base["agent_source"]["source_path"])
+        destination = old_agent_snapshot / relative
+        if source.is_dir():
+            destination.mkdir(parents=True, exist_ok=True)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(source.read_bytes())
+            _chmod(destination, source.stat().st_mode & 0o777)
+    for directory in sorted(
+        (path for path in old_agent_snapshot.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        _chmod(directory, 0o555)
+    _chmod(old_agent_snapshot, 0o555)
+    old_agent_manifest_path = (
+        base["agent_source"]["release_root"]
+        / "manifests"
+        / f"{old_agent_hash}.json"
+    )
+    old_agent_manifest_path.write_bytes(old_agent_encoded)
+    _chmod(old_agent_manifest_path, 0o444)
+    unknown = base["release_root"] / "legacy-unknown"
+    unknown.mkdir()
+    retention.configure_release_paths(
+        retention.release_paths(state_path, lock_path)
+    )
+    monkeypatch.setattr(
+        retention,
+        "_accepted_release_journal",
+        lambda transaction_id, expected_current_build: {
+            "transaction_id": transaction_id,
+            "expected_candidate_identity": {
+                "build_id": expected_current_build
+            },
+            "_path": str(tmp_path / "accepted.json"),
+        },
+    )
+    verified = []
+    real_verify = selector.verify_release
+
+    def record_verify(path, **kwargs):
+        verified.append(Path(path).name)
+        return real_verify(path, **kwargs)
+
+    monkeypatch.setattr(retention.release_selector, "verify_release", record_verify)
+    monkeypatch.setattr(retention, "lsof_open_rows", lambda _path: [])
+
+    plan = retention._rolling_release_plan(
+        accepted_transaction_id="rolling-accepted-transaction-000001",
+        expected_current_build="candidate",
+    )
+    assert {
+        item["path"]
+        for item in plan["candidates"]
+        if item["kind"] == "orphan-webui-release"
+    } == {str(orphan["release_path"])}
+    assert {
+        item["path"]
+        for item in plan["candidates"]
+        if item["kind"] == "artifact-snapshot"
+    } == {str(old_agent_snapshot)}
+    real_atomic_receipt = retention.atomic_receipt
+    crashed = False
+
+    def crash_after_selector_prune(path, payload):
+        nonlocal crashed
+        if payload.get("status") == "selector-pruned" and not crashed:
+            crashed = True
+            raise retention.CleanupError("injected after selector prune")
+        return real_atomic_receipt(path, payload)
+
+    monkeypatch.setattr(retention, "atomic_receipt", crash_after_selector_prune)
+    with pytest.raises(retention.CleanupError, match="injected"):
+        retention._apply_rolling_release_plan(plan)
+    persisted_one_delete = False
+
+    def crash_between_delete_and_receipt(path, payload):
+        nonlocal persisted_one_delete
+        deleted_count = sum(
+            operation.get("state") == "deleted"
+            for operation in payload.get("operations", [])
+        )
+        if payload.get("status") == "deleting" and deleted_count == 1:
+            if not persisted_one_delete:
+                persisted_one_delete = True
+                return real_atomic_receipt(path, payload)
+        if payload.get("status") == "deleting" and deleted_count == 2:
+            raise KeyboardInterrupt("injected after delete before receipt")
+        return real_atomic_receipt(path, payload)
+
+    monkeypatch.setattr(
+        retention,
+        "atomic_receipt",
+        crash_between_delete_and_receipt,
+    )
+    with pytest.raises(KeyboardInterrupt, match="after delete before receipt"):
+        retention._apply_rolling_release_plan(plan)
+    interrupted = retention.read_json_file(
+        retention.RECEIPTS_ROOT
+        / "rolling-release-cleanup-"
+        "rolling-accepted-transaction-000001.json",
+        label="interrupted rolling receipt",
+    )
+    assert interrupted["status"] == "deleting"
+    assert interrupted["operations"][0]["state"] == "deleted"
+    assert interrupted["operations"][1]["state"] == "quarantined"
+    monkeypatch.setattr(retention, "atomic_receipt", real_atomic_receipt)
+    receipt = retention._apply_rolling_release_plan(plan)
+
+    assert verified[:2] == ["candidate", "base"]
+    assert receipt["status"] == "completed"
+    assert not obsolete["release_path"].exists()
+    assert not orphan["release_path"].exists()
+    assert not old_agent_snapshot.exists()
+    assert not old_agent_manifest_path.exists()
+    assert unknown.exists()
+    final = selector.read_selector_state(state_path, lock_path=lock_path)
+    assert set(final["releases"]) == {"candidate", "base"}
+    assert final["bootstrap_fallback"] == "base"
 
 
 def test_selector_v2_reads_v1_state_and_fences_candidate_with_exact_transaction(
@@ -2560,8 +3207,8 @@ def test_cutover_cli_drives_selector_state_lifecycle(tmp_path, capsys):
 
     final_state = json.loads(capsys.readouterr().out.splitlines()[-1])
     assert final_state["generation"] == 4
-    assert final_state["current"] == "candidate"
-    assert final_state["last_good"] == "candidate"
+    assert final_state["current"] == "base"
+    assert final_state["last_good"] == "base"
     assert final_state["candidate"] is None
 
 
@@ -4622,6 +5269,7 @@ def test_release_transaction_resumes_release_intent_without_repreparing_pair(
             }
         ),
         expected_candidate_identity=expected_candidate,
+        expected_last_good_identity={"pid": 101},
         transaction_id=transaction_id,
         transaction_journal_path=journal_path,
         timeout_seconds=2,
@@ -5206,6 +5854,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(
             attest_external_drain if external_drain else None
         ),
         expected_candidate_identity=expected_candidate,
+        expected_last_good_identity=old_identity,
         transaction_id=transaction_id,
         transaction_journal_path=journal_path,
         timeout_seconds=2,
@@ -5277,6 +5926,7 @@ def test_legacy_webui_activity_drain_uses_exact_locked_durable_zero(
     }
     plan = {
         "last_good_identity": {"build_id": "last-good"},
+        "last_good_gateway_identity": {"build_id": "last-good-gateway"},
         "synthetic_process_notifications_path": str(
             tmp_path / "process_notifications.json"
         ),
@@ -5737,6 +6387,7 @@ def test_release_transaction_resumes_from_each_durable_external_phase(
         inspect_candidate_binding=lambda _identity: preaccepted_health,
         inspect_accepted_binding=inspect_deep_candidate,
         expected_candidate_identity=expected_candidate,
+        expected_last_good_identity=old_identity,
         transaction_id=transaction_id,
         transaction_journal_path=journal_path,
         timeout_seconds=2,
@@ -5986,6 +6637,7 @@ def test_release_early_failure_matrix_always_restores_selector_and_plist(
             inspect_candidate_binding=lambda _identity: {},
             inspect_accepted_binding=lambda _identity: {},
             expected_candidate_identity=expected_candidate,
+            expected_last_good_identity=old_identity,
             transaction_id=transaction_id,
             transaction_journal_path=journal_path,
             timeout_seconds=2,
@@ -6217,6 +6869,7 @@ def test_release_rollback_reentry_accepts_already_applied_external_state(tmp_pat
             inspect_candidate_binding=lambda _identity: {},
             inspect_accepted_binding=lambda _identity: {},
             expected_candidate_identity=expected_candidate,
+            expected_last_good_identity=old_identity,
             transaction_id=transaction_id,
             transaction_journal_path=journal_path,
             timeout_seconds=2,
@@ -6422,6 +7075,7 @@ def test_release_transaction_resumes_rollback_and_restores_preaccept_state(
             inspect_candidate_binding=lambda _identity: {},
             inspect_accepted_binding=lambda _identity: {},
             expected_candidate_identity=expected_candidate,
+            expected_last_good_identity=old_identity,
             transaction_id=transaction_id,
             transaction_journal_path=journal_path,
             timeout_seconds=2,
@@ -6558,6 +7212,7 @@ def test_release_control_driver_aborts_on_process_identity_change(tmp_path):
             inspect_candidate_binding=lambda _identity: {"status": "verified"},
             inspect_accepted_binding=lambda _identity: {"status": "verified"},
             expected_candidate_identity=expected_candidate,
+            expected_last_good_identity=identity,
             transaction_id=transaction_id,
             transaction_journal_path=journal_path,
             timeout_seconds=2,
@@ -6701,6 +7356,7 @@ def test_release_control_driver_surfaces_every_rollback_failure(tmp_path):
             inspect_candidate_binding=lambda _identity: {"status": "verified"},
             inspect_accepted_binding=lambda _identity: {"status": "verified"},
             expected_candidate_identity=expected_candidate,
+            expected_last_good_identity=identity,
             transaction_id=transaction_id,
             transaction_journal_path=journal_path,
             timeout_seconds=2,
@@ -10168,7 +10824,7 @@ def test_reconcile_cutover_journal_accepts_exact_durable_promotion(
         "generation": 3,
         "release_root": str(tmp_path / "releases"),
         "current": "candidate",
-        "last_good": "candidate",
+        "last_good": "last-good",
         "candidate": None,
         "pending_transaction_id": None,
         "bootstrap_fallback": "last-good",
@@ -11704,6 +12360,8 @@ def test_successful_release_cli_runs_rolling_retention(monkeypatch, command):
     plan = {
         "selector_state": "/managed/selector/selector-state.json",
         "selector_lock": "/managed/selector/selector-state.lock",
+        "transaction_id": "accepted-release-transaction-000001",
+        "expected_candidate_identity": {"build_id": "candidate"},
     }
     events = []
     monkeypatch.setattr(cutover, "_load_cutover_plan", lambda _path: plan)
@@ -11722,7 +12380,9 @@ def test_successful_release_cli_runs_rolling_retention(monkeypatch, command):
     monkeypatch.setattr(
         cutover.release_retention,
         "run_after_release",
-        lambda state, lock: events.append(("retention", state, lock))
+        lambda state, lock, **kwargs: events.append(
+            ("retention", state, lock, kwargs)
+        )
         or {"status": "completed", "deleted_payload_trees": 2},
     )
 
@@ -11739,6 +12399,10 @@ def test_successful_release_cli_runs_rolling_retention(monkeypatch, command):
         "retention",
         plan["selector_state"],
         plan["selector_lock"],
+        {
+            "accepted_transaction_id": plan["transaction_id"],
+            "expected_current_build": "candidate",
+        },
     )
 
 
@@ -11746,6 +12410,8 @@ def test_release_cli_dry_run_does_not_mutate_rollback_retention(monkeypatch):
     plan = {
         "selector_state": "/managed/selector/selector-state.json",
         "selector_lock": "/managed/selector/selector-state.lock",
+        "transaction_id": "accepted-release-transaction-000001",
+        "expected_candidate_identity": {"build_id": "candidate"},
     }
     monkeypatch.setattr(cutover, "_load_cutover_plan", lambda _path: plan)
     monkeypatch.setattr(
@@ -11766,7 +12432,7 @@ def test_release_cli_dry_run_does_not_mutate_rollback_retention(monkeypatch):
     assert result == {"status": "dry-run", "dry_run": True}
 
 
-def test_state_promote_runs_rolling_retention_after_durable_transition(monkeypatch):
+def test_state_promote_does_not_run_unbound_retention(monkeypatch):
     events = []
     monkeypatch.setattr(
         cutover.release_selector,
@@ -11790,11 +12456,8 @@ def test_state_promote_runs_rolling_retention_after_durable_transition(monkeypat
         )
     )
 
-    assert result == {
-        "generation": 42,
-        "rollback_retention": {"status": "completed"},
-    }
-    assert [event[0] for event in events] == ["promote", "retention"]
+    assert result == {"generation": 42}
+    assert [event[0] for event in events] == ["promote"]
 
 
 def test_release_commit_reports_watchdog_barrier_finish_failure(monkeypatch):
@@ -11854,6 +12517,7 @@ def test_gateway_last_good_attestation_is_idempotent_before_barrier(monkeypatch)
         "transaction_id": "gateway-before-barrier-transaction-0001",
         "transaction_journal": "/tmp/gateway-before-barrier.json",
         "last_good_identity": {"build_id": "last-good"},
+        "last_good_gateway_identity": {"build_id": "last-good-gateway"},
     }
     evidence = _last_good_split_evidence()
     plain_evidence = _plain_last_good_split_evidence()
@@ -11871,7 +12535,7 @@ def test_gateway_last_good_attestation_is_idempotent_before_barrier(monkeypatch)
 
     def attest(actual_plan, identity):
         assert actual_plan is plan
-        assert identity == plan["last_good_identity"]
+        assert identity == plan["last_good_gateway_identity"]
         calls["attest"] += 1
         return binding
 
@@ -11993,6 +12657,7 @@ def test_live_last_good_phase_serializes_the_preflight_evidence_without_reattest
         "transaction_id": "live-preflight-transaction-000001",
         "transaction_journal": "transaction.json",
         "last_good_identity": {"build_id": "r75-webui"},
+        "last_good_gateway_identity": {"build_id": "r72-gateway"},
     }
     immutable_evidence = MappingProxyType(
         {
@@ -12186,6 +12851,7 @@ def test_gateway_last_good_resume_rejects_missing_or_altered_binding(
         "transaction_id": "resume-gateway-binding-transaction-0001",
         "transaction_journal": "transaction.json",
         "last_good_identity": {"build_id": "last-good"},
+        "last_good_gateway_identity": {"build_id": "last-good-gateway"},
     }
     current_binding = {
         "status": "verified",
@@ -12227,7 +12893,9 @@ def test_gateway_last_good_resume_rejects_missing_or_altered_binding(
         )
 
     assert calls == (
-        [] if durable_binding is None else [(plan, plan["last_good_identity"])]
+        []
+        if durable_binding is None
+        else [(plan, plan["last_good_gateway_identity"])]
     )
 
 
@@ -13294,6 +13962,34 @@ def test_gateway_binding_wait_does_not_retry_programming_errors(monkeypatch):
     assert calls == {"count": 1}
 
 
+def test_managed_gateway_attestation_never_substitutes_a_peer_identity(
+    monkeypatch,
+):
+    webui_identity = {"build_id": "r75-webui"}
+    gateway_identity = {"build_id": "r72-gateway"}
+    observed = []
+
+    def capture(_plan, *, expected_identity, **_kwargs):
+        observed.append(expected_identity)
+        raise cutover.DrainIdentityMismatch("captured explicit identity")
+
+    monkeypatch.setattr(cutover, "_wait_for_gateway_binding", capture)
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="captured explicit identity",
+    ):
+        cutover._attest_managed_gateway_binding(
+            {
+                "last_good_identity": webui_identity,
+                "last_good_gateway_identity": gateway_identity,
+            },
+            webui_identity,
+        )
+
+    assert observed == [webui_identity]
+
+
 def test_managed_gateway_attestation_uses_last_good_originating_transaction(
     tmp_path,
     monkeypatch,
@@ -13445,7 +14141,7 @@ def test_managed_gateway_attestation_uses_last_good_originating_transaction(
 
     result = cutover._attest_managed_gateway_binding(
         plan,
-        restarted_webui_identity,
+        identity,
     )
 
     assert result["build_id"] == identity["build_id"]

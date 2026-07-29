@@ -105,6 +105,10 @@ class DrainIdentityMismatch(RuntimeError):
     """The final fenced process/listener identity no longer matches."""
 
 
+class _LastGoodWebUIIdentityMismatch(DrainIdentityMismatch):
+    """The live or durable old WebUI is not the authorized last-good build."""
+
+
 class ReleaseBuildError(RuntimeError):
     """The committed source cannot be materialized as an immutable release."""
 
@@ -2377,6 +2381,21 @@ def _candidate_identity_matches(actual: object, expected: dict) -> bool:
     return all(actual.get(key) == value for key, value in projected.items())
 
 
+def _require_expected_last_good_webui_identity(
+    actual: object,
+    expected: dict,
+) -> dict:
+    if (
+        not isinstance(actual, dict)
+        or not expected
+        or not _candidate_identity_matches(actual, expected)
+    ):
+        raise _LastGoodWebUIIdentityMismatch(
+            "release control process is not the exact last-good WebUI"
+        )
+    return actual
+
+
 def _promoted_candidate_identity_matches(actual: object, expected: dict) -> bool:
     ignored = {
         "selector_generation",
@@ -2533,6 +2552,7 @@ def run_release_control_cutover(
     inspect_candidate_binding: Callable[[dict], dict],
     inspect_accepted_binding: Callable[[dict], dict],
     expected_candidate_identity: dict,
+    expected_last_good_identity: dict,
     transaction_id: str,
     transaction_journal_path: Path | str,
     timeout_seconds: float,
@@ -2564,6 +2584,11 @@ def run_release_control_cutover(
         != transaction_id
     ):
         raise ValueError("expected candidate transaction identity is invalid")
+    if (
+        not isinstance(expected_last_good_identity, dict)
+        or not expected_last_good_identity
+    ):
+        raise ValueError("expected last-good WebUI identity is invalid")
     journal = read_transaction_journal(
         transaction_journal_path,
         transaction_id=transaction_id,
@@ -3103,6 +3128,10 @@ def run_release_control_cutover(
                 raise ReleaseBuildError(
                     "booted-out job has no durable old-process identity"
                 )
+            _require_expected_last_good_webui_identity(
+                old_identity,
+                expected_last_good_identity,
+            )
             if "old_stopped" not in completed_phases:
                 remaining = max(
                     0.1,
@@ -3173,6 +3202,10 @@ def run_release_control_cutover(
                     raise ReleaseBuildError(
                         "candidate is live without a durable old-process identity"
                     )
+                _require_expected_last_good_webui_identity(
+                    old_identity,
+                    expected_last_good_identity,
+                )
                 remaining = max(
                     0.1,
                     timeout_seconds - (monotonic() - started_at),
@@ -3210,6 +3243,10 @@ def run_release_control_cutover(
 
         if not isinstance(initial_identity, dict) or not initial_identity:
             raise DrainIdentityMismatch("release health has no process identity")
+        _require_expected_last_good_webui_identity(
+            initial_identity,
+            expected_last_good_identity,
+        )
         identity = initial_identity
         if "old_stopped" in completed_phases:
             raise DrainIdentityMismatch(
@@ -3386,6 +3423,8 @@ def run_release_control_cutover(
         )
         return finish_candidate(candidate_inspection)
     except Exception as original:
+        if isinstance(original, _LastGoodWebUIIdentityMismatch):
+            raise
         durable_now = read_transaction_journal(
             transaction_journal_path,
             transaction_id=transaction_id,
@@ -3412,6 +3451,11 @@ def run_release_control_cutover(
                 break
         if durable_old_identity is None and identity:
             durable_old_identity = dict(identity)
+        if durable_old_identity is not None:
+            _require_expected_last_good_webui_identity(
+                durable_old_identity,
+                expected_last_good_identity,
+            )
 
         if "rollback_started" not in completed_phases:
             try:
@@ -6318,7 +6362,7 @@ def _selector_transition(plan: dict, transition: str) -> dict:
         )
         if (
             state["current"] == candidate_id
-            and state["last_good"] == candidate_id
+            and state["last_good"] == last_good_id
             and state["candidate"] is None
             and state.get("pending_transaction_id") is None
         ):
@@ -6427,7 +6471,7 @@ def _reconcile_cutover_journal(
             plan["transaction_id"],
             last_good_id,
         ): "activated",
-        (candidate_id, None, None, candidate_id): "promoted",
+        (candidate_id, None, None, last_good_id): "promoted",
         (last_good_id, None, None, last_good_id): "last-good",
     }
     selector_phase = allowed.get(selector_tuple)
@@ -6532,7 +6576,7 @@ def _reconcile_cutover_journal(
                 plan["transaction_id"],
                 last_good_id,
             ),
-            (candidate_id, None, None, candidate_id),
+            (candidate_id, None, None, last_good_id),
         }:
             raise ReleaseBuildError("candidate stage is not externally attested")
         staged_receipt = {
@@ -6652,7 +6696,7 @@ def _inspect_cutover_plan(plan: dict) -> dict:
     last_good_id = plan["last_good_identity"]["build_id"]
     promoted = (
         selector_state["current"] == candidate_id
-        and selector_state["last_good"] == candidate_id
+        and selector_state["last_good"] == last_good_id
         and selector_state["candidate"] is None
         and selector_state.get("pending_transaction_id") is None
     )
@@ -6940,7 +6984,7 @@ def _ensure_gateway_last_good_attested(
     if existing is None and "rollback_started" not in phases:
         gateway_last_good = _attest_managed_gateway_binding(
             plan,
-            plan["last_good_identity"],
+            plan["last_good_gateway_identity"],
         )
         receipt = {
             "binding": gateway_last_good,
@@ -6970,7 +7014,7 @@ def _ensure_gateway_last_good_attested(
     if drain_intent is None:
         current_binding = _attest_managed_gateway_binding(
             plan,
-            plan["last_good_identity"],
+            plan["last_good_gateway_identity"],
         )
         if binding != current_binding:
             raise DrainIdentityMismatch("durable gateway last-good binding changed")
@@ -7103,14 +7147,14 @@ def _run_release_commit_plan_core(
                 try:
                     last_good = _attest_managed_gateway_binding(
                         plan,
-                        plan["last_good_identity"],
+                        plan["last_good_gateway_identity"],
                         expected_admission="accepting_new_work",
                     )
                 except Exception:
                     try:
                         drained_last_good = _attest_managed_gateway_binding(
                             plan,
-                            plan["last_good_identity"],
+                            plan["last_good_gateway_identity"],
                             expected_admission="rejecting_new_work",
                         )
                     except Exception:
@@ -7305,7 +7349,7 @@ def _run_release_commit_plan_core(
                 "status": "already-running",
                 "binding": _attest_managed_gateway_binding(
                     plan,
-                    plan["last_good_identity"],
+                    plan["last_good_gateway_identity"],
                 ),
             }
         except Exception as exc:
@@ -7329,7 +7373,7 @@ def _run_release_commit_plan_core(
                 ),
                 "binding": _attest_managed_gateway_binding(
                     plan,
-                    plan["last_good_identity"],
+                    plan["last_good_gateway_identity"],
                 ),
             }
         _bootout_launchd_job(plan, required=False)
@@ -7472,7 +7516,7 @@ def _run_release_commit_plan_core(
         else:
             gateway = _attest_managed_gateway_binding(
                 plan,
-                plan["last_good_identity"],
+                plan["last_good_gateway_identity"],
             )
             if gateway.get("status") != "verified":
                 raise ReleaseBuildError(
@@ -7756,6 +7800,7 @@ def _run_release_commit_plan_core(
             inspect_control=inspect_control,
         ),
         expected_candidate_identity=plan["expected_candidate_identity"],
+        expected_last_good_identity=plan["last_good_identity"],
         transaction_id=plan["transaction_id"],
         transaction_journal_path=plan["transaction_journal"],
         timeout_seconds=float(plan["timeout_seconds"]),
@@ -7960,7 +8005,7 @@ def _complete_candidate_gateway_transition(plan: dict, result: dict) -> dict:
         if "gateway_drain_intent" not in phases:
             last_good_gateway = _attest_managed_gateway_binding(
                 plan,
-                plan["last_good_identity"],
+                plan["last_good_gateway_identity"],
             )
             durable_runtime = last_good_binding.get("runtime")
             if (
@@ -8870,7 +8915,7 @@ def _owned_forward_selector_transition(
         if (
             state.get("generation") != startup_generation + 1
             or state.get("current") != candidate_id
-            or state.get("last_good") != candidate_id
+            or state.get("last_good") != last_good_id
             or state.get("candidate") is not None
             or state.get("pending_transaction_id") is not None
         ):
@@ -13801,7 +13846,7 @@ def _attest_legacy_webui_activity_drain(
 
     gateway_before = _attest_managed_gateway_binding(
         plan,
-        plan["last_good_identity"],
+        plan["last_good_gateway_identity"],
         expected_admission="accepting_new_work",
         expected_pair_gate="absent",
     )
@@ -13873,7 +13918,7 @@ def _attest_legacy_webui_activity_drain(
             )
         gateway_after = _attest_managed_gateway_binding(
             plan,
-            plan["last_good_identity"],
+            plan["last_good_gateway_identity"],
             expected_admission="accepting_new_work",
             expected_pair_gate="absent",
         )
@@ -16677,14 +16722,6 @@ def _attest_managed_gateway_binding(
     expected_pair_gate: str | dict | None = None,
 ) -> dict:
     """Prove the gateway is the exact immutable peer for one WebUI build."""
-    if identity == plan.get("last_good_identity"):
-        gateway_identity = plan.get("last_good_gateway_identity")
-        if gateway_identity is not None:
-            if not isinstance(gateway_identity, dict):
-                raise ReleaseBuildError(
-                    "last-good gateway identity is invalid"
-                )
-            identity = gateway_identity
     binding = _wait_for_gateway_binding(
         plan,
         previous_pid_start=None,
@@ -18003,7 +18040,7 @@ def _stop_current_pair(plan: dict, journal: dict | None = None) -> dict:
             if gateway:
                 binding = _attest_managed_gateway_binding(
                     plan,
-                    plan["last_good_identity"],
+                    plan["last_good_gateway_identity"],
                 )
             else:
                 binding = _probe_managed_webui_binding(
@@ -20055,6 +20092,10 @@ def _run_cli(options: argparse.Namespace) -> dict:
                 "rollback_retention": release_retention.run_after_release(
                     plan["selector_state"],
                     plan["selector_lock"],
+                    accepted_transaction_id=plan["transaction_id"],
+                    expected_current_build=plan[
+                        "expected_candidate_identity"
+                    ]["build_id"],
                 ),
             }
         return result
@@ -20124,20 +20165,6 @@ def _run_cli(options: argparse.Namespace) -> dict:
             expected_generation=options.expected_generation,
             transition=transitions[options.command],
         )
-        if (
-            options.command == "state-promote"
-            and release_retention.is_managed_selector_control_pair(
-                options.state,
-                options.lock,
-            )
-        ):
-            result = {
-                **result,
-                "rollback_retention": release_retention.run_after_release(
-                    options.state,
-                    options.lock,
-                ),
-            }
         return result
     if options.command == "state-show":
         return release_selector.read_selector_state(options.state, lock_path=options.lock)
