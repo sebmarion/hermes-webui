@@ -2908,8 +2908,420 @@ def test_internal_watchdog_registry_is_an_admitted_cutover_plan_path():
 
 
 def test_last_good_gateway_identity_is_an_admitted_cutover_plan_path():
-    assert "last_good_gateway_identity_json" in cutover._CUTOVER_PLAN_OPTIONAL
+    assert "last_good_gateway_identity_json" in cutover._CUTOVER_PLAN_REQUIRED
     assert "last_good_gateway_identity_json" in cutover._CUTOVER_PLAN_PATH_KEYS
+
+
+def _sealed_last_good_identity(
+    *,
+    build_id: str,
+    transaction_id: str,
+    selector_generation: int,
+    release_path: Path,
+) -> dict:
+    return {
+        "build_id": build_id,
+        "commit": ("a" if build_id == "r75-webui" else "b") * 40,
+        "tree": ("c" if build_id == "r75-webui" else "d") * 40,
+        "manifest_sha256": ("e" if build_id == "r75-webui" else "f") * 64,
+        "release_path": str(release_path),
+        "selector_path": "/sealed/selector",
+        "selector_resolved_path": "/sealed/selector",
+        "selector_verified": True,
+        "interpreter_path": "/sealed/runtime/bin/python",
+        "interpreter_resolved_path": "/sealed/runtime/bin/python",
+        "runtime_path": "/sealed/runtime",
+        "runtime_resolved_path": "/sealed/runtime",
+        "runtime_python_home_path": "/sealed/runtime/python-home",
+        "runtime_site_packages_path": "/sealed/runtime/site-packages",
+        "runtime_manifest_path": "/sealed/runtime/manifest.json",
+        "runtime_manifest_sha256": "1" * 64,
+        "agent_source_path": "/sealed/agent",
+        "agent_source_resolved_path": "/sealed/agent",
+        "agent_source_commit": "2" * 40,
+        "agent_source_tree": "3" * 40,
+        "agent_source_manifest_path": "/sealed/agent/manifest.json",
+        "agent_source_manifest_sha256": "4" * 64,
+        "selector_generation": selector_generation,
+        "startup_transaction_id": transaction_id,
+        "startup_fenced": False,
+        "launchd_label": "ai.hermes.webui",
+    }
+
+
+def _write_origin_journal(path: Path, identity: dict) -> str:
+    payload = {
+        "version": 1,
+        "transaction_id": identity["startup_transaction_id"],
+        "expected_candidate_identity": identity,
+        "rollback_receipt": {
+            "build_id": identity["build_id"],
+            "plist_sha256": "5" * 64,
+            "state_snapshot_id": "origin-snapshot-0000000000000001",
+            "state_snapshot_sha256": "6" * 64,
+        },
+        "phases": {},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+    return _sha(path)
+
+
+def _last_good_split_plan(tmp_path: Path) -> tuple[dict, dict, dict]:
+    root = tmp_path / "control"
+    root.mkdir(mode=0o700)
+    webui = _sealed_last_good_identity(
+        build_id="r75-webui",
+        transaction_id="webui-origin-transaction-0000001",
+        selector_generation=75,
+        release_path=tmp_path / "releases" / "r75-webui",
+    )
+    gateway = _sealed_last_good_identity(
+        build_id="r72-gateway",
+        transaction_id="gateway-origin-transaction-00001",
+        selector_generation=72,
+        release_path=tmp_path / "releases" / "r72-gateway",
+    )
+    webui_origin = root / "webui-origin.json"
+    gateway_origin = root / "gateway-origin.json"
+    plan = {
+        "version": 1,
+        "transaction_id": "candidate-cutover-transaction-00001",
+        "base_url": "http://127.0.0.1:8787",
+        "signing_key_file": str(root / "signing.key"),
+        "selector_state": str(root / "selector-state.json"),
+        "selector_lock": str(root / "selector-state.lock"),
+        "transaction_journal": str(root / "candidate-transaction.json"),
+        "expected_candidate_identity_json": str(root / "candidate.json"),
+        "last_good_identity_json": str(root / "webui.json"),
+        "last_good_gateway_identity_json": str(root / "gateway.json"),
+        "last_good_origin_journal": str(webui_origin),
+        "last_good_origin_journal_sha256": _write_origin_journal(webui_origin, webui),
+        "last_good_gateway_origin_journal": str(gateway_origin),
+        "last_good_gateway_origin_journal_sha256": _write_origin_journal(
+            gateway_origin, gateway
+        ),
+        "installed_plist": str(root / "installed.plist"),
+        "bootstrap_rollback_plist": str(root / "rollback.plist"),
+        "managed_plist": str(root / "managed.plist"),
+        "launchd_domain": "gui/501",
+        "launchd_label": "ai.hermes.webui",
+        "listener_port": 8787,
+        "snapshot_manifest": str(root / "snapshot.json"),
+        "snapshot_root": str(root / "snapshot"),
+        "mutable_state_paths": [str(tmp_path / "mutable")],
+        "selector_path": "/sealed/selector",
+        "managed_interpreter": str(root / "managed-python"),
+        "expected_old_interpreter": str(root / "old-python"),
+        "expected_old_target": str(root / "old-target"),
+        "cli_link": str(root / "hermes"),
+        "cli_old_target": str(root / "old-hermes"),
+        "cli_shim_dir": str(root / "shims"),
+    }
+    candidate = {
+        **webui,
+        "build_id": "candidate-r76",
+        "startup_fenced": True,
+        "startup_transaction_id": plan["transaction_id"],
+    }
+    for name, identity in (
+        ("candidate.json", candidate),
+        ("webui.json", webui),
+        ("gateway.json", gateway),
+    ):
+        (root / name).write_text(json.dumps(identity), encoding="utf-8")
+    plan_path = root / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    return plan, webui, gateway
+
+
+def test_load_cutover_plan_attests_independent_sealed_last_good_identities(
+    tmp_path,
+    monkeypatch,
+):
+    plan, webui, gateway = _last_good_split_plan(tmp_path)
+    monkeypatch.setattr(
+        cutover,
+        "_attest_expected_release_identity",
+        lambda identity, **_kwargs: identity,
+    )
+
+    loaded = cutover._load_cutover_plan(
+        Path(plan["transaction_journal"]).parent / "plan.json"
+    )
+
+    assert loaded["last_good_identity"]["build_id"] == "r75-webui"
+    assert loaded["last_good_gateway_identity"]["build_id"] == "r72-gateway"
+    assert loaded["last_good_identity"]["release_path"] != loaded[
+        "last_good_gateway_identity"
+    ]["release_path"]
+    assert loaded["last_good_origin_attestation"]["webui"]["identity"] == webui
+    assert loaded["last_good_origin_attestation"]["gateway"]["identity"] == gateway
+
+
+def _real_sealed_last_good_split(tmp_path: Path) -> tuple[dict, dict, Path, str, str]:
+    root = tmp_path / "control"
+    root.mkdir(mode=0o700)
+    webui_release = _managed_release(tmp_path, "r75-webui")
+    gateway_release = _managed_release(tmp_path, "r72-gateway")
+
+    def identity(release: dict, generation: int, transaction_id: str) -> dict:
+        verified = selector.verify_release(
+            release["release_path"],
+            release_root=release["release_root"],
+            expected_manifest_sha256=release["manifest_sha256"],
+            selector_path=str(release["selector_path"]),
+        )
+        return {
+            **verified,
+            "selector_generation": generation,
+            "startup_transaction_id": transaction_id,
+            "launchd_label": "ai.hermes.webui",
+        }
+
+    webui = identity(webui_release, 75, "webui-origin-transaction-0000001")
+    gateway = identity(gateway_release, 72, "gateway-origin-transaction-00001")
+    webui_journal = root / "webui-origin.json"
+    gateway_journal = root / "gateway-origin.json"
+    return (
+        webui,
+        gateway,
+        root,
+        _write_origin_journal(webui_journal, webui),
+        _write_origin_journal(gateway_journal, gateway),
+    )
+
+
+def test_last_good_split_attester_verifies_real_sealed_releases(tmp_path):
+    webui, gateway, root, webui_sha256, gateway_sha256 = _real_sealed_last_good_split(
+        tmp_path
+    )
+
+    evidence = cutover._attest_last_good_identity_split(
+        webui_identity=webui,
+        gateway_identity=gateway,
+        webui_origin_journal=str(root / "webui-origin.json"),
+        webui_origin_sha256=webui_sha256,
+        gateway_origin_journal=str(root / "gateway-origin.json"),
+        gateway_origin_sha256=gateway_sha256,
+        trusted_root=root,
+        selector_path=webui["selector_path"],
+    )
+
+    assert evidence["webui"]["identity"]["build_id"] == "r75-webui"
+    assert evidence["gateway"]["identity"]["build_id"] == "r72-gateway"
+
+
+def test_last_good_split_attester_never_writes_selector_service_or_journal(
+    tmp_path,
+    monkeypatch,
+):
+    webui, gateway, root, webui_sha256, gateway_sha256 = _real_sealed_last_good_split(
+        tmp_path
+    )
+
+    def forbid_write(*_args, **_kwargs):
+        raise AssertionError("attester must be read-only")
+
+    monkeypatch.setattr(cutover, "_atomic_write_transaction_journal", forbid_write)
+    monkeypatch.setattr(cutover, "_with_transaction_journal_lock", forbid_write)
+    monkeypatch.setattr(
+        cutover.release_selector, "initialize_selector_state", forbid_write
+    )
+    monkeypatch.setattr(
+        cutover.release_selector, "update_selector_state", forbid_write
+    )
+    monkeypatch.setattr(cutover.subprocess, "run", forbid_write)
+
+    assert cutover._attest_last_good_identity_split(
+        webui_identity=webui,
+        gateway_identity=gateway,
+        webui_origin_journal=str(root / "webui-origin.json"),
+        webui_origin_sha256=webui_sha256,
+        gateway_origin_journal=str(root / "gateway-origin.json"),
+        gateway_origin_sha256=gateway_sha256,
+        trusted_root=root,
+        selector_path=webui["selector_path"],
+    )["gateway"]["identity"]["build_id"] == "r72-gateway"
+
+
+@pytest.mark.parametrize(
+    "identity_name, field, replacement",
+    [
+        ("webui.json", "build_id", "changed-webui-build"),
+        ("gateway.json", "release_path", "/sealed/release-changed"),
+        ("gateway.json", "runtime_path", "/sealed/other-runtime"),
+    ],
+)
+def test_load_cutover_plan_rejects_changed_sealed_last_good_fields(
+    tmp_path,
+    monkeypatch,
+    identity_name,
+    field,
+    replacement,
+):
+    plan, _webui, _gateway = _last_good_split_plan(tmp_path)
+    root = Path(plan["transaction_journal"]).parent
+    identity_path = root / identity_name
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity[field] = replacement
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    monkeypatch.setattr(
+        cutover,
+        "_attest_expected_release_identity",
+        lambda identity, **_kwargs: identity,
+    )
+
+    with pytest.raises(cutover.ReleaseBuildError, match="origin.*identity"):
+        cutover._load_cutover_plan(root / "plan.json")
+
+
+def test_load_cutover_plan_rejects_gateway_webui_transaction_substitution(
+    tmp_path,
+    monkeypatch,
+):
+    plan, webui, _gateway = _last_good_split_plan(tmp_path)
+    root = Path(plan["transaction_journal"]).parent
+    plan["last_good_gateway_origin_journal"] = plan["last_good_origin_journal"]
+    plan["last_good_gateway_origin_journal_sha256"] = plan[
+        "last_good_origin_journal_sha256"
+    ]
+    (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setattr(
+        cutover,
+        "_attest_expected_release_identity",
+        lambda identity, **_kwargs: identity,
+    )
+
+    with pytest.raises(cutover.ReleaseBuildError, match="transaction journal schema"):
+        cutover._load_cutover_plan(root / "plan.json")
+
+    assert webui["startup_transaction_id"] != "gateway-origin-transaction-00001"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "last_good_origin_journal",
+        "last_good_origin_journal_sha256",
+        "last_good_gateway_origin_journal",
+        "last_good_gateway_origin_journal_sha256",
+    ],
+)
+def test_load_cutover_plan_requires_each_bound_last_good_origin_field(
+    tmp_path,
+    field,
+):
+    plan, _webui, _gateway = _last_good_split_plan(tmp_path)
+    root = Path(plan["transaction_journal"]).parent
+    plan.pop(field)
+    (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+
+    with pytest.raises(cutover.ReleaseBuildError, match="schema"):
+        cutover._load_cutover_plan(root / "plan.json")
+
+
+def test_load_cutover_plan_rejects_origin_journal_path_escaping_trusted_root(
+    tmp_path,
+    monkeypatch,
+):
+    plan, webui, _gateway = _last_good_split_plan(tmp_path)
+    root = Path(plan["transaction_journal"]).parent
+    outside = tmp_path / "outside-origin.json"
+    plan["last_good_origin_journal"] = str(root / ".." / outside.name)
+    plan["last_good_origin_journal_sha256"] = _write_origin_journal(outside, webui)
+    (root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setattr(
+        cutover,
+        "_attest_expected_release_identity",
+        lambda identity, **_kwargs: identity,
+    )
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="last_good_origin_journal path is invalid",
+    ):
+        cutover._load_cutover_plan(root / "plan.json")
+
+
+def test_sealed_origin_journal_rejects_symlinked_trusted_root_ancestor(tmp_path):
+    outside = tmp_path / "outside"
+    trusted_root = outside / "control"
+    trusted_root.mkdir(parents=True, mode=0o700)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(outside, target_is_directory=True)
+    identity = _sealed_last_good_identity(
+        build_id="r75-webui",
+        transaction_id="webui-origin-transaction-0000001",
+        selector_generation=75,
+        release_path=tmp_path / "releases" / "r75-webui",
+    )
+    journal = trusted_root / "origin.json"
+    expected_sha256 = _write_origin_journal(journal, identity)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="origin journal root is unsafe"):
+        cutover._read_sealed_origin_journal(
+            str(linked_parent / "control" / "origin.json"),
+            expected_sha256=expected_sha256,
+            transaction_id=identity["startup_transaction_id"],
+            trusted_root=linked_parent / "control",
+            label="last-good WebUI",
+        )
+
+
+def test_sealed_origin_journal_hashes_the_same_descriptor_it_parses(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "control"
+    root.mkdir(mode=0o700)
+    identity = _sealed_last_good_identity(
+        build_id="r75-webui",
+        transaction_id="webui-origin-transaction-0000001",
+        selector_generation=75,
+        release_path=tmp_path / "releases" / "r75-webui",
+    )
+    journal = root / "origin.json"
+    expected_sha256 = _write_origin_journal(journal, identity)
+    replacement = root / "replacement.json"
+    replacement.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "transaction_id": identity["startup_transaction_id"],
+                "expected_candidate_identity": identity,
+                "rollback_receipt": {
+                    "build_id": identity["build_id"],
+                    "plist_sha256": "7" * 64,
+                    "state_snapshot_id": "origin-snapshot-0000000000000001",
+                    "state_snapshot_sha256": "6" * 64,
+                },
+                "phases": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    replacement.chmod(0o600)
+    original_open = cutover.os.open
+    replaced = False
+
+    def replace_before_open(path, flags, *args):
+        nonlocal replaced
+        if Path(path) == journal and not replaced:
+            replaced = True
+            os.replace(replacement, journal)
+        return original_open(path, flags, *args)
+
+    monkeypatch.setattr(cutover.os, "open", replace_before_open)
+
+    with pytest.raises(cutover.ReleaseBuildError, match="origin journal identity"):
+        cutover._read_sealed_origin_journal(
+            str(journal),
+            expected_sha256=expected_sha256,
+            transaction_id=identity["startup_transaction_id"],
+            trusted_root=root,
+            label="last-good WebUI",
+        )
 
 
 def test_expected_old_interpreter_plan_path_allows_only_its_leaf_symlink(tmp_path):

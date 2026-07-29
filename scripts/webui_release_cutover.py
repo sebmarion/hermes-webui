@@ -30,6 +30,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from types import MappingProxyType
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -3639,6 +3640,11 @@ _CUTOVER_PLAN_REQUIRED = {
     "transaction_journal",
     "expected_candidate_identity_json",
     "last_good_identity_json",
+    "last_good_gateway_identity_json",
+    "last_good_origin_journal",
+    "last_good_origin_journal_sha256",
+    "last_good_gateway_origin_journal",
+    "last_good_gateway_origin_journal_sha256",
     "installed_plist",
     "bootstrap_rollback_plist",
     "managed_plist",
@@ -3697,7 +3703,6 @@ _BOOTSTRAP_LEGACY_BOUNDARY_PLAN_KEYS = {
 _CUTOVER_PLAN_OPTIONAL = {
     "timeout_seconds",
     "interval_seconds",
-    "last_good_gateway_identity_json",
     *_BOOTSTRAP_GATEWAY_PLAN_KEYS,
     *_BOOTSTRAP_WATCHDOG_PLAN_KEYS,
     *_BOOTSTRAP_WATCHDOG_SCHEDULER_PLAN_KEYS,
@@ -3712,6 +3717,8 @@ _CUTOVER_PLAN_PATH_KEYS = {
     "expected_candidate_identity_json",
     "last_good_identity_json",
     "last_good_gateway_identity_json",
+    "last_good_origin_journal",
+    "last_good_gateway_origin_journal",
     "installed_plist",
     "bootstrap_rollback_plist",
     "managed_plist",
@@ -3771,6 +3778,17 @@ _VERIFIED_RELEASE_IDENTITY_KEYS = {
     "agent_source_manifest_path",
     "agent_source_manifest_sha256",
 }
+_LAST_GOOD_SHARED_IDENTITY_KEYS = {
+    "selector_path", "selector_resolved_path", "selector_verified",
+    "interpreter_path", "interpreter_resolved_path",
+    "runtime_path", "runtime_resolved_path", "runtime_python_home_path",
+    "runtime_site_packages_path", "runtime_manifest_path", "runtime_manifest_sha256",
+    "agent_source_path", "agent_source_resolved_path", "agent_source_commit",
+    "agent_source_tree", "agent_source_manifest_path", "agent_source_manifest_sha256",
+}
+_LAST_GOOD_ORIGIN_IDENTITY_KEYS = _VERIFIED_RELEASE_IDENTITY_KEYS | {
+    "selector_generation", "startup_transaction_id", "launchd_label",
+}
 
 
 def _absolute_plan_path(value: object, *, label: str) -> Path:
@@ -3814,6 +3832,130 @@ def _attest_expected_release_identity(
         if identity.get(key) != verified.get(key):
             raise ReleaseBuildError(f"{label} release identity mismatch: {key}")
     return verified
+
+
+def _read_sealed_origin_journal(
+    path: str,
+    *,
+    expected_sha256: object,
+    transaction_id: object,
+    trusted_root: Path,
+    label: str,
+) -> dict:
+    """Read a bound origin journal without creating a lock or changing state."""
+    origin_path = Path(path)
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", str(expected_sha256 or ""))
+        or not _TRANSACTION_ID.fullmatch(str(transaction_id or ""))
+        or not trusted_root.is_absolute()
+        or Path(os.path.abspath(trusted_root)) != trusted_root
+        or not origin_path.is_absolute()
+        or Path(os.path.abspath(origin_path)) != origin_path
+        or not origin_path.is_relative_to(trusted_root)
+    ):
+        raise ReleaseBuildError(f"{label} origin journal binding is invalid")
+
+    current = Path(trusted_root.anchor)
+    for part in trusted_root.parts[1:]:
+        current /= part
+        try:
+            opened = os.lstat(current)
+        except OSError as exc:
+            raise ReleaseBuildError(f"{label} origin journal root is unreadable") from exc
+        if (
+            stat.S_ISLNK(opened.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+        ):
+            raise ReleaseBuildError(f"{label} origin journal root is unsafe")
+    if trusted_root.stat().st_uid != os.getuid() or trusted_root.stat().st_mode & 0o022:
+        raise ReleaseBuildError(f"{label} origin journal root is unsafe")
+    current = trusted_root
+    for part in origin_path.relative_to(trusted_root).parts[:-1]:
+        current /= part
+        try:
+            opened = os.lstat(current)
+        except OSError as exc:
+            raise ReleaseBuildError(f"{label} origin journal root is unreadable") from exc
+        if (
+            stat.S_ISLNK(opened.st_mode)
+            or not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_mode & 0o022
+        ):
+            raise ReleaseBuildError(f"{label} origin journal root is unsafe")
+    try:
+        descriptor = os.open(
+            origin_path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        with os.fdopen(descriptor, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            payload = handle.read(4 * 1024 * 1024 + 1)
+    except OSError as exc:
+        raise ReleaseBuildError(f"{label} origin journal is unreadable") from exc
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != os.getuid()
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or len(payload) > 4 * 1024 * 1024
+        or hashlib.sha256(payload).hexdigest() != expected_sha256
+    ):
+        raise ReleaseBuildError(f"{label} origin journal identity is invalid")
+    try:
+        raw = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseBuildError(f"{label} origin journal JSON is invalid") from exc
+    return _validated_transaction_journal(raw, str(transaction_id))
+
+
+def _attest_last_good_identity_split(
+    *,
+    webui_identity: dict,
+    gateway_identity: dict,
+    webui_origin_journal: str,
+    webui_origin_sha256: object,
+    gateway_origin_journal: str,
+    gateway_origin_sha256: object,
+    trusted_root: Path,
+    selector_path: str,
+) -> MappingProxyType:
+    """Purely attest independently sealed WebUI and gateway last-good identities."""
+    evidence = {}
+    for name, identity, journal_path, journal_sha256 in (
+        ("WebUI", webui_identity, webui_origin_journal, webui_origin_sha256),
+        ("gateway", gateway_identity, gateway_origin_journal, gateway_origin_sha256),
+    ):
+        label = f"last-good {name}"
+        if (
+            not isinstance(identity, dict)
+            or isinstance(identity.get("selector_generation"), bool)
+            or not isinstance(identity.get("selector_generation"), int)
+            or identity["selector_generation"] <= 0
+        ):
+            raise ReleaseBuildError(f"{label} provenance is invalid")
+        _attest_expected_release_identity(identity, selector_path=selector_path, label=label)
+        journal = _read_sealed_origin_journal(
+            journal_path,
+            expected_sha256=journal_sha256,
+            transaction_id=identity.get("startup_transaction_id"),
+            trusted_root=trusted_root,
+            label=label,
+        )
+        if any(
+            journal["expected_candidate_identity"].get(key) != identity.get(key)
+            for key in _LAST_GOOD_ORIGIN_IDENTITY_KEYS
+        ):
+            raise ReleaseBuildError(f"{label} origin journal identity changed")
+        evidence[name.lower()] = MappingProxyType(
+            {"identity": MappingProxyType(copy.deepcopy(identity))}
+        )
+    if any(
+        webui_identity.get(key) != gateway_identity.get(key)
+        for key in _LAST_GOOD_SHARED_IDENTITY_KEYS
+    ):
+        raise ReleaseBuildError("last-good shared runtime identity changed")
+    return MappingProxyType(evidence)
 
 
 def _load_cutover_plan(path: Path | str) -> dict:
@@ -3898,10 +4040,6 @@ def _load_cutover_plan(path: Path | str) -> dict:
     configured_gateway = _BOOTSTRAP_GATEWAY_PLAN_KEYS.intersection(plan)
     if configured_gateway and configured_gateway != _BOOTSTRAP_GATEWAY_PLAN_KEYS:
         raise ReleaseBuildError("cutover plan gateway transaction is incomplete")
-    if "last_good_gateway_identity_json" in plan and not configured_gateway:
-        raise ReleaseBuildError(
-            "cutover plan last-good gateway identity has no gateway transaction"
-        )
     if configured_gateway:
         gateway_domain = str(plan.get("gateway_launchd_domain") or "")
         gateway_label = str(plan.get("gateway_launchd_label") or "")
@@ -4075,12 +4213,10 @@ def _load_cutover_plan(path: Path | str) -> dict:
         plan["last_good_identity_json"],
         label="last-good identity",
     )
-    last_good_gateway = last_good
-    if "last_good_gateway_identity_json" in plan:
-        last_good_gateway = _read_json_object(
-            plan["last_good_gateway_identity_json"],
-            label="last-good gateway identity",
-        )
+    last_good_gateway = _read_json_object(
+        plan["last_good_gateway_identity_json"],
+        label="last-good gateway identity",
+    )
     if (
         candidate.get("startup_fenced") is not True
         or candidate.get("startup_transaction_id") != transaction_id
@@ -4095,37 +4231,20 @@ def _load_cutover_plan(path: Path | str) -> dict:
         selector_path=plan["selector_path"],
         label="candidate",
     )
-    _attest_expected_release_identity(
-        last_good,
+    attestation = _attest_last_good_identity_split(
+        webui_identity=last_good,
+        gateway_identity=last_good_gateway,
+        webui_origin_journal=plan["last_good_origin_journal"],
+        webui_origin_sha256=plan["last_good_origin_journal_sha256"],
+        gateway_origin_journal=plan["last_good_gateway_origin_journal"],
+        gateway_origin_sha256=plan["last_good_gateway_origin_journal_sha256"],
+        trusted_root=Path(plan["transaction_journal"]).parent,
         selector_path=plan["selector_path"],
-        label="last-good",
     )
-    if last_good_gateway is not last_good:
-        if (
-            any(
-                last_good_gateway.get(key) != last_good.get(key)
-                for key in _VERIFIED_RELEASE_IDENTITY_KEYS
-            )
-            or last_good_gateway.get("launchd_label")
-            != last_good.get("launchd_label")
-            or isinstance(last_good_gateway.get("selector_generation"), bool)
-            or not isinstance(last_good_gateway.get("selector_generation"), int)
-            or last_good_gateway["selector_generation"] <= 0
-            or not _TRANSACTION_ID.fullmatch(
-                str(last_good_gateway.get("startup_transaction_id") or "")
-            )
-        ):
-            raise ReleaseBuildError(
-                "cutover plan last-good gateway provenance is invalid"
-            )
-        _attest_expected_release_identity(
-            last_good_gateway,
-            selector_path=plan["selector_path"],
-            label="last-good gateway",
-        )
     plan["expected_candidate_identity"] = candidate
     plan["last_good_identity"] = last_good
     plan["last_good_gateway_identity"] = last_good_gateway
+    plan["last_good_origin_attestation"] = attestation
     return plan
 
 
