@@ -43,6 +43,7 @@ class DeferredStartupCrash(BaseException):
 class Reconciliation(str, Enum):
     PROVED_COMPLETE = "proved-complete"
     PROVED_ABSENT = "proved-absent"
+    PROVED_RETRY_SAFE_PARTIAL = "proved-retry-safe-partial"
     PARTIAL = "partial"
     AMBIGUOUS = "ambiguous"
 
@@ -52,6 +53,13 @@ class PriorCompletionAbsentPolicy(str, Enum):
 
     DENY = "deny"
     ALLOW_RERUN = "allow-rerun"
+
+
+class RetrySafePartialPolicy(str, Enum):
+    """Whether an explicitly retry-safe partial effect may be mutated again."""
+
+    DENY = "deny"
+    ALLOW = "allow"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +88,7 @@ class DeferredStartupStep:
     prior_completion_absent_policy: PriorCompletionAbsentPolicy = (
         PriorCompletionAbsentPolicy.DENY
     )
+    retry_safe_partial_policy: RetrySafePartialPolicy = RetrySafePartialPolicy.DENY
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +107,7 @@ class DeferredStartupDurableDriver(Protocol):
         step_name: str,
         *,
         prior_completion_absent_policy: PriorCompletionAbsentPolicy,
+        retry_safe_partial_policy: RetrySafePartialPolicy,
     ) -> DeferredStartupStepState: ...
 
     def record_intent(
@@ -108,6 +118,7 @@ class DeferredStartupDurableDriver(Protocol):
         step_name: str,
         *,
         prior_completion_absent_policy: PriorCompletionAbsentPolicy,
+        retry_safe_partial_policy: RetrySafePartialPolicy,
     ) -> None: ...
 
     def record_completion(
@@ -182,6 +193,7 @@ def _validate_binding(
             or not callable(step.reconciler)
             or type(step.prior_completion_absent_policy)
             is not PriorCompletionAbsentPolicy
+            or type(step.retry_safe_partial_policy) is not RetrySafePartialPolicy
             or step.name in names
         ):
             raise DeferredStartupBindingError("startup step definitions are invalid")
@@ -320,6 +332,10 @@ def _mutate_and_prove(
         raise DeferredStartupRetryableError(
             f"deferred startup step remains absent: {step.name}"
         )
+    if result is Reconciliation.PROVED_RETRY_SAFE_PARTIAL:
+        raise DeferredStartupRetryableError(
+            f"deferred startup step remains retry-safe partial: {step.name}"
+        )
     _mark_indeterminate(
         transaction_id=transaction_id,
         manifest_receipt=manifest_receipt,
@@ -355,6 +371,7 @@ def replay_deferred_startup(
                 process_epoch,
                 step.name,
                 prior_completion_absent_policy=(step.prior_completion_absent_policy),
+                retry_safe_partial_policy=step.retry_safe_partial_policy,
             )
         )
         if state.indeterminate:
@@ -416,6 +433,24 @@ def replay_deferred_startup(
                     driver=driver,
                     crash_hook=crash_hook,
                 )
+            elif result is Reconciliation.PROVED_RETRY_SAFE_PARTIAL:
+                if step.retry_safe_partial_policy is not RetrySafePartialPolicy.ALLOW:
+                    _mark_indeterminate(
+                        transaction_id=transaction_id,
+                        manifest_receipt=manifest_receipt,
+                        process_epoch=process_epoch,
+                        driver=driver,
+                        step_name=step.name,
+                        reason="retry-safe-partial-policy-denied",
+                    )
+                _mutate_and_prove(
+                    step,
+                    transaction_id=transaction_id,
+                    manifest_receipt=manifest_receipt,
+                    process_epoch=process_epoch,
+                    driver=driver,
+                    crash_hook=crash_hook,
+                )
             else:
                 _mark_indeterminate(
                     transaction_id=transaction_id,
@@ -437,6 +472,7 @@ def replay_deferred_startup(
                 process_epoch,
                 step.name,
                 prior_completion_absent_policy=(step.prior_completion_absent_policy),
+                retry_safe_partial_policy=step.retry_safe_partial_policy,
             )
             if crash_hook is not None:
                 crash_hook(AFTER_INTENT, step.name)
@@ -485,6 +521,24 @@ def replay_deferred_startup(
                     driver=driver,
                     crash_hook=crash_hook,
                 )
+            elif result is Reconciliation.PROVED_RETRY_SAFE_PARTIAL:
+                if step.retry_safe_partial_policy is not RetrySafePartialPolicy.ALLOW:
+                    _mark_indeterminate(
+                        transaction_id=transaction_id,
+                        manifest_receipt=manifest_receipt,
+                        process_epoch=process_epoch,
+                        driver=driver,
+                        step_name=step.name,
+                        reason="retry-safe-partial-policy-denied",
+                    )
+                _mutate_and_prove(
+                    step,
+                    transaction_id=transaction_id,
+                    manifest_receipt=manifest_receipt,
+                    process_epoch=process_epoch,
+                    driver=driver,
+                    crash_hook=crash_hook,
+                )
             else:
                 _mark_indeterminate(
                     transaction_id=transaction_id,
@@ -501,6 +555,7 @@ def replay_deferred_startup(
                 process_epoch,
                 step.name,
                 prior_completion_absent_policy=(step.prior_completion_absent_policy),
+                retry_safe_partial_policy=step.retry_safe_partial_policy,
             )
             if crash_hook is not None:
                 crash_hook(AFTER_INTENT, step.name)

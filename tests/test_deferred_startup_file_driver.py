@@ -69,6 +69,7 @@ def _journal_payload(
                 "attempt": 1,
                 "process_epoch": PROCESS_EPOCH,
                 "prior_completion_absent_policy": "deny",
+                "retry_safe_partial_policy": "deny",
                 "intent": {"generation": next_generation},
             }
             next_generation += 1
@@ -86,7 +87,7 @@ def _journal_payload(
         else:
             attempt_steps[step_name] = record
     return {
-        "version": 2,
+        "version": 3,
         "generation": generation,
         "previous_sha256": previous_sha256,
         "transaction_id": TRANSACTION_ID,
@@ -873,6 +874,7 @@ def test_file_driver_rejects_same_generation_with_different_content(tmp_path):
                 "attempt": 1,
                 "process_epoch": PROCESS_EPOCH + "-fork",
                 "prior_completion_absent_policy": "deny",
+                "retry_safe_partial_policy": "deny",
                 "intent": {"generation": 1},
             },
         ],
@@ -1321,7 +1323,7 @@ def test_file_driver_writes_exact_canonical_journal_and_anchor_bytes(tmp_path):
     )
     expected_journal_bytes = _canonical_json_bytes(journal) + b"\n"
     expected_anchor = {
-        "version": 2,
+        "version": 3,
         "transaction_id": TRANSACTION_ID,
         "manifest_receipt": {
             "version": deferred_release_manifest.MANIFEST_VERSION,
@@ -1681,7 +1683,7 @@ def test_file_driver_attestation_receipt_has_exact_immutable_schema(tmp_path):
     anchor = json.loads(path.with_name(path.name + ".anchor").read_bytes())
     parent_status = path.parent.stat()
     expected = {
-        "schema_version": 2,
+        "schema_version": 3,
         "transaction_id": TRANSACTION_ID,
         "manifest_receipt": {
             "version": deferred_release_manifest.MANIFEST_VERSION,

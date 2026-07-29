@@ -31,11 +31,13 @@ from deferred_startup_replay import (
     DeferredStartupManifestReceipt,
     DeferredStartupStepState,
     PriorCompletionAbsentPolicy,
+    RetrySafePartialPolicy,
 )
 
 
-JOURNAL_VERSION = 2
-ANCHOR_VERSION = 2
+JOURNAL_VERSION = 3
+ANCHOR_VERSION = 3
+ATTESTATION_VERSION = 3
 DEFAULT_MAX_BYTES = 1024 * 1024
 MAX_CONFIGURABLE_BYTES = 4 * 1024 * 1024
 MAX_RECOVERY_ARTIFACTS = 32
@@ -259,7 +261,7 @@ class DeferredStartupFileDriver:
                 ).hexdigest()
             self._accept_observed_journal(journal)
             return DeferredStartupFileAttestation(
-                schema_version=2,
+                schema_version=ATTESTATION_VERSION,
                 transaction_id=self._transaction_id,
                 manifest_version=self._manifest_receipt.version,
                 manifest_sha256=self._manifest_receipt.sha256,
@@ -287,10 +289,17 @@ class DeferredStartupFileDriver:
         prior_completion_absent_policy: PriorCompletionAbsentPolicy = (
             PriorCompletionAbsentPolicy.DENY
         ),
+        retry_safe_partial_policy: RetrySafePartialPolicy = (
+            RetrySafePartialPolicy.DENY
+        ),
     ) -> DeferredStartupStepState:
         if type(prior_completion_absent_policy) is not PriorCompletionAbsentPolicy:
             raise DeferredStartupFileDriverError(
                 "startup journal step policy is invalid"
+            )
+        if type(retry_safe_partial_policy) is not RetrySafePartialPolicy:
+            raise DeferredStartupFileDriverError(
+                "startup journal retry-safe partial policy is invalid"
             )
         process_epoch, step_name = self._validate_call(
             transaction_id,
@@ -337,6 +346,8 @@ class DeferredStartupFileDriver:
             if (
                 current["prior_completion_absent_policy"]
                 != prior_completion_absent_policy.value
+                or current["retry_safe_partial_policy"]
+                != retry_safe_partial_policy.value
             ):
                 raise DeferredStartupFileDriverError(
                     "startup journal process epoch policy binding does not match"
@@ -365,10 +376,17 @@ class DeferredStartupFileDriver:
         prior_completion_absent_policy: PriorCompletionAbsentPolicy = (
             PriorCompletionAbsentPolicy.DENY
         ),
+        retry_safe_partial_policy: RetrySafePartialPolicy = (
+            RetrySafePartialPolicy.DENY
+        ),
     ) -> None:
         if type(prior_completion_absent_policy) is not PriorCompletionAbsentPolicy:
             raise DeferredStartupFileDriverError(
                 "startup journal step policy is invalid"
+            )
+        if type(retry_safe_partial_policy) is not RetrySafePartialPolicy:
+            raise DeferredStartupFileDriverError(
+                "startup journal retry-safe partial policy is invalid"
             )
         self._transition(
             transaction_id,
@@ -376,7 +394,12 @@ class DeferredStartupFileDriver:
             process_epoch,
             step_name,
             "intent",
-            {"policy": prior_completion_absent_policy.value},
+            {
+                "prior_completion_absent_policy": (
+                    prior_completion_absent_policy.value
+                ),
+                "retry_safe_partial_policy": retry_safe_partial_policy.value,
+            },
         )
 
     def record_completion(
@@ -469,7 +492,9 @@ class DeferredStartupFileDriver:
                     if current is not None:
                         if (
                             current["prior_completion_absent_policy"]
-                            != payload["policy"]
+                            != payload["prior_completion_absent_policy"]
+                            or current["retry_safe_partial_policy"]
+                            != payload["retry_safe_partial_policy"]
                         ):
                             raise DeferredStartupFileDriverError(
                                 "startup process epoch has a conflicting policy"
@@ -486,7 +511,12 @@ class DeferredStartupFileDriver:
                     proposed = {
                         "attempt": len(attempts) + 1,
                         "process_epoch": process_epoch,
-                        "prior_completion_absent_policy": payload["policy"],
+                        "prior_completion_absent_policy": payload[
+                            "prior_completion_absent_policy"
+                        ],
+                        "retry_safe_partial_policy": payload[
+                            "retry_safe_partial_policy"
+                        ],
                         "intent": {"generation": journal["generation"] + 1},
                     }
                     attempts.append(proposed)
@@ -1662,6 +1692,10 @@ class DeferredStartupFileDriver:
         }
 
     def _validate_journal(self, raw: object) -> dict:
+        if type(raw) is dict and raw.get("version") == 2:
+            raise DeferredStartupFileDriverError(
+                "pre-policy startup journal version 2 is unsupported"
+            )
         expected_receipt = {
             "version": self._manifest_receipt.version,
             "sha256": self._manifest_receipt.sha256,
@@ -1727,12 +1761,14 @@ class DeferredStartupFileDriver:
                             "attempt",
                             "process_epoch",
                             "prior_completion_absent_policy",
+                            "retry_safe_partial_policy",
                             "intent",
                         },
                         {
                             "attempt",
                             "process_epoch",
                             "prior_completion_absent_policy",
+                            "retry_safe_partial_policy",
                             "intent",
                             "completion",
                         },
@@ -1740,6 +1776,7 @@ class DeferredStartupFileDriver:
                             "attempt",
                             "process_epoch",
                             "prior_completion_absent_policy",
+                            "retry_safe_partial_policy",
                             "intent",
                             "indeterminate",
                         },
@@ -1753,6 +1790,9 @@ class DeferredStartupFileDriver:
                     or type(attempt.get("prior_completion_absent_policy")) is not str
                     or attempt["prior_completion_absent_policy"]
                     not in {policy.value for policy in PriorCompletionAbsentPolicy}
+                    or type(attempt.get("retry_safe_partial_policy")) is not str
+                    or attempt["retry_safe_partial_policy"]
+                    not in {policy.value for policy in RetrySafePartialPolicy}
                     or type(attempt.get("intent")) is not dict
                     or set(attempt["intent"]) != {"generation"}
                     or type(attempt["intent"].get("generation")) is not int
@@ -1864,6 +1904,10 @@ class DeferredStartupFileDriver:
         return self._validate_anchor(raw), receipt
 
     def _validate_anchor(self, raw: object) -> dict:
+        if type(raw) is dict and raw.get("version") == 2:
+            raise DeferredStartupFileDriverError(
+                "pre-policy startup anchor version 2 is unsupported"
+            )
         expected_receipt = {
             "version": self._manifest_receipt.version,
             "sha256": self._manifest_receipt.sha256,
@@ -2054,6 +2098,7 @@ class DeferredStartupFileDriver:
                     "attempt",
                     "process_epoch",
                     "prior_completion_absent_policy",
+                    "retry_safe_partial_policy",
                     "intent",
                 }:
                     return False
@@ -2067,6 +2112,7 @@ class DeferredStartupFileDriver:
                         "attempt",
                         "process_epoch",
                         "prior_completion_absent_policy",
+                        "retry_safe_partial_policy",
                         "intent",
                         "completion",
                     },
@@ -2074,6 +2120,7 @@ class DeferredStartupFileDriver:
                         "attempt",
                         "process_epoch",
                         "prior_completion_absent_policy",
+                        "retry_safe_partial_policy",
                         "intent",
                         "indeterminate",
                     },

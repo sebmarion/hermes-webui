@@ -15,10 +15,12 @@ from deferred_startup_file_driver import (
 )
 from deferred_startup_replay import (
     AFTER_INTENT,
+    AFTER_MUTATION_BEFORE_COMPLETION,
     DeferredStartupCrash,
     DeferredStartupBindingError,
     DeferredStartupIndeterminateError,
     DeferredStartupManifestReceipt,
+    DeferredStartupRetryableError,
     DeferredStartupStep,
     Reconciliation,
     replay_deferred_startup,
@@ -58,14 +60,18 @@ def _step(
     mutations: list[str],
     *,
     policy=None,
+    retry_safe_partial_policy=None,
 ) -> DeferredStartupStep:
     if policy is None:
         policy = replay_module.PriorCompletionAbsentPolicy.DENY
+    if retry_safe_partial_policy is None:
+        retry_safe_partial_policy = replay_module.RetrySafePartialPolicy.DENY
     return DeferredStartupStep(
         name="plugins",
         mutator=lambda: mutations.append("plugins"),
         reconciler=lambda: reconciliations.pop(0),
         prior_completion_absent_policy=policy,
+        retry_safe_partial_policy=retry_safe_partial_policy,
     )
 
 
@@ -81,6 +87,349 @@ def _replay(
         steps=(step,),
         driver=_driver(path),
     )
+
+
+def test_first_retry_safe_partial_leaves_reopenable_nonterminal_intent(tmp_path):
+    path = _journal_path(tmp_path)
+    mutations: list[str] = []
+    step = _step(
+        [Reconciliation.PROVED_RETRY_SAFE_PARTIAL],
+        mutations,
+        retry_safe_partial_policy=replay_module.RetrySafePartialPolicy.ALLOW,
+    )
+
+    with pytest.raises(DeferredStartupRetryableError, match="retry-safe partial"):
+        _replay(path, EPOCH_ONE, step)
+
+    assert mutations == ["plugins"]
+    attempt = json.loads(path.read_bytes())["steps"]["plugins"]["attempts"][0]
+    assert attempt == {
+        "attempt": 1,
+        "process_epoch": EPOCH_ONE,
+        "prior_completion_absent_policy": "deny",
+        "retry_safe_partial_policy": "allow",
+        "intent": {"generation": 1},
+    }
+    reopened_state = _driver(path).read_step_state(
+        TRANSACTION_ID,
+        _receipt(),
+        EPOCH_ONE,
+        "plugins",
+        retry_safe_partial_policy=replay_module.RetrySafePartialPolicy.ALLOW,
+    )
+    assert reopened_state.intent is True
+    assert reopened_state.completion is False
+    assert reopened_state.indeterminate is False
+
+
+def test_same_epoch_retries_only_explicit_retry_safe_partial_when_allowed(tmp_path):
+    path = _journal_path(tmp_path)
+    mutations: list[str] = []
+    reconciliations = [
+        Reconciliation.PROVED_RETRY_SAFE_PARTIAL,
+        Reconciliation.PROVED_RETRY_SAFE_PARTIAL,
+        Reconciliation.PROVED_COMPLETE,
+    ]
+    step = _step(
+        reconciliations,
+        mutations,
+        retry_safe_partial_policy=replay_module.RetrySafePartialPolicy.ALLOW,
+    )
+
+    with pytest.raises(DeferredStartupRetryableError):
+        _replay(path, EPOCH_ONE, step)
+    result = _replay(path, EPOCH_ONE, step)
+
+    assert result.completed == ("plugins",)
+    assert mutations == ["plugins", "plugins"]
+    attempt = json.loads(path.read_bytes())["steps"]["plugins"]["attempts"][0]
+    assert attempt["completion"] == {"generation": 2, "recovered": False}
+
+
+def test_same_epoch_retry_safe_partial_default_deny_becomes_indeterminate(tmp_path):
+    path = _journal_path(tmp_path)
+    mutations: list[str] = []
+    reconciliations = [
+        Reconciliation.PROVED_RETRY_SAFE_PARTIAL,
+        Reconciliation.PROVED_RETRY_SAFE_PARTIAL,
+    ]
+    step = _step(reconciliations, mutations)
+
+    with pytest.raises(DeferredStartupRetryableError):
+        _replay(path, EPOCH_ONE, step)
+    with pytest.raises(DeferredStartupIndeterminateError):
+        _replay(path, EPOCH_ONE, step)
+
+    assert mutations == ["plugins"]
+    attempt = json.loads(path.read_bytes())["steps"]["plugins"]["attempts"][0]
+    assert attempt["indeterminate"]["reason"] == "retry-safe-partial-policy-denied"
+
+
+@pytest.mark.parametrize("prior_history", ("completion", "unresolved"))
+def test_new_epoch_retry_safe_partial_requires_fresh_intent_and_allow(
+    tmp_path,
+    prior_history,
+):
+    path = _journal_path(tmp_path)
+    if prior_history == "completion":
+        _replay(
+            path,
+            EPOCH_ONE,
+            _step([Reconciliation.PROVED_COMPLETE], []),
+        )
+    else:
+        with pytest.raises(DeferredStartupCrash):
+            replay_deferred_startup(
+                transaction_id=TRANSACTION_ID,
+                manifest_receipt=_receipt(),
+                process_epoch=EPOCH_ONE,
+                steps=(_step([], []),),
+                driver=_driver(path),
+                crash_hook=lambda boundary, _name: (
+                    (_ for _ in ()).throw(DeferredStartupCrash())
+                    if boundary == AFTER_INTENT
+                    else None
+                ),
+            )
+    mutations: list[str] = []
+    step = _step(
+        [
+            Reconciliation.PROVED_RETRY_SAFE_PARTIAL,
+            Reconciliation.PROVED_COMPLETE,
+        ],
+        mutations,
+        retry_safe_partial_policy=replay_module.RetrySafePartialPolicy.ALLOW,
+    )
+
+    result = _replay(path, EPOCH_TWO, step)
+
+    assert result.completed == ("plugins",)
+    assert mutations == ["plugins"]
+    attempts = json.loads(path.read_bytes())["steps"]["plugins"]["attempts"]
+    assert [attempt["process_epoch"] for attempt in attempts] == [
+        EPOCH_ONE,
+        EPOCH_TWO,
+    ]
+    assert attempts[-1]["retry_safe_partial_policy"] == "allow"
+    assert (
+        attempts[-1]["intent"]["generation"] < attempts[-1]["completion"]["generation"]
+    )
+
+
+def test_new_epoch_retry_safe_partial_default_deny_is_indeterminate(tmp_path):
+    path = _journal_path(tmp_path)
+    with pytest.raises(DeferredStartupCrash):
+        replay_deferred_startup(
+            transaction_id=TRANSACTION_ID,
+            manifest_receipt=_receipt(),
+            process_epoch=EPOCH_ONE,
+            steps=(_step([], []),),
+            driver=_driver(path),
+            crash_hook=lambda boundary, _name: (
+                (_ for _ in ()).throw(DeferredStartupCrash())
+                if boundary == AFTER_INTENT
+                else None
+            ),
+        )
+    mutations: list[str] = []
+
+    with pytest.raises(DeferredStartupIndeterminateError):
+        _replay(
+            path,
+            EPOCH_TWO,
+            _step([Reconciliation.PROVED_RETRY_SAFE_PARTIAL], mutations),
+        )
+
+    assert mutations == []
+    attempts = json.loads(path.read_bytes())["steps"]["plugins"]["attempts"]
+    assert attempts[-1]["indeterminate"]["reason"] == (
+        "retry-safe-partial-policy-denied"
+    )
+
+
+def test_crash_after_mutation_can_retry_safe_partial_only_with_allow(tmp_path):
+    path = _journal_path(tmp_path)
+    mutations: list[str] = []
+    step = _step(
+        [
+            Reconciliation.PROVED_RETRY_SAFE_PARTIAL,
+            Reconciliation.PROVED_COMPLETE,
+        ],
+        mutations,
+        retry_safe_partial_policy=replay_module.RetrySafePartialPolicy.ALLOW,
+    )
+
+    with pytest.raises(DeferredStartupCrash):
+        replay_deferred_startup(
+            transaction_id=TRANSACTION_ID,
+            manifest_receipt=_receipt(),
+            process_epoch=EPOCH_ONE,
+            steps=(step,),
+            driver=_driver(path),
+            crash_hook=lambda boundary, _name: (
+                (_ for _ in ()).throw(DeferredStartupCrash())
+                if boundary == AFTER_MUTATION_BEFORE_COMPLETION
+                else None
+            ),
+        )
+    result = _replay(path, EPOCH_ONE, step)
+
+    assert result.completed == ("plugins",)
+    assert mutations == ["plugins", "plugins"]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    (Reconciliation.PARTIAL, Reconciliation.AMBIGUOUS),
+)
+def test_allow_never_retries_ordinary_partial_or_ambiguous(tmp_path, outcome):
+    path = _journal_path(tmp_path)
+    mutations: list[str] = []
+    step = _step(
+        [outcome],
+        mutations,
+        retry_safe_partial_policy=replay_module.RetrySafePartialPolicy.ALLOW,
+    )
+
+    with pytest.raises(DeferredStartupIndeterminateError):
+        _replay(path, EPOCH_ONE, step)
+
+    assert mutations == ["plugins"]
+    attempt = json.loads(path.read_bytes())["steps"]["plugins"]["attempts"][0]
+    assert attempt["indeterminate"] == {
+        "generation": 2,
+        "reason": outcome.value,
+    }
+    later_reconciliations: list[str] = []
+    later_mutations: list[str] = []
+    with pytest.raises(DeferredStartupIndeterminateError):
+        _replay(
+            path,
+            EPOCH_ONE,
+            DeferredStartupStep(
+                name="plugins",
+                reconciler=lambda: (
+                    later_reconciliations.append("called")
+                    or Reconciliation.PROVED_COMPLETE
+                ),
+                mutator=lambda: later_mutations.append("called"),
+                retry_safe_partial_policy=(replay_module.RetrySafePartialPolicy.ALLOW),
+            ),
+        )
+    assert later_reconciliations == []
+    assert later_mutations == []
+
+
+def test_completed_current_attempt_never_reruns_retry_safe_partial(tmp_path):
+    path = _journal_path(tmp_path)
+    _replay(
+        path,
+        EPOCH_ONE,
+        _step(
+            [Reconciliation.PROVED_COMPLETE],
+            [],
+            retry_safe_partial_policy=replay_module.RetrySafePartialPolicy.ALLOW,
+        ),
+    )
+    mutations: list[str] = []
+
+    with pytest.raises(DeferredStartupIndeterminateError):
+        _replay(
+            path,
+            EPOCH_ONE,
+            _step(
+                [Reconciliation.PROVED_RETRY_SAFE_PARTIAL],
+                mutations,
+                retry_safe_partial_policy=replay_module.RetrySafePartialPolicy.ALLOW,
+            ),
+        )
+
+    assert mutations == []
+
+
+def test_retry_safe_partial_policy_conflict_and_tamper_fail_closed(tmp_path):
+    path = _journal_path(tmp_path)
+    driver = _driver(path)
+    driver.record_intent(
+        TRANSACTION_ID,
+        _receipt(),
+        EPOCH_ONE,
+        "plugins",
+    )
+    original_attestation = driver.attestation_receipt()
+    with pytest.raises(DeferredStartupFileDriverError, match="policy"):
+        driver.read_step_state(
+            TRANSACTION_ID,
+            _receipt(),
+            EPOCH_ONE,
+            "plugins",
+            retry_safe_partial_policy=replay_module.RetrySafePartialPolicy.ALLOW,
+        )
+    with pytest.raises(DeferredStartupFileDriverError, match="policy"):
+        driver.record_intent(
+            TRANSACTION_ID,
+            _receipt(),
+            EPOCH_ONE,
+            "plugins",
+            retry_safe_partial_policy=replay_module.RetrySafePartialPolicy.ALLOW,
+        )
+
+    payload = json.loads(path.read_bytes())
+    payload["steps"]["plugins"]["attempts"][0]["retry_safe_partial_policy"] = "allow"
+    path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    os.chmod(path, 0o600)
+    anchor_path = path.with_name(path.name + ".anchor")
+    anchor = json.loads(anchor_path.read_bytes())
+    anchor["journal_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    anchor_path.write_text(
+        json.dumps(anchor, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    os.chmod(anchor_path, 0o600)
+
+    reopened = _driver(path)
+    assert (
+        reopened.attestation_receipt().attempt_topology_sha256
+        != original_attestation.attempt_topology_sha256
+    )
+    with pytest.raises(DeferredStartupFileDriverError, match="policy"):
+        reopened.read_step_state(
+            TRANSACTION_ID,
+            _receipt(),
+            EPOCH_ONE,
+            "plugins",
+        )
+
+
+def test_retry_safe_partial_policy_requires_exact_enum_before_side_effects(tmp_path):
+    path = _journal_path(tmp_path)
+    mutations: list[str] = []
+    invalid_step = DeferredStartupStep(
+        name="plugins",
+        mutator=lambda: mutations.append("plugins"),
+        reconciler=lambda: Reconciliation.PROVED_COMPLETE,
+        retry_safe_partial_policy="allow",
+    )
+
+    with pytest.raises(DeferredStartupBindingError, match="step definitions"):
+        _replay(path, EPOCH_ONE, invalid_step)
+    with pytest.raises(DeferredStartupFileDriverError, match="policy"):
+        _driver(path).record_intent(
+            TRANSACTION_ID,
+            _receipt(),
+            EPOCH_ONE,
+            "plugins",
+            retry_safe_partial_policy="allow",
+        )
+
+    assert mutations == []
+    assert not path.exists()
 
 
 @pytest.mark.parametrize(
@@ -143,6 +492,65 @@ def test_file_driver_rejects_v1_journal_instead_of_migrating_it(tmp_path):
         _driver(path)
 
 
+def test_file_driver_explicitly_rejects_genuine_pre_policy_v2_journal(tmp_path):
+    path = _journal_path(tmp_path)
+    pre_policy_v2 = {
+        "version": 2,
+        "generation": 1,
+        "previous_sha256": "0" * 64,
+        "transaction_id": TRANSACTION_ID,
+        "manifest_receipt": {
+            "version": _receipt().version,
+            "sha256": _receipt().sha256,
+        },
+        "steps": {
+            "plugins": {
+                "attempts": [
+                    {
+                        "attempt": 1,
+                        "process_epoch": EPOCH_ONE,
+                        "prior_completion_absent_policy": "deny",
+                        "intent": {"generation": 1},
+                    }
+                ]
+            }
+        },
+    }
+    path.write_text(
+        json.dumps(pre_policy_v2, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    os.chmod(path, 0o600)
+
+    with pytest.raises(
+        DeferredStartupFileDriverError,
+        match="pre-policy.*version 2.*unsupported",
+    ):
+        _driver(path)
+
+
+def test_file_driver_explicitly_rejects_pre_policy_v2_anchor(tmp_path):
+    path = _journal_path(tmp_path)
+    _driver(path).record_intent(
+        TRANSACTION_ID,
+        _receipt(),
+        EPOCH_ONE,
+        "plugins",
+    )
+    anchor_path = path.with_name(path.name + ".anchor")
+    anchor = json.loads(anchor_path.read_bytes())
+    anchor["version"] = 2
+    anchor_path.write_text(
+        json.dumps(anchor, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    os.chmod(anchor_path, 0o600)
+
+    with pytest.raises(
+        DeferredStartupFileDriverError,
+        match="pre-policy.*anchor.*version 2.*unsupported",
+    ):
+        _driver(path)
+
+
 def test_new_epoch_recovers_prior_completion_without_mutation(tmp_path):
     path = _journal_path(tmp_path)
     first_mutations: list[str] = []
@@ -174,6 +582,7 @@ def test_new_epoch_recovers_prior_completion_without_mutation(tmp_path):
             "attempt": 1,
             "process_epoch": EPOCH_ONE,
             "prior_completion_absent_policy": "deny",
+            "retry_safe_partial_policy": "deny",
             "intent": {"generation": 1},
             "completion": {"recovered": False, "generation": 2},
         },
@@ -181,6 +590,7 @@ def test_new_epoch_recovers_prior_completion_without_mutation(tmp_path):
             "attempt": 2,
             "process_epoch": EPOCH_TWO,
             "prior_completion_absent_policy": "deny",
+            "retry_safe_partial_policy": "deny",
             "intent": {"generation": 3},
             "completion": {"recovered": True, "generation": 4},
         },
@@ -209,6 +619,7 @@ def test_new_epoch_prior_completion_absent_fails_closed_without_policy(tmp_path)
         "attempt": 2,
         "process_epoch": EPOCH_TWO,
         "prior_completion_absent_policy": "deny",
+        "retry_safe_partial_policy": "deny",
         "intent": {"generation": 3},
         "indeterminate": {
             "reason": "prior-completion-absent-policy-denied",
@@ -247,6 +658,7 @@ def test_new_epoch_prior_completion_absent_mutates_only_with_explicit_policy(
         "attempt": 2,
         "process_epoch": EPOCH_TWO,
         "prior_completion_absent_policy": "allow-rerun",
+        "retry_safe_partial_policy": "deny",
         "intent": {"generation": 3},
         "completion": {"recovered": False, "generation": 4},
     }
@@ -409,6 +821,7 @@ def test_new_epoch_crash_after_intent_never_mutates_under_old_receipt(tmp_path):
         "attempt": 2,
         "process_epoch": EPOCH_TWO,
         "prior_completion_absent_policy": "allow-rerun",
+        "retry_safe_partial_policy": "deny",
         "intent": {"generation": 3},
     }
 

@@ -225,6 +225,7 @@ class _InMemoryDeferredStartupDriver:
         step_name,
         *,
         prior_completion_absent_policy,
+        retry_safe_partial_policy,
     ):
         from deferred_startup_replay import DeferredStartupStepState
 
@@ -248,6 +249,7 @@ class _InMemoryDeferredStartupDriver:
         step_name,
         *,
         prior_completion_absent_policy,
+        retry_safe_partial_policy,
     ):
         from deferred_startup_replay import DeferredStartupStepState
 
@@ -1385,6 +1387,76 @@ def test_failed_deferred_start_keeps_startup_fenced_and_can_retry(
     )
     assert accepted["state"] == "open"
     assert attempts == ["attempt", "attempt"]
+
+
+def test_startup_fence_rejects_stale_expected_deferred_attestation(
+    monkeypatch,
+    tmp_path,
+    isolated_startup_admission,
+):
+    from deferred_startup_file_driver import DeferredStartupFileDriver
+
+    parent = tmp_path / "private"
+    parent.mkdir(mode=0o700)
+    os.chmod(parent, 0o700)
+    path = parent / "deferred-startup.json"
+    receipt = _canonical_deferred_startup_receipt()
+    driver = DeferredStartupFileDriver(
+        path,
+        transaction_id=TRANSACTION_ID,
+        manifest_receipt=receipt,
+    )
+    driver.record_intent(
+        TRANSACTION_ID,
+        receipt,
+        PROCESS_EPOCH,
+        "plugins",
+    )
+    expected_attestation = driver.attestation_receipt()
+
+    payload = json.loads(path.read_bytes())
+    payload["steps"]["plugins"]["attempts"][0]["retry_safe_partial_policy"] = "allow"
+    path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+    os.chmod(path, 0o600)
+    anchor_path = path.with_name(path.name + ".anchor")
+    anchor = json.loads(anchor_path.read_bytes())
+    anchor["journal_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    anchor_path.write_text(
+        json.dumps(anchor, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    os.chmod(anchor_path, 0o600)
+    reopened = DeferredStartupFileDriver(
+        path,
+        transaction_id=TRANSACTION_ID,
+        manifest_receipt=receipt,
+    )
+
+    def verify_controller_binding(transaction_id):
+        assert transaction_id == TRANSACTION_ID
+        if reopened.attestation_receipt() != expected_attestation:
+            raise RuntimeError("deferred startup attestation binding changed")
+
+    _select_managed_candidate(monkeypatch)
+    config.configure_startup_acceptor(verify_controller_binding)
+    fenced = _claim_startup_fence()
+
+    with pytest.raises(config.RunAdmissionBusy, match="deferred startup failed"):
+        config.accept_startup_run_admission(
+            fenced["token"],
+            expected_identity=IDENTITY,
+            transaction_id=TRANSACTION_ID,
+        )
+
+    snapshot = config.run_admission_snapshot()
+    assert snapshot["state"] == "startup-fenced"
+    assert snapshot["startup_error"] == "deferred_startup_failed"
 
 
 def test_startup_acceptor_has_scoped_admission_for_deferred_recovery(
