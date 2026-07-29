@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib
 import json
 import os
 import subprocess
 import sys
 import threading
+from dataclasses import FrozenInstanceError
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +21,370 @@ from api import config
 
 TRANSACTION_ID = "startup-transaction-" + ("x" * 32)
 IDENTITY = {"pid": 123, "started_at": 456.0, "instance_id": "candidate-a"}
+
+EXPECTED_DEFERRED_RELEASE_DESCRIPTORS = [
+    {
+        "name": "candidate_accept_intent",
+        "owner": "release_controller",
+        "operation": "record_phase:candidate_accept_intent",
+        "condition": "always",
+    },
+    {
+        "name": "gateway_opening",
+        "owner": "release_controller",
+        "operation": "open_pair_after_promotion",
+        "condition": "always",
+    },
+    {
+        "name": "credential_permissions",
+        "owner": "webui_server",
+        "operation": "api.startup.fix_credential_permissions",
+        "condition": "always",
+    },
+    {
+        "name": "internal_recovery_key",
+        "owner": "webui_server",
+        "operation": "server._materialize_internal_recovery_key",
+        "condition": "always",
+    },
+    {
+        "name": "state_directories",
+        "owner": "webui_server",
+        "operation": "server._create_state_directories",
+        "condition": "always",
+    },
+    {
+        "name": "startup_profile_state",
+        "owner": "webui_server",
+        "operation": "api.config.apply_startup_profile_state",
+        "condition": "always",
+    },
+    {
+        "name": "provider_model_seed",
+        "owner": "webui_server",
+        "operation": "api.config.seed_startup_provider_models",
+        "condition": "always",
+    },
+    {
+        "name": "startup_configuration",
+        "owner": "webui_server",
+        "operation": "api.config.apply_deferred_startup_configuration",
+        "condition": "always",
+    },
+    {
+        "name": "session_recovery",
+        "owner": "webui_server",
+        "operation": "server._recover_startup_sessions",
+        "condition": "always",
+    },
+    {
+        "name": "plugins",
+        "owner": "webui_server",
+        "operation": "server._load_startup_plugins",
+        "condition": "always",
+    },
+    {
+        "name": "process_completion_recovery",
+        "owner": "webui_server",
+        "operation": "server._recover_process_completion_notifications",
+        "condition": "always",
+    },
+    {
+        "name": "async_delegation_recovery",
+        "owner": "webui_server",
+        "operation": "server._recover_async_delegation_notifications",
+        "condition": "always",
+    },
+    {
+        "name": "tool_limit_continuation_recovery",
+        "owner": "webui_server",
+        "operation": "server._recover_tool_limit_continuations_for_startup",
+        "condition": "startup_run_admission_closed",
+    },
+    {
+        "name": "goal_continuation_recovery",
+        "owner": "webui_server",
+        "operation": "server._recover_goal_continuations_for_startup",
+        "condition": "startup_run_admission_closed",
+    },
+    {
+        "name": "background_services",
+        "owner": "webui_server",
+        "operation": "server._start_startup_background_services",
+        "condition": "always",
+    },
+    {
+        "name": "full_open_health",
+        "owner": "release_controller",
+        "operation": "inspect_accepted_binding:require_full_health",
+        "condition": "always",
+    },
+    {
+        "name": "pair_gate_release",
+        "owner": "release_controller",
+        "operation": "release_pair_after_acceptance",
+        "condition": "always",
+    },
+    {
+        "name": "pair_opened",
+        "owner": "release_controller",
+        "operation": "record_phase:pair_opened",
+        "condition": "always",
+    },
+    {
+        "name": "watchdog_restoration",
+        "owner": "release_controller",
+        "operation": "_restore_watchdog_cron",
+        "condition": "always",
+    },
+]
+EXPECTED_DEFERRED_RELEASE_MANIFEST = {
+    "version": 1,
+    "descriptors": EXPECTED_DEFERRED_RELEASE_DESCRIPTORS,
+}
+EXPECTED_DEFERRED_RELEASE_MANIFEST_SHA256 = (
+    "040d95fe27e21611ec01c5d63da7a8767bc120e1d771593df17446be0943a38b"
+)
+
+
+def _manifest_as_dict(manifest):
+    return {
+        "version": manifest.version,
+        "descriptors": [
+            {
+                "name": descriptor.name,
+                "owner": descriptor.owner,
+                "operation": descriptor.operation,
+                "condition": descriptor.condition,
+            }
+            for descriptor in manifest.descriptors
+        ],
+    }
+
+
+def test_deferred_release_manifest_is_exact_versioned_and_immutable():
+    release_manifest = importlib.import_module("deferred_release_manifest")
+
+    manifest = release_manifest.deferred_release_manifest()
+
+    assert _manifest_as_dict(manifest) == EXPECTED_DEFERRED_RELEASE_MANIFEST
+    with pytest.raises(FrozenInstanceError):
+        manifest.version = 2
+    with pytest.raises(FrozenInstanceError):
+        manifest.descriptors[0].name = "changed"
+
+
+def test_deferred_release_manifest_has_stable_canonical_digest():
+    release_manifest = importlib.import_module("deferred_release_manifest")
+
+    canonical = release_manifest.canonical_manifest_bytes()
+
+    assert canonical == json.dumps(
+        EXPECTED_DEFERRED_RELEASE_MANIFEST,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert (
+        release_manifest.deferred_release_manifest_sha256()
+        == EXPECTED_DEFERRED_RELEASE_MANIFEST_SHA256
+    )
+    assert hashlib.sha256(canonical).hexdigest() == (
+        EXPECTED_DEFERRED_RELEASE_MANIFEST_SHA256
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda manifest: manifest.update(version=2),
+        lambda manifest: manifest["descriptors"].pop(),
+        lambda manifest: manifest["descriptors"].insert(
+            0,
+            {
+                "name": "unknown",
+                "owner": "release_controller",
+                "operation": "unknown",
+                "condition": "always",
+            },
+        ),
+        lambda manifest: manifest["descriptors"].reverse(),
+        lambda manifest: manifest["descriptors"][0].update(operation="changed"),
+        lambda manifest: manifest["descriptors"][0].update(unknown=True),
+    ),
+)
+def test_deferred_release_manifest_rejects_any_contract_change(mutate):
+    release_manifest = importlib.import_module("deferred_release_manifest")
+    candidate = deepcopy(EXPECTED_DEFERRED_RELEASE_MANIFEST)
+    mutate(candidate)
+
+    with pytest.raises(ValueError, match="deferred release manifest"):
+        release_manifest.validate_deferred_release_manifest(candidate)
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "bool-version",
+        "float-version",
+        "list-descriptors",
+        "tuple-subclass",
+        "str-subclass",
+        "descriptor-subclass",
+        "malformed-descriptor",
+    ),
+)
+def test_deferred_release_manifest_rejects_non_exact_typed_values(case):
+    release_manifest = importlib.import_module("deferred_release_manifest")
+    canonical = release_manifest.deferred_release_manifest()
+
+    class ManifestStr(str):
+        pass
+
+    class ManifestTuple(tuple):
+        pass
+
+    class DescriptorSubclass(release_manifest.DeferredReleaseDescriptor):
+        pass
+
+    if case == "bool-version":
+        candidate = release_manifest.DeferredReleaseManifest(
+            True,
+            canonical.descriptors,
+        )
+    elif case == "float-version":
+        candidate = release_manifest.DeferredReleaseManifest(
+            1.0,
+            canonical.descriptors,
+        )
+    elif case == "list-descriptors":
+        candidate = release_manifest.DeferredReleaseManifest(
+            1,
+            list(canonical.descriptors),
+        )
+    elif case == "tuple-subclass":
+        candidate = release_manifest.DeferredReleaseManifest(
+            1,
+            ManifestTuple(canonical.descriptors),
+        )
+    elif case == "str-subclass":
+        first = canonical.descriptors[0]
+        changed = release_manifest.DeferredReleaseDescriptor(
+            ManifestStr(first.name),
+            first.owner,
+            first.operation,
+            first.condition,
+        )
+        candidate = release_manifest.DeferredReleaseManifest(
+            1,
+            (changed, *canonical.descriptors[1:]),
+        )
+    elif case == "descriptor-subclass":
+        first = canonical.descriptors[0]
+        changed = DescriptorSubclass(
+            first.name,
+            first.owner,
+            first.operation,
+            first.condition,
+        )
+        candidate = release_manifest.DeferredReleaseManifest(
+            1,
+            (changed, *canonical.descriptors[1:]),
+        )
+    else:
+        candidate = release_manifest.DeferredReleaseManifest(
+            1,
+            (SimpleNamespace(name="candidate_accept_intent"),)
+            + canonical.descriptors[1:],
+        )
+
+    with pytest.raises(ValueError, match="deferred release manifest"):
+        release_manifest.validate_deferred_release_manifest(candidate)
+
+
+def test_deferred_release_manifest_conditional_startup_subset():
+    release_manifest = importlib.import_module("deferred_release_manifest")
+    manifest = release_manifest.deferred_release_manifest()
+
+    normal = release_manifest.webui_startup_descriptors(
+        manifest,
+        startup_admission_closed=False,
+    )
+    fenced = release_manifest.webui_startup_descriptors(
+        manifest,
+        startup_admission_closed=True,
+    )
+
+    normal_names = [descriptor.name for descriptor in normal]
+    fenced_names = [descriptor.name for descriptor in fenced]
+    assert normal_names == [
+        descriptor["name"]
+        for descriptor in EXPECTED_DEFERRED_RELEASE_DESCRIPTORS
+        if descriptor["owner"] == "webui_server"
+        and descriptor["condition"] == "always"
+    ]
+    assert fenced_names == [
+        descriptor["name"]
+        for descriptor in EXPECTED_DEFERRED_RELEASE_DESCRIPTORS
+        if descriptor["owner"] == "webui_server"
+    ]
+
+
+def test_server_deferred_startup_mapping_matches_canonical_subset(
+    monkeypatch,
+    isolated_startup_admission,
+):
+    import server
+
+    normal_names = [name for name, _mutator in server._deferred_startup_steps()]
+    _select_managed_candidate(monkeypatch)
+    fenced_names = [name for name, _mutator in server._deferred_startup_steps()]
+
+    expected_normal = [
+        descriptor["name"]
+        for descriptor in EXPECTED_DEFERRED_RELEASE_DESCRIPTORS
+        if descriptor["owner"] == "webui_server"
+        and descriptor["condition"] == "always"
+    ]
+    expected_fenced = [
+        descriptor["name"]
+        for descriptor in EXPECTED_DEFERRED_RELEASE_DESCRIPTORS
+        if descriptor["owner"] == "webui_server"
+    ]
+    assert normal_names == expected_normal
+    assert fenced_names == expected_fenced
+    assert [
+        f"{mutator.__module__}.{mutator.__name__}"
+        for _name, mutator in server._deferred_startup_steps()
+    ] == [
+        descriptor["operation"]
+        for descriptor in EXPECTED_DEFERRED_RELEASE_DESCRIPTORS
+        if descriptor["owner"] == "webui_server"
+    ]
+
+
+def test_server_deferred_startup_mapping_rejects_non_callable_before_return(
+    monkeypatch,
+):
+    import server
+
+    monkeypatch.setattr(server, "_recover_startup_sessions", None)
+
+    with pytest.raises(RuntimeError, match="callable mapping changed"):
+        server._deferred_startup_steps()
+
+
+def test_server_deferred_startup_mapping_rejects_swapped_callable_association(
+    monkeypatch,
+):
+    import server
+
+    recover = server._recover_startup_sessions
+    plugins = server._load_startup_plugins
+    monkeypatch.setattr(server, "_recover_startup_sessions", plugins)
+    monkeypatch.setattr(server, "_load_startup_plugins", recover)
+
+    with pytest.raises(RuntimeError, match="callable mapping changed"):
+        server._deferred_startup_steps()
 
 
 def _tree_bytes_and_mtimes(root):

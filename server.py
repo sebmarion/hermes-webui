@@ -122,6 +122,7 @@ from api.routes import handle_delete, handle_get, handle_patch, handle_post, han
 from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
 from api.crash_visibility import install_crash_visibility
+import deferred_release_manifest as release_manifest
 
 
 _STARTUP_FENCE_ALLOWED_REQUESTS = {
@@ -775,45 +776,72 @@ def _recover_async_delegation_notifications() -> dict:
 
 def _deferred_startup_steps():
     """Ordered, individually idempotent process-start mutators."""
-    steps = [
-        ("credential_permissions", fix_credential_permissions),
-        ("internal_recovery_key", _materialize_internal_recovery_key),
-        ("state_directories", _create_state_directories),
-        ("startup_profile_state", api_config.apply_startup_profile_state),
-        ("provider_model_seed", api_config.seed_startup_provider_models),
-        (
-            "startup_configuration",
-            api_config.apply_deferred_startup_configuration,
+    mutators_by_operation = {
+        "api.startup.fix_credential_permissions": fix_credential_permissions,
+        "server._materialize_internal_recovery_key": (
+            _materialize_internal_recovery_key
         ),
-        ("session_recovery", _recover_startup_sessions),
-        ("plugins", _load_startup_plugins),
-        (
-            "process_completion_recovery",
-            _recover_process_completion_notifications,
+        "server._create_state_directories": _create_state_directories,
+        "api.config.apply_startup_profile_state": (
+            api_config.apply_startup_profile_state
         ),
-        (
-            "async_delegation_recovery",
-            _recover_async_delegation_notifications,
+        "api.config.seed_startup_provider_models": (
+            api_config.seed_startup_provider_models
         ),
-    ]
-    # api.routes normally schedules these at module import. Managed startup is
-    # already fenced by then, so those attempts are intentionally refused and
-    # must be replayed through the acceptor's transaction-scoped admission.
-    if api_config.startup_run_admission_is_closed():
-        steps.extend(
-            (
-                (
-                    "tool_limit_continuation_recovery",
-                    _recover_tool_limit_continuations_for_startup,
-                ),
-                (
-                    "goal_continuation_recovery",
-                    _recover_goal_continuations_for_startup,
-                ),
-            )
-        )
-    steps.append(("background_services", _start_startup_background_services))
-    return tuple(steps)
+        "api.config.apply_deferred_startup_configuration": (
+            api_config.apply_deferred_startup_configuration
+        ),
+        "server._recover_startup_sessions": _recover_startup_sessions,
+        "server._load_startup_plugins": _load_startup_plugins,
+        "server._recover_process_completion_notifications": (
+            _recover_process_completion_notifications
+        ),
+        "server._recover_async_delegation_notifications": (
+            _recover_async_delegation_notifications
+        ),
+        "server._recover_tool_limit_continuations_for_startup": (
+            _recover_tool_limit_continuations_for_startup
+        ),
+        "server._recover_goal_continuations_for_startup": (
+            _recover_goal_continuations_for_startup
+        ),
+        "server._start_startup_background_services": (
+            _start_startup_background_services
+        ),
+    }
+    manifest = release_manifest.deferred_release_manifest()
+    descriptors = release_manifest.webui_startup_descriptors(
+        manifest,
+        startup_admission_closed=api_config.startup_run_admission_is_closed(),
+    )
+    canonical_operations = {
+        descriptor.operation
+        for descriptor in manifest.descriptors
+        if descriptor.owner == "webui_server"
+    }
+    def callable_operation(mutator):
+        if (
+            not callable(mutator)
+            or type(getattr(mutator, "__module__", None)) is not str
+            or type(getattr(mutator, "__name__", None)) is not str
+        ):
+            return None
+        module = "server" if mutator.__module__ == __name__ else mutator.__module__
+        return f"{module}.{mutator.__name__}"
+
+    callables_match_operations = all(
+        callable_operation(mutator) == operation
+        for operation, mutator in mutators_by_operation.items()
+    )
+    if (
+        set(mutators_by_operation) != canonical_operations
+        or not callables_match_operations
+    ):
+        raise RuntimeError("deferred startup callable mapping changed")
+    return tuple(
+        (descriptor.name, mutators_by_operation[descriptor.operation])
+        for descriptor in descriptors
+    )
 
 
 def _run_deferred_startup_mutators() -> dict:
