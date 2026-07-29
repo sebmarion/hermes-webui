@@ -3958,7 +3958,7 @@ def _write_split_adoption_receipt(
     webui_binding = {
         "listener_pid": 7501,
         "pid_start_token": "webui-start",
-        "deep_health": {"admission": {"state": "open"}},
+        "admission": {"state": "open", "transaction_id": None},
     }
     gateway_binding = {
         "listener_pid": 7201,
@@ -4215,7 +4215,7 @@ def test_create_live_split_adoption_rejects_non_idle_selector_authority(
     )
     monkeypatch.setattr(
         cutover,
-        "_probe_managed_webui_binding",
+        "_probe_live_adoption_webui_binding",
         lambda *_args: pytest.fail("live process must not be probed"),
     )
 
@@ -4261,11 +4261,11 @@ def test_create_live_split_adoption_writes_exact_files_after_double_check(
     )
     monkeypatch.setattr(
         cutover,
-        "_probe_managed_webui_binding",
+        "_probe_live_adoption_webui_binding",
         lambda _plan, _identity: {
             "listener_pid": 7501,
             "pid_start_token": "webui-start",
-            "deep_health": {"admission": {"state": "open"}},
+            "admission": {"state": "open", "transaction_id": None},
         },
     )
     monkeypatch.setattr(
@@ -4339,11 +4339,11 @@ def test_create_live_split_adoption_rejects_process_drift_without_writes(
     starts = iter(("webui-before", "webui-after"))
     monkeypatch.setattr(
         cutover,
-        "_probe_managed_webui_binding",
+        "_probe_live_adoption_webui_binding",
         lambda _plan, _identity: {
             "listener_pid": 7501,
             "pid_start_token": next(starts),
-            "deep_health": {"admission": {"state": "open"}},
+            "admission": {"state": "open", "transaction_id": None},
         },
     )
     monkeypatch.setattr(
@@ -4423,6 +4423,180 @@ def test_probe_managed_webui_binding_rejects_changed_startup_marker(monkeypatch)
         cutover._probe_managed_webui_binding(plan, identity)
 
 
+def test_probe_live_adoption_webui_uses_signed_inspect_without_deep_health(
+    monkeypatch,
+):
+    transaction_id = "adopt-transaction-0000000000000001"
+    identity = {
+        "build_id": "r75-webui",
+        "selector_generation": 187,
+        "startup_fenced": True,
+        "startup_transaction_id": "r75-clarify-composer-transition-20260729",
+    }
+    signed_identity = {
+        **identity,
+        "pid": 41,
+        "pid_start_token": "r75-start",
+    }
+    inspection = {
+        "status": "inspected",
+        "transaction_id": transaction_id,
+        "identity": signed_identity,
+        "admission": {"state": "open", "transaction_id": None},
+        "volatile_nonce": "first",
+    }
+    plan = {
+        "listener_port": 8787,
+        "base_url": "http://127.0.0.1:8787",
+        "signing_key_file": "/tmp/release-control.key",
+        "transaction_id": transaction_id,
+        "timeout_seconds": 1,
+    }
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_job_pid", lambda *_args, **_kwargs: 41)
+    monkeypatch.setattr(cutover, "_read_release_control_key", lambda _path: b"k")
+    monkeypatch.setattr(
+        cutover,
+        "_release_control_client",
+        lambda *_args, **_kwargs: (
+            lambda: copy.deepcopy(inspection),
+            lambda *_args, **_kwargs: {},
+            transaction_id,
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_listener_process_receipt",
+        lambda *_args, **_kwargs: {
+            "pid": 41,
+            "pid_start_token": "r75-start",
+            "program_identity": {"sha256": "a" * 64},
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_http_json",
+        lambda *_args, **_kwargs: pytest.fail(
+            "adoption probe must not call deep health"
+        ),
+    )
+
+    binding = cutover._probe_live_adoption_webui_binding(plan, identity)
+
+    assert binding["signed_identity"] == signed_identity
+    assert binding["admission"] == {"state": "open", "transaction_id": None}
+    assert binding["runtime"]["program_identity"]["sha256"] == "a" * 64
+
+
+def test_create_live_split_adoption_ignores_volatile_inspect_receipt_drift(
+    tmp_path,
+    monkeypatch,
+):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    selector = {
+        "generation": 76,
+        "current": webui["build_id"],
+        "last_good": webui["build_id"],
+        "candidate": None,
+        "pending_transaction_id": None,
+    }
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: copy.deepcopy(selector),
+    )
+    observations = iter(("a" * 64, "b" * 64))
+    stable = {
+        "status": "verified",
+        "launchd_pid": 7501,
+        "listener_pid": 7501,
+        "signed_health_pid": 7501,
+        "pid_start_token": "webui-start",
+        "signed_identity": {
+            "pid": 7501,
+            "pid_start_token": "webui-start",
+            "build_id": webui["build_id"],
+            "selector_generation": webui["selector_generation"],
+            "startup_fenced": True,
+            "startup_transaction_id": webui["startup_transaction_id"],
+        },
+        "runtime": {
+            "pid": 7501,
+            "pid_start_token": "webui-start",
+            "program_identity": {"sha256": "c" * 64},
+        },
+        "admission": {"state": "open", "transaction_id": None},
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_probe_live_adoption_webui_binding",
+        lambda *_args: {
+            **copy.deepcopy(stable),
+            "release_control_receipt_sha256": next(observations),
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda *_args, **_kwargs: {
+            "listener_pid": 7201,
+            "pid_start_token": "gateway-start",
+            "health": {
+                "drain": {
+                    "admission": {"state": "accepting_new_work"}
+                }
+            },
+        },
+    )
+
+    result = cutover.create_live_split_adoption(
+        {
+            "selector_state": str(root / "selector-state.json"),
+            "selector_lock": str(root / "selector-state.lock"),
+        },
+        webui_identity=webui,
+        gateway_identity=gateway,
+        webui_identity_path=root / "adopted-webui.json",
+        gateway_identity_path=root / "adopted-gateway.json",
+        adoption_receipt_path=root / "live-split-adoption.json",
+        adoption_id="adopt-live-split-000000000000001",
+        created_at="2026-07-30T10:00:00+00:00",
+    )
+
+    assert Path(result["last_good_split_adoption_receipt"]).is_file()
+
+
+def test_live_adoption_stable_projection_detects_signed_identity_drift():
+    before = {
+        "launchd_pid": 7501,
+        "listener_pid": 7501,
+        "signed_health_pid": 7501,
+        "pid_start_token": "webui-start",
+        "signed_identity": {
+            "build_id": "r75-webui",
+            "startup_transaction_id": "r75-origin-transaction-00000000001",
+        },
+        "runtime": {"program_identity": {"sha256": "a" * 64}},
+        "admission": {"state": "open", "transaction_id": None},
+        "release_control_receipt_sha256": "b" * 64,
+    }
+    volatile_only = {
+        **copy.deepcopy(before),
+        "release_control_receipt_sha256": "c" * 64,
+    }
+    changed_identity = copy.deepcopy(volatile_only)
+    changed_identity["signed_identity"]["build_id"] = "r74-webui"
+
+    assert cutover._stable_live_adoption_webui_binding(
+        before
+    ) == cutover._stable_live_adoption_webui_binding(volatile_only)
+    assert cutover._stable_live_adoption_webui_binding(
+        before
+    ) != cutover._stable_live_adoption_webui_binding(changed_identity)
+
+
 def _patch_live_split_adoption_probes(monkeypatch, build_id: str) -> None:
     selector = {
         "generation": 76,
@@ -4438,11 +4612,11 @@ def _patch_live_split_adoption_probes(monkeypatch, build_id: str) -> None:
     )
     monkeypatch.setattr(
         cutover,
-        "_probe_managed_webui_binding",
+        "_probe_live_adoption_webui_binding",
         lambda *_args: {
             "listener_pid": 7501,
             "pid_start_token": "webui-start",
-            "deep_health": {"admission": {"state": "open"}},
+            "admission": {"state": "open", "transaction_id": None},
         },
     )
     monkeypatch.setattr(

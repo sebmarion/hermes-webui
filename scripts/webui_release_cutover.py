@@ -4257,9 +4257,7 @@ def _read_sealed_split_adoption_receipt(
                 f"last-good adoption receipt {name} live binding is invalid"
             )
         observed_admission = (
-            binding["evidence"].get("deep_health", {}).get("admission", {}).get(
-                "state"
-            )
+            binding["evidence"].get("admission", {}).get("state")
             if name == "webui"
             else binding["evidence"].get("health", {}).get("drain", {}).get(
                 "admission", {}
@@ -17192,6 +17190,126 @@ def _probe_managed_webui_binding(plan: dict, identity: dict) -> dict | None:
     )
 
 
+def _probe_live_adoption_webui_binding(
+    plan: dict,
+    identity: dict,
+) -> dict | None:
+    """Attest an already-live split without depending on deep-health latency."""
+    try:
+        listener_pid = _listener_pid(int(plan["listener_port"]))
+    except DrainIdentityMismatch:
+        listener_pid = None
+    job_pid = _job_pid(plan, gateway=False)
+    if listener_pid is None and job_pid is None:
+        return None
+    if listener_pid is None or job_pid != listener_pid:
+        raise DrainIdentityMismatch("managed WebUI launch boundary is ambiguous")
+    inspect_control, _send_control, transaction = _release_control_client(
+        plan["base_url"],
+        _read_release_control_key(plan["signing_key_file"]),
+        transaction_id=plan["transaction_id"],
+        request_timeout_seconds=max(30.0, float(plan["timeout_seconds"])),
+    )
+    if transaction != plan["transaction_id"]:
+        raise ReleaseBuildError("managed WebUI transaction identity changed")
+    inspection = _require_bound_control_receipt(
+        inspect_control(),
+        status="inspected",
+        transaction_id=transaction,
+    )
+    signed_identity = inspection.get("identity")
+    admission = inspection.get("admission")
+    if (
+        not isinstance(signed_identity, dict)
+        or not _candidate_identity_matches(signed_identity, identity)
+    ):
+        raise DrainIdentityMismatch(
+            "managed WebUI identity does not match release"
+        )
+    try:
+        signed_pid = int(signed_identity.get("pid"))
+    except (TypeError, ValueError) as exc:
+        raise DrainIdentityMismatch(
+            "managed WebUI signed PID is invalid"
+        ) from exc
+    start = str(signed_identity.get("pid_start_token") or "")
+    if (
+        signed_pid != listener_pid
+        or not start
+        or not isinstance(admission, dict)
+        or admission.get("state") != "open"
+        or admission.get("transaction_id") is not None
+    ):
+        raise DrainIdentityMismatch(
+            "managed WebUI signed admission binding is invalid"
+        )
+    runtime = _listener_process_receipt(
+        plan,
+        gateway=False,
+        require_git_source=False,
+    )
+    if (
+        runtime.get("pid") != listener_pid
+        or runtime.get("pid_start_token") != start
+    ):
+        raise DrainIdentityMismatch(
+            "managed WebUI runtime identity changed during adoption"
+        )
+    return {
+        "status": "verified",
+        "launchd_pid": job_pid,
+        "listener_pid": listener_pid,
+        "signed_health_pid": signed_pid,
+        "pid_start_token": start,
+        "signed_identity": copy.deepcopy(signed_identity),
+        "runtime": copy.deepcopy(runtime),
+        "admission": copy.deepcopy(admission),
+        "release_control_receipt_sha256": _canonical_journal_value_sha256(
+            inspection
+        ),
+    }
+
+
+def _stable_live_adoption_webui_binding(binding: dict) -> dict:
+    return {
+        key: copy.deepcopy(binding.get(key))
+        for key in (
+            "launchd_pid",
+            "listener_pid",
+            "signed_health_pid",
+            "pid_start_token",
+            "signed_identity",
+            "runtime",
+            "admission",
+        )
+    }
+
+
+def _stable_live_adoption_gateway_binding(binding: dict) -> dict:
+    health = binding.get("health")
+    return {
+        "listener_pid": binding.get("listener_pid"),
+        "pid_start_token": binding.get("pid_start_token"),
+        "runtime": copy.deepcopy(binding.get("runtime")),
+        "build_id": binding.get("build_id"),
+        "plist": copy.deepcopy(binding.get("plist")),
+        "shim_sha256": binding.get("shim_sha256"),
+        "routing_environment": copy.deepcopy(
+            binding.get("routing_environment")
+        ),
+        "release_identity": copy.deepcopy(
+            health.get("release_identity")
+            if isinstance(health, dict)
+            else None
+        ),
+        "admission": copy.deepcopy(
+            health.get("drain", {}).get("admission")
+            if isinstance(health, dict)
+            else None
+        ),
+    }
+
+
 def _rename_noreplace(source: Path, destination: Path) -> None:
     """Atomically publish one same-filesystem file without replacing a target."""
     libc = ctypes.CDLL(None, use_errno=True)
@@ -17451,7 +17569,7 @@ def create_live_split_adoption(
         raise ReleaseBuildError(
             "live split selector authority is not idle on adopted build"
         )
-    webui_before = _probe_managed_webui_binding(plan, webui_identity)
+    webui_before = _probe_live_adoption_webui_binding(plan, webui_identity)
     if webui_before is None:
         raise DrainIdentityMismatch("managed WebUI is absent during adoption")
     gateway_before = _attest_managed_gateway_binding(
@@ -17459,7 +17577,7 @@ def create_live_split_adoption(
         gateway_identity,
         expected_admission="accepting_new_work",
     )
-    webui_after = _probe_managed_webui_binding(plan, webui_identity)
+    webui_after = _probe_live_adoption_webui_binding(plan, webui_identity)
     if webui_after is None:
         raise DrainIdentityMismatch("managed WebUI is absent during adoption")
     gateway_after = _attest_managed_gateway_binding(
@@ -17471,24 +17589,17 @@ def create_live_split_adoption(
         plan["selector_state"],
         lock_path=plan["selector_lock"],
     )
-    copied_bindings = [
-        _journal_copy_of_immutable_evidence(value)
-        for value in (
-            webui_before,
-            gateway_before,
-            webui_after,
-            gateway_after,
-        )
-    ]
     if (
         selector_before != selector_after
-        or copied_bindings[0] != copied_bindings[2]
-        or copied_bindings[1] != copied_bindings[3]
+        or _stable_live_adoption_webui_binding(webui_before)
+        != _stable_live_adoption_webui_binding(webui_after)
+        or _stable_live_adoption_gateway_binding(gateway_before)
+        != _stable_live_adoption_gateway_binding(gateway_after)
     ):
         raise DrainIdentityMismatch(
             "live split process or selector changed during adoption"
         )
-    webui_admission = webui_before.get("deep_health", {}).get("admission", {})
+    webui_admission = webui_before.get("admission", {})
     if webui_admission.get("state") != "open":
         raise ReleaseBuildError("live split WebUI admission is not open")
 
