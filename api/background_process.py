@@ -41,13 +41,22 @@ this module routes them to the same listener so the frontend's single
 
 from __future__ import annotations
 
+import inspect
 import logging
+import os
 import queue
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
+
+from api.managed_background_workers import (
+    ManagedBackgroundWorker,
+    ManagedBackgroundWorkerReceipt,
+    ManagedBackgroundWorkerStart,
+    ManagedBackgroundWorkerVerification,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +74,15 @@ _REAPER_INTERVAL_SECS = 60.0
 # forever, un-joinable. A dedicated lock (not the purpose-bound
 # ``SESSION_CHANNELS_LOCK`` / ``_EMIT_COALESCE_LOCK``) keeps this narrow.
 _THREAD_LIFECYCLE_LOCK = threading.Lock()
+
+_DRAIN_WORKER_MANAGER = ManagedBackgroundWorker(
+    "drain",
+    "hermes-webui-bg-task-complete-drain",
+)
+_REAPER_WORKER_MANAGER = ManagedBackgroundWorker(
+    "session-channel-reaper",
+    "hermes-webui-session-channel-reaper",
+)
 
 # T3: per-session coalesce gate for the public bg_task_complete SSE emit.
 # The server-side wakeup path remains immediate; only the browser-observation
@@ -390,7 +408,9 @@ def should_emit_session_updated(
     return persisted_count > subscriber_known_count
 
 
-def _reaper_loop() -> None:
+def _reaper_loop(readiness: threading.Event | None = None) -> None:
+    if readiness is not None:
+        readiness.set()
     logger.info("SessionChannel reaper thread started")
     while not _REAPER_STOP.is_set():
         try:
@@ -447,8 +467,65 @@ def _reaper_loop() -> None:
             break
 
 
+def _invoke_worker_loop(
+    loop,
+    readiness: threading.Event,
+) -> None:
+    """Invoke current loops strictly while tolerating legacy zero-arg test hooks."""
+    try:
+        inspect.signature(loop).bind(readiness)
+    except (TypeError, ValueError):
+        readiness.set()
+        loop()
+        return
+    loop(readiness)
+
+
+def _get_reaper_thread() -> threading.Thread | None:
+    return _REAPER_THREAD
+
+
+def _publish_reaper_thread(thread: threading.Thread | None) -> None:
+    global _REAPER_THREAD
+    _REAPER_THREAD = thread
+
+
+def start_managed_session_channel_reaper(
+    *,
+    readiness_timeout: float = 2.0,
+) -> ManagedBackgroundWorkerStart:
+    return _REAPER_WORKER_MANAGER.start(
+        target=lambda readiness: _invoke_worker_loop(_reaper_loop, readiness),
+        stop_event=_REAPER_STOP,
+        get_published_thread=_get_reaper_thread,
+        publish_thread=_publish_reaper_thread,
+        readiness_timeout=readiness_timeout,
+    )
+
+
+def verify_managed_session_channel_reaper(
+    receipt: ManagedBackgroundWorkerReceipt | None = None,
+) -> ManagedBackgroundWorkerVerification:
+    return _REAPER_WORKER_MANAGER.verify(
+        get_published_thread=_get_reaper_thread,
+        receipt=receipt,
+    )
+
+
+def stop_managed_session_channel_reaper(
+    *,
+    timeout: float = 2.0,
+) -> ManagedBackgroundWorkerVerification:
+    return _REAPER_WORKER_MANAGER.stop(
+        stop_event=_REAPER_STOP,
+        get_published_thread=_get_reaper_thread,
+        publish_thread=_publish_reaper_thread,
+        timeout=timeout,
+    )
+
+
 def start_session_channel_reaper() -> bool:
-    """Start the SessionChannel reaper thread. Idempotent; returns True on first start."""
+    """Start the unmanaged legacy reaper without claiming a managed receipt."""
     global _REAPER_THREAD
     with _THREAD_LIFECYCLE_LOCK:
         if _REAPER_THREAD is not None and _REAPER_THREAD.is_alive():
@@ -465,9 +542,9 @@ def start_session_channel_reaper() -> bool:
 
 def stop_session_channel_reaper(timeout: float = 2.0) -> None:
     _REAPER_STOP.set()
-    th = _REAPER_THREAD
-    if th is not None and th.is_alive():
-        th.join(timeout=timeout)
+    thread = _REAPER_THREAD
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=timeout)
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -1762,13 +1839,15 @@ def _try_mark_async_delegation_tracker(*, evt: dict) -> bool:
     return False
 
 
-def _drain_loop() -> None:
+def _drain_loop(readiness: threading.Event | None = None) -> None:
     try:
         from tools import process_registry as _pr_mod  # noqa: F401
         from tools.process_registry import process_registry
     except Exception as exc:
         logger.warning("bg_task_complete drain unavailable: %s", exc)
         return
+    if readiness is not None:
+        readiness.set()
     logger.info("bg_task_complete drain thread started")
     while not _DRAIN_STOP.is_set():
         # Read the queue defensively: a rebuilt/partially-initialized registry
@@ -1842,21 +1921,62 @@ def forget_bg_task_completion_dedup(session_id: str) -> None:
         _cfg.BG_TASK_COMPLETE_EVENTS_SEEN.pop(str(session_id), None)
 
 
+def _get_drain_thread() -> threading.Thread | None:
+    return _DRAIN_THREAD
+
+
+def _publish_drain_thread(thread: threading.Thread | None) -> None:
+    global _DRAIN_THREAD
+    _DRAIN_THREAD = thread
+
+
+def start_managed_drain_worker(
+    *,
+    readiness_timeout: float = 2.0,
+) -> ManagedBackgroundWorkerStart:
+    _WAKEUP_INTAKE_STOP.clear()
+    return _DRAIN_WORKER_MANAGER.start(
+        target=lambda readiness: _invoke_worker_loop(_drain_loop, readiness),
+        stop_event=_DRAIN_STOP,
+        get_published_thread=_get_drain_thread,
+        publish_thread=_publish_drain_thread,
+        readiness_timeout=readiness_timeout,
+    )
+
+
+def verify_managed_drain_worker(
+    receipt: ManagedBackgroundWorkerReceipt | None = None,
+) -> ManagedBackgroundWorkerVerification:
+    return _DRAIN_WORKER_MANAGER.verify(
+        get_published_thread=_get_drain_thread,
+        receipt=receipt,
+    )
+
+
+def stop_managed_drain_worker(
+    *,
+    timeout: float = 2.0,
+) -> ManagedBackgroundWorkerVerification:
+    return _DRAIN_WORKER_MANAGER.stop(
+        stop_event=_DRAIN_STOP,
+        get_published_thread=_get_drain_thread,
+        publish_thread=_publish_drain_thread,
+        timeout=timeout,
+    )
+
+
 def start_drain_thread() -> bool:
-    """Start the background drain thread idempotently. Returns True on first start."""
+    """Start the unmanaged legacy drain worker without hidden recovery.
+
+    Durable async-delegation recovery and wakeup replay are deliberately
+    separate startup steps.  This function starts exactly one queue consumer
+    and performs no hidden recovery mutation.
+    """
     global _DRAIN_THREAD
     with _THREAD_LIFECYCLE_LOCK:
         if _DRAIN_THREAD is not None and _DRAIN_THREAD.is_alive():
             return False
         _WAKEUP_INTAKE_STOP.clear()
-        try:
-            recover_profile_async_delegations()
-        except Exception:
-            logger.warning("Hermes async tracker startup recovery failed", exc_info=True)
-        try:
-            replay_pending_delegation_wakeups()
-        except Exception:
-            logger.warning("async_delegation startup replay failed", exc_info=True)
         _DRAIN_STOP.clear()
         _DRAIN_THREAD = threading.Thread(
             target=_drain_loop,
@@ -1870,9 +1990,9 @@ def start_drain_thread() -> bool:
 def stop_drain_thread(timeout: float | None = None) -> None:
     _WAKEUP_INTAKE_STOP.set()
     _DRAIN_STOP.set()
-    th = _DRAIN_THREAD
-    if th is not None and th.is_alive():
-        th.join(timeout=timeout)
+    thread = _DRAIN_THREAD
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=timeout)
     deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
     while True:
         with _WAKEUP_THREADS_LOCK:
@@ -1900,3 +2020,39 @@ def stop_drain_thread(timeout: float | None = None) -> None:
             raise RuntimeError(
                 f"shutdown refused to continue with {len(live)} live wakeup worker(s)"
             )
+
+
+def _reset_background_worker_lifecycle_after_fork() -> None:
+    global _THREAD_LIFECYCLE_LOCK
+    global _DRAIN_THREAD, _DRAIN_STOP
+    global _REAPER_THREAD, _REAPER_STOP
+    global _WAKEUP_THREADS, _WAKEUP_THREADS_LOCK, _WAKEUP_INTAKE_STOP
+    global _PROCESS_OWNER_UUID
+
+    _THREAD_LIFECYCLE_LOCK = threading.Lock()
+    _DRAIN_THREAD = None
+    _DRAIN_STOP = threading.Event()
+    _REAPER_THREAD = None
+    _REAPER_STOP = threading.Event()
+    _WAKEUP_THREADS = set()
+    _WAKEUP_THREADS_LOCK = threading.Lock()
+    _WAKEUP_INTAKE_STOP = threading.Event()
+    _PROCESS_OWNER_UUID = uuid.uuid4().hex
+    _DRAIN_WORKER_MANAGER.reset_after_fork()
+    _REAPER_WORKER_MANAGER.reset_after_fork()
+
+
+def _reset_background_worker_lifecycle_for_tests() -> None:
+    global _DRAIN_THREAD, _DRAIN_STOP
+    global _REAPER_THREAD, _REAPER_STOP
+
+    _DRAIN_WORKER_MANAGER.reset_for_tests()
+    _REAPER_WORKER_MANAGER.reset_for_tests()
+    _DRAIN_THREAD = None
+    _DRAIN_STOP = threading.Event()
+    _REAPER_THREAD = None
+    _REAPER_STOP = threading.Event()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_background_worker_lifecycle_after_fork)
