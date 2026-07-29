@@ -100,6 +100,8 @@ PROJECTS_FILE = STATE_DIR / "projects.json"
 
 logger = logging.getLogger(__name__)
 
+_MANAGED_RELEASE_SELECTION_FROZEN: bool | None = None
+
 
 def _managed_release_selected_from_environment() -> bool:
     """Return whether this process was selected by the release controller.
@@ -110,6 +112,8 @@ def _managed_release_selected_from_environment() -> bool:
     state machine, so import-time callers need the immutable environment as
     their fail-closed bootstrap signal.
     """
+    if _MANAGED_RELEASE_SELECTION_FROZEN is not None:
+        return _MANAGED_RELEASE_SELECTION_FROZEN
     return any(
         str(os.environ.get(key) or "").strip()
         for key in (
@@ -1144,7 +1148,7 @@ def _normalize_cli_toolsets(toolsets):
     return normalized
 
 
-def _resolve_cli_toolsets(cfg=None):
+def _resolve_cli_toolsets(cfg=None, *, strict: bool = False):
     """Resolve CLI toolsets using the agent's _get_platform_tools() so that
     MCP server toolsets are automatically included, matching CLI behaviour."""
     if cfg is None:
@@ -1167,10 +1171,19 @@ def _resolve_cli_toolsets(cfg=None):
         from hermes_cli.tools_config import _get_platform_tools
         return _normalize_cli_toolsets(_get_platform_tools(cfg, "cli"))
     except Exception:
+        if strict:
+            raise
         # Fallback: read raw list from config (MCP toolsets will be missing)
         return _normalize_cli_toolsets(fallback_toolsets)
 
-CLI_TOOLSETS = _resolve_cli_toolsets()
+from api.managed_startup_configuration import (
+    PendingStartupSettingsFailure,
+    PendingStartupSettingsRecord,
+    StableCliToolsets,
+    capture_pending_startup_settings_record,
+)
+
+CLI_TOOLSETS = StableCliToolsets(tuple(_resolve_cli_toolsets()))
 
 # ── Model / provider discovery ───────────────────────────────────────────────
 
@@ -9718,6 +9731,7 @@ def initialize_run_admission_from_environment() -> dict:
     global _RUN_ADMISSION_TRANSACTION_ID, _RUN_ADMISSION_EXPECTED_IDENTITY
     global _RUN_ADMISSION_FENCED_AT, _RUN_ADMISSION_LEASE_EXPIRES_AT
     global _RUN_ADMISSION_STARTUP_ERROR
+    global _MANAGED_RELEASE_SELECTION_FROZEN
 
     managed_selected = any(
         str(os.environ.get(key) or "").strip()
@@ -9727,6 +9741,10 @@ def initialize_run_admission_from_environment() -> dict:
             "HERMES_WEBUI_LAUNCH_MODE",
         )
     )
+    if _MANAGED_RELEASE_SELECTION_FROZEN is None:
+        _MANAGED_RELEASE_SELECTION_FROZEN = managed_selected
+    elif _MANAGED_RELEASE_SELECTION_FROZEN != managed_selected:
+        managed_selected = _MANAGED_RELEASE_SELECTION_FROZEN
     with ACTIVE_RUNS_LOCK:
         if not managed_selected:
             return _run_admission_snapshot_locked()
@@ -11197,8 +11215,20 @@ def _current_umask() -> int:
     return umask
 
 
-_DEFERRED_STARTUP_SETTINGS_TEXT: str | None = None
+_DEFERRED_STARTUP_SETTINGS_TEXT: (
+    PendingStartupSettingsRecord | PendingStartupSettingsFailure | str | None
+) = None
+_DEFERRED_STARTUP_SETTINGS_GENERATION = 0
 _DEFERRED_STARTUP_CONFIG_LOCK = threading.Lock()
+
+
+def _managed_pending_settings_failure(exc: BaseException):
+    if not _managed_release_selected_from_environment():
+        return None
+    return PendingStartupSettingsFailure(
+        type(exc).__name__,
+        str(exc)[:1024],
+    )
 
 
 def apply_startup_profile_state():
@@ -11207,6 +11237,11 @@ def apply_startup_profile_state():
         raise RunAdmissionClosed(
             "startup profile initialization requires signed acceptance"
         )
+    if not _managed_release_selected_from_environment():
+        from api.profiles import init_profile_state
+
+        init_profile_state()
+        return {"status": "initialized"}
     try:
         from api.managed_startup_profile import (
             apply_managed_startup_profile_state,
@@ -11221,6 +11256,10 @@ def apply_startup_profile_state():
 def verify_startup_profile_state(receipt=None):
     """Return the strict four-way startup profile verification result."""
 
+    if not _managed_release_selected_from_environment():
+        raise RuntimeError(
+            "strict startup profile verification requires a managed release"
+        )
     try:
         from api.managed_startup_profile import (
             verify_managed_startup_profile_state,
@@ -11238,6 +11277,15 @@ def seed_startup_provider_models():
         raise RunAdmissionClosed(
             "provider model seeding requires signed acceptance"
         )
+    if not _managed_release_selected_from_environment():
+        try:
+            _seed_provider_models_from_core()
+        except ImportError:
+            return {"status": "unavailable"}
+        except Exception:
+            logger.warning("provider-model seeder failed", exc_info=True)
+            return {"status": "failed"}
+        return {"status": "seeded"}
     try:
         from managed_startup_provider_models import (
             reconcile_managed_startup_provider_models,
@@ -11252,6 +11300,10 @@ def seed_startup_provider_models():
 def verify_startup_provider_models(receipt=None):
     """Return the strict four-way provider-model verification result."""
 
+    if not _managed_release_selected_from_environment():
+        raise RuntimeError(
+            "strict provider-model verification requires a managed release"
+        )
     try:
         from managed_startup_provider_models import (
             verify_managed_startup_provider_models,
@@ -11263,37 +11315,59 @@ def verify_startup_provider_models(receipt=None):
     return verify_managed_startup_provider_models(receipt)
 
 
-def apply_deferred_startup_configuration() -> dict:
-    """Commit import-deferred config state inside signed startup acceptance.
-
-    The managed candidate may read and normalize configuration while fenced,
-    but must not rewrite settings or invoke Agent plugin discovery until the
-    release controller accepts the exact process identity. The server calls
-    this as an idempotent deferred startup step while the acceptor transaction
-    owns the narrow internal admission scope.
-    """
+def apply_deferred_startup_configuration():
+    """Apply the strict deferred settings and CLI-toolset snapshot."""
     if not _startup_mutations_are_admitted():
         raise RunAdmissionClosed(
             "startup configuration mutation requires signed acceptance"
         )
+    if not _managed_release_selected_from_environment():
+        global _DEFERRED_STARTUP_SETTINGS_TEXT, CLI_TOOLSETS
+        settings_rewritten = False
+        with _DEFERRED_STARTUP_CONFIG_LOCK:
+            pending_text = _DEFERRED_STARTUP_SETTINGS_TEXT
+            if pending_text is not None:
+                if isinstance(pending_text, PendingStartupSettingsRecord):
+                    pending_text = pending_text.desired_bytes.decode("utf-8")
+                _atomic_write_settings_text(SETTINGS_FILE, pending_text)
+                _DEFERRED_STARTUP_SETTINGS_TEXT = None
+                settings_rewritten = True
+            resolved_toolsets = tuple(_resolve_cli_toolsets())
+            if isinstance(CLI_TOOLSETS, StableCliToolsets):
+                CLI_TOOLSETS.publish(resolved_toolsets)
+            else:
+                CLI_TOOLSETS = list(resolved_toolsets)
+        return {
+            "settings_rewritten": settings_rewritten,
+            "cli_toolsets": list(CLI_TOOLSETS),
+        }
+    try:
+        from api.managed_startup_configuration import (
+            apply_managed_startup_configuration,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict startup configuration reconciler is unavailable"
+        ) from exc
+    return apply_managed_startup_configuration()
 
-    global _DEFERRED_STARTUP_SETTINGS_TEXT, CLI_TOOLSETS
-    settings_rewritten = False
-    with _DEFERRED_STARTUP_CONFIG_LOCK:
-        pending_text = _DEFERRED_STARTUP_SETTINGS_TEXT
-        if pending_text is not None:
-            _atomic_write_settings_text(SETTINGS_FILE, pending_text)
-            _DEFERRED_STARTUP_SETTINGS_TEXT = None
-            settings_rewritten = True
 
-        # This resolver can discover Agent plugins and therefore belongs in
-        # the same accepted transaction even when no settings rewrite exists.
-        CLI_TOOLSETS = _resolve_cli_toolsets()
+def verify_deferred_startup_configuration(receipt=None):
+    """Return strict deferred startup configuration verification."""
 
-    return {
-        "settings_rewritten": settings_rewritten,
-        "cli_toolsets": list(CLI_TOOLSETS),
-    }
+    if not _managed_release_selected_from_environment():
+        raise RuntimeError(
+            "strict startup configuration verification requires a managed release"
+        )
+    try:
+        from api.managed_startup_configuration import (
+            verify_managed_startup_configuration,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict startup configuration verifier is unavailable"
+        ) from exc
+    return verify_managed_startup_configuration(receipt)
 
 
 def _coerce_provider_cost_budget(value: Any) -> float | None:
@@ -11509,9 +11583,18 @@ if _settings_file_exists:
                 _atomic_write_settings_text(SETTINGS_FILE, startup_settings_text)
             else:
                 with _DEFERRED_STARTUP_CONFIG_LOCK:
-                    _DEFERRED_STARTUP_SETTINGS_TEXT = startup_settings_text
-        except Exception:
-            pass
+                    _DEFERRED_STARTUP_SETTINGS_GENERATION += 1
+                    _DEFERRED_STARTUP_SETTINGS_TEXT = (
+                        capture_pending_startup_settings_record(
+                            SETTINGS_FILE,
+                            startup_settings_text,
+                            _DEFERRED_STARTUP_SETTINGS_GENERATION,
+                        )
+                    )
+        except Exception as exc:
+            failure = _managed_pending_settings_failure(exc)
+            if failure is not None:
+                _DEFERRED_STARTUP_SETTINGS_TEXT = failure
 
 # ── SESSIONS in-memory cache (LRU OrderedDict) ───────────────────────────────
 SESSIONS: collections.OrderedDict = collections.OrderedDict()

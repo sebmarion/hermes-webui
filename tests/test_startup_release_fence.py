@@ -1184,6 +1184,7 @@ def _tree_bytes_and_mtimes(root):
 def isolated_startup_admission(monkeypatch):
     import server
 
+    monkeypatch.setattr(config, "_MANAGED_RELEASE_SELECTION_FROZEN", None)
     for key in (
         "HERMES_WEBUI_RELEASE_PATH",
         "HERMES_WEBUI_MANIFEST_SHA256",
@@ -1225,6 +1226,7 @@ def isolated_startup_admission(monkeypatch):
 
 def _select_managed_candidate(monkeypatch, *, transaction_id=TRANSACTION_ID):
     monkeypatch.setenv("HERMES_WEBUI_RELEASE_PATH", "/immutable/webui/candidate")
+    monkeypatch.setenv("HERMES_WEBUI_MANIFEST_SHA256", "a" * 64)
     monkeypatch.setenv("HERMES_WEBUI_LAUNCH_MODE", "selector")
     monkeypatch.setenv("HERMES_WEBUI_STARTUP_FENCED", "1")
     monkeypatch.setenv("HERMES_WEBUI_STARTUP_TRANSACTION_ID", transaction_id)
@@ -1236,6 +1238,19 @@ def _claim_startup_fence():
         IDENTITY,
         transaction_id=TRANSACTION_ID,
     )
+
+
+def test_managed_release_selection_freezes_at_admission_initialization(
+    monkeypatch,
+    isolated_startup_admission,
+):
+    _select_managed_candidate(monkeypatch)
+    assert config._managed_release_selected_from_environment() is True
+    monkeypatch.delenv("HERMES_WEBUI_RELEASE_PATH")
+    monkeypatch.delenv("HERMES_WEBUI_MANIFEST_SHA256")
+    monkeypatch.delenv("HERMES_WEBUI_LAUNCH_MODE")
+
+    assert config._managed_release_selected_from_environment() is True
 
 
 def test_selected_managed_candidate_starts_fenced_and_never_lease_expires(
@@ -2899,19 +2914,34 @@ def test_deferred_startup_configuration_commits_once_only_during_accept(
     isolated_startup_admission,
 ):
     settings_file = tmp_path / "settings.json"
+    journal_dir = tmp_path / "startup-journal"
+    journal_dir.mkdir(mode=0o700)
+    monkeypatch.setenv(
+        "HERMES_WEBUI_STARTUP_CONFIGURATION_JOURNAL",
+        str(journal_dir / "configuration.json"),
+    )
     settings_text = '{"default_workspace":"/accepted/workspace"}'
     resolver_calls = []
     monkeypatch.setattr(config, "SETTINGS_FILE", settings_file)
     monkeypatch.setattr(
         config,
         "_DEFERRED_STARTUP_SETTINGS_TEXT",
-        settings_text,
+        __import__(
+            "api.managed_startup_configuration",
+            fromlist=["capture_pending_startup_settings_record"],
+        ).capture_pending_startup_settings_record(
+            settings_file,
+            settings_text,
+            1,
+        ),
     )
     monkeypatch.setattr(config, "CLI_TOOLSETS", ["fenced-fallback"])
     monkeypatch.setattr(
         config,
         "_resolve_cli_toolsets",
-        lambda: resolver_calls.append("resolved") or ["accepted-toolset"],
+        lambda *args, **kwargs: (
+            resolver_calls.append("resolved") or ["accepted-toolset"]
+        ),
     )
     _select_managed_candidate(monkeypatch)
 

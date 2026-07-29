@@ -542,6 +542,11 @@ def test_config_startup_profile_adapter_returns_typed_receipt(
 
     managed, _profiles, _home, _epoch = managed_profile
     monkeypatch.setattr(config, "_startup_mutations_are_admitted", lambda: True)
+    monkeypatch.setattr(
+        config,
+        "_managed_release_selected_from_environment",
+        lambda: True,
+    )
     monkeypatch.setattr(managed, "_startup_mutations_are_admitted", lambda: True)
 
     receipt = config.apply_startup_profile_state()
@@ -557,7 +562,39 @@ def test_config_startup_profile_adapter_fails_closed_when_reconciler_unavailable
 
     _managed, _profiles, _home, _epoch = managed_profile
     monkeypatch.setattr(config, "_startup_mutations_are_admitted", lambda: True)
+    monkeypatch.setattr(
+        config,
+        "_managed_release_selected_from_environment",
+        lambda: True,
+    )
     monkeypatch.setitem(sys.modules, "api.managed_startup_profile", None)
 
     with pytest.raises(RuntimeError, match="reconciler is unavailable"):
         config.apply_startup_profile_state()
+
+
+def test_config_startup_profile_adapter_preserves_unmanaged_legacy_init(
+    managed_profile,
+    monkeypatch,
+):
+    import api.config as config
+    import api.profiles as real_profiles
+
+    _managed, _profiles, _home, _epoch = managed_profile
+    calls = []
+    monkeypatch.setattr(config, "_startup_mutations_are_admitted", lambda: True)
+    monkeypatch.setattr(
+        config,
+        "_managed_release_selected_from_environment",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        real_profiles,
+        "init_profile_state",
+        lambda: calls.append("legacy-init"),
+    )
+
+    assert config.apply_startup_profile_state() == {"status": "initialized"}
+    assert calls == ["legacy-init"]
+    with pytest.raises(RuntimeError, match="requires a managed release"):
+        config.verify_startup_profile_state()
