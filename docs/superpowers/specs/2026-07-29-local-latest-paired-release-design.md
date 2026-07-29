@@ -94,7 +94,9 @@ Before the release transaction begins:
    pre-pause status in a deployment pause receipt. Persist that receipt
    atomically as private `0600` data and fsync its parent before sending the
    first steering message.
-4. Send each selected task a steering message:
+4. Before each steering message, persist that task's lifecycle state as
+   `steer-intent` and fsync the receipt directory. Then send the steering
+   message and advance the state to `steer-sent`:
 
    > Deployment `<id>` is preparing a Hermes restart. At your next safe
    > boundary, stop starting new work, persist/checkpoint your current state,
@@ -156,8 +158,13 @@ prompt bodies, credentials, or model secrets.
 On coordinator startup, an incomplete receipt must be reconciled before a new
 deployment begins:
 
-- If no release transaction started, resume every acknowledged task and mark
-  the deployment aborted.
+- Re-read every task in `steer-intent`, `steer-sent`, or `acknowledged` state.
+  The external send may have succeeded even when the coordinator crashed
+  before recording it. Treat every such task as possibly paused, inspect for
+  the deployment-specific marker, and send an idempotent terminal-state or
+  abort-resume message before closing the receipt.
+- If no release transaction started, resume every possibly steered task and
+  mark the deployment aborted.
 - If the selector transaction is nonterminal, resume the existing release
   transaction before steering or resuming tasks.
 - If the new release is durably accepted and its pair identity verifies,
@@ -201,6 +208,13 @@ On a pre-promotion failure, use the transaction's exact rollback. On a
 post-promotion retention failure, keep the accepted release, report retention
 failure, and do not pretend the release rolled back.
 
+For any other post-promotion identity or health failure, retry bounded
+verification without changing state. If neither the candidate pair nor an
+exact transaction-owned rollback reaches a verified terminal identity, mark
+the deployment `indeterminate`, keep the possibly steered tasks paused, and
+require operator recovery. Do not use selector-only rollback, do not claim the
+candidate is healthy, and do not resume tasks into an unverified runtime.
+
 ## Future Release Interface
 
 Add one supported high-level command that:
@@ -224,12 +238,12 @@ Implementation is split into three independently verifiable deliverables:
 1. **r76 paired deployment:** establish initial `release/current` branches,
    cooperatively pause active tasks using an operator-managed durable receipt,
    deploy the proven r76 pair, verify one rollback, and resume tasks.
-2. **Local-history reconciliation and r77:** reconcile only Seb's local WebUI
-   and Agent histories into new tested `release/current` tips, then deploy and
-   verify the r77 pair.
-3. **Reusable release command:** encode plan generation, canonical-tip checks,
+2. **Reusable release command:** encode plan generation, canonical-tip checks,
    durable pause recovery, paired release, retention, and targeted resume in
    one supported high-level interface.
+3. **Local-history reconciliation and r77:** reconcile only Seb's local WebUI
+   and Agent histories into new tested `release/current` tips, then use the
+   reusable command to deploy and verify the r77 pair.
 
 Each deliverable has its own tests, receipt, rollback boundary, and acceptance
 checkpoint. Failure in a later deliverable does not invalidate an already
@@ -275,3 +289,16 @@ Stage 2 is accepted only when:
 - WebUI and gateway both report the r77 pair built from those branch tips;
 - future plan generation refuses stale or arbitrary commits;
 - the same one-rollback and cooperative pause/resume invariants pass.
+
+The reusable release command is accepted before Stage 2 only when:
+
+- clean fixture releases prove exact `release/current` tip resolution;
+- dirty, stale, arbitrary, or identity-changing source inputs are refused;
+- crash-point tests cover every pause lifecycle transition from selection
+  through resume;
+- accepted-release, verified-rollback, pause-timeout, retention-warning, and
+  indeterminate-runtime outcomes produce the specified task behavior;
+- plan, release, retention, and task lifecycle results appear in one durable
+  machine-readable receipt;
+- production use requires the full paired transaction and never invokes a
+  selector-only promotion.
