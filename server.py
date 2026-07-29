@@ -671,15 +671,18 @@ class _ManagedDeferredStartupProcessReceipt(Mapping[str, object]):
 _DEFERRED_STARTUP_PROCESS_RECEIPT: (
     _ManagedDeferredStartupProcessReceipt | None
 ) = None
+_MANAGED_STARTUP_SESSION_RECEIPT = None
 
 
 def _reset_deferred_startup_process_state_after_fork() -> None:
     global _DEFERRED_STARTUP_PROCESS_EPOCH_LOCK
     global _DEFERRED_STARTUP_PROCESS_EPOCH
     global _DEFERRED_STARTUP_PROCESS_RECEIPT
+    global _MANAGED_STARTUP_SESSION_RECEIPT
     _DEFERRED_STARTUP_PROCESS_EPOCH_LOCK = threading.Lock()
     _DEFERRED_STARTUP_PROCESS_EPOCH = None
     _DEFERRED_STARTUP_PROCESS_RECEIPT = None
+    _MANAGED_STARTUP_SESSION_RECEIPT = None
 
 
 if hasattr(os, "register_at_fork"):
@@ -841,21 +844,82 @@ def _create_state_directories() -> None:
     DEFAULT_WORKSPACE.mkdir(parents=True, exist_ok=True)
 
 
-def _recover_startup_sessions() -> None:
-    from api.models import _active_state_db_path
-    from api.session_recovery import recover_all_sessions_on_startup
-
-    result = recover_all_sessions_on_startup(
-        SESSION_DIR,
-        rebuild_index=True,
-        state_db_path=_active_state_db_path(),
-    )
-    if result.get("restored"):
-        print(
-            f"[recovery] Restored {result['restored']}/{result['scanned']} "
-            "sessions from .bak (see #1558).",
-            flush=True,
+def _managed_startup_session_binding() -> tuple[str, str]:
+    active_transaction = str(
+        getattr(api_config, "_RUN_ADMISSION_TRANSACTION_ID", "") or ""
+    ).strip()
+    selected_transaction = str(
+        os.environ.get("HERMES_WEBUI_STARTUP_TRANSACTION_ID") or ""
+    ).strip()
+    selected_manifest = str(
+        os.environ.get("HERMES_WEBUI_MANIFEST_SHA256") or ""
+    ).strip()
+    canonical_manifest = release_manifest.deferred_release_manifest_sha256()
+    if (
+        not active_transaction
+        or selected_transaction != active_transaction
+        or selected_manifest != canonical_manifest
+    ):
+        raise RuntimeError(
+            "managed startup session binding is absent, partial, or noncanonical"
         )
+    return active_transaction, canonical_manifest
+
+
+def _recover_startup_sessions():
+    global _MANAGED_STARTUP_SESSION_RECEIPT
+    from api.models import _active_state_db_path
+
+    if not api_config._managed_release_selected_from_environment():
+        from api.session_recovery import recover_all_sessions_on_startup
+
+        result = recover_all_sessions_on_startup(
+            SESSION_DIR,
+            rebuild_index=True,
+            state_db_path=_active_state_db_path(),
+        )
+        if result.get("restored"):
+            print(
+                f"[recovery] Restored {result['restored']}/{result['scanned']} "
+                "sessions from .bak (see #1558).",
+                flush=True,
+            )
+        return None
+
+    from api.managed_startup_session_recovery import (
+        audit_managed_startup_sessions,
+    )
+
+    transaction_id, manifest_sha256 = _managed_startup_session_binding()
+    receipt = audit_managed_startup_sessions(
+        SESSION_DIR,
+        _active_state_db_path(),
+        transaction_id=transaction_id,
+        manifest_sha256=manifest_sha256,
+    )
+    _MANAGED_STARTUP_SESSION_RECEIPT = receipt
+    return receipt
+
+
+def _reconcile_startup_sessions():
+    from api.managed_startup_session_recovery import (
+        SessionRecoveryOutcome,
+        verify_managed_startup_sessions,
+    )
+    from deferred_startup_replay import Reconciliation
+
+    try:
+        transaction_id, manifest_sha256 = _managed_startup_session_binding()
+        verification = verify_managed_startup_sessions(
+            _MANAGED_STARTUP_SESSION_RECEIPT,
+            transaction_id=transaction_id,
+            manifest_sha256=manifest_sha256,
+        )
+    except Exception:
+        return Reconciliation.AMBIGUOUS
+    if verification.outcome is SessionRecoveryOutcome.PROVED_COMPLETE:
+        return Reconciliation.PROVED_COMPLETE
+    return Reconciliation.AMBIGUOUS
 
 
 def _load_startup_plugins() -> None:
