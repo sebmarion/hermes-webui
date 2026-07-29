@@ -24465,7 +24465,12 @@ def start_session_turn(
     return resp
 
 
-def _recover_tool_limit_continuations_on_startup(*, strict: bool = False) -> dict:
+def _recover_tool_limit_continuations_on_startup(
+    *,
+    strict: bool = False,
+    transaction_id: str | None = None,
+    manifest_sha256: str | None = None,
+) -> dict:
     """Recover claimed children and return a terminal startup receipt.
 
     Unmanaged imports retain their historical best-effort detached behavior.
@@ -24476,19 +24481,19 @@ def _recover_tool_limit_continuations_on_startup(*, strict: bool = False) -> dic
         from api import tool_limit_continuation
 
         if strict:
-            store = tool_limit_continuation.load_receipts()
-            pending = sum(
-                1
-                for receipt in (store.get("receipts") or {}).values()
-                if isinstance(receipt, dict)
-                and receipt.get("child_session_id")
-                and receipt.get("state") in {"claimed", "starting"}
+            receipt = tool_limit_continuation.recover_managed_continuations_exact(
+                transaction_id=transaction_id,
+                manifest_sha256=manifest_sha256,
+                start=lambda sid, prompt: start_session_turn(
+                    sid, prompt, source="tool_limit_continuation"
+                ),
             )
-            if pending:
+            if receipt.outcome.value not in {"ABSENT", "COMPLETE"}:
                 raise RuntimeError(
-                    f"{pending} tool-limit continuation(s) require recovery"
+                    "managed tool-limit continuation recovery was not terminal: "
+                    f"{receipt.outcome.value}"
                 )
-            return {"status": "complete", "recovered": 0, "pending": 0}
+            return receipt.to_dict()
 
         recovered = tool_limit_continuation.recover_pending_continuations(
             start=lambda sid, prompt: start_session_turn(
@@ -24515,24 +24520,30 @@ start_admitted_auxiliary_thread(
 )
 
 
-def _recover_goal_continuations_on_startup(*, strict: bool = False) -> dict:
+def _recover_goal_continuations_on_startup(
+    *,
+    strict: bool = False,
+    transaction_id: str | None = None,
+    manifest_sha256: str | None = None,
+) -> dict:
     """Recover judged goal turns and return a terminal startup receipt."""
     try:
         from api import goal_continuation
 
         if strict:
-            store = goal_continuation.load_receipts()
-            pending = sum(
-                1
-                for receipt in (store.get("receipts") or {}).values()
-                if isinstance(receipt, dict)
-                and receipt.get("state") in {"claimed", "starting"}
+            receipt = goal_continuation.recover_managed_goal_continuations_exact(
+                transaction_id=transaction_id,
+                manifest_sha256=manifest_sha256,
+                start=lambda sid, prompt: start_session_turn(
+                    sid, prompt, source="goal_continuation"
+                ),
             )
-            if pending:
+            if receipt.outcome.value not in {"ABSENT", "COMPLETE"}:
                 raise RuntimeError(
-                    f"{pending} goal continuation(s) require recovery"
+                    "managed goal continuation recovery was not terminal: "
+                    f"{receipt.outcome.value}"
                 )
-            return {"status": "complete", "recovered": 0, "pending": 0}
+            return receipt.to_dict()
 
         recovered = goal_continuation.recover_pending_goal_continuations(
             start=lambda sid, prompt: start_session_turn(

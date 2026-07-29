@@ -11,17 +11,27 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import subprocess
 import threading
 import time
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable
 
 from api import config
 from api.models import Session
+from api.process_identity import process_start_token
+from api.managed_continuation_recovery import (
+    recover_exact,
+    stable_store_snapshot,
+    strict_store_save,
+    strict_store_lock,
+    verify_exact,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +44,9 @@ DEFAULTS = {
     "no_progress_limit": 3,
 }
 _RECEIPT_VERSION = 1
+_MAX_MANAGED_RECEIPTS = 4096
 _LOCK = threading.RLock()
+_MANAGED_EXACT = ContextVar("tool_continuation_managed_exact", default=False)
 
 
 class ContinuationReceiptStoreError(RuntimeError):
@@ -52,16 +64,22 @@ def _lock_path() -> Path:
 @contextmanager
 def _store_lock():
     """Serialize receipt transactions in this and sibling server processes."""
+    if _MANAGED_EXACT.get():
+        with strict_store_lock(_lock_path(), _LOCK):
+            yield
+        return
     with _LOCK:
         Path(config.SESSION_DIR).mkdir(parents=True, exist_ok=True)
         fp = open(_lock_path(), "a+b")
         try:
             if os.name == "nt":
                 import msvcrt
+
                 fp.seek(0)
                 msvcrt.locking(fp.fileno(), msvcrt.LK_LOCK, 1)
             else:
                 import fcntl
+
                 fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
             yield
         finally:
@@ -71,9 +89,16 @@ def _store_lock():
                     msvcrt.locking(fp.fileno(), msvcrt.LK_UNLCK, 1)
                 else:
                     import fcntl
+
                     fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
             finally:
                 fp.close()
+
+
+@contextmanager
+def _verification_store_lock():
+    with strict_store_lock(_lock_path(), _LOCK, create=False):
+        yield
 
 
 def _empty_store() -> dict:
@@ -82,6 +107,8 @@ def _empty_store() -> dict:
 
 def _load_store() -> dict:
     path = _receipt_path()
+    if _MANAGED_EXACT.get():
+        return stable_store_snapshot(path)[0]
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -108,6 +135,9 @@ def _load_store() -> dict:
 
 def _save_store(store: dict) -> None:
     path = _receipt_path()
+    if _MANAGED_EXACT.get():
+        strict_store_save(path, store)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
     try:
@@ -312,6 +342,12 @@ def _pid_is_alive(pid: int | None) -> bool:
     return True
 
 
+def _process_start_token(pid: int | None) -> str | None:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return None
+    return process_start_token(pid)
+
+
 def _reserve_start(key: str) -> tuple[dict | None, str | None]:
     """Atomically reserve one claimed receipt for a single start attempt."""
     with _store_lock():
@@ -330,8 +366,10 @@ def _reserve_start(key: str) -> tuple[dict | None, str | None]:
             {
                 "state": "starting",
                 "owner_pid": os.getpid(),
+                "owner_start_token": _process_start_token(os.getpid()),
                 "owner_thread": threading.get_ident(),
                 "start_token": token,
+                "launch_phase": "reserved",
                 "starting_at": now,
                 "updated_at": now,
             }
@@ -340,13 +378,38 @@ def _reserve_start(key: str) -> tuple[dict | None, str | None]:
         return copy.deepcopy(receipt), token
 
 
-def _response_confirms_started_child(receipt: dict, response: dict) -> tuple[bool, str | None]:
+def _mark_launching(key: str, token: str) -> dict | None:
+    with _store_lock():
+        store = _load_store()
+        receipt = store["receipts"].get(key)
+        if (
+            receipt is None
+            or receipt.get("state") != "starting"
+            or receipt.get("start_token") != token
+        ):
+            return copy.deepcopy(receipt) if receipt else None
+        receipt["launch_phase"] = "launching"
+        receipt["updated_at"] = time.time()
+        _save_store(store)
+        return copy.deepcopy(receipt)
+
+
+def _response_confirms_started_child(
+    receipt: dict,
+    response: dict,
+    *,
+    require_session_id: bool = False,
+) -> tuple[bool, str | None]:
     """Accept a launch only with a stream id, including a proven replayed 409."""
     try:
         status = int(response.get("_status", 200) or 200)
     except (TypeError, ValueError):
         status = 500
     stream_id = response.get("stream_id") or response.get("active_stream_id")
+    if require_session_id and str(response.get("session_id") or "") != str(
+        receipt.get("child_session_id") or ""
+    ):
+        return False, None
     if status < 400:
         return bool(stream_id), str(stream_id) if stream_id else None
     if status != 409 or not stream_id:
@@ -368,13 +431,21 @@ def _response_confirms_started_child(receipt: dict, response: dict) -> tuple[boo
     return confirmed, str(stream_id) if confirmed else None
 
 
-def _finish_start(key: str, token: str, response: dict | None) -> tuple[dict | None, bool]:
+def _finish_start(
+    key: str,
+    token: str,
+    response: dict | None,
+    *,
+    require_session_id: bool = False,
+) -> tuple[dict | None, bool]:
     response = response if isinstance(response, dict) else {}
     with _store_lock():
         current = copy.deepcopy(_load_store()["receipts"].get(key))
     if current is None:
         return None, False
-    succeeded, stream_id = _response_confirms_started_child(current, response)
+    succeeded, stream_id = _response_confirms_started_child(
+        current, response, require_session_id=require_session_id
+    )
     with _store_lock():
         store = _load_store()
         receipt = store["receipts"].get(key)
@@ -390,6 +461,7 @@ def _finish_start(key: str, token: str, response: dict | None) -> tuple[dict | N
                     "child_stream_id": stream_id,
                     "started_at": now,
                     "updated_at": now,
+                    "completed_start_token": token,
                 }
             )
         else:
@@ -398,7 +470,15 @@ def _finish_start(key: str, token: str, response: dict | None) -> tuple[dict | N
             # the child session is idle.
             receipt.update({"state": "claimed", "updated_at": now})
             receipt.pop("child_stream_id", None)
-        for field in ("owner_pid", "owner_thread", "start_token", "starting_at"):
+            receipt.pop("completed_start_token", None)
+        for field in (
+            "owner_pid",
+            "owner_start_token",
+            "owner_thread",
+            "start_token",
+            "starting_at",
+            "launch_phase",
+        ):
             receipt.pop(field, None)
         _save_store(store)
         return copy.deepcopy(receipt), succeeded
@@ -507,7 +587,14 @@ def _block_unrecoverable_child(key: str, token: str) -> dict | None:
         if receipt.get("state") != "starting" or receipt.get("start_token") != token:
             return copy.deepcopy(receipt)
         _blocked_receipt(receipt, "child_recovery_failed")
-        for field in ("owner_pid", "owner_thread", "start_token", "starting_at"):
+        for field in (
+            "owner_pid",
+            "owner_start_token",
+            "owner_thread",
+            "start_token",
+            "starting_at",
+            "launch_phase",
+        ):
             receipt.pop(field, None)
         _save_store(store)
         result = copy.deepcopy(receipt)
@@ -520,11 +607,15 @@ def _start_receipt(
     key: str,
     *,
     start: Callable[[str, str], dict] | None = None,
+    managed_exact: bool = False,
+    crash_hook: Callable[[str], None] | None = None,
 ) -> tuple[dict | None, bool]:
     """Reserve, reconstruct, and launch one receipt without holding its lock."""
     receipt, token = _reserve_start(key)
     if receipt is None or token is None:
         return receipt, False
+    if managed_exact and crash_hook is not None:
+        crash_hook("claim_committed")
     try:
         child = _ensure_receipt_child(receipt)
     except Exception:
@@ -546,6 +637,9 @@ def _start_receipt(
         or "Continue the unfinished task from the parent segment. Use the inherited context, "
         "perform the remaining tool work and verification, and return a normal final answer."
     )
+    receipt = _mark_launching(key, token)
+    if receipt is None or receipt.get("launch_phase") != "launching":
+        return receipt, False
     try:
         response = starter(str(receipt["child_session_id"]), prompt) or {}
     except Exception:
@@ -554,7 +648,14 @@ def _start_receipt(
             receipt.get("child_session_id"),
         )
         response = {"error": "continuation start failed", "_status": 500}
-    return _finish_start(key, token, response)
+    if managed_exact and crash_hook is not None:
+        crash_hook("launch_returned")
+    result = _finish_start(
+        key, token, response, require_session_id=managed_exact
+    )
+    if managed_exact and result[1] and crash_hook is not None:
+        crash_hook("started_committed")
+    return result
 
 
 def _blocked_receipt(base: dict, reason: str) -> dict:
@@ -688,6 +789,163 @@ def recover_pending_continuations(
             if receipt is not None:
                 _emit(receipt, emit)
     return started
+
+
+_MANAGED_RECEIPT_FIELDS = {
+    "claim_key", "execution_id", "profile", "root_session_id",
+    "parent_session_id", "parent_run_id", "child_session_id",
+    "child_snapshot", "continuation_prompt", "continuation_index",
+    "chain_started_at", "claimed_at", "updated_at", "progress_fingerprint",
+    "state", "blocked_reason", "owner_pid", "owner_start_token",
+    "owner_thread", "start_token", "launch_phase", "starting_at",
+    "child_stream_id", "started_at", "completed_start_token",
+}
+
+
+def _managed_text(receipt: dict, field: str, *, optional: bool = False) -> str:
+    value = receipt.get(field)
+    if optional and value is None:
+        return ""
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 65536:
+        raise ValueError(f"{field} must be bounded non-empty text")
+    return value
+
+
+def _managed_timestamp(receipt: dict, field: str) -> float:
+    value = receipt.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a timestamp")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be finite")
+    return value
+
+
+def _validate_managed_store(store: dict, *, max_receipts: int) -> dict:
+    if not isinstance(store, dict) or set(store) != {"version", "receipts"}:
+        raise ValueError("tool continuation store root schema is invalid")
+    if store.get("version") != _RECEIPT_VERSION:
+        raise ValueError("tool continuation store version is invalid")
+    receipts = store.get("receipts")
+    if (
+        not isinstance(receipts, dict)
+        or isinstance(max_receipts, bool)
+        or not isinstance(max_receipts, int)
+        or max_receipts < 1
+        or len(receipts) > max_receipts
+    ):
+        raise ValueError("tool continuation receipt count is invalid")
+    for key, receipt in receipts.items():
+        if not isinstance(receipt, dict) or set(receipt) - _MANAGED_RECEIPT_FIELDS:
+            raise ValueError(f"{key}: tool continuation receipt schema is invalid")
+        claim_key = _managed_text(receipt, "claim_key")
+        parent = _managed_text(receipt, "parent_session_id")
+        run_id = _managed_text(receipt, "parent_run_id")
+        if (
+            key != claim_key
+            or len(key) != 64
+            or any(character not in "0123456789abcdef" for character in key)
+            or key != _claim_key(parent, run_id)
+        ):
+            raise ValueError(f"{key}: tool continuation claim identity is invalid")
+        for field in ("execution_id", "root_session_id"):
+            _managed_text(receipt, field)
+        for field in ("claimed_at", "updated_at", "chain_started_at"):
+            _managed_timestamp(receipt, field)
+        index = receipt.get("continuation_index")
+        if isinstance(index, bool) or not isinstance(index, int) or not 1 <= index <= 1000000:
+            raise ValueError(f"{key}: continuation_index is invalid")
+        state = receipt.get("state")
+        if state not in {"claimed", "starting", "started", "blocked", "completed"}:
+            raise ValueError(f"{key}: tool continuation state is invalid")
+        if state in {"claimed", "starting", "started"}:
+            _managed_text(receipt, "child_session_id")
+            if not isinstance(receipt.get("child_snapshot"), dict):
+                raise ValueError(f"{key}: child_snapshot is invalid")
+            _managed_text(receipt, "continuation_prompt")
+        if state == "starting":
+            owner_pid = receipt.get("owner_pid")
+            if isinstance(owner_pid, bool) or not isinstance(owner_pid, int) or owner_pid <= 1:
+                raise ValueError(f"{key}: owner_pid is invalid")
+            for field in ("owner_start_token", "start_token"):
+                _managed_text(receipt, field)
+            if receipt.get("launch_phase") not in {"reserved", "launching"}:
+                raise ValueError(f"{key}: launch_phase is invalid")
+            _managed_timestamp(receipt, "starting_at")
+        if state == "started":
+            _managed_text(receipt, "child_stream_id")
+            _managed_text(receipt, "completed_start_token")
+            _managed_timestamp(receipt, "started_at")
+        if state == "blocked":
+            _managed_text(receipt, "blocked_reason")
+    return receipts
+
+
+def recover_managed_continuations_exact(
+    *,
+    transaction_id: str,
+    manifest_sha256: str,
+    start: Callable[[str, str], dict] | None = None,
+    emit: Callable[[str, dict], None] | None = None,
+    crash_hook: Callable[[str], None] | None = None,
+):
+    """Recover the exact bounded store under the managed startup transaction."""
+    scope = _MANAGED_EXACT.set(True)
+    try:
+        result = recover_exact(
+            path=_receipt_path(),
+            store_lock=_store_lock,
+            validate_store=_validate_managed_store,
+            start_one=lambda key: _start_receipt(
+                key,
+                start=start,
+                managed_exact=True,
+                crash_hook=crash_hook,
+            ),
+            session_id_for=lambda receipt: str(
+                receipt.get("child_session_id")
+                or receipt.get("parent_session_id")
+                or ""
+            ),
+            terminal_states={"blocked", "completed"},
+            transaction_id=transaction_id,
+            manifest_sha256=manifest_sha256,
+            max_receipts=_MAX_MANAGED_RECEIPTS,
+            process_token_lookup=_process_start_token,
+        )
+        if emit is not None:
+            with _store_lock():
+                current = _load_store()["receipts"]
+            for key in result.started_receipt_keys:
+                receipt = current.get(key)
+                if isinstance(receipt, dict):
+                    _emit(receipt, emit)
+        return result
+    finally:
+        _MANAGED_EXACT.reset(scope)
+
+
+def verify_managed_continuations_exact(
+    receipt,
+    *,
+    transaction_id: str,
+    manifest_sha256: str,
+):
+    """Read-only verification of an exact managed tool continuation receipt."""
+    return verify_exact(
+        receipt,
+        path=_receipt_path(),
+        store_lock=_verification_store_lock,
+        validate_store=_validate_managed_store,
+        session_id_for=lambda row: str(
+            row.get("child_session_id") or row.get("parent_session_id") or ""
+        ),
+        terminal_states={"blocked", "completed"},
+        transaction_id=transaction_id,
+        manifest_sha256=manifest_sha256,
+        max_receipts=_MAX_MANAGED_RECEIPTS,
+        process_token_lookup=_process_start_token,
+    )
 
 
 def load_receipts() -> dict:
