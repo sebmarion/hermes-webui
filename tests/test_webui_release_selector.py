@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -51,6 +51,37 @@ def _restore_immutable_tmp_permissions(tmp_path):
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _last_good_split_evidence() -> MappingProxyType:
+    return MappingProxyType(
+        {
+            "webui": MappingProxyType(
+                {"identity": MappingProxyType({"build_id": "last-good"})}
+            ),
+            "gateway": MappingProxyType(
+                {"identity": MappingProxyType({"build_id": "last-good-gateway"})}
+            ),
+        }
+    )
+
+
+def _plain_last_good_split_evidence() -> dict:
+    return {
+        "webui": {"identity": {"build_id": "last-good"}},
+        "gateway": {"identity": {"build_id": "last-good-gateway"}},
+    }
+
+
+def _canonical_test_value_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def test_cutover_script_is_directly_executable_from_outside_repo(tmp_path):
@@ -2638,7 +2669,23 @@ def _candidate_gateway_start_transaction(tmp_path: Path) -> tuple[dict, dict]:
     receipts = (
         ("staged", {}),
         ("plist_installed", {}),
-        ("gateway_last_good_attested", {"binding": binding}),
+        (
+            "last_good_split_attested",
+            {
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                )
+            },
+        ),
+        (
+            "gateway_last_good_attested",
+            {
+                "binding": binding,
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                ),
+            },
+        ),
         (
             "watchdog_cron_disable_intent",
             {"prepared": {"status": "prepared"}},
@@ -2651,7 +2698,15 @@ def _candidate_gateway_start_transaction(tmp_path: Path) -> tuple[dict, dict]:
             "watchdog_state_reconciled",
             {"status": "reconciled"},
         ),
-        ("gateway_drain_intent", {"status": "drained"}),
+        (
+            "gateway_drain_intent",
+            {
+                "status": "drained",
+                "last_good_binding_sha256": (
+                    _canonical_test_value_sha256(binding)
+                ),
+            },
+        ),
         ("gateway_drained", {"status": "drained"}),
         ("gateway_stop_intent", {"status": "planned"}),
         ("gateway_gracefully_stopped", {"status": "stopped"}),
@@ -2808,6 +2863,18 @@ def test_candidate_gateway_adopts_launch_after_crash_before_accept_receipt(
             {"status": "startup-fenced"},
         )
     assert state["owner"] == "candidate"
+    crashed = cutover.read_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+    )
+    assert (
+        cutover._ensure_gateway_last_good_attested(
+            plan,
+            crashed,
+            last_good_origin_attestation=_last_good_split_evidence(),
+        )
+        == crashed
+    )
 
     result = cutover._complete_candidate_gateway_transition(
         plan,
@@ -2816,6 +2883,92 @@ def test_candidate_gateway_adopts_launch_after_crash_before_accept_receipt(
 
     assert result["gateway"]["binding"] == candidate_binding
     assert calls == {"start": 1}
+
+
+def test_bootstrap_adopted_gateway_drain_intent_anchors_last_good_binding(
+    monkeypatch,
+):
+    plan = {
+        "transaction_id": "bootstrap-adopt-anchor-transaction-0001",
+        "transaction_journal": "transaction.json",
+        "expected_candidate_identity": {"build_id": "candidate"},
+        "last_good_identity": {"build_id": "last-good"},
+    }
+    last_good_binding = {
+        "status": "verified",
+        "listener_pid": 41,
+        "pid_start_token": "retired-start",
+    }
+    candidate_binding = {
+        "status": "verified",
+        "listener_pid": 42,
+        "pid_start_token": "candidate-start",
+    }
+    journal = {
+        "phases": {
+            "gateway_last_good_attested": {
+                "binding": last_good_binding,
+            }
+        }
+    }
+    bootstrap_phases = {
+        phase: {"status": phase}
+        for phase in (
+            "legacy_gateway_drain_intent",
+            "legacy_gateway_drain_acknowledged",
+            "legacy_gateway_stop_intent",
+            "legacy_gateway_gracefully_stopped",
+            "legacy_dispatcher_lock_acquired",
+            "frozen_boundary_proved",
+            "snapshot_created",
+            "legacy_dispatcher_lock_released",
+        )
+    }
+
+    monkeypatch.setattr(
+        cutover,
+        "read_transaction_journal",
+        lambda *_args, **_kwargs: copy.deepcopy(journal),
+    )
+
+    def record(_path, *, transaction_id, phase, receipt):
+        assert transaction_id == plan["transaction_id"]
+        journal["phases"][phase] = copy.deepcopy(receipt)
+        return copy.deepcopy(journal)
+
+    monkeypatch.setattr(cutover, "record_transaction_phase", record)
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda actual_plan, identity, *, expected_admission=None: (
+            candidate_binding
+            if actual_plan is plan
+            and identity == plan["expected_candidate_identity"]
+            and expected_admission == "rejecting_new_work"
+            else pytest.fail("unexpected binding probe")
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_bootstrap_journal",
+        lambda actual_plan: {"phases": bootstrap_phases}
+        if actual_plan is plan
+        else pytest.fail("wrong plan"),
+    )
+    monkeypatch.setattr(cutover, "_render_cli_shim", lambda _identity: b"shim")
+
+    result = cutover._complete_candidate_gateway_transition(
+        plan,
+        {"status": "startup-fenced"},
+    )
+
+    assert result["gateway"]["binding"] == candidate_binding
+    assert journal["phases"]["gateway_drain_intent"][
+        "last_good_binding_sha256"
+    ] == _canonical_test_value_sha256(last_good_binding)
+    assert journal["phases"]["candidate_gateway_start_intent"][
+        "last_good_binding"
+    ] == last_good_binding
 
 
 def _watchdog_barrier_transaction(tmp_path: Path) -> tuple[dict, dict]:
@@ -2840,7 +2993,23 @@ def _watchdog_barrier_transaction(tmp_path: Path) -> tuple[dict, dict]:
     for phase, receipt in (
         ("staged", {}),
         ("plist_installed", {"plist_sha256": "c" * 64}),
-        ("gateway_last_good_attested", {"binding": {"status": "verified"}}),
+        (
+            "last_good_split_attested",
+            {
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                )
+            },
+        ),
+        (
+            "gateway_last_good_attested",
+            {
+                "binding": {"status": "verified"},
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                ),
+            },
+        ),
     ):
         cutover.record_transaction_phase(
             journal_path,
@@ -5878,14 +6047,38 @@ def _candidate_gateway_precommit_receipts(
         "admission": "rejecting_new_work",
     }
     return (
-        ("gateway_last_good_attested", {"binding": last_good_binding}),
+        (
+            "last_good_split_attested",
+            {
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                )
+            },
+        ),
+        (
+            "gateway_last_good_attested",
+            {
+                "binding": last_good_binding,
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                ),
+            },
+        ),
         (
             "watchdog_cron_disable_intent",
             {"prepared": {"status": "prepared"}},
         ),
         ("watchdog_cron_disabled", {"status": "disabled"}),
         ("watchdog_state_reconciled", {"status": "reconciled"}),
-        ("gateway_drain_intent", {"status": "drained"}),
+        (
+            "gateway_drain_intent",
+            {
+                "status": "drained",
+                "last_good_binding_sha256": (
+                    _canonical_test_value_sha256(last_good_binding)
+                ),
+            },
+        ),
         ("gateway_drained", {"status": "drained"}),
         ("gateway_stop_intent", {"status": "planned"}),
         ("gateway_gracefully_stopped", {"status": "stopped"}),
@@ -11607,13 +11800,23 @@ def test_state_promote_runs_rolling_retention_after_durable_transition(monkeypat
 def test_release_commit_reports_watchdog_barrier_finish_failure(monkeypatch):
     monkeypatch.setattr(
         cutover,
+        "_preflight_last_good_identity_split",
+        lambda _plan: _last_good_split_evidence(),
+    )
+    monkeypatch.setattr(
+        cutover,
         "_reconcile_cutover_journal",
         lambda *_args, **_kwargs: {"phases": {}},
     )
     monkeypatch.setattr(
         cutover,
+        "_ensure_last_good_split_attested",
+        lambda _plan, journal, **_kwargs: journal,
+    )
+    monkeypatch.setattr(
+        cutover,
         "_ensure_gateway_last_good_attested",
-        lambda _plan, journal: journal,
+        lambda _plan, journal, **_kwargs: journal,
         raising=False,
     )
     monkeypatch.setattr(
@@ -11652,7 +11855,17 @@ def test_gateway_last_good_attestation_is_idempotent_before_barrier(monkeypatch)
         "transaction_journal": "/tmp/gateway-before-barrier.json",
         "last_good_identity": {"build_id": "last-good"},
     }
-    journal = {"phases": {"staged": {}, "plist_installed": {}}}
+    evidence = _last_good_split_evidence()
+    plain_evidence = _plain_last_good_split_evidence()
+    journal = {
+        "phases": {
+            "staged": {},
+            "plist_installed": {},
+            "last_good_split_attested": {
+                "last_good_origin_attestation": plain_evidence
+            },
+        }
+    }
     binding = {"status": "verified", "build_id": "last-good"}
     calls = {"attest": 0, "record": 0}
 
@@ -11666,7 +11879,10 @@ def test_gateway_last_good_attestation_is_idempotent_before_barrier(monkeypatch)
         assert path == plan["transaction_journal"]
         assert transaction_id == plan["transaction_id"]
         assert phase == "gateway_last_good_attested"
-        assert receipt == {"binding": binding}
+        assert receipt == {
+            "binding": binding,
+            "last_good_origin_attestation": plain_evidence,
+        }
         calls["record"] += 1
         return {
             "phases": {
@@ -11678,19 +11894,594 @@ def test_gateway_last_good_attestation_is_idempotent_before_barrier(monkeypatch)
     monkeypatch.setattr(cutover, "_attest_managed_gateway_binding", attest)
     monkeypatch.setattr(cutover, "record_transaction_phase", record)
 
-    attested = cutover._ensure_gateway_last_good_attested(plan, journal)
-    assert cutover._ensure_gateway_last_good_attested(plan, attested) == attested
-    assert cutover._ensure_gateway_last_good_attested(
+    attested = cutover._ensure_gateway_last_good_attested(
         plan,
-        {"phases": {"rollback_started": {}}},
-    ) == {"phases": {"rollback_started": {}}}
-    assert calls == {"attest": 1, "record": 1}
+        journal,
+        last_good_origin_attestation=evidence,
+    )
+    assert (
+        cutover._ensure_gateway_last_good_attested(
+            plan,
+            attested,
+            last_good_origin_attestation=evidence,
+        )
+        == attested
+    )
+    assert calls == {"attest": 2, "record": 1}
+
+
+def test_cutover_preflight_attests_the_immutable_last_good_split_before_live_journal_write(
+    monkeypatch,
+):
+    """Dry runs expose the same split proof that live runs persist before work."""
+    plan = {
+        "transaction_id": "preflight-split-transaction-000001",
+        "transaction_journal": "transaction.json",
+        "last_good_identity": {"build_id": "r75-webui"},
+        "last_good_gateway_identity": {"build_id": "r72-gateway"},
+        "last_good_origin_journal": "webui-origin.json",
+        "last_good_origin_journal_sha256": "a" * 64,
+        "last_good_gateway_origin_journal": "gateway-origin.json",
+        "last_good_gateway_origin_journal_sha256": "b" * 64,
+        "selector_path": "/sealed/selector",
+        "selector_state": "selector-state.json",
+        "selector_lock": "selector.lock",
+        "expected_candidate_identity": {
+            "build_id": "candidate",
+            "selector_generation": 2,
+        },
+        "snapshot_manifest": "missing-snapshot.json",
+        "cli_link": "missing-cli-link",
+    }
+    immutable_evidence = MappingProxyType(
+        {
+            "webui": MappingProxyType({"identity": MappingProxyType({"build_id": "r75-webui"})}),
+            "gateway": MappingProxyType({"identity": MappingProxyType({"build_id": "r72-gateway"})}),
+        }
+    )
+    calls = []
+
+    def attest(**kwargs):
+        calls.append(("attest", kwargs))
+        return immutable_evidence
+
+    monkeypatch.setattr(cutover, "_attest_last_good_identity_split", attest)
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: {
+            "generation": 2,
+            "current": "candidate",
+            "candidate": "candidate",
+            "last_good": "r75-webui",
+            "pending_transaction_id": plan["transaction_id"],
+            "releases": {},
+        },
+    )
+    monkeypatch.setattr(cutover, "_installed_plist_attestation", lambda _plan: {})
+    monkeypatch.setattr(cutover, "_launchd_pid", lambda _plan: 1)
+    monkeypatch.setattr(
+        cutover,
+        "record_transaction_phase",
+        lambda *_args, **_kwargs: pytest.fail("dry-run must not write a phase"),
+    )
+
+    dry_run = cutover._run_release_commit_plan_core(plan, dry_run=True)
+
+    assert dry_run["last_good_origin_attestation"] is immutable_evidence
+    assert calls == [
+        (
+            "attest",
+            {
+                "webui_identity": plan["last_good_identity"],
+                "gateway_identity": plan["last_good_gateway_identity"],
+                "webui_origin_journal": plan["last_good_origin_journal"],
+                "webui_origin_sha256": plan["last_good_origin_journal_sha256"],
+                "gateway_origin_journal": plan["last_good_gateway_origin_journal"],
+                "gateway_origin_sha256": plan["last_good_gateway_origin_journal_sha256"],
+                "trusted_root": Path(plan["transaction_journal"]).parent,
+                "selector_path": plan["selector_path"],
+            },
+        )
+    ]
+
+
+def test_live_last_good_phase_serializes_the_preflight_evidence_without_reattesting(
+    monkeypatch,
+):
+    plan = {
+        "transaction_id": "live-preflight-transaction-000001",
+        "transaction_journal": "transaction.json",
+        "last_good_identity": {"build_id": "r75-webui"},
+    }
+    immutable_evidence = MappingProxyType(
+        {
+            "webui": MappingProxyType(
+                {"identity": MappingProxyType({"build_id": "r75-webui"})}
+            ),
+            "gateway": MappingProxyType(
+                {"identity": MappingProxyType({"build_id": "r72-gateway"})}
+            ),
+        }
+    )
+    events = []
+    journal = {"phases": {"plist_installed": {}}}
+
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda *_args, **_kwargs: events.append("gateway-binding")
+        or {"status": "verified"},
+    )
+
+    def record(_path, *, transaction_id, phase, receipt):
+        events.append("journal-write")
+        assert transaction_id == plan["transaction_id"]
+        assert receipt["last_good_origin_attestation"] == {
+                "webui": {"identity": {"build_id": "r75-webui"}},
+                "gateway": {"identity": {"build_id": "r72-gateway"}},
+        }
+        next_journal = copy.deepcopy(journal)
+        next_journal["phases"][phase] = receipt
+        return next_journal
+
+    monkeypatch.setattr(cutover, "record_transaction_phase", record)
+
+    journal = cutover._ensure_last_good_split_attested(
+        plan, journal, last_good_origin_attestation=immutable_evidence
+    )
+    assert (
+        cutover._ensure_last_good_split_attested(
+            plan,
+            journal,
+            last_good_origin_attestation=immutable_evidence,
+        )
+        == journal
+    )
+    result = cutover._ensure_gateway_last_good_attested(
+        plan,
+        journal,
+        last_good_origin_attestation=immutable_evidence,
+    )
+
+    assert result["phases"]["gateway_last_good_attested"][
+        "last_good_origin_attestation"
+    ] == {
+        "webui": {"identity": {"build_id": "r75-webui"}},
+        "gateway": {"identity": {"build_id": "r72-gateway"}},
+    }
+    assert events == ["journal-write", "gateway-binding", "journal-write"]
+
+
+@pytest.mark.parametrize(
+    ("phases", "ensure_phase", "message"),
+    [
+        (
+            {
+                "plist_installed": {},
+                "last_good_split_attested": {},
+            },
+            "split",
+            "durable last-good split attestation changed",
+        ),
+        (
+            {
+                "plist_installed": {},
+                "last_good_split_attested": {
+                    "last_good_origin_attestation": {
+                        "webui": {"identity": {"build_id": "stale"}},
+                        "gateway": {
+                            "identity": {"build_id": "last-good-gateway"}
+                        },
+                    }
+                },
+            },
+            "split",
+            "durable last-good split attestation changed",
+        ),
+        (
+            {
+                "plist_installed": {},
+                "last_good_split_attested": {
+                    "last_good_origin_attestation": (
+                        _plain_last_good_split_evidence()
+                    )
+                },
+                "gateway_last_good_attested": {
+                    "binding": {"status": "verified"}
+                },
+            },
+            "gateway",
+            "durable gateway last-good split attestation changed",
+        ),
+        (
+            {
+                "plist_installed": {},
+                "last_good_split_attested": {
+                    "last_good_origin_attestation": (
+                        _plain_last_good_split_evidence()
+                    )
+                },
+                "gateway_last_good_attested": {
+                    "binding": {"status": "verified"},
+                    "last_good_origin_attestation": {
+                        "webui": {"identity": {"build_id": "last-good"}},
+                        "gateway": {"identity": {"build_id": "mismatched"}},
+                    },
+                },
+            },
+            "gateway",
+            "durable gateway last-good split attestation changed",
+        ),
+        (
+            {
+                "plist_installed": {},
+                "gateway_last_good_attested": {
+                    "binding": {"status": "legacy-binding-only"}
+                },
+            },
+            "gateway",
+            "durable last-good split attestation changed",
+        ),
+    ],
+    ids=(
+        "missing-split-evidence",
+        "stale-split-evidence",
+        "tampered-gateway-evidence",
+        "mismatched-receipts",
+        "binding-only-not-grandfathered",
+    ),
+)
+def test_last_good_split_resume_fails_closed(
+    monkeypatch,
+    phases,
+    ensure_phase,
+    message,
+):
+    plan = {
+        "transaction_id": "resume-last-good-split-transaction-0001",
+        "transaction_journal": "transaction.json",
+        "last_good_identity": {"build_id": "last-good"},
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid resume evidence must fail before gateway binding"
+        ),
+    )
+
+    with pytest.raises(cutover.DrainIdentityMismatch, match=message):
+        if ensure_phase == "split":
+            cutover._ensure_last_good_split_attested(
+                plan,
+                {"phases": phases},
+                last_good_origin_attestation=_last_good_split_evidence(),
+            )
+        else:
+            cutover._ensure_gateway_last_good_attested(
+                plan,
+                {"phases": phases},
+                last_good_origin_attestation=_last_good_split_evidence(),
+            )
+
+
+@pytest.mark.parametrize(
+    "durable_binding",
+    [
+        None,
+        {
+            "status": "verified",
+            "listener_pid": 999,
+            "pid_start_token": "tampered-start",
+        },
+    ],
+    ids=("missing-binding", "altered-binding"),
+)
+def test_gateway_last_good_resume_rejects_missing_or_altered_binding(
+    monkeypatch,
+    durable_binding,
+):
+    plan = {
+        "transaction_id": "resume-gateway-binding-transaction-0001",
+        "transaction_journal": "transaction.json",
+        "last_good_identity": {"build_id": "last-good"},
+    }
+    current_binding = {
+        "status": "verified",
+        "listener_pid": 41,
+        "pid_start_token": "current-start",
+    }
+    gateway_receipt = {
+        "last_good_origin_attestation": _plain_last_good_split_evidence()
+    }
+    if durable_binding is not None:
+        gateway_receipt["binding"] = durable_binding
+    journal = {
+        "phases": {
+            "plist_installed": {},
+            "last_good_split_attested": {
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                )
+            },
+            "gateway_last_good_attested": gateway_receipt,
+        }
+    }
+    calls = []
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda actual_plan, identity: calls.append((actual_plan, identity))
+        or current_binding,
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="durable gateway last-good binding changed",
+    ):
+        cutover._ensure_gateway_last_good_attested(
+            plan,
+            journal,
+            last_good_origin_attestation=_last_good_split_evidence(),
+        )
+
+    assert calls == (
+        [] if durable_binding is None else [(plan, plan["last_good_identity"])]
+    )
+
+
+@pytest.mark.parametrize(
+    "terminal_phase",
+    ("gateway_gracefully_stopped", "candidate_gateway_accepted"),
+)
+def test_gateway_last_good_replay_uses_durable_anchor_after_transition(
+    monkeypatch,
+    terminal_phase,
+):
+    plan = {
+        "transaction_id": "anchored-gateway-replay-transaction-0001",
+        "transaction_journal": "transaction.json",
+        "last_good_identity": {"build_id": "last-good"},
+    }
+    binding = {
+        "status": "verified",
+        "listener_pid": 41,
+        "pid_start_token": "retired-start",
+    }
+    phases = {
+        "gateway_last_good_attested": {
+            "binding": binding,
+            "last_good_origin_attestation": (
+                _plain_last_good_split_evidence()
+            ),
+        },
+        "last_good_split_attested": {
+            "last_good_origin_attestation": (
+                _plain_last_good_split_evidence()
+            )
+        },
+        "gateway_drain_intent": {
+            "last_good_binding_sha256": _canonical_test_value_sha256(binding)
+        },
+        terminal_phase: {"status": "durable"},
+    }
+    if terminal_phase == "candidate_gateway_accepted":
+        phases["candidate_gateway_start_intent"] = {
+            "last_good_binding": copy.deepcopy(binding)
+        }
+    journal = {"phases": phases}
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda *_args, **_kwargs: pytest.fail(
+            "retired last-good gateway must not be required live"
+        ),
+    )
+
+    assert (
+        cutover._ensure_gateway_last_good_attested(
+            plan,
+            journal,
+            last_good_origin_attestation=_last_good_split_evidence(),
+        )
+        == journal
+    )
+
+
+@pytest.mark.parametrize("anchor", (None, "f" * 64), ids=("missing", "altered"))
+def test_gateway_last_good_replay_rejects_missing_or_altered_anchor(
+    monkeypatch,
+    anchor,
+):
+    plan = {
+        "transaction_id": "invalid-gateway-anchor-transaction-0001",
+        "transaction_journal": "transaction.json",
+        "last_good_identity": {"build_id": "last-good"},
+    }
+    binding = {"status": "verified", "listener_pid": 41}
+    drain_intent = {}
+    if anchor is not None:
+        drain_intent["last_good_binding_sha256"] = anchor
+    journal = {
+        "phases": {
+            "last_good_split_attested": {
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                )
+            },
+            "gateway_last_good_attested": {
+                "binding": binding,
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                ),
+            },
+            "gateway_drain_intent": drain_intent,
+            "gateway_gracefully_stopped": {"status": "stopped"},
+        }
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid durable anchor must fail without a live probe"
+        ),
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="durable gateway drain binding anchor changed",
+    ):
+        cutover._ensure_gateway_last_good_attested(
+            plan,
+            journal,
+            last_good_origin_attestation=_last_good_split_evidence(),
+        )
+
+
+def test_gateway_last_good_replay_rejects_candidate_start_binding_mismatch(
+    monkeypatch,
+):
+    plan = {
+        "transaction_id": "candidate-start-binding-transaction-0001",
+        "transaction_journal": "transaction.json",
+        "last_good_identity": {"build_id": "last-good"},
+    }
+    binding = {"status": "verified", "listener_pid": 41}
+    journal = {
+        "phases": {
+            "last_good_split_attested": {
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                )
+            },
+            "gateway_last_good_attested": {
+                "binding": binding,
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                ),
+            },
+            "gateway_drain_intent": {
+                "last_good_binding_sha256": (
+                    _canonical_test_value_sha256(binding)
+                )
+            },
+            "candidate_gateway_start_intent": {
+                "last_good_binding": {
+                    "status": "verified",
+                    "listener_pid": 999,
+                }
+            },
+            "candidate_gateway_accepted": {"status": "accepted"},
+        }
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda *_args, **_kwargs: pytest.fail(
+            "candidate-start receipt mismatch must fail without a live probe"
+        ),
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="candidate gateway last-good binding changed",
+    ):
+        cutover._ensure_gateway_last_good_attested(
+            plan,
+            journal,
+            last_good_origin_attestation=_last_good_split_evidence(),
+        )
+
+
+def test_release_core_rejects_arbitrary_last_good_split_proof_parameter():
+    with pytest.raises(TypeError, match="last_good_origin_attestation"):
+        cutover._run_release_commit_plan_core(
+            {},
+            last_good_origin_attestation=_last_good_split_evidence(),
+        )
+
+
+def test_last_good_split_phase_prerequisites_are_enforced(tmp_path):
+    transaction_id = "split-phase-prerequisite-transaction-0001"
+    journal_path = tmp_path / "transaction.json"
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity={"build_id": "candidate"},
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "a" * 64,
+            "state_snapshot_id": "snapshot",
+            "state_snapshot_sha256": "b" * 64,
+        },
+    )
+    split_receipt = {
+        "last_good_origin_attestation": _plain_last_good_split_evidence()
+    }
+    gateway_receipt = {
+        "binding": {"status": "verified"},
+        "last_good_origin_attestation": _plain_last_good_split_evidence(),
+    }
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="transaction phase prerequisites are missing: plist_installed",
+    ):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase="last_good_split_attested",
+            receipt=split_receipt,
+        )
+    cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase="staged",
+        receipt={},
+    )
+    cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase="plist_installed",
+        receipt={},
+    )
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="transaction phase prerequisites are missing: "
+        "last_good_split_attested",
+    ):
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase="gateway_last_good_attested",
+            receipt=gateway_receipt,
+        )
+    cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase="last_good_split_attested",
+        receipt=split_receipt,
+    )
+    journal = cutover.record_transaction_phase(
+        journal_path,
+        transaction_id=transaction_id,
+        phase="gateway_last_good_attested",
+        receipt=gateway_receipt,
+    )
+
+    assert journal["phases"]["gateway_last_good_attested"] == gateway_receipt
 
 
 def test_release_commit_reconciles_journal_before_watchdog_barrier(monkeypatch):
     plan = {"transaction_id": "journal-before-barrier-transaction-0001"}
     barrier = {"status": "held"}
     events = []
+    monkeypatch.setattr(
+        cutover,
+        "_preflight_last_good_identity_split",
+        lambda _plan: _last_good_split_evidence(),
+    )
 
     def reconcile(actual_plan):
         assert actual_plan is plan
@@ -11702,6 +12493,7 @@ def test_release_commit_reconciles_journal_before_watchdog_barrier(monkeypatch):
         assert prepared is None
         assert events == [
             "reconcile-journal",
+            "attest-last-good-split",
             "attest-last-good-gateway",
         ]
         events.append("begin-watchdog-barrier")
@@ -11721,8 +12513,18 @@ def test_release_commit_reconciles_journal_before_watchdog_barrier(monkeypatch):
     monkeypatch.setattr(cutover, "_reconcile_cutover_journal", reconcile)
     monkeypatch.setattr(
         cutover,
+        "_ensure_last_good_split_attested",
+        lambda actual_plan, journal, **_kwargs: events.append(
+            "attest-last-good-split"
+        )
+        or journal
+        if actual_plan is plan
+        else pytest.fail("wrong plan"),
+    )
+    monkeypatch.setattr(
+        cutover,
         "_ensure_gateway_last_good_attested",
-        lambda actual_plan, journal: events.append(
+        lambda actual_plan, journal, **_kwargs: events.append(
             "attest-last-good-gateway"
         )
         or journal
@@ -11742,6 +12544,7 @@ def test_release_commit_reconciles_journal_before_watchdog_barrier(monkeypatch):
     }
     assert events == [
         "reconcile-journal",
+        "attest-last-good-split",
         "attest-last-good-gateway",
         "begin-watchdog-barrier",
         "run-cutover",
@@ -11756,6 +12559,11 @@ def test_release_commit_passes_held_watchdog_barrier_to_managed_readiness(
     barrier = {"status": "held"}
     readiness = {"status": "verified-disabled-barrier"}
     events = []
+    monkeypatch.setattr(
+        cutover,
+        "_preflight_last_good_identity_split",
+        lambda _plan: _last_good_split_evidence(),
+    )
 
     monkeypatch.setattr(
         cutover,
@@ -11766,8 +12574,15 @@ def test_release_commit_passes_held_watchdog_barrier_to_managed_readiness(
     )
     monkeypatch.setattr(
         cutover,
+        "_ensure_last_good_split_attested",
+        lambda actual_plan, journal, **_kwargs: journal
+        if actual_plan is plan
+        else pytest.fail("wrong plan"),
+    )
+    monkeypatch.setattr(
+        cutover,
         "_ensure_gateway_last_good_attested",
-        lambda actual_plan, journal: journal
+        lambda actual_plan, journal, **_kwargs: journal
         if actual_plan is plan
         else pytest.fail("wrong plan"),
     )
@@ -11818,11 +12633,17 @@ def test_release_commit_resumes_after_crash_between_reconcile_and_barrier(
     barrier = {"status": "held"}
     calls = {
         "reconcile": 0,
+        "attest_split": 0,
         "attest_gateway": 0,
         "begin": 0,
         "core": 0,
         "finish": 0,
     }
+    monkeypatch.setattr(
+        cutover,
+        "_preflight_last_good_identity_split",
+        lambda _plan: _last_good_split_evidence(),
+    )
 
     def reconcile(actual_plan):
         assert actual_plan is plan
@@ -11851,8 +12672,19 @@ def test_release_commit_resumes_after_crash_between_reconcile_and_barrier(
     monkeypatch.setattr(cutover, "_reconcile_cutover_journal", reconcile)
     monkeypatch.setattr(
         cutover,
+        "_ensure_last_good_split_attested",
+        lambda actual_plan, journal, **_kwargs: calls.__setitem__(
+            "attest_split",
+            calls["attest_split"] + 1,
+        )
+        or journal
+        if actual_plan is plan
+        else pytest.fail("wrong plan"),
+    )
+    monkeypatch.setattr(
+        cutover,
         "_ensure_gateway_last_good_attested",
-        lambda actual_plan, journal: calls.__setitem__(
+        lambda actual_plan, journal, **_kwargs: calls.__setitem__(
             "attest_gateway",
             calls["attest_gateway"] + 1,
         )
@@ -11877,6 +12709,7 @@ def test_release_commit_resumes_after_crash_between_reconcile_and_barrier(
     assert result["watchdog_barrier"] == {"status": "released"}
     assert calls == {
         "reconcile": 2,
+        "attest_split": 2,
         "attest_gateway": 2,
         "begin": 2,
         "core": 1,
@@ -11899,6 +12732,11 @@ def test_release_commit_prepares_bootstrap_watchdog_before_state_lock(
     }
     barrier = {"status": "held"}
     events = []
+    monkeypatch.setattr(
+        cutover,
+        "_preflight_last_good_identity_split",
+        lambda _plan: _last_good_split_evidence(),
+    )
 
     def prepare(identity):
         assert identity == expected_identity
@@ -11946,8 +12784,18 @@ def test_release_commit_prepares_bootstrap_watchdog_before_state_lock(
     )
     monkeypatch.setattr(
         cutover,
+        "_ensure_last_good_split_attested",
+        lambda actual_plan, journal, **_kwargs: events.append(
+            "attest-last-good-split"
+        )
+        or journal
+        if actual_plan is plan
+        else pytest.fail("wrong plan"),
+    )
+    monkeypatch.setattr(
+        cutover,
         "_ensure_gateway_last_good_attested",
-        lambda actual_plan, journal: events.append(
+        lambda actual_plan, journal, **_kwargs: events.append(
             "attest-last-good-gateway"
         )
         or journal
@@ -11976,6 +12824,7 @@ def test_release_commit_prepares_bootstrap_watchdog_before_state_lock(
     assert events == [
         "prepare-watchdog",
         "reconcile-journal",
+        "attest-last-good-split",
         "attest-last-good-gateway",
         "acquire-state-lock",
         "run-cutover",
@@ -12004,6 +12853,12 @@ def test_release_core_uses_barrier_readiness_while_watchdog_is_disabled(
             "transaction_journal": "transaction.json",
             "expected_candidate_identity": candidate_identity,
             "last_good_identity": {"build_id": "last-good"},
+            "last_good_gateway_identity": {"build_id": "last-good-gateway"},
+            "last_good_origin_journal": "webui-origin.json",
+            "last_good_origin_journal_sha256": "a" * 64,
+            "last_good_gateway_origin_journal": "gateway-origin.json",
+            "last_good_gateway_origin_journal_sha256": "b" * 64,
+            "selector_path": "/sealed/selector",
             "base_url": "http://127.0.0.1:8787",
             "signing_key_file": "release-control.key",
             "timeout_seconds": 1,
@@ -12020,11 +12875,26 @@ def test_release_core_uses_barrier_readiness_while_watchdog_is_disabled(
     journal = {
         "rollback_receipt": {},
         "phases": {
-            "gateway_last_good_attested": {"status": "verified"},
+            "last_good_split_attested": {
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                )
+            },
+            "gateway_last_good_attested": {
+                "binding": {"status": "verified"},
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                ),
+            },
             "candidate_gateway_accepted": {"binding": gateway_binding},
             "pair_gate_install_intent": gate_intent,
             "pair_gate_installed": gate_installed,
-            "gateway_drain_intent": {"intent": drain_intent},
+            "gateway_drain_intent": {
+                "intent": drain_intent,
+                "last_good_binding_sha256": (
+                    _canonical_test_value_sha256({"status": "verified"})
+                ),
+            },
         },
     }
     readiness_receipts = [
@@ -12034,6 +12904,11 @@ def test_release_core_uses_barrier_readiness_while_watchdog_is_disabled(
     ]
     readiness_calls = []
     events = []
+    monkeypatch.setattr(
+        cutover,
+        "_attest_last_good_identity_split",
+        lambda **_kwargs: _last_good_split_evidence(),
+    )
     monkeypatch.setattr(
         cutover,
         "_reconcile_cutover_journal",
@@ -12088,11 +12963,17 @@ def test_release_core_uses_barrier_readiness_while_watchdog_is_disabled(
     monkeypatch.setattr(
         cutover,
         "_attest_managed_gateway_binding",
-        lambda *_args, **kwargs: {
-            "health": {
-                "drain": {"pair_open_gate": kwargs["expected_pair_gate"]}
+        lambda *_args, **kwargs: (
+            {
+                "health": {
+                    "drain": {
+                        "pair_open_gate": kwargs["expected_pair_gate"]
+                    }
+                }
             }
-        },
+            if kwargs
+            else {"status": "verified"}
+        ),
     )
     monkeypatch.setattr(
         cutover,
@@ -12209,6 +13090,12 @@ def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
             "transaction_journal": "transaction.json",
             "expected_candidate_identity": sealed_identity,
             "last_good_identity": {"build_id": "last-good"},
+            "last_good_gateway_identity": {"build_id": "last-good-gateway"},
+            "last_good_origin_journal": "webui-origin.json",
+            "last_good_origin_journal_sha256": "a" * 64,
+            "last_good_gateway_origin_journal": "gateway-origin.json",
+            "last_good_gateway_origin_journal_sha256": "b" * 64,
+            "selector_path": "/sealed/selector",
             "base_url": "http://127.0.0.1:8787",
             "signing_key_file": "release-control.key",
             "timeout_seconds": 1,
@@ -12223,7 +13110,17 @@ def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
     journal = {
         "rollback_receipt": {},
         "phases": {
-            "gateway_last_good_attested": {"status": "verified"},
+            "last_good_split_attested": {
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                )
+            },
+            "gateway_last_good_attested": {
+                "binding": {"status": "verified"},
+                "last_good_origin_attestation": (
+                    _plain_last_good_split_evidence()
+                ),
+            },
             "pair_gate_install_intent": gate_intent,
             "pair_gate_installed": gate_installed,
         },
@@ -12235,6 +13132,11 @@ def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
         "pid": 41,
         "pid_start_token": "old-process-start",
     }
+    monkeypatch.setattr(
+        cutover,
+        "_attest_last_good_identity_split",
+        lambda **_kwargs: _last_good_split_evidence(),
+    )
     monkeypatch.setattr(
         cutover,
         "_reconcile_cutover_journal",
@@ -12276,6 +13178,8 @@ def test_release_commit_uses_sealed_identity_for_gateway_pair_attestation(
     )
 
     def attest_gateway(_plan, identity, **_kwargs):
+        if not _kwargs:
+            return {"status": "verified"}
         gateway_identities.append(identity)
         return {
             "health": {

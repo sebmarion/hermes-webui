@@ -772,7 +772,8 @@ _TRANSACTION_PHASE_PREREQUISITES = {
     "pair_gate_release_intent": ("pair_accepted",),
     "pair_released": ("pair_gate_release_intent",),
     "pair_opened": ("pair_released",),
-    "gateway_last_good_attested": ("plist_installed",),
+    "last_good_split_attested": ("plist_installed",),
+    "gateway_last_good_attested": ("last_good_split_attested",),
     "watchdog_cron_disable_intent": ("gateway_last_good_attested",),
     "watchdog_cron_disabled": ("watchdog_cron_disable_intent",),
     "watchdog_state_reconciled": ("watchdog_cron_disabled",),
@@ -6523,7 +6524,24 @@ def _reconcile_cutover_journal(
     return journal
 
 
+def _preflight_last_good_identity_split(plan: dict) -> MappingProxyType:
+    """Read-only, repeatable proof of the independently sealed last-good pair."""
+    return _attest_last_good_identity_split(
+        webui_identity=plan["last_good_identity"],
+        gateway_identity=plan["last_good_gateway_identity"],
+        webui_origin_journal=plan["last_good_origin_journal"],
+        webui_origin_sha256=plan["last_good_origin_journal_sha256"],
+        gateway_origin_journal=plan["last_good_gateway_origin_journal"],
+        gateway_origin_sha256=plan[
+            "last_good_gateway_origin_journal_sha256"
+        ],
+        trusted_root=Path(plan["transaction_journal"]).parent,
+        selector_path=plan["selector_path"],
+    )
+
+
 def _inspect_cutover_plan(plan: dict) -> dict:
+    last_good_origin_attestation = _preflight_last_good_identity_split(plan)
     selector_state = release_selector.read_selector_state(
         plan["selector_state"],
         lock_path=plan["selector_lock"],
@@ -6603,6 +6621,7 @@ def _inspect_cutover_plan(plan: dict) -> dict:
             "last_good": selector_state["last_good"],
         },
         "candidate_startup_generation": startup_generation,
+        "last_good_origin_attestation": last_good_origin_attestation,
         "installed_plist": _installed_plist_attestation(plan),
         "snapshot_manifest_sha256": (
             sha256_file(Path(plan["snapshot_manifest"]))
@@ -6667,23 +6686,118 @@ def _bootstrap_rollback_context(
     }
 
 
-def _ensure_gateway_last_good_attested(plan: dict, journal: dict) -> dict:
+def _journal_copy_of_immutable_evidence(value: object) -> object:
+    if isinstance(value, MappingProxyType):
+        return {
+            str(key): _journal_copy_of_immutable_evidence(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_journal_copy_of_immutable_evidence(item) for item in value]
+    if isinstance(value, list):
+        return [_journal_copy_of_immutable_evidence(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _journal_copy_of_immutable_evidence(item)
+            for key, item in value.items()
+        }
+    return copy.deepcopy(value)
+
+
+def _canonical_journal_value_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _ensure_last_good_split_attested(
+    plan: dict, journal: dict, *, last_good_origin_attestation: MappingProxyType
+) -> dict:
     phases = journal.get("phases") if isinstance(journal, dict) else None
     if not isinstance(phases, dict):
         raise ReleaseBuildError("cutover journal phases are invalid")
+    evidence = _journal_copy_of_immutable_evidence(last_good_origin_attestation)
+    existing = phases.get("last_good_split_attested")
+    if existing is not None:
+        if (
+            not isinstance(existing, dict)
+            or existing.get("last_good_origin_attestation") != evidence
+        ):
+            raise DrainIdentityMismatch("durable last-good split attestation changed")
+        return journal
+    return record_transaction_phase(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+        phase="last_good_split_attested",
+        receipt={"last_good_origin_attestation": evidence},
+    )
+
+
+def _ensure_gateway_last_good_attested(
+    plan: dict,
+    journal: dict,
+    *,
+    last_good_origin_attestation: MappingProxyType,
+) -> dict:
+    phases = journal.get("phases") if isinstance(journal, dict) else None
+    if not isinstance(phases, dict):
+        raise ReleaseBuildError("cutover journal phases are invalid")
+    evidence = _journal_copy_of_immutable_evidence(last_good_origin_attestation)
+    split = phases.get("last_good_split_attested")
     if (
-        "gateway_last_good_attested" not in phases
-        and "rollback_started" not in phases
+        not isinstance(split, dict)
+        or split.get("last_good_origin_attestation") != evidence
     ):
+        raise DrainIdentityMismatch("durable last-good split attestation changed")
+    existing = phases.get("gateway_last_good_attested")
+    if existing is None and "rollback_started" not in phases:
         gateway_last_good = _attest_managed_gateway_binding(
             plan,
             plan["last_good_identity"],
         )
+        receipt = {
+            "binding": gateway_last_good,
+            "last_good_origin_attestation": evidence,
+        }
         return record_transaction_phase(
             plan["transaction_journal"],
             transaction_id=plan["transaction_id"],
             phase="gateway_last_good_attested",
-            receipt={"binding": gateway_last_good},
+            receipt=receipt,
+        )
+    if (
+        not isinstance(existing, dict)
+        or existing.get("last_good_origin_attestation") != evidence
+    ):
+        raise DrainIdentityMismatch("durable gateway last-good split attestation changed")
+    binding = existing.get("binding")
+    if not isinstance(binding, dict):
+        raise DrainIdentityMismatch("durable gateway last-good binding changed")
+    candidate_start = phases.get("candidate_gateway_start_intent")
+    if candidate_start is not None and (
+        not isinstance(candidate_start, dict)
+        or candidate_start.get("last_good_binding") != binding
+    ):
+        raise DrainIdentityMismatch("candidate gateway last-good binding changed")
+    drain_intent = phases.get("gateway_drain_intent")
+    if drain_intent is None:
+        current_binding = _attest_managed_gateway_binding(
+            plan,
+            plan["last_good_identity"],
+        )
+        if binding != current_binding:
+            raise DrainIdentityMismatch("durable gateway last-good binding changed")
+    elif (
+        not isinstance(drain_intent, dict)
+        or drain_intent.get("last_good_binding_sha256")
+        != _canonical_journal_value_sha256(binding)
+    ):
+        raise DrainIdentityMismatch(
+            "durable gateway drain binding anchor changed"
         )
     return journal
 
@@ -6708,6 +6822,7 @@ def _run_release_commit_plan_core(
             "promote-selector-and-cli",
         ]
         return inspected
+    last_good_origin_attestation = _preflight_last_good_identity_split(plan)
     paired_safety_keys = (
         _BOOTSTRAP_GATEWAY_PLAN_KEYS
         | _BOOTSTRAP_WATCHDOG_PLAN_KEYS
@@ -6718,7 +6833,16 @@ def _run_release_commit_plan_core(
             "release commit requires the complete paired safety transaction"
         )
     journal = _reconcile_cutover_journal(plan)
-    journal = _ensure_gateway_last_good_attested(plan, journal)
+    journal = _ensure_last_good_split_attested(
+        plan,
+        journal,
+        last_good_origin_attestation=last_good_origin_attestation,
+    )
+    journal = _ensure_gateway_last_good_attested(
+        plan,
+        journal,
+        last_good_origin_attestation=last_good_origin_attestation,
+    )
     bootstrap_rollback = _bootstrap_rollback_context(plan, journal)
     inspect_control, send_control, client_transaction = _release_control_client(
         plan["base_url"],
@@ -7519,8 +7643,18 @@ def _run_release_commit_plan(
             return copy.deepcopy(prepared_bootstrap_pair)
 
         core_bootstrap_prepare_pair = use_prepared_bootstrap_pair
+    last_good_origin_attestation = _preflight_last_good_identity_split(plan)
     journal = _reconcile_cutover_journal(plan)
-    _ensure_gateway_last_good_attested(plan, journal)
+    journal = _ensure_last_good_split_attested(
+        plan,
+        journal,
+        last_good_origin_attestation=last_good_origin_attestation,
+    )
+    _ensure_gateway_last_good_attested(
+        plan,
+        journal,
+        last_good_origin_attestation=last_good_origin_attestation,
+    )
     barrier = _begin_release_watchdog_barrier(
         plan,
         prepared=watchdog_prepared,
@@ -7626,6 +7760,12 @@ def _complete_candidate_gateway_transition(plan: dict, result: dict) -> dict:
                     "bootstrap_phase": bootstrap_phase,
                     "receipt": receipt,
                 }
+                if cutover_phase == "gateway_drain_intent":
+                    adopted["last_good_binding_sha256"] = (
+                        _canonical_journal_value_sha256(
+                            phases["gateway_last_good_attested"]["binding"]
+                        )
+                    )
             record(cutover_phase, adopted)
 
     if "gateway_gracefully_stopped" not in phases:
@@ -7666,6 +7806,9 @@ def _complete_candidate_gateway_transition(plan: dict, result: dict) -> dict:
                     "intent": _legacy_gateway_drain_intent_receipt(
                         plan,
                         prepared,
+                    ),
+                    "last_good_binding_sha256": (
+                        _canonical_journal_value_sha256(last_good_binding)
                     ),
                 },
             )

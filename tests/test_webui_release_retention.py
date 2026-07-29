@@ -101,3 +101,58 @@ def test_after_release_reports_failure_without_raising(tmp_path):
 
     assert result["status"] == "failed"
     assert result["error"].startswith("CleanupError:")
+
+
+def test_retention_requires_split_attestation_before_gateway_binding():
+    split_receipt = {
+        "last_good_origin_attestation": {
+            "webui": {"identity": {"build_id": "last-good"}},
+            "gateway": {"identity": {"build_id": "last-good-gateway"}},
+        }
+    }
+    gateway_receipt = {
+        "binding": {"status": "verified"},
+        "last_good_origin_attestation": split_receipt[
+            "last_good_origin_attestation"
+        ],
+    }
+
+    with pytest.raises(
+        retention.CleanupError,
+        match=(
+            "phase prerequisites are missing for last_good_split_attested: "
+            "plist_installed"
+        ),
+    ):
+        retention.validate_phase_graph(
+            {"last_good_split_attested": split_receipt},
+            retention.TRANSACTION_PHASE_PREREQUISITES,
+            label="managed journal",
+        )
+    with pytest.raises(
+        retention.CleanupError,
+        match=(
+            "phase prerequisites are missing for gateway_last_good_attested: "
+            "last_good_split_attested"
+        ),
+    ):
+        retention.validate_phase_graph(
+            {
+                "staged": {},
+                "plist_installed": {},
+                "gateway_last_good_attested": gateway_receipt,
+            },
+            retention.TRANSACTION_PHASE_PREREQUISITES,
+            label="managed journal",
+        )
+
+    assert retention.validate_phase_graph(
+        {
+            "staged": {},
+            "plist_installed": {},
+            "last_good_split_attested": split_receipt,
+            "gateway_last_good_attested": gateway_receipt,
+        },
+        retention.TRANSACTION_PHASE_PREREQUISITES,
+        label="managed journal",
+    )["gateway_last_good_attested"] == gateway_receipt
