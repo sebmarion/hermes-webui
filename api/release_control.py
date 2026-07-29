@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -12,17 +13,226 @@ import stat
 import sys
 import threading
 import time
+from dataclasses import fields, is_dataclass
+from enum import Enum
 
 from api.auth import _is_loopback, _signing_key
 from api.build_identity import get_build_identity
 from api import config
 from api.process_identity import process_start_token
+import deferred_release_manifest
+from deferred_startup_file_driver import DeferredStartupFileAttestation
+from managed_startup_coordinator import ManagedStartupReceiptBundle
 
 
 _AUTH_WINDOW_SECONDS = 60
 _NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
 _SEEN_NONCES: dict[str, float] = {}
 _SEEN_NONCES_LOCK = threading.Lock()
+_STARTUP_TOKEN_RECEIPT_DOMAIN = (
+    b"hermes-webui:managed-deferred-startup:start-token-receipt:v1\x00"
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _startup_type_name(value: object) -> str:
+    value_type = type(value)
+    return f"{value_type.__module__}.{value_type.__qualname__}"
+
+
+def _canonical_startup_receipt_value(value: object):
+    if value is None or type(value) in {bool, int, str}:
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("startup receipt is not JSON-safe")
+        return value
+    if type(value) is bytes:
+        return {"$bytes": value.hex()}
+    if isinstance(value, Path):
+        return {"$path": os.fspath(value)}
+    if isinstance(value, Enum):
+        return {
+            "$enum": _startup_type_name(value),
+            "value": _canonical_startup_receipt_value(value.value),
+        }
+    if type(value) in {tuple, list}:
+        return {
+            "$tuple" if type(value) is tuple else "$list": [
+                _canonical_startup_receipt_value(item) for item in value
+            ]
+        }
+    if type(value) is dict:
+        if any(type(key) is not str for key in value):
+            raise ValueError("startup receipt mapping is not canonical")
+        return {
+            "$dict": [
+                [key, _canonical_startup_receipt_value(value[key])]
+                for key in sorted(value)
+            ]
+        }
+    params = getattr(type(value), "__dataclass_params__", None)
+    if (
+        not is_dataclass(value)
+        or params is None
+        or not params.frozen
+    ):
+        raise ValueError("startup receipt type is not immutable and canonical")
+    return {
+        "$type": _startup_type_name(value),
+        "fields": {
+            field.name: _canonical_startup_receipt_value(
+                getattr(value, field.name)
+            )
+            for field in fields(value)
+        },
+    }
+
+
+def _canonical_startup_sha256(value: object) -> str:
+    canonical = _canonical_startup_receipt_value(value)
+    try:
+        payload = json.dumps(
+            canonical,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("startup receipt is not JSON-safe") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _validated_startup_evidence(
+    evidence: object,
+    *,
+    transaction_id: str,
+) -> dict:
+    manifest_sha256 = deferred_release_manifest.deferred_release_manifest_sha256()
+    if (
+        type(evidence).__module__ != "server"
+        or type(evidence).__name__ != "ManagedStartupAcceptanceEvidence"
+    ):
+        raise ValueError("managed startup acceptance evidence is absent")
+    process_receipt = getattr(evidence, "process_receipt", None)
+    driver = getattr(evidence, "driver_attestation", None)
+    bundle = getattr(evidence, "step_receipt_bundle", None)
+    pid = os.getpid()
+    token = process_start_token(pid)
+    if type(token) is not str or not token:
+        raise ValueError("managed startup process identity is unavailable")
+    token_bytes = token.encode("ascii")
+    expected_token_sha256 = hashlib.sha256(
+        _STARTUP_TOKEN_RECEIPT_DOMAIN
+        + len(token_bytes).to_bytes(4, "big")
+        + token_bytes
+    ).hexdigest()
+    if (
+        type(getattr(process_receipt, "version", None)) is not int
+        or process_receipt.version != 1
+        or type(getattr(process_receipt, "pid", None)) is not int
+        or isinstance(process_receipt.pid, bool)
+        or process_receipt.pid != pid
+        or type(getattr(process_receipt, "process_epoch", None)) is not str
+        or re.fullmatch(
+            r"[A-Za-z0-9_-]{32,128}", process_receipt.process_epoch
+        )
+        is None
+        or getattr(process_receipt, "process_start_token_sha256", None)
+        != expected_token_sha256
+    ):
+        raise ValueError("managed startup process evidence is mismatched")
+    if (
+        type(driver) is not DeferredStartupFileAttestation
+        or driver.schema_version != 3
+        or driver.transaction_id != transaction_id
+        or driver.manifest_version != deferred_release_manifest.MANIFEST_VERSION
+        or driver.manifest_sha256 != manifest_sha256
+        or driver.status != "stable-parent-consistent"
+        or driver.latest_process_epoch != process_receipt.process_epoch
+        or type(driver.journal_generation) is not int
+        or driver.journal_generation <= 0
+        or driver.anchor_generation != driver.journal_generation
+        or type(driver.attempt_count) is not int
+        or isinstance(driver.attempt_count, bool)
+        or driver.attempt_count <= 0
+        or _SHA256_RE.fullmatch(driver.journal_sha256) is None
+        or _SHA256_RE.fullmatch(driver.anchor_sha256) is None
+        or _SHA256_RE.fullmatch(driver.attempt_topology_sha256) is None
+    ):
+        raise ValueError("managed startup driver evidence is mismatched")
+    if (
+        type(bundle) is not ManagedStartupReceiptBundle
+        or bundle.transaction_id != transaction_id
+        or bundle.manifest_sha256 != manifest_sha256
+        or type(bundle.receipt_journal_generation) is not int
+        or isinstance(bundle.receipt_journal_generation, bool)
+        or bundle.receipt_journal_generation <= 0
+        or _SHA256_RE.fullmatch(bundle.receipt_journal_sha256) is None
+        or type(bundle.receipts) is not tuple
+    ):
+        raise ValueError("managed startup receipt evidence is mismatched")
+    canonical_names = tuple(
+        descriptor.name
+        for descriptor in deferred_release_manifest.webui_startup_descriptors(
+            deferred_release_manifest.deferred_release_manifest(),
+            startup_admission_closed=True,
+        )
+    )
+    if (
+        len(bundle.receipts) != len(canonical_names)
+        or tuple(name for name, _receipt in bundle.receipts)
+        != canonical_names
+        or any(receipt is None for _name, receipt in bundle.receipts)
+    ):
+        raise ValueError("managed startup receipt evidence is partial or reordered")
+    steps = [
+        {
+            "name": name,
+            "receipt_type": _startup_type_name(receipt),
+            "receipt_sha256": _canonical_startup_sha256(receipt),
+        }
+        for name, receipt in bundle.receipts
+    ]
+    driver_payload = driver.as_dict()
+    result = {
+        "version": 1,
+        "transaction_id": transaction_id,
+        "manifest_sha256": manifest_sha256,
+        "process": {
+            "pid": pid,
+            "start_token_sha256": expected_token_sha256,
+        },
+        "attempt_driver": {
+            "type": _startup_type_name(driver),
+            "journal_generation": driver.journal_generation,
+            "journal_sha256": driver.journal_sha256,
+            "anchor_generation": driver.anchor_generation,
+            "anchor_sha256": driver.anchor_sha256,
+            "attempt_count": driver.attempt_count,
+            "attempt_topology_sha256": driver.attempt_topology_sha256,
+            "attestation_sha256": _canonical_startup_sha256(driver_payload),
+        },
+        "receipt_journal": {
+            "generation": bundle.receipt_journal_generation,
+            "sha256": bundle.receipt_journal_sha256,
+        },
+        "steps": steps,
+    }
+    try:
+        encoded = json.dumps(
+            result,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        if json.loads(encoded) != result:
+            raise ValueError("managed startup evidence JSON round trip changed")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("managed startup evidence is not JSON-safe") from exc
+    return result
 
 
 def _release_control_signing_key() -> bytes:
@@ -409,11 +619,30 @@ def execute_release_control(body: dict, *, fence_token: str | None = None) -> di
             }
         )
     if action == "accept":
+        startup_evidence: list[dict] = []
+
+        def validate_startup_evidence(value: object) -> None:
+            startup_evidence.append(
+                _validated_startup_evidence(
+                    value,
+                    transaction_id=transaction_id,
+                )
+            )
+
         admission = config.accept_startup_run_admission(
             str(fence_token or ""),
             expected_identity=current,
             transaction_id=transaction_id,
+            evidence_validator=validate_startup_evidence,
         )
+        retained = config.startup_acceptance_evidence(transaction_id)
+        if (
+            len(startup_evidence) != 1
+            or retained is None
+        ):
+            raise config.RunAdmissionBusy(
+                "managed startup acceptance evidence is unavailable"
+            )
         return _attest_release_control_response(
             {
                 "status": "accepted",
@@ -422,6 +651,7 @@ def execute_release_control(body: dict, *, fence_token: str | None = None) -> di
                 "admission": admission,
                 "identity": current,
                 "activity": release_activity_snapshot(),
+                "startup_evidence": startup_evidence[0],
             }
         )
     if action == "abort":

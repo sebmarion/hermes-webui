@@ -9322,6 +9322,8 @@ _RUN_ADMISSION_LAST_TOKEN_DIGEST: str | None = None
 _RUN_ADMISSION_LAST_EXPECTED_IDENTITY: dict | None = None
 _RUN_ADMISSION_STARTUP_ERROR: str | None = None
 _RUN_ADMISSION_STARTUP_ACCEPTOR = None
+_RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID: str | None = None
+_RUN_ADMISSION_STARTUP_EVIDENCE = None
 _RUN_ADMISSION_MAX_RESERVATIONS = 4096
 RUN_ADMISSION_FENCE_LEASE_SECONDS = 180.0
 _RUN_ADMISSION_LOCAL = threading.local()
@@ -9360,6 +9362,36 @@ class RunAdmissionBusy(RunAdmissionError):
 
 class RunAdmissionStartupIndeterminate(RunAdmissionConflict):
     """Deferred startup cannot be proved safe to retry or accept."""
+
+
+def _clear_startup_acceptance_evidence_locked() -> None:
+    global _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID
+    global _RUN_ADMISSION_STARTUP_EVIDENCE
+    _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID = None
+    _RUN_ADMISSION_STARTUP_EVIDENCE = None
+
+
+def startup_acceptance_evidence(transaction_id: str):
+    """Return the exact immutable acceptor evidence for one accepted transaction."""
+    normalized = _normalize_run_admission_transaction_id(transaction_id)
+    with ACTIVE_RUNS_LOCK:
+        if (
+            _RUN_ADMISSION_LAST_ACTION != "accept"
+            or _RUN_ADMISSION_LAST_TRANSACTION_ID != normalized
+            or _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID != normalized
+        ):
+            return None
+        return _RUN_ADMISSION_STARTUP_EVIDENCE
+
+
+def _reset_startup_acceptance_evidence_after_fork() -> None:
+    _clear_startup_acceptance_evidence_locked()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        after_in_child=_reset_startup_acceptance_evidence_after_fork
+    )
 
 
 def _normalize_run_admission_identity(identity: dict) -> dict:
@@ -9714,6 +9746,7 @@ def _expire_run_admission_fence_locked() -> bool:
     _RUN_ADMISSION_EXPECTED_IDENTITY = None
     _RUN_ADMISSION_FENCED_AT = None
     _RUN_ADMISSION_LEASE_EXPIRES_AT = None
+    _clear_startup_acceptance_evidence_locked()
     return True
 
 
@@ -9746,6 +9779,7 @@ def initialize_run_admission_from_environment() -> dict:
     elif _MANAGED_RELEASE_SELECTION_FROZEN != managed_selected:
         managed_selected = _MANAGED_RELEASE_SELECTION_FROZEN
     with ACTIVE_RUNS_LOCK:
+        _clear_startup_acceptance_evidence_locked()
         if not managed_selected:
             return _run_admission_snapshot_locked()
         startup_fence_present = "HERMES_WEBUI_STARTUP_FENCED" in os.environ
@@ -9832,6 +9866,7 @@ def configure_startup_acceptor(acceptor) -> None:
         raise TypeError("startup acceptor must be callable")
     with ACTIVE_RUNS_LOCK:
         _RUN_ADMISSION_STARTUP_ACCEPTOR = acceptor
+        _clear_startup_acceptance_evidence_locked()
 
 
 def reserve_run_admission(*, kind: str, **metadata) -> str:
@@ -10016,6 +10051,7 @@ def fence_run_admission(
                 }
             raise RunAdmissionConflict("run admission is already fenced")
         token = secrets.token_urlsafe(32)
+        _clear_startup_acceptance_evidence_locked()
         _RUN_ADMISSION_STATE = "fenced"
         _RUN_ADMISSION_GENERATION += 1
         _RUN_ADMISSION_TOKEN_DIGEST = hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -10035,6 +10071,7 @@ def accept_startup_run_admission(
     *,
     expected_identity: dict,
     transaction_id: str,
+    evidence_validator=None,
 ) -> dict:
     """Start deferred services, then open the exact claimed startup fence.
 
@@ -10051,9 +10088,13 @@ def accept_startup_run_admission(
     global _RUN_ADMISSION_LAST_TRANSACTION_ID, _RUN_ADMISSION_LAST_ACTION
     global _RUN_ADMISSION_LAST_TOKEN_DIGEST, _RUN_ADMISSION_LAST_EXPECTED_IDENTITY
     global _RUN_ADMISSION_STARTUP_ERROR
+    global _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID
+    global _RUN_ADMISSION_STARTUP_EVIDENCE
 
     requested_transaction = _normalize_run_admission_transaction_id(transaction_id)
     normalized_identity = _normalize_run_admission_identity(expected_identity)
+    if evidence_validator is not None and not callable(evidence_validator):
+        raise TypeError("startup evidence validator must be callable")
     with ACTIVE_RUNS_LOCK:
         supplied_digest = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
         if _RUN_ADMISSION_STATE == "open":
@@ -10067,6 +10108,14 @@ def accept_startup_run_admission(
                     _RUN_ADMISSION_LAST_TOKEN_DIGEST,
                 )
             ):
+                evidence = (
+                    _RUN_ADMISSION_STARTUP_EVIDENCE
+                    if _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID
+                    == requested_transaction
+                    else None
+                )
+                if evidence_validator is not None:
+                    evidence_validator(evidence)
                 return _run_admission_snapshot_locked()
             raise RunAdmissionConflict("startup fence cannot be accepted")
         if _RUN_ADMISSION_STATE == "startup-invalid":
@@ -10090,6 +10139,7 @@ def accept_startup_run_admission(
         _RUN_ADMISSION_STATE = "startup-accepting"
         _RUN_ADMISSION_GENERATION += 1
         _RUN_ADMISSION_STARTUP_ERROR = None
+        _clear_startup_acceptance_evidence_locked()
 
     previous_startup_transaction = getattr(
         _RUN_ADMISSION_LOCAL,
@@ -10097,9 +10147,20 @@ def accept_startup_run_admission(
         None,
     )
     _RUN_ADMISSION_LOCAL.startup_acceptor_transaction = requested_transaction
+    acceptance_evidence = None
     try:
         try:
-            acceptor(requested_transaction)
+            acceptor_receipt = acceptor(requested_transaction)
+            if type(acceptor_receipt) is dict:
+                if acceptor_receipt.get("transaction_id") != requested_transaction:
+                    raise RunAdmissionConflict(
+                        "startup acceptor transaction receipt changed"
+                    )
+                acceptance_evidence = acceptor_receipt.get(
+                    "acceptance_evidence"
+                )
+            if evidence_validator is not None:
+                evidence_validator(acceptance_evidence)
         except RunAdmissionStartupIndeterminate:
             with ACTIVE_RUNS_LOCK:
                 if (
@@ -10112,6 +10173,7 @@ def accept_startup_run_admission(
                     _RUN_ADMISSION_STARTUP_ERROR = (
                         "deferred_startup_indeterminate"
                     )
+                    _clear_startup_acceptance_evidence_locked()
             raise
         except Exception as exc:
             with ACTIVE_RUNS_LOCK:
@@ -10123,6 +10185,7 @@ def accept_startup_run_admission(
                     _RUN_ADMISSION_STATE = "startup-fenced"
                     _RUN_ADMISSION_GENERATION += 1
                     _RUN_ADMISSION_STARTUP_ERROR = "deferred_startup_failed"
+                    _clear_startup_acceptance_evidence_locked()
             raise RunAdmissionBusy(
                 "deferred startup failed; candidate remains fenced"
             ) from exc
@@ -10149,6 +10212,8 @@ def accept_startup_run_admission(
         _RUN_ADMISSION_LAST_ACTION = "accept"
         _RUN_ADMISSION_LAST_TOKEN_DIGEST = _RUN_ADMISSION_TOKEN_DIGEST
         _RUN_ADMISSION_LAST_EXPECTED_IDENTITY = _RUN_ADMISSION_EXPECTED_IDENTITY
+        _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID = requested_transaction
+        _RUN_ADMISSION_STARTUP_EVIDENCE = acceptance_evidence
         _RUN_ADMISSION_STATE = "open"
         _RUN_ADMISSION_GENERATION += 1
         _RUN_ADMISSION_TOKEN_DIGEST = None
@@ -10220,6 +10285,7 @@ def abort_run_admission(
         _RUN_ADMISSION_EXPECTED_IDENTITY = None
         _RUN_ADMISSION_FENCED_AT = None
         _RUN_ADMISSION_LEASE_EXPIRES_AT = None
+        _clear_startup_acceptance_evidence_locked()
         return _run_admission_snapshot_locked()
 
 

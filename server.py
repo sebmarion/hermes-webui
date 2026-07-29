@@ -626,6 +626,9 @@ _DEFERRED_STARTUP_LOCK = threading.Lock()
 _DEFERRED_STARTUP_COMPLETED: set[str] = set()
 _DEFERRED_STARTUP_REPLAY_DRIVER = None
 _DEFERRED_STARTUP_REPLAY_STEPS: tuple[DeferredStartupStep, ...] | None = None
+_MANAGED_STARTUP_COORDINATOR_LOCK = threading.Lock()
+_MANAGED_STARTUP_COORDINATOR = None
+_MANAGED_STARTUP_ACCEPTANCE_EVIDENCE = None
 _DEFERRED_STARTUP_PROCESS_EPOCH_LOCK = threading.Lock()
 _DEFERRED_STARTUP_PROCESS_EPOCH: str | None = None
 _DEFERRED_STARTUP_PROCESS_EPOCH_DOMAIN = (
@@ -668,6 +671,15 @@ class _ManagedDeferredStartupProcessReceipt(Mapping[str, object]):
         return 4
 
 
+@dataclass(frozen=True, slots=True)
+class ManagedStartupAcceptanceEvidence:
+    """Typed process-local evidence from one successful managed startup replay."""
+
+    process_receipt: _ManagedDeferredStartupProcessReceipt
+    driver_attestation: object
+    step_receipt_bundle: object
+
+
 _DEFERRED_STARTUP_PROCESS_RECEIPT: (
     _ManagedDeferredStartupProcessReceipt | None
 ) = None
@@ -675,10 +687,22 @@ _MANAGED_STARTUP_SESSION_RECEIPT = None
 
 
 def _reset_deferred_startup_process_state_after_fork() -> None:
+    global _DEFERRED_STARTUP_LOCK
+    global _DEFERRED_STARTUP_REPLAY_DRIVER
+    global _DEFERRED_STARTUP_REPLAY_STEPS
+    global _MANAGED_STARTUP_COORDINATOR_LOCK
+    global _MANAGED_STARTUP_COORDINATOR
+    global _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE
     global _DEFERRED_STARTUP_PROCESS_EPOCH_LOCK
     global _DEFERRED_STARTUP_PROCESS_EPOCH
     global _DEFERRED_STARTUP_PROCESS_RECEIPT
     global _MANAGED_STARTUP_SESSION_RECEIPT
+    _DEFERRED_STARTUP_LOCK = threading.Lock()
+    _DEFERRED_STARTUP_REPLAY_DRIVER = None
+    _DEFERRED_STARTUP_REPLAY_STEPS = None
+    _MANAGED_STARTUP_COORDINATOR_LOCK = threading.Lock()
+    _MANAGED_STARTUP_COORDINATOR = None
+    _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE = None
     _DEFERRED_STARTUP_PROCESS_EPOCH_LOCK = threading.Lock()
     _DEFERRED_STARTUP_PROCESS_EPOCH = None
     _DEFERRED_STARTUP_PROCESS_RECEIPT = None
@@ -830,6 +854,38 @@ def configure_managed_deferred_startup_replay(*, driver, steps) -> None:
         if existing_driver is driver and existing_steps is steps:
             return
         raise RuntimeError("durable deferred startup replay is already configured")
+
+
+def managed_startup_acceptance_evidence():
+    """Return stable typed evidence after managed startup completes successfully."""
+    with _DEFERRED_STARTUP_LOCK:
+        return _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE
+
+
+def _configure_production_managed_startup_coordinator():
+    """Build and retain the exact production coordinator once per process."""
+    global _MANAGED_STARTUP_COORDINATOR
+    global _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE
+    with _MANAGED_STARTUP_COORDINATOR_LOCK:
+        coordinator = _MANAGED_STARTUP_COORDINATOR
+        if coordinator is None:
+            from managed_startup_coordinator import (
+                build_production_managed_startup_coordinator,
+            )
+
+            coordinator = build_production_managed_startup_coordinator()
+        driver = _DEFERRED_STARTUP_REPLAY_DRIVER
+        steps = _DEFERRED_STARTUP_REPLAY_STEPS
+        if driver is None and steps is None:
+            configure_managed_deferred_startup_replay(
+                driver=coordinator.driver,
+                steps=coordinator.steps,
+            )
+        elif driver is not coordinator.driver or steps is not coordinator.steps:
+            raise RuntimeError("managed startup coordinator binding changed")
+        _MANAGED_STARTUP_COORDINATOR = coordinator
+        _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE = None
+        return coordinator
 
 
 def _materialize_internal_recovery_key() -> None:
@@ -1141,24 +1197,41 @@ def _run_deferred_startup_mutators() -> dict:
 
 def _run_managed_deferred_startup(transaction_id: str) -> dict:
     """Replay configured managed steps under durable transaction receipts."""
+    global _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE
+    if (
+        _DEFERRED_STARTUP_REPLAY_DRIVER is None
+        and _DEFERRED_STARTUP_REPLAY_STEPS is None
+    ):
+        _configure_production_managed_startup_coordinator()
     with _DEFERRED_STARTUP_LOCK:
         driver = _DEFERRED_STARTUP_REPLAY_DRIVER
         steps = _DEFERRED_STARTUP_REPLAY_STEPS
         if driver is None or steps is None:
             raise RuntimeError("durable deferred startup replay is not configured")
-        canonical_steps = _deferred_startup_steps()
-        if tuple((step.name, step.mutator) for step in steps) != canonical_steps:
+        canonical_names = tuple(name for name, _mutator in _deferred_startup_steps())
+        if tuple(step.name for step in steps) != canonical_names:
             raise RuntimeError("durable deferred startup step mapping changed")
+        coordinator = _MANAGED_STARTUP_COORDINATOR
+        if coordinator is not None and (
+            coordinator.driver is not driver or coordinator.steps is not steps
+        ):
+            raise RuntimeError("managed startup coordinator binding changed")
         receipt = DeferredStartupManifestReceipt(
             transaction_id=transaction_id,
             version=release_manifest.MANIFEST_VERSION,
             sha256=release_manifest.deferred_release_manifest_sha256(),
         )
+        if coordinator is not None and (
+            coordinator.transaction_id != transaction_id
+            or coordinator.manifest_receipt != receipt
+        ):
+            raise RuntimeError("managed startup coordinator binding changed")
+        process_receipt = _managed_deferred_startup_process_receipt()
         try:
             result = replay_deferred_startup(
                 transaction_id=transaction_id,
                 manifest_receipt=receipt,
-                process_epoch=_managed_deferred_startup_process_epoch(),
+                process_epoch=process_receipt.process_epoch,
                 steps=steps,
                 driver=driver,
             )
@@ -1166,10 +1239,17 @@ def _run_managed_deferred_startup(transaction_id: str) -> dict:
             raise api_config.RunAdmissionStartupIndeterminate(
                 "deferred startup is indeterminate; candidate remains fenced"
             ) from exc
+        if coordinator is not None:
+            _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE = ManagedStartupAcceptanceEvidence(
+                process_receipt=process_receipt,
+                driver_attestation=coordinator.driver_attestation(),
+                step_receipt_bundle=coordinator.step_receipt_bundle(),
+            )
         return {
             "status": "started",
             "transaction_id": result.transaction_id,
             "completed": list(result.completed),
+            "acceptance_evidence": _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE,
         }
 
 

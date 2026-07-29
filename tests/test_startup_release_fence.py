@@ -13,7 +13,7 @@ import signal
 import subprocess
 import sys
 import threading
-from dataclasses import FrozenInstanceError
+from dataclasses import dataclass, FrozenInstanceError, replace as dataclass_replace
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -25,6 +25,12 @@ from api import config
 TRANSACTION_ID = "startup-transaction-" + ("x" * 32)
 PROCESS_EPOCH = "startup-process-epoch-" + ("e" * 32)
 IDENTITY = {"pid": 123, "started_at": 456.0, "instance_id": "candidate-a"}
+
+
+@dataclass(frozen=True)
+class _AcceptanceStepReceipt:
+    step: str
+    generation: int
 
 EXPECTED_DEFERRED_RELEASE_DESCRIPTORS = [
     {
@@ -1209,6 +1215,18 @@ def isolated_startup_admission(monkeypatch):
     monkeypatch.setattr(config, "_RUN_ADMISSION_LAST_EXPECTED_IDENTITY", None)
     monkeypatch.setattr(config, "_RUN_ADMISSION_STARTUP_ERROR", None, raising=False)
     monkeypatch.setattr(config, "_RUN_ADMISSION_STARTUP_ACCEPTOR", None, raising=False)
+    monkeypatch.setattr(
+        config,
+        "_RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        config,
+        "_RUN_ADMISSION_STARTUP_EVIDENCE",
+        None,
+        raising=False,
+    )
     monkeypatch.setattr(config, "_RUN_ADMISSION_LOCAL", threading.local())
     monkeypatch.setattr(server, "_DEFERRED_STARTUP_PROCESS_EPOCH", PROCESS_EPOCH)
     monkeypatch.setattr(
@@ -1345,6 +1363,119 @@ def test_exact_startup_transaction_accepts_once_and_opens_admission(
     assert calls == [TRANSACTION_ID]
     reservation = config.reserve_run_admission(kind="post-accept")
     assert config.release_run_admission(reservation) is True
+
+
+def test_startup_accept_retains_exact_validated_evidence_idempotently(
+    monkeypatch,
+    isolated_startup_admission,
+):
+    evidence = object()
+    calls = []
+    _select_managed_candidate(monkeypatch)
+    config.configure_startup_acceptor(
+        lambda transaction_id: {
+            "transaction_id": transaction_id,
+            "acceptance_evidence": evidence,
+        }
+    )
+    fenced = _claim_startup_fence()
+
+    accepted = config.accept_startup_run_admission(
+        fenced["token"],
+        expected_identity=IDENTITY,
+        transaction_id=TRANSACTION_ID,
+        evidence_validator=lambda value: calls.append(value),
+    )
+    repeated = config.accept_startup_run_admission(
+        fenced["token"],
+        expected_identity=IDENTITY,
+        transaction_id=TRANSACTION_ID,
+        evidence_validator=lambda value: calls.append(value),
+    )
+
+    assert accepted["state"] == "open"
+    assert repeated["state"] == "open"
+    assert calls == [evidence, evidence]
+    assert (
+        config.startup_acceptance_evidence(TRANSACTION_ID)
+        is evidence
+    )
+
+
+def test_startup_accept_validation_failure_keeps_fenced_and_clears_evidence(
+    monkeypatch,
+    isolated_startup_admission,
+):
+    _select_managed_candidate(monkeypatch)
+    config.configure_startup_acceptor(
+        lambda transaction_id: {
+            "transaction_id": transaction_id,
+            "acceptance_evidence": object(),
+        }
+    )
+    fenced = _claim_startup_fence()
+
+    with pytest.raises(config.RunAdmissionBusy, match="deferred startup failed"):
+        config.accept_startup_run_admission(
+            fenced["token"],
+            expected_identity=IDENTITY,
+            transaction_id=TRANSACTION_ID,
+            evidence_validator=lambda _value: (_ for _ in ()).throw(
+                ValueError("invalid evidence")
+            ),
+        )
+
+    assert config.run_admission_snapshot()["state"] == "startup-fenced"
+    assert config.startup_acceptance_evidence(TRANSACTION_ID) is None
+
+
+def test_startup_acceptance_evidence_clears_on_new_fence_abort_and_fork(
+    monkeypatch,
+    isolated_startup_admission,
+):
+    evidence = object()
+    _select_managed_candidate(monkeypatch)
+    config.configure_startup_acceptor(
+        lambda transaction_id: {
+            "transaction_id": transaction_id,
+            "acceptance_evidence": evidence,
+        }
+    )
+    initial = _claim_startup_fence()
+    config.accept_startup_run_admission(
+        initial["token"],
+        expected_identity=IDENTITY,
+        transaction_id=TRANSACTION_ID,
+    )
+    assert config.startup_acceptance_evidence(TRANSACTION_ID) is evidence
+
+    next_transaction = "next-startup-transaction-" + ("n" * 32)
+    next_fence = config.fence_run_admission(
+        IDENTITY,
+        transaction_id=next_transaction,
+    )
+    assert config.startup_acceptance_evidence(TRANSACTION_ID) is None
+    monkeypatch.setattr(
+        config,
+        "_RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID",
+        next_transaction,
+    )
+    monkeypatch.setattr(config, "_RUN_ADMISSION_STARTUP_EVIDENCE", evidence)
+    config.abort_run_admission(
+        next_fence["token"],
+        expected_identity=IDENTITY,
+        transaction_id=next_transaction,
+    )
+    assert config._RUN_ADMISSION_STARTUP_EVIDENCE is None
+
+    monkeypatch.setattr(
+        config,
+        "_RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID",
+        TRANSACTION_ID,
+    )
+    monkeypatch.setattr(config, "_RUN_ADMISSION_STARTUP_EVIDENCE", evidence)
+    config._reset_startup_acceptance_evidence_after_fork()
+    assert config._RUN_ADMISSION_STARTUP_EVIDENCE is None
 
 
 def test_wrong_startup_transaction_or_identity_cannot_accept(
@@ -1548,6 +1679,22 @@ def test_signed_release_control_fence_and_accept_are_transaction_bound(
     from api import release_control
 
     calls = []
+    identity = {**IDENTITY, "pid": 4321}
+    process_token = "darwin-proc:4321:1:0"
+    token_bytes = process_token.encode("ascii")
+    evidence = _acceptance_evidence()
+    evidence = dataclass_replace(
+        evidence,
+        process_receipt=dataclass_replace(
+            evidence.process_receipt,
+            process_start_token_sha256=hashlib.sha256(
+                b"hermes-webui:managed-deferred-startup:"
+                b"start-token-receipt:v1\x00"
+                + len(token_bytes).to_bytes(4, "big")
+                + token_bytes
+            ).hexdigest(),
+        ),
+    )
     monkeypatch.setattr(
         release_control,
         "_release_control_signing_key",
@@ -1556,11 +1703,23 @@ def test_signed_release_control_fence_and_accept_are_transaction_bound(
     monkeypatch.setattr(
         release_control,
         "current_release_process_identity",
-        lambda **_kwargs: dict(IDENTITY),
+        lambda **_kwargs: dict(identity),
+    )
+    monkeypatch.setattr(release_control.os, "getpid", lambda: 4321)
+    monkeypatch.setattr(
+        release_control,
+        "process_start_token",
+        lambda _pid: process_token,
     )
     _select_managed_candidate(monkeypatch)
     config.configure_startup_acceptor(
-        lambda transaction_id: calls.append(transaction_id)
+        lambda transaction_id: (
+            calls.append(transaction_id)
+            or {
+                "transaction_id": transaction_id,
+                "acceptance_evidence": evidence,
+            }
+        )
     )
 
     fenced = release_control.execute_release_control(
@@ -1568,7 +1727,7 @@ def test_signed_release_control_fence_and_accept_are_transaction_bound(
             "action": "fence",
             "nonce": "f" * 32,
             "transaction_id": TRANSACTION_ID,
-            "expected": IDENTITY,
+            "expected": identity,
         }
     )
     accepted = release_control.execute_release_control(
@@ -1576,7 +1735,16 @@ def test_signed_release_control_fence_and_accept_are_transaction_bound(
             "action": "accept",
             "nonce": "a" * 32,
             "transaction_id": TRANSACTION_ID,
-            "expected": IDENTITY,
+            "expected": identity,
+        },
+        fence_token=fenced["fence_token"],
+    )
+    repeated = release_control.execute_release_control(
+        {
+            "action": "accept",
+            "nonce": "r" * 32,
+            "transaction_id": TRANSACTION_ID,
+            "expected": identity,
         },
         fence_token=fenced["fence_token"],
     )
@@ -1584,9 +1752,286 @@ def test_signed_release_control_fence_and_accept_are_transaction_bound(
     assert fenced["status"] == "startup-fenced"
     assert accepted["status"] == "accepted"
     assert accepted["transaction_id"] == TRANSACTION_ID
-    assert accepted["identity"] == IDENTITY
+    assert accepted["identity"] == identity
+    assert accepted["startup_evidence"]["transaction_id"] == TRANSACTION_ID
+    assert repeated["startup_evidence"] == accepted["startup_evidence"]
     assert len(accepted["attestation"]) == 64
     assert calls == [TRANSACTION_ID]
+
+
+def _acceptance_evidence(*, receipt_names=None, receipt_override=None):
+    import deferred_release_manifest
+    import server
+    from deferred_startup_file_driver import DeferredStartupFileAttestation
+    from managed_startup_coordinator import ManagedStartupReceiptBundle
+
+    manifest_sha256 = (
+        deferred_release_manifest.deferred_release_manifest_sha256()
+    )
+    names = tuple(
+        descriptor.name
+        for descriptor in deferred_release_manifest.webui_startup_descriptors(
+            deferred_release_manifest.deferred_release_manifest(),
+            startup_admission_closed=True,
+        )
+    )
+    if receipt_names is not None:
+        names = tuple(receipt_names)
+    receipts = tuple(
+        (
+            name,
+            (
+                receipt_override
+                if receipt_override is not None and index == 0
+                else _AcceptanceStepReceipt(name, index + 1)
+            ),
+        )
+        for index, name in enumerate(names)
+    )
+    process_receipt = server._ManagedDeferredStartupProcessReceipt(
+        version=1,
+        pid=4321,
+        process_epoch=PROCESS_EPOCH,
+        process_start_token_sha256="c" * 64,
+    )
+    driver_attestation = DeferredStartupFileAttestation(
+        schema_version=3,
+        transaction_id=TRANSACTION_ID,
+        manifest_version=deferred_release_manifest.MANIFEST_VERSION,
+        manifest_sha256=manifest_sha256,
+        parent_device=1,
+        parent_inode=2,
+        journal_generation=13,
+        journal_sha256="d" * 64,
+        anchor_generation=13,
+        anchor_sha256="e" * 64,
+        latest_process_epoch=PROCESS_EPOCH,
+        attempt_count=1,
+        attempt_topology_sha256="f" * 64,
+        status="stable-parent-consistent",
+    )
+    bundle = ManagedStartupReceiptBundle(
+        transaction_id=TRANSACTION_ID,
+        manifest_sha256=manifest_sha256,
+        configuration_journal="/private/configuration.json",
+        receipt_journal_generation=13,
+        receipt_journal_sha256="1" * 64,
+        receipts=receipts,
+    )
+    return server.ManagedStartupAcceptanceEvidence(
+        process_receipt=process_receipt,
+        driver_attestation=driver_attestation,
+        step_receipt_bundle=bundle,
+    )
+
+
+def test_release_accept_returns_sanitized_exact_startup_evidence(
+    monkeypatch,
+    isolated_startup_admission,
+):
+    from api import release_control
+
+    evidence = _acceptance_evidence()
+    identity = {**IDENTITY, "pid": 4321}
+    token = "darwin-proc:4321:1:0"
+    token_bytes = token.encode("ascii")
+    token_sha256 = hashlib.sha256(
+        b"hermes-webui:managed-deferred-startup:start-token-receipt:v1\x00"
+        + len(token_bytes).to_bytes(4, "big")
+        + token_bytes
+    ).hexdigest()
+    evidence = dataclass_replace(
+        evidence,
+        process_receipt=dataclass_replace(
+            evidence.process_receipt,
+            process_start_token_sha256=token_sha256,
+        ),
+    )
+    monkeypatch.setattr(
+        release_control,
+        "_release_control_signing_key",
+        lambda: b"k" * 32,
+    )
+    monkeypatch.setattr(
+        release_control,
+        "current_release_process_identity",
+        lambda **_kwargs: dict(identity),
+    )
+    monkeypatch.setattr(release_control.os, "getpid", lambda: 4321)
+    monkeypatch.setattr(
+        release_control,
+        "process_start_token",
+        lambda _pid: token,
+    )
+    _select_managed_candidate(monkeypatch)
+    config.configure_startup_acceptor(
+        lambda transaction_id: {
+            "status": "started",
+            "transaction_id": transaction_id,
+            "completed": [],
+            "acceptance_evidence": evidence,
+        }
+    )
+
+    fenced = release_control.execute_release_control(
+        {
+            "action": "fence",
+            "nonce": "f" * 32,
+            "transaction_id": TRANSACTION_ID,
+            "expected": identity,
+        }
+    )
+    accepted = release_control.execute_release_control(
+        {
+            "action": "accept",
+            "nonce": "a" * 32,
+            "transaction_id": TRANSACTION_ID,
+            "expected": identity,
+        },
+        fence_token=fenced["fence_token"],
+    )
+    repeated = release_control.execute_release_control(
+        {
+            "action": "accept",
+            "nonce": "r" * 32,
+            "transaction_id": TRANSACTION_ID,
+            "expected": identity,
+        },
+        fence_token=fenced["fence_token"],
+    )
+
+    startup = accepted["startup_evidence"]
+    assert startup["transaction_id"] == TRANSACTION_ID
+    assert startup["manifest_sha256"] == (
+        __import__(
+            "deferred_release_manifest"
+        ).deferred_release_manifest_sha256()
+    )
+    assert startup["process"] == {
+        "pid": 4321,
+        "start_token_sha256": token_sha256,
+    }
+    assert [step["name"] for step in startup["steps"]] == [
+        receipt[0] for receipt in evidence.step_receipt_bundle.receipts
+    ]
+    assert all(step["receipt_sha256"] for step in startup["steps"])
+    assert all(step["receipt_type"] for step in startup["steps"])
+    assert json.loads(
+        json.dumps(startup, sort_keys=True, allow_nan=False)
+    ) == startup
+    assert repeated["startup_evidence"] == startup
+    assert config.startup_acceptance_evidence(TRANSACTION_ID) is evidence
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("absent", "mismatched", "partial", "reordered", "not-json-safe"),
+)
+def test_release_accept_invalid_startup_evidence_stays_fenced(
+    monkeypatch,
+    isolated_startup_admission,
+    case,
+):
+    from api import release_control
+
+    identity = {**IDENTITY, "pid": 4321}
+    token = "darwin-proc:4321:1:0"
+    token_bytes = token.encode("ascii")
+    token_sha256 = hashlib.sha256(
+        b"hermes-webui:managed-deferred-startup:start-token-receipt:v1\x00"
+        + len(token_bytes).to_bytes(4, "big")
+        + token_bytes
+    ).hexdigest()
+    evidence = _acceptance_evidence()
+    evidence = dataclass_replace(
+        evidence,
+        process_receipt=dataclass_replace(
+            evidence.process_receipt,
+            process_start_token_sha256=token_sha256,
+        ),
+    )
+    if case == "absent":
+        evidence = None
+    elif case == "mismatched":
+        evidence = dataclass_replace(
+            evidence,
+            step_receipt_bundle=dataclass_replace(
+                evidence.step_receipt_bundle,
+                transaction_id="different-transaction-" + ("z" * 32),
+            ),
+        )
+    elif case == "partial":
+        receipts = list(evidence.step_receipt_bundle.receipts)
+        receipts[0] = (receipts[0][0], None)
+        evidence = dataclass_replace(
+            evidence,
+            step_receipt_bundle=dataclass_replace(
+                evidence.step_receipt_bundle,
+                receipts=tuple(receipts),
+            ),
+        )
+    elif case == "reordered":
+        evidence = dataclass_replace(
+            evidence,
+            step_receipt_bundle=dataclass_replace(
+                evidence.step_receipt_bundle,
+                receipts=tuple(
+                    reversed(evidence.step_receipt_bundle.receipts)
+                ),
+            ),
+        )
+    else:
+        receipts = list(evidence.step_receipt_bundle.receipts)
+        receipts[0] = (receipts[0][0], object())
+        evidence = dataclass_replace(
+            evidence,
+            step_receipt_bundle=dataclass_replace(
+                evidence.step_receipt_bundle,
+                receipts=tuple(receipts),
+            ),
+        )
+    monkeypatch.setattr(
+        release_control,
+        "current_release_process_identity",
+        lambda **_kwargs: dict(identity),
+    )
+    monkeypatch.setattr(release_control.os, "getpid", lambda: 4321)
+    monkeypatch.setattr(
+        release_control,
+        "process_start_token",
+        lambda _pid: token,
+    )
+    _select_managed_candidate(monkeypatch)
+    config.configure_startup_acceptor(
+        lambda transaction_id: {
+            "status": "started",
+            "transaction_id": transaction_id,
+            "completed": [],
+            "acceptance_evidence": evidence,
+        }
+    )
+    fenced = release_control.execute_release_control(
+        {
+            "action": "fence",
+            "nonce": "f" * 32,
+            "transaction_id": TRANSACTION_ID,
+            "expected": identity,
+        }
+    )
+
+    with pytest.raises(config.RunAdmissionBusy):
+        release_control.execute_release_control(
+            {
+                "action": "accept",
+                "nonce": "a" * 32,
+                "transaction_id": TRANSACTION_ID,
+                "expected": identity,
+            },
+            fence_token=fenced["fence_token"],
+        )
+
+    assert config.run_admission_snapshot()["state"] == "startup-fenced"
+    assert config.startup_acceptance_evidence(TRANSACTION_ID) is None
 
 
 def test_startup_release_auth_never_generates_a_missing_signing_key(
@@ -2826,20 +3271,18 @@ def test_zero_pending_continuation_recovery_accepts_without_mutation(
 
     continuation_module = __import__(f"api.{module_name}", fromlist=[module_name])
     recovery_calls = []
-    monkeypatch.setattr(
-        continuation_module,
-        "load_receipts",
-        lambda: {"version": 1, "receipts": {}},
-    )
     recover_name = (
-        "recover_pending_continuations"
+        "recover_managed_continuations_exact"
         if module_name == "tool_limit_continuation"
-        else "recover_pending_goal_continuations"
+        else "recover_managed_goal_continuations_exact"
     )
     monkeypatch.setattr(
         continuation_module,
         recover_name,
-        lambda **_kwargs: recovery_calls.append("mutated") or 0,
+        lambda **_kwargs: SimpleNamespace(
+            outcome=SimpleNamespace(value="ABSENT"),
+            to_dict=lambda: {"status": "complete", "outcome": "ABSENT"},
+        ),
     )
     monkeypatch.setattr(server, "_DEFERRED_STARTUP_COMPLETED", set())
     monkeypatch.setattr(
