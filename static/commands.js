@@ -810,7 +810,9 @@ async function cmdTerminal(){
       const first=(data&&data.workspaces||[])[0];
       S._profileSwitchWorkspace=(data&&data.last)||(first&&first.path)||null;
     }
-    await newSession();
+    // System-minted session (#6022): opening the terminal auto-creates a
+    // session — explicit worktree:false so the config default can't leak.
+    await newSession(false, {worktree: false});
     if(typeof renderSessionList==='function') await renderSessionList();
   }
   if(!S.session||!S.session.workspace){
@@ -1220,7 +1222,10 @@ async function cmdPersonality(args){
 async function cmdStop(){
   if(!S.session){showToast(t('no_active_session'));return;}
   if(!S.activeStreamId){showToast(t('no_active_task'));return;}
-  if(typeof cancelStream==='function'){await cancelStream('slash-stop');showToast(t('stream_stopped'));}
+  if(typeof cancelStream==='function'){
+    if(await cancelStream('slash-stop')) showToast(t('stream_stopped'));
+    else showToast(t('cancel_failed'),null,'error');
+  }
   else showToast(t('cancel_unavailable'));
 }
 
@@ -1326,8 +1331,10 @@ async function cmdInterrupt(args){
   updateQueueBadge(S.session.session_id);
   S.pendingFiles=[];renderTray();
   // Cancel the active stream; setBusy(false) will drain the queue
-  if(typeof cancelStream==='function'){await cancelStream('slash-interrupt');}
-  showToast(t('cmd_interrupt_confirm'),2000);
+  if(typeof cancelStream==='function'){
+    if(await cancelStream('slash-interrupt')) showToast(t('cmd_interrupt_confirm'),2000);
+    else showToast(t('cancel_failed'),null,'error');
+  }
 }
 
 /**
@@ -1953,7 +1960,19 @@ async function cmdBranch(args){
 // count (_oldestIdx + msgIdx) BEFORE awaiting _ensureAllMessagesLoaded,
 // which resets _oldestIdx to 0 after its wholesale replace.  See #2184.
 async function forkFromMessage(msgIdx){
-  if(!S.session||S.busy)return;
+  if(!S.session)return;
+  // During streaming, only block fork if the clicked message is the
+  // currently-streaming (live) message itself.  Past messages that are
+  // already committed server-side can be forked immediately without
+  // waiting for the stream to finish.
+  if(S.busy){
+    const _msg=(Array.isArray(S.messages)&&S.messages[msgIdx-1])||null;
+    const _isLastMsg=msgIdx>=(Array.isArray(S.messages)?S.messages.length:0);
+    if((_msg&&(_msg._live||_msg._pending))||_isLastMsg){
+      showToast('Cannot fork a message still being generated.',3000);
+      return;
+    }
+  }
   const readOnlySession=typeof _isReadOnlySession==='function'
     ? _isReadOnlySession(S.session)
     : !!(S.session&&(S.session.read_only||S.session.is_read_only));
@@ -1968,7 +1987,9 @@ async function forkFromMessage(msgIdx){
   const absoluteKeepCount = _oldestIdx + msgIdx;
   // Ensure the full transcript is loaded so the forked session renders
   // correctly and subsequent operations see the complete history.
-  if(typeof _ensureAllMessagesLoaded==='function'){
+  // Skip during streaming to avoid visual flicker — the fork data
+  // (absoluteKeepCount) was already captured above and is unaffected.
+  if(!S.busy && typeof _ensureAllMessagesLoaded==='function'){
     await _ensureAllMessagesLoaded();
   }
   if(!S.session || S.session.session_id !== initialSid) return;

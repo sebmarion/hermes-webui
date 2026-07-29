@@ -224,15 +224,23 @@ def test_update_flows_keep_explicit_longer_timeouts():
 def test_session_message_loads_keep_explicit_longer_timeouts():
     """Large state.db installs can take longer than the generic 30s API timeout."""
     src = _source(SESSIONS_JS)
-    for request in (
-        r"/api/session\?session_id=\$\{encodeURIComponent\(sid\)\}&messages=1&resolve_model=0\$\{reloadLimitParam\}\$\{expandParam\}",
-        r"/api/session\?session_id=\$\{encodeURIComponent\(sid\)\}&messages=1&resolve_model=0&msg_limit=\$\{requestedLimit\}",
-        r"/api/session\?session_id=\$\{encodeURIComponent\(sid\)\}&messages=1&resolve_model=0&msg_before=\$\{_oldestIdx\}&msg_limit=\$\{_INITIAL_MSG_LIMIT\}",
-    ):
-        assert re.search(
-            rf"api\(\s*`{request}`,\s*\{{timeoutMs:120000\}}\s*\)",
-            src,
-        ), f"{request} must retain the explicit 120s timeout"
+    assert (
+        "api(\n"
+        "      `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`,\n"
+        "      {timeoutMs:120000}\n"
+        "    )"
+    ) in src
+    # _loadOlderMessages now picks between two strategies (tail-growth vs
+    # msg_before paging) via a useBeforePaging ternary, but both keep the long
+    # timeoutMs:120000. Assert each URL + timeout survives in the source.
+    assert (
+        "`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`,\n"
+        "          {timeoutMs:120000}"
+    ) in src
+    assert (
+        "`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_limit=${requestedLimit}`,\n"
+        "          {timeoutMs:120000}"
+    ) in src
 
 
 def test_passive_background_polls_suppress_timeout_toasts():

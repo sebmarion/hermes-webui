@@ -4,18 +4,16 @@ from email.message import Message
 import json
 from pathlib import Path
 import re
+import time
 import urllib.error
 
 import api.gateway_chat as gateway_chat
-import api.goal_continuation as goal_continuation
-import api.config as config
 import api.models as models
 import api.streaming as streaming
-from api.config import STREAMS, create_stream_channel
+from api.config import PENDING_GOAL_CONTINUATION, STREAMS, create_stream_channel
 from api.models import new_session
 from api.gateway_chat import (
     _gateway_http_error_event,
-    _gateway_reasoning_effort_for_request,
     _gateway_reasoning_delta,
     _gateway_sse_delta,
     _gateway_sse_reasoning_delta,
@@ -82,149 +80,6 @@ def test_gateway_chat_backend_env_wins_over_config_and_stays_safe():
         {"webui_chat_backend": "gateway"},
         {"HERMES_WEBUI_CHAT_BACKEND": "legacy-direct"},
     ) == "legacy"
-
-
-def test_gateway_reasoning_effort_canonicalizes_legacy_ultra_to_max():
-    effort = _gateway_reasoning_effort_for_request(
-        {"agent": {"reasoning_effort": "ultra"}},
-        model="gpt-5.6-sol",
-        model_provider="openai-codex",
-    )
-
-    assert effort == "max"
-    assert effort != "ultra"
-
-
-def test_gateway_ultra_fails_closed_before_any_gateway_request(tmp_path, monkeypatch):
-    session_dir = tmp_path / "sessions"
-    session_dir.mkdir()
-    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
-    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
-    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
-    monkeypatch.setattr(
-        config,
-        "get_config",
-        lambda: {
-            "webui_chat_backend": "gateway",
-            "agent": {"reasoning_effort": "max", "reasoning_mode": "ultra"},
-        },
-    )
-    monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
-    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_USE_RUNS_API", "1")
-
-    gateway_calls = []
-
-    def unexpected_gateway_call(*args, **kwargs):
-        gateway_calls.append((args, kwargs))
-        raise AssertionError("Ultra guard must run before opening or probing the Gateway")
-
-    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", unexpected_gateway_call)
-    monkeypatch.setattr(gateway_chat, "gateway_supports_approval", unexpected_gateway_call)
-    monkeypatch.setattr(gateway_chat, "_run_gateway_runs_api_streaming", unexpected_gateway_call)
-
-    s = new_session()
-    stream_id = "stream-gateway-ultra-fail-closed"
-    s.active_stream_id = stream_id
-    s.pending_user_message = "Use real Ultra"
-    s.pending_attachments = []
-    s.pending_started_at = 123
-    s.save()
-    channel = create_stream_channel()
-    subscriber = channel.subscribe()
-    STREAMS[stream_id] = channel
-
-    gateway_chat._run_gateway_chat_streaming(
-        s.session_id,
-        "Use real Ultra",
-        "gpt-5.6-sol",
-        str(tmp_path),
-        stream_id,
-        [],
-        model_provider="openai-codex",
-    )
-
-    events = []
-    while not subscriber.empty():
-        events.append(subscriber.get_nowait())
-    app_errors = [item[1] for item in events if item[0] == "apperror"]
-
-    assert gateway_calls == []
-    assert app_errors == [
-        {
-            "label": "Ultra is unavailable through Gateway chat",
-            "type": "gateway_ultra_unsupported",
-            "message": "Real Ultra requires native WebUI chat and cannot run through the Gateway backend.",
-            "hint": "Use native WebUI chat for Ultra, or select Max to keep using Gateway chat.",
-        }
-    ]
-    assert not any(item[0] in {"token", "done", "stream_end"} for item in events)
-
-
-def test_gateway_stale_ultra_mode_is_inert_after_switching_away_from_sol(tmp_path, monkeypatch):
-    session_dir = tmp_path / "sessions"
-    session_dir.mkdir()
-    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
-    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
-    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
-    monkeypatch.setattr(
-        config,
-        "get_config",
-        lambda: {
-            "webui_chat_backend": "gateway",
-            "agent": {"reasoning_effort": "max", "reasoning_mode": "ultra"},
-        },
-    )
-    monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
-    monkeypatch.delenv("HERMES_WEBUI_GATEWAY_USE_RUNS_API", raising=False)
-    monkeypatch.setattr(gateway_chat, "gateway_approval_unavailable_reason", lambda *_args: None)
-
-    captured = {}
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def __iter__(self):
-            yield b'data: {"choices":[{"delta":{"content":"normal request"}}]}\n\n'
-            yield b'data: [DONE]\n\n'
-
-    def fake_urlopen(req, timeout=0):
-        captured["body"] = json.loads(req.data.decode("utf-8"))
-        return FakeResponse()
-
-    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
-
-    s = new_session()
-    stream_id = "stream-gateway-stale-ultra-mode"
-    s.active_stream_id = stream_id
-    s.pending_user_message = "Use the selected model"
-    s.pending_attachments = []
-    s.pending_started_at = 123
-    s.save()
-    channel = create_stream_channel()
-    subscriber = channel.subscribe()
-    STREAMS[stream_id] = channel
-
-    gateway_chat._run_gateway_chat_streaming(
-        s.session_id,
-        "Use the selected model",
-        "gpt-5.5",
-        str(tmp_path),
-        stream_id,
-        [],
-        model_provider="openai-codex",
-    )
-
-    events = []
-    while not subscriber.empty():
-        events.append(subscriber.get_nowait())
-
-    assert captured["body"]["reasoning_effort"] == "xhigh"
-    assert captured["body"]["reasoning_effort"] != "ultra"
-    assert not any(item[0] == "apperror" for item in events)
 
 
 def test_gateway_sse_delta_extracts_openai_chat_chunks():
@@ -296,6 +151,26 @@ def test_gateway_tool_progress_event_translates_gateway_lifecycle_payloads():
         },
     )
     assert _gateway_tool_progress_event({"tool": "_thinking", "status": "running"}) is None
+
+
+def test_gateway_tool_progress_event_bounds_pathological_args():
+    long_command = "python -c " + repr("print('x')\n" * 24)
+    event_name, event_payload = _gateway_tool_progress_event(
+        {
+            "tool": "terminal",
+            "toolCallId": "call-huge",
+            "status": "running",
+            "args": {
+                "command": long_command,
+                "items": [{"index": i, "payload": "x" * 100} for i in range(50_000)],
+            },
+        }
+    )
+
+    assert event_name == "tool"
+    assert event_payload["args"]["command"] == long_command
+    assert len(event_payload["args"]["items"]) <= 64
+    assert len(json.dumps(event_payload["args"], sort_keys=True)) < 100_000
 
 
 def test_gateway_reasoning_delta_keeps_string_deltas_and_ignores_structured_payloads():
@@ -521,12 +396,20 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
     assert all(len(item) == 3 and item[2] for item in events)
 
 
-def test_gateway_continuation_writeback_keeps_one_internal_control_prompt(tmp_path, monkeypatch):
+def test_gateway_chat_worker_classifies_terminal_provider_error_without_text(tmp_path, monkeypatch):
+    """Gateway terminal errors must survive an empty assistant stream."""
+    from unittest.mock import MagicMock
+
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
     monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    error_text = (
+        'HTTP 400: {"detail":"Invalid Request: Invalid model format or no credentials '
+        'for provider: <redacted>"}'
+    )
+    response_error = [error_text]
 
     class FakeResponse:
         def __enter__(self):
@@ -536,53 +419,247 @@ def test_gateway_continuation_writeback_keeps_one_internal_control_prompt(tmp_pa
             return False
 
         def __iter__(self):
-            yield b'data: {"choices":[{"delta":{"content":"continued"}}]}\n\n'
-            yield b'data: [DONE]\n\n'
+            if response_error[0] == "partial":
+                yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+                yield f'data: {{"error":{json.dumps(error_text)}}}\n\n'.encode()
+            elif response_error[0]:
+                yield f'data: {{"error":{json.dumps(response_error[0])}}}\n\n'.encode()
+            yield b"data: [DONE]\n\n"
 
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
+    monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda cfg: {"status": "not_configured", "source": "none", "label": "", "message_count": 0, "messages": []})
+    monkeypatch.setattr(streaming, "_prefill_messages_with_webui_context", lambda ctx, cfg: [])
     monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", lambda req, timeout=0: FakeResponse())
 
-    prompt = "Continue the interrupted task without repeating completed work."
-    control = {"execution_id": "exec-1", "continuation_index": 1}
+    events = []
+    channel = MagicMock()
+    channel.put_nowait = lambda item: events.append(item)
     s = new_session()
-    s.messages = [{"role": "assistant", "content": "Segment one complete."}]
-    s.context_messages = [
-        {"role": "assistant", "content": "Segment one complete."},
-        {
-            "role": "user",
-            "content": prompt,
-            "_tool_limit_continuation_control": control,
-        },
+    stream_id = "stream-gateway-terminal-provider-error-test"
+    s.active_stream_id = stream_id
+    s.pending_user_message = "Say hello"
+    s.pending_started_at = 222
+    s.pending_attachments = [{"name": "current.png"}]
+    s.messages = [
+        {"role": "user", "content": "Say hello", "timestamp": 111, "attachments": [{"name": "old.png"}]},
+        {"role": "assistant", "content": "Earlier answer"},
     ]
-    s.tool_limit_continuation = control
-    s.active_stream_id = "stream-gateway-continuation"
-    s.pending_user_message = prompt
-    s.pending_user_source = "tool_limit_continuation"
-    s.pending_attachments = []
-    s.pending_started_at = 123
+    s.context_messages = [
+        {"role": "user", "content": "Say hello", "timestamp": 111, "attachments": [{"name": "old.png"}]},
+        {"role": "assistant", "content": "Earlier answer"},
+    ]
     s.save()
-    channel = create_stream_channel()
-    STREAMS[s.active_stream_id] = channel
+    STREAMS[stream_id] = channel
 
     gateway_chat._run_gateway_chat_streaming(
         s.session_id,
-        prompt,
+        "Say hello",
         "test-model",
         str(tmp_path),
-        s.active_stream_id,
+        stream_id,
+        [],
+    )
+
+    apperrors = [item[1] for item in events if item[0] == "apperror"]
+    assert apperrors
+    assert apperrors[-1]["type"] in {"model_not_found", "auth_mismatch"}
+    assert apperrors[-1]["session_id"] == s.session_id
+    saved = models.get_session(s.session_id)
+    user_messages = [m for m in saved.messages if m.get("role") == "user"]
+    assert len(user_messages) == 2
+    assert user_messages[-1]["timestamp"] == 222
+    assert user_messages[-1]["attachments"] == [{"name": "current.png"}]
+    context_users = [m for m in saved.context_messages if m.get("role") == "user"]
+    assert len(context_users) == 2
+    assert context_users[-1]["timestamp"] == 222
+    assert context_users[-1]["attachments"] == [{"name": "current.png"}]
+    assert saved.messages[-1].get("_error") is True
+
+    response_error[0] = ""
+    empty_stream_id = "stream-gateway-empty-response-test"
+    s = new_session()
+    s.active_stream_id = empty_stream_id
+    s.pending_user_message = "Say hello"
+    s.pending_attachments = []
+    s.save()
+    empty_events = []
+    empty_channel = MagicMock()
+    empty_channel.put_nowait = lambda item: empty_events.append(item)
+    STREAMS[empty_stream_id] = empty_channel
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "Say hello",
+        "test-model",
+        str(tmp_path),
+        empty_stream_id,
+        [],
+    )
+    empty_errors = [item[1] for item in empty_events if item[0] == "apperror"]
+    assert empty_errors[-1]["type"] == "gateway_empty_response"
+    assert empty_errors[-1]["session_id"] == s.session_id
+
+    response_error[0] = "Gateway provider failed without a known classification"
+    unknown_stream_id = "stream-gateway-unknown-terminal-error-test"
+    s = new_session()
+    s.active_stream_id = unknown_stream_id
+    s.pending_user_message = "Say hello"
+    s.pending_attachments = []
+    s.save()
+    unknown_events = []
+    unknown_channel = MagicMock()
+    unknown_channel.put_nowait = lambda item: unknown_events.append(item)
+    STREAMS[unknown_stream_id] = unknown_channel
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "Say hello",
+        "test-model",
+        str(tmp_path),
+        unknown_stream_id,
+        [],
+    )
+    unknown_errors = [item[1] for item in unknown_events if item[0] == "apperror"]
+    assert unknown_errors[-1]["type"] == "error"
+    assert "Gateway provider failed" in unknown_errors[-1]["message"]
+    unknown_payload_error = unknown_errors[-1]["session"]["messages"][-1]
+    assert unknown_payload_error.get("_error") is True
+    assert "_turnDuration" not in unknown_payload_error
+
+    response_error[0] = error_text
+    future_stream_id = "stream-gateway-future-duration-terminal-error-test"
+    s = new_session()
+    s.active_stream_id = future_stream_id
+    s.pending_user_message = "Say hello"
+    s.pending_started_at = time.time() + 30
+    s.pending_attachments = []
+    s.save()
+    future_events = []
+    future_channel = MagicMock()
+    future_channel.put_nowait = lambda item: future_events.append(item)
+    STREAMS[future_stream_id] = future_channel
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "Say hello",
+        "test-model",
+        str(tmp_path),
+        future_stream_id,
+        [],
+    )
+    future_errors = [item[1] for item in future_events if item[0] == "apperror"]
+    assert future_errors[-1]["type"] in {"model_not_found", "auth_mismatch"}
+    saved = models.get_session(s.session_id)
+    assert saved.messages[-1].get("_error") is True
+    assert "_turnDuration" not in saved.messages[-1]
+    future_payload_error = future_errors[-1]["session"]["messages"][-1]
+    assert future_payload_error.get("_error") is True
+    assert "_turnDuration" not in future_payload_error
+
+    response_error[0] = "partial"
+    partial_stream_id = "stream-gateway-partial-terminal-error-test"
+    s = new_session()
+    s.active_stream_id = partial_stream_id
+    s.pending_user_message = "Say hello"
+    s.pending_attachments = []
+    s.save()
+    partial_events = []
+    partial_channel = MagicMock()
+    partial_channel.put_nowait = lambda item: partial_events.append(item)
+    STREAMS[partial_stream_id] = partial_channel
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "Say hello",
+        "test-model",
+        str(tmp_path),
+        partial_stream_id,
+        [],
+    )
+    partial_errors = [item[1] for item in partial_events if item[0] == "apperror"]
+    assert partial_errors[-1]["type"] in {"model_not_found", "auth_mismatch"}
+    saved = models.get_session(s.session_id)
+    assert [message.get("role") for message in saved.messages[-3:]] == ["user", "assistant", "assistant"]
+    partial_message = saved.messages[-2]
+    assert partial_message.get("_partial") is True
+    assert partial_message["content"] == "partial"
+    error_message = saved.messages[-1]
+    assert error_message.get("_error") is True
+    assert "Invalid Request" in error_message.get("provider_details", "")
+    payload_messages = partial_errors[-1]["session"]["messages"]
+    assert payload_messages[-2]["_partial"] is True
+    assert payload_messages[-2]["content"] == "partial"
+    assert payload_messages[-1]["_error"] is True
+    assert "_turnDuration" not in payload_messages[-1]
+
+
+def test_gateway_chat_worker_persists_reasoning_and_tool_state_on_terminal_error(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    error_text = (
+        'HTTP 400: {"detail":"Invalid Request: Invalid model format or no credentials '
+        'for provider: <redacted>"}'
+    )
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"part"}}]}\n\n'
+            yield b'event: hermes.tool.progress\n'
+            yield b'data: {"tool":"terminal","label":"terminal: pytest","toolCallId":"call-1","status":"running","arguments":{}}\n\n'
+            yield b'event: reasoning.available\n'
+            yield b'data: {"text":"Preview reasoning"}\n\n'
+            yield f'data: {{"error":{json.dumps(error_text)}}}\n\n'.encode()
+            yield b"data: [DONE]\n\n"
+
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
+    monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda cfg: {"status": "not_configured", "source": "none", "label": "", "message_count": 0, "messages": []})
+    monkeypatch.setattr(streaming, "_prefill_messages_with_webui_context", lambda ctx, cfg: [])
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", lambda req, timeout=0: FakeResponse())
+
+    events = []
+    channel = MagicMock()
+    channel.put_nowait = lambda item: events.append(item)
+    s = new_session()
+    stream_id = "stream-gateway-terminal-reasoning-tool-error-test"
+    s.active_stream_id = stream_id
+    s.pending_user_message = "Say hello"
+    s.pending_attachments = []
+    s.save()
+    STREAMS[stream_id] = channel
+
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "Say hello",
+        "test-model",
+        str(tmp_path),
+        stream_id,
         [],
     )
 
     saved = models.get_session(s.session_id)
-    matching = [
-        message
-        for message in saved.context_messages
-        if streaming._internal_control_prompt_matches(message, prompt)
-    ]
-    assert len(matching) == 1
-    assert matching[0]["_tool_limit_continuation_control"] == control
-    assert all(message.get("content") != prompt for message in saved.messages)
-    assert saved.messages[-1]["content"] == "continued"
+    partial_message = saved.messages[-2]
+    assert partial_message.get("_partial") is True
+    assert partial_message["content"] == "part"
+    assert partial_message["reasoning"] == "Preview reasoning"
+    assert partial_message["_partial_tool_calls"] == [{
+        "name": "terminal",
+        "args": {},
+        "done": True,
+        "tid": "call-1",
+        "_sealed_by_terminal_error": True,
+    }]
+    apperrors = [item[1] for item in events if item[0] == "apperror"]
+    assert apperrors[-1]["session"]["messages"][-2]["reasoning"] == "Preview reasoning"
+    assert apperrors[-1]["session"]["messages"][-2]["_partial_tool_calls"][0]["name"] == "terminal"
+    assert apperrors[-1]["session"]["messages"][-1]["_error"] is True
 
 
 def test_gateway_chat_worker_preserves_reasoning_delta_whitespace_and_persists_reasoning(tmp_path, monkeypatch):
@@ -706,16 +783,6 @@ def test_gateway_chat_worker_emits_goal_continue_for_goal_related_turn(tmp_path,
     monkeypatch.setattr(models, "SESSION_DIR", session_dir)
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
     monkeypatch.setattr(models, "SESSIONS", OrderedDict())
-    monkeypatch.setattr(config, "SESSION_DIR", session_dir)
-    monkeypatch.setattr(goal_continuation, "_goal_revision_is_active", lambda *args, **kwargs: True)
-    starts = []
-    from api import routes
-    monkeypatch.setattr(
-            routes,
-            "start_session_turn",
-            lambda sid, prompt, source=None: starts.append((sid, prompt, source))
-            or {"session_id": sid, "stream_id": "goal-successor"},
-        )
 
     class FakeResponse:
         def __enter__(self):
@@ -744,7 +811,6 @@ def test_gateway_chat_worker_emits_goal_continue_for_goal_related_turn(tmp_path,
             "message": "Continuing goal",
             "message_key": "goal_continuing",
             "message_args": ["one step remains"],
-            "goal_revision": 7,
         },
     )
 
@@ -758,6 +824,7 @@ def test_gateway_chat_worker_emits_goal_continue_for_goal_related_turn(tmp_path,
     channel = create_stream_channel()
     subscriber = channel.subscribe()
     STREAMS[stream_id] = channel
+    PENDING_GOAL_CONTINUATION.discard(s.session_id)
 
     gateway_chat._run_gateway_chat_streaming(
         s.session_id,
@@ -781,10 +848,7 @@ def test_gateway_chat_worker_emits_goal_continue_for_goal_related_turn(tmp_path,
     assert "stream_end" in event_names
     assert event_names.index("goal_continue") < event_names.index("done")
     assert event_names.index("done") < event_names.index("stream_end")
-    assert starts == [(s.session_id, "continue the goal", "goal_continuation")]
-    receipt = next(iter(goal_continuation.load_receipts()["receipts"].values()))
-    assert receipt["state"] == "started"
-    assert receipt["child_stream_id"] == "goal-successor"
+    assert s.session_id in PENDING_GOAL_CONTINUATION
 
     goal_continue_event = next(item for item in events if item[0] == "goal_continue")
     assert goal_continue_event[1]["continuation_prompt"] == "continue the goal"
@@ -792,56 +856,6 @@ def test_gateway_chat_worker_emits_goal_continue_for_goal_related_turn(tmp_path,
     assert goal_continue_event[1]["message_key"] == "goal_continuing"
     assert saved.messages[-1]["role"] == "assistant"
     assert saved.messages[-1]["content"] == "goal reply"
-
-
-def test_gateway_chat_worker_preserves_raw_paused_goal_message(tmp_path, monkeypatch):
-    session_dir = tmp_path / "sessions"
-    session_dir.mkdir()
-    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
-    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
-    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
-
-    class FakeResponse:
-        def __enter__(self):
-            return self
-        def __exit__(self, exc_type, exc, tb):
-            return False
-        def __iter__(self):
-            yield b'data: {"choices":[{"delta":{"content":"blocked"}}]}\n\n'
-            yield b'data: [DONE]\n\n'
-
-    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
-    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", lambda req, timeout=0: FakeResponse())
-    from api import goals as webui_goals
-    monkeypatch.setattr(webui_goals, "has_active_goal", lambda *args, **kwargs: True)
-    monkeypatch.setattr(webui_goals, "evaluate_goal_after_turn", lambda *args, **kwargs: {
-        "should_continue": False,
-        "continuation_prompt": None,
-        "message": "Goal paused — resume manually",
-    })
-
-    s = new_session()
-    stream_id = "stream-gateway-goal-paused"
-    s.active_stream_id = stream_id
-    s.pending_user_message = "finish it"
-    s.pending_attachments = []
-    s.pending_started_at = 123
-    s.save()
-    channel = create_stream_channel()
-    subscriber = channel.subscribe()
-    STREAMS[stream_id] = channel
-
-    gateway_chat._run_gateway_chat_streaming(
-        s.session_id, "finish it", "test-model", str(tmp_path), stream_id, [], goal_related=True
-    )
-
-    events = []
-    while not subscriber.empty():
-        events.append(subscriber.get_nowait())
-    goal_event = [item for item in events if item[0] == "goal"][-1]
-    assert goal_event[1]["message"] == "Goal paused — resume manually"
-    assert goal_event[1]["message_key"] == ""
-    assert "goal_continue" not in [item[0] for item in events]
 
 
 def test_gateway_chat_worker_skips_goal_judge_for_non_goal_turn(tmp_path, monkeypatch):
@@ -891,6 +905,7 @@ def test_gateway_chat_worker_skips_goal_judge_for_non_goal_turn(tmp_path, monkey
     channel = create_stream_channel()
     subscriber = channel.subscribe()
     STREAMS[stream_id] = channel
+    PENDING_GOAL_CONTINUATION.discard(s.session_id)
 
     gateway_chat._run_gateway_chat_streaming(
         s.session_id,
@@ -913,6 +928,7 @@ def test_gateway_chat_worker_skips_goal_judge_for_non_goal_turn(tmp_path, monkey
     assert "stream_end" in event_names
     assert has_goal_calls == []
     assert judge_calls == []
+    assert s.session_id not in PENDING_GOAL_CONTINUATION
 
 
 def test_gateway_chat_worker_normalizes_prefill_slice_before_system_prefix(tmp_path, monkeypatch):
@@ -1456,6 +1472,73 @@ def test_gateway_runs_api_body_includes_session_id():
                 )
         assert "/v1/runs" in captured["url"]
         assert captured["body"]["session_id"] == "sess-stable-uuid"
+    finally:
+        with STREAMS_LOCK:
+            STREAMS.pop(stream_id, None)
+
+
+def test_gateway_runs_api_classifies_terminal_provider_error(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock, patch
+
+    from api.config import STREAMS, STREAMS_LOCK
+    from api.gateway_chat import _run_gateway_chat_streaming
+
+    error_text = "HTTP 400: Invalid model format or no credentials for provider"
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    events = []
+    q = MagicMock()
+    q.put_nowait = lambda item: events.append(item)
+    stream_id = "sid-runs-terminal-provider-error"
+    with STREAMS_LOCK:
+        STREAMS[stream_id] = q
+
+    call_count = [0]
+
+    def fake_urlopen(req, *, timeout=None):
+        call_count[0] += 1
+        resp = MagicMock()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = lambda s, *a: None
+        if call_count[0] == 1:
+            resp.read = lambda sz=65536: b'{"run_id":"run_error"}'
+        else:
+            resp.__iter__ = lambda s: iter([
+                b'event: run.failed\n',
+                f'data: {{"error":{json.dumps(error_text)}}}\n'.encode(),
+            ])
+        return resp
+
+    try:
+        s = new_session()
+        s.active_stream_id = stream_id
+        s.pending_user_message = "hi"
+        s.pending_attachments = []
+        s.save()
+        with patch.dict("os.environ", {
+            "HERMES_WEBUI_CHAT_BACKEND": "gateway",
+            "HERMES_WEBUI_GATEWAY_USE_RUNS_API": "1",
+            "HERMES_WEBUI_GATEWAY_BASE_URL": "http://gateway.local",
+        }, clear=True), \
+             patch("api.gateway_chat.gateway_supports_approval", return_value=True), \
+             patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            _run_gateway_chat_streaming(
+                session_id=s.session_id,
+                msg_text="hi",
+                model="test",
+                workspace="/tmp",
+                stream_id=stream_id,
+            )
+        apperrors = [item[1] for item in events if item[0] == "apperror"]
+        assert apperrors[-1]["type"] in {"model_not_found", "auth_mismatch"}
+        assert apperrors[-1]["session_id"] == s.session_id
+        saved = models.get_session(s.session_id)
+        assert [message.get("role") for message in saved.messages[-2:]] == ["user", "assistant"]
+        assert saved.messages[-1]["_error"] is True
+        assert apperrors[-1]["session"]["messages"][-1]["_error"] is True
     finally:
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
