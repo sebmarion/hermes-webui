@@ -1,478 +1,547 @@
-# Zeus Evidence-Calibrated WebUI Release Design
+# Zeus WebUI Release Actuator MVP
 
 **Date:** 2026-07-31
-**Status:** Draft — ready for user review; implementation blocked by open decisions
-**Owners:** Hermes WebUI, Hermes Agent, and Zeus release automation
+**Status:** Proposed — corrected after adversarial review; ready for user approval
+**Scope:** Hermes WebUI only
 
-## Summary
+## Decision
 
-Zeus will research, implement, evaluate, and publish WebUI release candidates
-using whichever local model is active at the time. The Mac will pull, verify,
-materialize, promote, and roll back the WebUI release. Gateway and Hermes Agent
-remain compatibility-checked but are not co-released by this system.
+The MVP has two independent lanes:
 
-The release system will not use arbitrary global limits such as a fixed token
-cap, file-count threshold, line-count threshold, candidate age, or retry
-interval. Those values are policy decisions that must be derived from measured
-workload and operator capacity. The first version therefore has:
+1. A deterministic release actuator automatically integrates and releases
+   policy-approved WebUI commits from Zeus to the Mac.
+2. A finite shadow worker uses whichever local model is active on Zeus to
+   research, propose, and review one candidate without gaining production
+   authority.
 
-- fixed safety invariants;
-- a fresh-context, structured workflow that prevents transcript replay;
-- an instrumented shadow phase;
-- model- and task-class-specific budgets learned from successful and failed
-  traces;
-- semantic risk admission instead of file size as the release authority;
-- an independently signed admission policy that shadow data cannot change.
+This is deliberately a **release-actuator MVP**, not autonomous promotion of
+model-authored patches. It proves the production release and rollback mechanism
+while collecting bounded local-model evidence. Automatic promotion of
+Zeus-authored patches is a separate Phase 2 contract:
 
-This document deliberately separates the MVP actuator from the later
-autonomous-promotion policy. Without that boundary, calibration, attestation,
-privileged Mac sealing, and crash-safe release become one oversized first
-implementation.
+`2026-07-31-zeus-local-model-autonomous-promotion-phase2.md`
 
-The scheduler uses otherwise-idle Zeus capacity and yields immediately when
-interactive local inference needs the model. A candidate can pause and resume
-while its source, model, runtime, and compatibility identities remain valid.
+The distinction is an acceptance boundary, not wording:
 
-## Evidence and decision
+- a trusted release-ref commit may promote automatically in the MVP;
+- a local-model-authored commit may not reach the release ref, sign policy, sign
+  READY, or trigger Mac activation in the MVP;
+- no Phase 2 broker, learned budget, or local-patch promotion requirement can
+  block MVP acceptance.
 
-The previous numerical proposal is withdrawn.
+## Why this controls token spend
 
-Observed recent data does not justify universal file or token limits. The
-planning observations are accompanied by the reproducible collection commands,
-population definitions, percentile rank rule, repository/remote identity, and
-collection timestamp in the companion evidence receipt:
+The observed Hermes sessions show pathological transcript replay. They do not
+justify a universal token number for a new local-model workflow. The planning
+receipt records the observations and their limitations:
 
 `2026-07-31-zeus-evidence-calibrated-webui-release-evidence.json`
 
-The receipt is planning evidence only. It is not an admission policy and cannot
-authorize a release.
+The MVP controls consumption structurally:
 
-The measured observations are:
+- every stage receives a fresh context;
+- there are at most three model invocation attempts per shadow candidate:
+  research,
+  implementation, and review;
+- stages cannot recursively create agents or reviewers;
+- deterministic test failures and review findings quarantine the candidate;
+- there is no autonomous repair, retry, continuation, or conversation loop;
+- a shadow candidate requires an immutable externally supplied task receipt;
+- `{task digest, source base, model identity}` may run only once unless a new
+  task receipt explicitly supersedes it;
+- only one shadow model stage may execute at a time;
+- interactive local inference immediately preempts shadow work;
+- preemption terminates that candidate; the controller does not restart or
+  resume the stage automatically;
+- the scheduler does not start another shadow stage until the local runtime
+  proves the cancelled request released its inference slot; missing proof
+  disables shadow scheduling;
+- the active runtime's reported context capacity and the stage's bounded output
+  schema provide the absolute per-call ceiling; the request sets an explicit
+  output cap no larger than the remaining context capacity;
+- any missing usage, model identity, cancellation, or progress receipt fails the
+  stage closed.
 
-- The latest 100 merged WebUI PRs have a median of 3 changed files and 187
-  changed lines, but a P95 of 11 files and 1,590 lines.
-- The proposed 8-file/400-line rule would admit about 70% of those PRs, but
-  the same rule admits about 57% of the last 100 local non-merge commits.
-- Recent full test workflow runs have a median duration of about 243 seconds
-  and a P95 of about 328 seconds. Full deterministic testing is therefore a
-  better control than saving model context by weakening tests.
-- Recent Hermes WebUI sessions contain pathological long-context replay. They
-  are evidence for eliminating the session-shaped harness, not evidence for a
-  production token budget for fresh local-model stages.
-
-Size remains useful as an anomaly signal and emergency circuit breaker, but it
-does not decide semantic release risk. A small authentication change can be
-more dangerous than a large stylesheet change.
+These are fixed safety invariants. They do not depend on statistical calibration
+and they do not claim that three calls are an optimal long-term budget. Each call
+exists because the MVP requires one independently attributable artifact.
 
 ## Goals
 
-- Automate bounded WebUI research and candidate construction on Zeus.
-- Use only the currently active local Zeus model for model-driven work.
-- Prevent long-lived conversational context from being replayed between steps.
-- Measure prompt, cached-prompt, completion, context, wall-time, and GPU-work
-  usage per stage and per model identity.
-- Derive operating budgets from observed completion and failure distributions.
-- Release trusted candidates without changing Gateway or Agent versions.
-- Preserve exact identity, idle-drain, selector-CAS, restart, health, and
-  rollback guarantees.
-- Allow a complaint-triggered deterministic rollback without requiring a
-  natural-language classifier in the MVP.
+- Pull upstream changes into the operator-controlled release ref on Zeus.
+- Build and test platform-neutral WebUI candidates on Zeus.
+- Use only the active local Zeus model for shadow research, implementation, and
+  review.
+- Prevent Hermes transcript replay and online-provider fallback.
+- Automatically release an eligible trusted release-ref commit without
+  per-release approval.
+- Keep Gateway and Hermes Agent at their current exact identities.
+- Materialize the macOS release on the Mac using the pinned local runtime and
+  Agent source already trusted by the selector.
+- Fence new work, drain authoritative activity, activate by selector CAS,
+  verify exact identity, and either promote or roll back.
+- Preserve a deterministic authenticated complaint rollback.
 
 ## Non-goals
 
-- Automatically changing the active Zeus model.
-- Calling an online model or routing through Hermes provider selection.
-- Releasing Gateway, Hermes Agent, or release-controller changes.
-- Automatically accepting authentication, security, migration, dependency,
-  state-durability, or release-machinery changes in the first local-patch tier.
-- Treating file count, line count, token count, or candidate age as proof of
-  safety.
-- Making the Mac production workspace a mutable Git checkout.
-- Requiring the Mac to listen for inbound Zeus SSH connections.
+- Automatically promoting a Zeus-authored patch.
+- Automatically resolving an upstream merge conflict.
+- Calling an online model or routing model work through Hermes provider
+  selection.
+- Changing the active local model.
+- Releasing Gateway, Hermes Agent, the selector, or the release controller.
+- Introducing a privileged Mac helper or a second Mac service account.
+- Treating file count, line count, candidate age, or a guessed token number as
+  semantic release authority.
+- Running deep production health checks during cutover.
 
-## MVP boundary
+## Trust boundaries
 
-The MVP is a deterministic WebUI release actuator plus a local-model shadow
-pipeline.
+### Trusted in the MVP
 
-MVP may automatically promote only a trusted upstream candidate that matches a
-hand-authored, independently approved immutable admission policy. That path proves source
-provenance, Mac pull/materialization, isolated smoke, WebUI fencing, selector
-CAS, restart, exact identity verification, and rollback.
+- the operator-signed static admission policy;
+- the deterministic Zeus source synchronizer, evaluator, and publisher;
+- the dedicated READY signing key, unavailable to the model worker;
+- the Mac user-level release controller;
+- the pinned selector, macOS runtime, Agent source, and release-control
+  primitives named by policy.
 
-The static MVP policy names the authoritative release remote, WebUI-only path
-scope, forbidden surfaces, required deterministic gates, expected Gateway/Agent
-identities, and exact selector/runtime contract. It is not learned and cannot
-authorize a Zeus-authored patch or a policy change.
+### Untrusted in the MVP
 
-The Zeus local model is active in the MVP for research, implementation, and
-review shadow runs. It may create candidates and evidence, but it cannot create
-or widen the admission policy and cannot cause a model-authored candidate to
-promote automatically. This gives us real local-model telemetry without making
-unvalidated calibration the release authority.
+- model output;
+- the model worker's filesystem edits;
+- downloaded archives before verification;
+- network transport;
+- mutable remote refs until re-fetched and bound to a commit;
+- stale receipts, stale selector generations, and incomplete activity data.
 
-The MVP implementation slice is therefore:
+The model worker has no Git push credential, READY signing key, policy signing
+key, Mac credential, sudo, or external network access. The deterministic source
+fetcher may use the network but has no model-provider credentials.
 
-- direct local-model invocation and model-identity telemetry;
-- bounded fresh-context research/implementation/review stages;
-- deterministic baseline/candidate tests and forbidden-surface checks;
-- signed, content-addressed READY bundles;
-- Mac pull, sealed materialization, isolated smoke, fence, selector activation,
-  exact health verification, and durable rollback;
-- append-only evidence receipts with reproducible collection metadata.
+## Static admission policy
 
-The following are Phase 2, not MVP implementation requirements:
+The operator signs one immutable MVP policy before enabling automation. This is
+a one-time policy approval, not a per-release approval.
 
-- learned model/task-class budgets that authorize promotion;
-- automated promotion of Zeus-authored patches;
-- the full statistical calibration and held-out policy-fitting loop;
-- an attested inference broker lease protocol;
-- expansion beyond the initial fixed policy's low-risk WebUI class.
+The policy pins:
 
-Phase 2 cannot be enabled by a model output or by shadow data. It requires a
-separately reviewed and signed policy artifact.
+- upstream repository: `git@github.com:nesquena/hermes-webui.git`;
+- upstream ref: `refs/heads/master`;
+- release repository: `git@github.com:sebmarion/hermes-webui.git`;
+- release ref: `refs/heads/main`;
+- the READY signer public key;
+- exact selector digest and selector-state schema;
+- exact macOS runtime manifest;
+- exact Hermes Agent source identity;
+- exact expected Gateway identity;
+- WebUI-only archive roots and forbidden surface manifest;
+- repository test command and an external protected evaluator-bundle digest;
+- isolated smoke contract;
+- receipt schemas and byte/count bounds.
 
-## Architecture
+The policy is signed with an operator policy key whose private half is not
+available to Zeus automation or the Mac controller. The Mac pins the policy
+public key and the approved policy digest. A policy change applies only to
+future candidates.
 
-### Zeus
+The MVP forbidden surface manifest rejects changes to:
 
-Zeus contains separate deterministic and model-facing components:
+- Gateway or Agent source/version declarations;
+- authentication, credential, and trust-boundary code;
+- state schema, migration, durability, and recovery machinery;
+- dependency and packaging declarations;
+- bootstrap, installer, Docker, supervisor, CI, and release machinery;
+- selector, runtime, policy, signer, controller, or controller-owned gate
+  definitions;
+- symlinks, submodules, generated binaries, or files outside the WebUI source
+  archive.
 
-1. **Source fetcher**
-   Fetches the authoritative upstream and release remotes and creates a clean
-   candidate worktree. It may use the network, but has no model-provider
-   credentials.
+The implementation must materialize these families as an exact reviewed path
+manifest with fixture tests. Unknown paths fail closed. A model cannot propose,
+generate, or widen this manifest.
 
-2. **Local-model invoker**
-   Calls only the active local inference service through a fixed local endpoint.
-   It resolves and records the active model identity before the first model
-   call and revalidates it before every later call.
+## Authoritative source and integration
 
-3. **Unprivileged work runner**
-   Runs model-requested repository inspection and edits under a dedicated
-   no-sudo service account. It cannot publish, sign, alter the release policy,
-   access Mac credentials, or modify the controller.
+### One-time baseline reconciliation
 
-4. **Deterministic evaluator**
-   Runs protected baseline tests, candidate tests, static checks, provenance
-   checks, and risk admission. Existing tests cannot be weakened or deleted
-   without causing quarantine.
+Automation cannot assume that the currently running legacy release is reachable
+from the new release ref. Before enabling the scheduler:
 
-5. **Publisher**
-   Writes an immutable source archive and signed READY manifest only after the
-   deterministic gates pass. The signing key is unavailable to the model
-   worker.
+1. Record the exact live WebUI commit, tree, manifest, Agent, runtime, selector,
+   current, and last-good receipts.
+2. Reconcile every intentional live-only change into one reviewed bootstrap
+   commit on the release ref, or record its explicit rejection.
+3. Run the protected gates against that bootstrap commit.
+4. Sign one baseline receipt binding the live selector state to the bootstrap
+   release-ref commit and its retained rollback artifacts.
+5. Disable automation if the release ref, live tree, or receipt does not match
+   that signed reconciliation.
+6. Prove that the pinned WebUI/Agent pair exposes every activity source required
+   by the release fence. If any source is unavailable, stop; a separately
+   approved compatibility prerequisite must land before the WebUI-only actuator
+   can be enabled.
 
-### Mac
+The first automated candidate must descend from the signed bootstrap commit.
+The baseline exception cannot be reused for a later non-fast-forward update.
 
-The Mac has separate pull and activation boundaries. A dedicated unprivileged
-puller uses an outbound read-only Zeus SSH identity with a forced command. It
-cannot write the selector release root, selector state, launchd configuration,
-or last-good artifacts. There is no Zeus-to-Mac inbound SSH requirement.
+### Recurring integration
 
-A narrow privileged activation helper owns only fixed staging and sealing. It
-creates release files with the ownership required by the existing selector,
-then seals them with an OS-enforced no-write boundary. It hands an exact,
-content-addressed activation request to the existing WebUI LaunchAgent, which
-continues to execute the selector/CAS and launchd operations as the WebUI user.
-The helper does not accept arbitrary shell, paths, commands, model output, or
-network requests. The puller cannot invoke the helper except through its typed
-local request interface.
+Zeus performs each integration from clean fetched objects:
 
-The poller:
+1. Fetch the exact upstream and release refs named by policy.
+2. Record both fetched object IDs and the prior accepted release commit.
+3. Reject an upstream ref that is not a descendant of the last accepted
+   upstream tip.
+4. Reject a release ref that is not a descendant of the prior accepted commit.
+5. If the fetched upstream tip is already an ancestor of the release tip, use
+   the release tip as the candidate.
+6. Otherwise create a normal merge commit from the fetched release tip and
+   fetched upstream tip in a clean worktree.
+7. If the merge conflicts, quarantine it. The local model may produce a shadow
+   suggestion, but it cannot resolve, push, or release the conflict.
+8. Run the protected baseline and candidate gates before any push.
+9. Push only a fast-forward update from the exact fetched release tip. Force
+   pushes are forbidden.
+10. Re-fetch the release ref and require its tip to equal the tested commit.
+11. Build READY only from that re-fetched commit and tree.
 
-1. verifies the publisher signature, source digest, candidate manifest, and
-   expected WebUI/Gateway/Agent identities;
-2. submits the exact candidate to the activation helper for materialization
-   against the pinned macOS
-   runtime and agent source already trusted by the selector;
-3. verifies the helper's sealed, read-only, symlink-free release receipt;
-4. runs an isolated WebUI smoke test on a disposable state directory and port;
-5. obtains the WebUI admission fence and waits for authoritative zero activity;
-6. sends the helper receipt to the existing WebUI LaunchAgent, which stages and
-   activates the existing hash-pinned selector through its lock/CAS contract;
-7. restarts the WebUI and verifies exact shallow health/build identity;
-8. promotes the candidate, or resumes one durable rollback transaction if the
-   candidate is not accepted.
+Any remote movement, source identity change, external evaluator-bundle change,
+or policy change invalidates the in-flight candidate. Repository test changes
+are recorded and run, but cannot alter the external protected evaluator. Dirty
+working-tree files are never copied into a release.
 
-The existing selector remains the authority for immutable release files,
-runtime identity, selector generation, atomic state updates, and last-good
-selection. The helper must prove that the puller cannot rewrite a staged or
-last-good tree after sealing. The new controller must not replace or weaken
-those primitives.
+## Zeus components
 
-## Model identity and local-only enforcement
+### Deterministic source synchronizer
 
-Each model-driven run records:
+- owns fetch and fast-forward push credentials;
+- creates clean integration worktrees;
+- performs conflict detection without model assistance;
+- records remote, ref, commit, tree, parent, and ancestry receipts;
+- cannot sign policy.
 
-- model-serving alias and returned model identity;
-- model-weight digest or an authoritative content-addressed model receipt;
-- inference executable digest;
-- exact serving arguments, including context size and parallelism;
-- service PID and start identity;
-- local endpoint identity.
+### Local-model shadow worker
 
-The invoker rejects any endpoint that is not the configured local endpoint,
-does not inherit online provider credentials, and never accepts a model name or
-endpoint supplied by model output. In the MVP, local inference is verified by
-the serving process executable and service identity, PID lineage and start
-token, exact configuration and model-weight identity, listening socket, and
-the absence of Hermes provider routing. This direct-process proof is recorded
-for shadow telemetry; it is not treated as the Phase 2 broker attestation.
+- resolves the active local inference process before every call;
+- calls one configured loopback/local endpoint directly;
+- does not inherit online provider credentials;
+- runs under a no-sudo account with no external network;
+- writes only to a disposable shadow worktree;
+- cannot push, publish, sign, or contact the Mac.
 
-The MVP work runner has no external network access and source research that
-needs the network is performed by a separate fetcher. Phase 2 may replace the
-MVP process proof with an attested broker over a Unix socket with peer
-credentials, a signed short-lived lease, and enforced egress denial. A Phase 2
-broker must have one pinned local inference target and no general proxy
-behavior.
+It records:
 
-If any model identity changes during a candidate, the candidate is quarantined
-and the run ends. Budgets are never carried from one model identity to another.
+- model alias and returned model identity;
+- model-weight digest or authoritative content-addressed model receipt;
+- inference executable digest, PID, start token, listening socket, and arguments;
+- context capacity and parallelism;
+- logical, cached, and uncached input; output; context high-water mark;
+- prompt/decode throughput, wall time, cancellation, and preemption;
+- exact stage input and output digests.
 
-## Workflow and state
+If the model process, weights, executable, endpoint, or serving configuration
+changes during a candidate, the candidate is quarantined.
 
-Zeus states:
+### Deterministic evaluator
+
+- loads the policy-pinned evaluator bundle outside the candidate worktree;
+- runs that protected bundle plus the repository's baseline and candidate tests
+  in clean isolated environments;
+- verifies source ancestry and the forbidden surface manifest;
+- treats missing or inconsistent evidence as failure;
+- produces the only gate result consumed by the publisher.
+
+### Publisher
+
+- has the READY signing key but no policy signing key;
+- accepts only an evaluator receipt matching the re-fetched release tip;
+- emits one immutable platform-neutral source archive and READY manifest;
+- cannot widen policy or substitute another commit after evaluation.
+
+## Finite local-model shadow workflow
+
+The shadow scheduler owns an append-only attempt ledger keyed by
+`{task digest, source base, model identity}`. It durably claims the candidate and
+then each stage before issuing a model request. A claimed stage is never invoked
+again:
+
+- a response is accepted only when it matches the unique claim;
+- a crash, lost response, cancellation ambiguity, or missing terminal receipt
+  marks that stage `INDETERMINATE` and quarantines the candidate;
+- recovery never replays an invocation to discover whether it completed.
+
+This at-most-once rule prefers losing one shadow candidate over silently
+multiplying model work.
+
+The shadow workflow is a directed acyclic graph:
 
 ```text
-DISCOVERED → RESEARCHED → PATCHED → TESTED → REVIEWED → READY
+DISCOVERED
+  → RESEARCHED
+  → PATCH_PROPOSED
+  → TESTED
+  → REVIEWED
+  → SHADOW_COMPLETE | QUARANTINED
 ```
 
-Mac states:
+### Research response
+
+One fresh call receives the task contract, bounded fetched research, repository
+map, and selected source slices. It emits bounded `research.json`. It receives
+no prior Hermes conversation.
+
+### Implementation response
+
+One fresh call receives the task contract, `research.json`, selected source
+slices, protected test contract, and output schema. It emits one patch plus
+`implementation.json`. It has no interactive tool loop.
+
+### Review response
+
+After deterministic tests, one independent fresh call receives the task
+contract, patch, bounded test result, risk manifest, and relevant source slices.
+It emits `review.json`.
+
+A failed test, malformed output, non-empty blocking review finding, identity
+drift, cancellation failure, or repeated stage request terminates the candidate.
+Repair requires a new candidate with a new deterministic task receipt; the MVP
+controller never creates it automatically.
+
+## READY bundle
+
+READY contains:
+
+- source remote/ref/commit/tree and ancestry receipt;
+- archive digest and canonical file manifest;
+- static policy digest and signer identities;
+- exact external evaluator and repository test receipts;
+- forbidden surface decision;
+- required Gateway, Agent, selector, and runtime identities;
+- expected WebUI build identity;
+- publisher signature.
+
+Shadow artifacts are stored separately and cannot be referenced as release
+authority. A READY signature authenticates the deterministic release bundle, not
+the quality of model output.
+
+## Mac release controller
+
+The MVP adds one trusted user-level release controller. It is separate from the
+existing WebUI LaunchAgent; the existing LaunchAgent remains a selector-to-WebUI
+execution path and is not treated as an IPC service.
+
+The controller:
+
+1. pulls READY over an outbound read-only transport;
+2. verifies the operator policy signature and pinned policy digest;
+3. verifies the READY signer, source identity, archive digest, and compatibility
+   identities;
+4. extracts through a traversal-safe, symlink-free materializer into a private
+   temporary directory;
+5. binds the pinned macOS runtime and Agent source;
+6. writes files with the UID expected by the selector, read-only modes, one link,
+   and no symlinks;
+7. fsyncs files and directories, then atomically renames the completed release
+   under the selector release root;
+8. asks the existing selector to verify the exact manifest;
+9. runs isolated smoke with disposable WebUI state and an isolated port;
+10. executes the durable activation transaction below.
+
+This MVP trusts the controller's user account. Read-only modes protect against
+accidental mutation and against the remote/model boundary; they are not claimed
+as protection from a compromised process running as the same trusted user.
+Stronger account separation and privileged sealing are Phase 2 hardening.
+
+## Durable activation and rollback transaction
+
+The controller owns one append-only transaction journal and one controller lock.
+Selector state remains authoritative for release selection. Every journal write
+uses atomic replace plus file and parent-directory fsync.
+
+The normal transaction is:
 
 ```text
-READY → FETCHED → MATERIALIZED → SMOKE_VERIFIED → WAITING_FOR_IDLE
-      → FENCED → ACTIVATED → ACCEPTED
+PREPARED → FENCED → ACTIVATING → ACTIVATED
+         → HEALTH_VERIFIED → PROMOTING → ACCEPTED
 ```
 
-Any pre-activation failure becomes `QUARANTINED`. A post-activation failure
-enters a durable `ROLLING_BACK` transaction. Rollback is idempotent and
-crash-resumable; transport retries are bounded by the scheduler's current
-resource policy, while the semantic rollback operation remains one transaction.
+The exact ordering is:
 
-The durable ledger also records explicit exits for `CANCELLED`, `REPLACED`,
-`IDENTITY_INVALIDATED`, `POLICY_INVALIDATED`, `FETCH_FAILED`,
-`MATERIALIZATION_FAILED`, `FENCE_FAILED`, `ACTIVATION_FAILED`,
-`ROLLBACK_FAILED`, and `MANUAL_RECOVERY_REQUIRED`. Each terminal state records
-the owner, last durable phase, failure class, retry eligibility, and the exact
-receipt needed for recovery. A replacement cannot delete or overwrite an
-active transaction; it must first reach a durable cancellation or quarantine
-state.
+1. Under the controller lock, read and validate selector state.
+2. Persist `PREPARED` with transaction ID, policy/READY digests, current and
+   last-good identities, selector generation/state digest, and candidate.
+3. Acquire the authenticated WebUI admission fence, establish the existing
+   process-independent pair-open gate, and wait until every authoritative
+   activity source is available and zero.
+4. Commit the fence and persist `FENCED`. Admission must remain closed across
+   both candidate and rollback restarts.
+5. Persist `ACTIVATING` with the expected selector generation.
+6. In one selector `update_selector_state` CAS, compose `stage_candidate` and
+   `activate_candidate`. This prevents a durable stage-only crash state.
+7. Persist the resulting selector generation and state digest as `ACTIVATED`.
+8. Restart the existing WebUI LaunchAgent.
+9. Require exact shallow health: candidate build/commit/tree/manifest, Agent,
+   runtime, selector generation, launch mode, process identity, and closed
+   admission transaction. Do not run deep production health.
+10. Persist the signed health receipt as `HEALTH_VERIFIED`.
+11. Persist `PROMOTING`, then run `promote_candidate` through selector CAS.
+12. Persist the promoted selector generation/state digest as `ACCEPTED`.
+13. Remove the pair-open gate and reopen admission only after the accepted
+    identity is re-read successfully.
 
-A candidate becomes invalid immediately if its source base, model identity,
-runtime identity, compatibility identity, signature, or policy digest changes.
-No arbitrary time-to-live is required.
+Any failure after selector activation first persists `ROLLING_BACK`. Rollback:
 
-## Evidence-calibrated budgets
+1. keeps the process-independent gate closed;
+2. runs `rollback_to_last_good` through selector CAS using the last observed
+   generation;
+3. persists the rollback selector generation and exact target identity;
+4. restarts the WebUI;
+5. verifies exact shallow health for the recorded prior release while admission
+   remains pair-gated;
+6. when the rollback follows a failed candidate, restores the journal's
+   independently verified pre-activation fallback as `last_good` through one
+   more selector CAS;
+7. persists `ROLLED_BACK`;
+8. removes the gate and reopens admission.
 
-### Structural controls
+The existing `rollback_to_last_good` transition makes `current` and `last_good`
+equal. The controller must not pretend that rollback depth still exists:
 
-Every model stage receives a fresh context assembled from:
+- after a failed candidate, it may restore the older pre-activation fallback
+  only after verifying its immutable release record; if that fallback is
+  missing or invalid, it records `ROLLBACK_DEPTH_EXHAUSTED`;
+- after a complaint rollback, the complained-about release is not eligible as
+  `last_good`; if no third independently verified release exists, it records the
+  same exhausted state.
 
-- the stage contract;
-- the compact candidate state;
-- relevant file slices;
-- the current diff;
-- the latest deterministic test result;
-- bounded research evidence.
+In either exhausted case, the controller reopens the verified rollback target
+for normal use but disables further automatic releases until a new signed
+baseline restores a distinct rollback target.
 
-It never receives the entire preceding conversation. Prompt and output usage,
-including cached prompt usage, is reconciled against the model response. Missing
-or inconsistent usage accounting fails closed.
+If rollback restart or health verification fails, the state becomes
+`ROLLBACK_FAILED` or `MANUAL_RECOVERY_REQUIRED`; admission stays closed.
 
-The context assembler fills the active model's available context using exact
-measured system/tool overhead and reserves the declared structured output
-space. It does not use a universal 16k, 32k, or 64k prompt limit.
+### Crash reconciliation
 
-Implementation progress is event-driven. A new repair request requires a new
-deterministic failure signature or a concrete review finding. Repeating a
-failure without a meaningful state change quarantines the candidate. The
-reviewer gets a fresh context and cannot recursively create more reviewers.
+On startup the controller scans nonterminal journals before fetching new work:
 
-There is no unbounded retry loop. Each stage has a signed policy containing an
-absolute resource ceiling, preemption behavior, retry/backoff rule, and
-exhaustion state. If the policy is absent, stale, or inconsistent with the
-active model identity, the candidate remains shadow-only or is quarantined.
+- selector unchanged from `PREPARED`, `FENCED`, or `ACTIVATING`: abort the
+  uncommitted transaction and reopen only after exact prior identity proof;
+- selector shows the candidate with the same pending transaction: enter or
+  resume `ROLLING_BACK` unless a durable accepted health receipt and
+  `PROMOTING` record prove promotion was in progress;
+- selector shows promoted candidate with the expected promoted generation:
+  finalize `ACCEPTED` only from the already persisted exact health receipt;
+- selector shows the recorded rollback target: resume rollback restart and
+  health verification, then restore only the journaled verified fallback or
+  persist `ROLLBACK_DEPTH_EXHAUSTED`;
+- any unexpected generation, transaction, current, candidate, or last-good
+  identity: enter `MANUAL_RECOVERY_REQUIRED` and keep admission closed.
 
-### Calibration
-
-The shadow recorder records, per `{model_identity, task_class, stage}`:
-
-- logical input tokens;
-- cached and uncached input tokens;
-- output tokens;
-- context high-water mark;
-- prompt and decode throughput;
-- estimated GPU work and wall time;
-- tool-call count and deterministic state transitions;
-- test outcome, failure signatures, repair outcome, and final release outcome.
-
-Phase 2 calibration has two sources:
-
-1. **Historical replay** covering every task class intended for automatic
-   release, including representative successful and failed changes.
-2. **Live shadow runs** that build real candidates and execute every gate but
-   do not promote them.
-
-Calibration is failure-inclusive. Model failures, policy failures, timeouts,
-budget exhaustion, and infrastructure failures are labelled separately;
-infrastructure failures do not count as model success, and still count against
-the resource-capacity SLO. Censored or interrupted runs remain visible in the
-denominator rather than disappearing from the sample.
-
-The calibration corpus is content-addressed and split into training/shadow and
-held-out partitions before any policy is fitted. A policy declares its task
-classes, evidence-window digest, sample floor, target completion SLO,
-non-interference SLO, confidence method, and exhaustion behavior. The
-completion lower bound uses the declared exact binomial confidence method; no
-policy may use point estimates alone. The sample floor and confidence target
-are policy inputs that require independent approval, not values inferred by
-the model.
-
-The budget is the smallest measured resource allowance whose failure-inclusive
-held-out lower bound meets the signed policy SLO. A model/task-class policy is
-invalid until the held-out result and its lower-bound calculation are signed
-by the independent policy authority. Shadow evidence is advisory only: it can
-never write, widen, or activate production admission policy.
-
-Prompt and decode work are measured from stage telemetry. GPU work is labelled
-`measured` only when device telemetry covers the complete stage; otherwise it
-is labelled `estimated` and cannot be used as proof of a GPU-work limit. A
-model change or material runtime change invalidates the policy and returns the
-class to shadow mode.
-
-The MVP scheduler is independently simple: release work is low priority,
-preemptible, and resumes from durable stage state when interactive work
-appears. Its idle-capacity behavior is not a statistical admission SLO.
-Phase 2 may add the measured resource SLO and learned budgets after the signed
-policy contract exists.
-
-## Semantic admission policy
-
-Candidates are classified by provenance and touched behavior:
-
-- **Trusted upstream candidate:** an already-reviewed upstream/release commit;
-  eligible for automatic deterministic release after compatibility, forbidden-
-  surface, WebUI-only, and smoke gates. Human upstream review does not exempt
-  a candidate from local safety gates.
-- **Local low-risk candidate:** a Zeus-authored change in a calibrated class
-  with no forbidden surfaces; eligible only after shadow evidence supports the
-  class.
-- **Stateful or privileged candidate:** changes to lifecycle, persistence,
-  authentication, security, dependencies, Gateway/Agent contracts, bootstrap,
-  or release machinery; proposal/quarantine only in the MVP.
-
-Every class is rejected if the archive contains non-WebUI product changes,
-Gateway/Agent version changes, forbidden paths, dependency changes, symlinks,
-or release-controller changes. Provenance never overrides path or semantic
-exclusion gates.
-
-Graph impact, changed behavior, test coverage, and ownership boundaries are
-inputs to classification. File and line counts are recorded as anomaly data,
-not as the decision authority.
-
-## Durable evidence contracts
-
-Each candidate publishes immutable, bounded records:
-
-- `model-identity.json` — exact active local model and serving identity;
-- `research.json` — source references and compact evidence digests;
-- `evaluation.json` — tests, risk classification, usage, and calibration links;
-- `candidate-manifest.json` — source/tree/archive identity and policy digest;
-- `promotion-receipt.json` — Mac materialization, fence, selector, health, and
-  rollback evidence.
-
-Receipts are content-addressed, append-only, authenticated by the candidate or
-policy receipt that references them, and rejected when they exceed the signed
-policy's byte/count bounds. Receipt references form a hash chain from model
-identity through evaluation, candidate manifest, materialization, activation,
-and rollback. Existing receipts cannot be overwritten or silently replaced.
-Retention is policy-controlled: active, last-good, policy, and rollback
-receipts are protected; expendable shadow traces may be pruned only with a
-recorded retention receipt. Receipts contain counts, digests, identities,
-status and bounded failure tails; they do not contain full prompts,
-credentials, or unbounded transcripts.
-
-## Admission policy authority
-
-The production admission policy is a separate, signed, immutable artifact. It
-is generated offline from the calibration evidence and held-out result, then
-approved by the operator or an explicitly trusted policy service. The Zeus
-controller, local model, candidate manifest, and shadow recorder cannot sign or
-modify it. Mac verifies the policy digest before accepting READY.
-
-Policy changes are versioned and take effect only for future candidates. A
-policy cannot retroactively authorize an already-quarantined candidate.
+No replacement candidate may overwrite or delete a nonterminal transaction.
 
 ## Complaint rollback
 
-The MVP exposes an authenticated local rollback command and a durable rollback
-marker. The marker contains the target last-good receipt, request identity,
-requester identity, current selector generation, and reason code. Duplicate
-markers for the same target are idempotent; a marker targeting a stale or
-unverified last-good receipt is rejected. Rollback acquires the same activation
-lock, preserves the current receipt for forensics, verifies the restored exact
-identity, and only then reopens admission. Natural-language complaint parsing
-is outside the MVP.
+The MVP exposes an authenticated local command that creates one durable rollback
+request. The request binds:
 
-## Verification
+- current selector generation and state digest;
+- current accepted release receipt;
+- target last-good receipt;
+- requester identity and reason code;
+- unique transaction ID.
 
-The acceptance suite must prove:
+The controller runs the same rollback algorithm and gate. Duplicate requests for
+the same accepted/target pair are idempotent. A stale, missing, or unverified
+last-good target is rejected. Natural-language complaint classification is not
+part of the MVP.
 
-- local-only model endpoint enforcement and rejection of online provider paths;
-- MVP direct local-process identity and endpoint proof;
-- Phase 2 broker lease, socket-peer, and egress-denial proof;
-- model identity drift quarantine;
-- exact token/cache accounting and replay amplification detection;
-- context assembly excludes prior transcripts and respects measured model
-  overhead;
-- shadow telemetry and historical replay produce reproducible, non-gating
-  calibration records;
-- evidence receipts include population, timestamp, repository/remote identity,
-  inclusion rules, percentile method, denominator, and raw-artifact digests;
-- budget policy invalidates on model/runtime/task-class changes;
-- shadow results cannot modify production admission policy;
-- protected tests cannot be weakened by candidate changes;
-- forbidden semantic classes cannot reach READY;
-- corrupt, truncated, path-traversal, symlinked, or mismatched archives fail;
-- Mac materialization preserves selector ownership and read-only invariants;
-- the unprivileged puller cannot rewrite sealed or last-good artifacts;
-- busy WebUI, fence races, selector races, restart failures and health identity
-  mismatches fail closed;
-- crash recovery resumes activation or rollback without double promotion;
-- Gateway identity drift is rejected while Gateway remains unreleased;
-- complaint-triggered rollback restores the exact last-good release.
+## Evidence retention
 
-Live verification uses isolated WebUI state and an isolated port. It does not
-run deep health checks on the production WebUI during the release transaction.
+Protect:
 
-## Rollout
+- active and last-good release manifests;
+- static policy and signer receipts;
+- READY and promotion receipts;
+- every nonterminal or failed transaction;
+- the terminal complaint rollback receipt.
 
-1. Implement the deterministic trusted-upstream actuator, static policy,
-   evidence records, local-process identity telemetry, and local-model
-   shadow-only candidate execution.
-2. Run live shadow candidates while the deterministic trusted-upstream release
-   path remains separately usable. Shadow results are non-gating.
-3. Replay representative historical tasks and validate calibration output as a
-   Phase 2 input, not as MVP release authority.
-4. Have the independent policy authority sign an immutable Phase 2 policy only after
-   its declared sample floor, held-out lower bound, and non-interference SLO
-   pass.
-5. Enable automatic promotion only for task classes whose signed policy meets
-   the agreed SLO and has passed held-out validation.
-6. Expand classes only through another shadow-and-review cycle.
+Shadow prompts and outputs are not release evidence. Keep bounded stage metadata,
+digests, token/accounting totals, failure tails, and model identity. Pruning a
+shadow artifact records a retention receipt; it cannot remove production
+rollback evidence.
 
-No implementation should begin until the static MVP policy, ownership/helper
-boundary, and authoritative release remote are explicitly confirmed. The MVP
-defaults to trusted upstream candidates only; all Zeus-authored candidates are
-shadow-only until Phase 2 policy approval.
+## MVP acceptance
 
-## Open decisions
+### Token and local-model controls
 
-- Confirm the static MVP policy signer and exact WebUI-only allowlist/forbidden
-  surface manifest.
-- Confirm the authoritative upstream/release remote used for READY provenance.
-- Confirm the privileged Mac activation helper boundary and the OS-level
-  sealing primitive it will use.
-- Phase 2 decisions: independent policy authority, sample floor, confidence,
-  completion/non-interference SLOs, retention, and absolute resource ceiling.
+- at most three model invocation attempts are possible for one shadow candidate;
+- no stage receives a Hermes transcript or another stage's conversation;
+- no autonomous retry, repair, continuation, or recursive reviewer exists;
+- one immutable task receipt can create at most one candidate for the same
+  source base and model identity;
+- malformed output, test failure, review finding, or identity drift quarantines;
+- preemption cancels the active local call and preserves only terminal compact
+  evidence; it cannot resume the candidate;
+- cancellation must prove the inference slot is released before another shadow
+  stage starts; otherwise shadow scheduling disables itself;
+- online-provider credentials and Hermes provider routing are absent;
+- direct process, model-weight, executable, endpoint, and socket identity are
+  recorded for every call;
+- usage accounting reconciles or fails closed.
+- crash or response loss after a durable stage claim cannot cause reinvocation.
+
+### Source and policy
+
+- only the pinned release ref can produce READY;
+- upstream fast-forward ancestry, prior accepted release ancestry, normal
+  fast-forward push, and post-push re-fetch are proved;
+- force-push, remote movement, conflict, dirty worktree, unknown path, external
+  evaluator drift, and forbidden surface all quarantine;
+- model output cannot alter policy, the external evaluator, release ref, or
+  signatures.
+
+### Mac and selector
+
+- corrupt, truncated, traversal, symlink, hard-link, ownership, mode, and digest
+  failures are rejected;
+- isolated smoke uses disposable state and port;
+- any unavailable or nonzero activity source blocks activation;
+- selector generation races fail closed;
+- stage and activate occur in one selector CAS;
+- exact candidate health is required before promotion;
+- Gateway and Agent identities remain unchanged.
+
+### Recovery
+
+- failure injection at every journal write and external mutation resumes without
+  double promotion;
+- a candidate never starts ordinary work before acceptance;
+- rollback restarts remain pair-gated until exact last-good health passes;
+- unexpected selector state requires manual recovery and remains closed;
+- complaint rollback restores the exact recorded last-good release;
+- rollback never advertises a fallback equal to current, and exhausted rollback
+  depth disables subsequent automatic releases;
+- a nonterminal transaction blocks replacement and retention cleanup.
+
+Phase 2 broker, statistical calibration, learned-budget, and model-authored
+promotion tests are explicitly excluded from MVP acceptance.
+
+## Implementation order
+
+1. Define and sign the static policy schema, exact forbidden path manifest, and
+   fixture tests.
+2. Implement the deterministic Zeus source synchronizer, evaluator, publisher,
+   READY schema, and signer separation.
+3. Implement the finite local-model shadow worker and accounting receipts.
+4. Implement the trusted Mac user-level controller, safe materializer, isolated
+   smoke, and selector adapter.
+5. Implement the durable transaction journal, pair-gate integration, exact
+   shallow health, complaint rollback, and crash reconciliation.
+6. Run failure-injection tests and shadow-only live trials.
+7. Enable automatic release only for the pinned trusted release ref.
+
+Implementation starts with a written implementation plan. This design does not
+authorize changing the live selector, release state, LaunchAgents, Gateway,
+Agent, or production WebUI.

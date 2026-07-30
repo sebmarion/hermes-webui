@@ -1,9 +1,9 @@
 {
-  "schema": "zeus_release_planning_evidence.v1",
+  "schema": "zeus_release_planning_evidence.v2",
   "collected_at_utc": "2026-07-30T22:24:06Z",
   "purpose": "Planning evidence only; not a production admission policy.",
   "repository": {
-    "path": "/Users/seb/hermes-webui",
+    "path": "<repository-root>",
     "head": "5b4899958103f07ca94a05ef91e1aea735dd788e",
     "origin": "git@github.com:nesquena/hermes-webui.git",
     "release_remote": "git@github.com:sebmarion/hermes-webui.git"
@@ -36,7 +36,7 @@
     "hermes_sessions": {
       "population": "session JSON objects excluding _index.json, updated in the preceding 172800 seconds",
       "cutoff_epoch": 1785277508,
-      "query": "rg --files /Users/seb/.hermes/webui/sessions -g '*.json' | rg -v '/_index\\.json$' | jq select(updated_at >= cutoff)",
+      "query": "rg --files \"$HERMES_WEBUI_STATE_DIR/sessions\" -g '*.json' | rg -v '/_index\\.json$' | jq select(updated_at >= cutoff)",
       "canonical_output_sha256": "fc61ccc1bb7335a5aa4789ab8f6f14600ef7ac49ca75f16f066cf582a7fdb53e",
       "sessions": 31,
       "nonzero_input_sessions": 25,
@@ -49,7 +49,10 @@
   },
   "integrity": {
     "hash": "sha256",
-    "raw_query_payloads": "not embedded; canonical query hashes and commands are recorded above",
+    "reproducibility": "traceable_not_reproducible",
+    "raw_query_payloads": "not retained; canonical query hashes and commands are recorded above",
+    "limitation": "latest-N queries drift and the recorded hashes cannot be independently recomputed without the omitted member lists",
+    "required_before_policy_use": "retain immutable member identities, bounded raw aggregates, and the derivation script",
     "policy_authority": "none; this receipt cannot authorize release"
   }
 }
