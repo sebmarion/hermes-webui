@@ -491,10 +491,14 @@ def test_server_routes_unmanaged_to_exact_legacy_and_managed_to_audit(
     assert calls[0][0] == "legacy"
     assert calls[0][2]["rebuild_index"] is True
 
-    receipt = object()
     monkeypatch.setattr(
         config, "_managed_release_selected_from_environment", lambda: True
     )
+    monkeypatch.setattr(config, "_RUN_ADMISSION_TRANSACTION_ID", None)
+    assert server._recover_startup_sessions() is None
+    assert calls[-1][0] == "legacy"
+
+    receipt = object()
     monkeypatch.setattr(
         managed,
         "audit_managed_startup_sessions",

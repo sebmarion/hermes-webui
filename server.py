@@ -926,7 +926,12 @@ def _recover_startup_sessions():
     global _MANAGED_STARTUP_SESSION_RECEIPT
     from api.models import _active_state_db_path
 
-    if not api_config._managed_release_selected_from_environment():
+    if (
+        not api_config._managed_release_selected_from_environment()
+        or not str(
+            getattr(api_config, "_RUN_ADMISSION_TRANSACTION_ID", "") or ""
+        ).strip()
+    ):
         from api.session_recovery import recover_all_sessions_on_startup
 
         result = recover_all_sessions_on_startup(
