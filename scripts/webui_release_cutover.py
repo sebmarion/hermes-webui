@@ -9397,7 +9397,6 @@ def _pre_managed_control_stage_intent_receipt(
     if (
         selector_state["candidate"] != candidate_id
         or selector_state.get("pending_transaction_id") != plan["transaction_id"]
-        or selector_state["last_good"] != plan["last_good_identity"]["build_id"]
     ):
         raise ReleaseBuildError("pre-managed selector stage intent changed")
     _attest_candidate_startup_generation(plan, selector_state)
@@ -9412,7 +9411,11 @@ def _pre_managed_control_stage_intent_receipt(
         expected_label=plan["launchd_label"],
         expected_old_interpreter=prepared["legacy"]["program_arguments"][0],
         managed_interpreter=plan["managed_interpreter"],
-        expected_old_target=prepared["legacy"]["program_arguments"][1],
+        expected_old_target=(
+            prepared["legacy"]["program_arguments"][2]
+            if prepared["legacy"]["program_arguments"][1] == "-S"
+            else prepared["legacy"]["program_arguments"][1]
+        ),
         selector_state_path=plan["selector_state"],
         selector_lock_path=plan["selector_lock"],
         managed_routing_environment=prepared["legacy"]["routing_environment"],
@@ -9480,7 +9483,11 @@ def _stage_pre_managed_controls(plan: dict, prepared: dict) -> dict:
         expected_label=plan["launchd_label"],
         expected_old_interpreter=prepared["legacy"]["program_arguments"][0],
         managed_interpreter=plan["managed_interpreter"],
-        expected_old_target=prepared["legacy"]["program_arguments"][1],
+        expected_old_target=(
+            prepared["legacy"]["program_arguments"][2]
+            if prepared["legacy"]["program_arguments"][1] == "-S"
+            else prepared["legacy"]["program_arguments"][1]
+        ),
         selector_state_path=plan["selector_state"],
         selector_lock_path=plan["selector_lock"],
         managed_routing_environment=prepared["legacy"][
