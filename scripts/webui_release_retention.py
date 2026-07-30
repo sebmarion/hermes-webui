@@ -811,11 +811,23 @@ def validate_managed_journal(
         raise CleanupError(
             f"bootstrap rollback claim receipt is invalid: {path}"
         )
+    legacy_pre_split = (
+        isinstance(phases, dict)
+        and "gateway_last_good_attested" in phases
+        and "last_good_split_attested" not in phases
+    )
+    prerequisites = TRANSACTION_PHASE_PREREQUISITES
+    if legacy_pre_split:
+        prerequisites = {
+            **TRANSACTION_PHASE_PREREQUISITES,
+            "gateway_last_good_attested": ("plist_installed",),
+        }
     validate_phase_graph(
         phases,
-        TRANSACTION_PHASE_PREREQUISITES,
+        prerequisites,
         label=f"managed journal {path.name}",
     )
+    journal["_legacy_pre_split"] = legacy_pre_split
     return journal
 
 
@@ -844,7 +856,7 @@ def load_journals() -> tuple[
     dict[str, dict[str, Any]], dict[str, dict[str, Any]]
 ]:
     journals: dict[str, dict[str, Any]] = {}
-    for path in sorted(TRANSACTIONS_ROOT.glob("*.json")):
+    for path in sorted(TRANSACTIONS_ROOT.glob("release*.json")):
         if not canonical_child(path, TRANSACTIONS_ROOT):
             raise CleanupError(f"transaction journal escapes its root: {path}")
         require_private_regular_file(path, label="transaction journal")
@@ -861,7 +873,7 @@ def load_journals() -> tuple[
         journal["_mtime"] = path.stat().st_mtime
         journals[snapshot_id] = journal
     bootstraps: dict[str, dict[str, Any]] = {}
-    for path in sorted(TRANSACTIONS_ROOT.glob("*.json.bootstrap")):
+    for path in sorted(TRANSACTIONS_ROOT.glob("release*.json.bootstrap")):
         if not canonical_child(path, TRANSACTIONS_ROOT):
             raise CleanupError(f"bootstrap journal escapes its root: {path}")
         require_private_regular_file(path, label="bootstrap journal")
@@ -1126,6 +1138,8 @@ def inspect_snapshot(
         managed_phases=journal["phases"] if journal else None,
         rollback_receipt=journal["rollback_receipt"] if journal else None,
     )
+    if journal is not None and journal.get("_legacy_pre_split") is True:
+        terminal_kind = None
     newest_timestamp = opened.st_mtime
     journal_paths: list[str] = []
     descriptors: list[dict[str, str]] = []
@@ -1389,15 +1403,15 @@ def open_all_transaction_locks() -> list[Any]:
     try:
         journal_paths = sorted(
             [
-                *TRANSACTIONS_ROOT.glob("*.json"),
-                *TRANSACTIONS_ROOT.glob("*.json.bootstrap"),
+                *TRANSACTIONS_ROOT.glob("release*.json"),
+                *TRANSACTIONS_ROOT.glob("release*.json.bootstrap"),
             ],
             key=str,
         )
         expected_locks = {
             Path(f"{journal_path}.lock") for journal_path in journal_paths
         }
-        actual_locks = set(TRANSACTIONS_ROOT.glob("*.lock"))
+        actual_locks = set(TRANSACTIONS_ROOT.glob("release*.lock"))
         if not expected_locks <= actual_locks:
             missing = sorted(str(path) for path in expected_locks - actual_locks)
             raise CleanupError(

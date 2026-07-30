@@ -629,6 +629,37 @@ def test_last_good_webui_identity_accepts_normalized_promoted_runtime(
         )
 
 
+def test_normalized_candidate_identity_requires_durable_promotion_history():
+    transaction_id = "resume-promoted-candidate-000000001"
+    expected = {
+        "build_id": "candidate",
+        "manifest_sha256": "a" * 64,
+        "selector_generation": 2,
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    normalized = {
+        "build_id": "candidate",
+        "manifest_sha256": "a" * 64,
+        "selector_generation": 3,
+        "startup_fenced": False,
+        "startup_transaction_id": None,
+        "pid": 202,
+        "pid_start_token": "candidate-restart",
+    }
+
+    assert not cutover._resumable_candidate_identity_matches(
+        normalized,
+        expected,
+        {"pair_commit_intent", "gateway_opened"},
+    )
+    assert cutover._resumable_candidate_identity_matches(
+        normalized,
+        expected,
+        {"pair_commit_intent", "promoted", "gateway_opened"},
+    )
+
+
 @pytest.mark.parametrize("generation", [None, True, "192", 0, -1, 186])
 def test_last_good_promoted_runtime_rejects_invalid_generation(generation):
     expected = {
@@ -2045,6 +2076,13 @@ def test_selector_v2_reads_v1_state_and_fences_candidate_with_exact_transaction(
         selected["environment"]["HERMES_WEBUI_STARTUP_TRANSACTION_ID"]
         == transaction_id
     )
+    journal_root = tmp_path / "private" / "transactions"
+    assert selected["environment"]["HERMES_WEBUI_STARTUP_ATTEMPT_JOURNAL"] == str(
+        journal_root / f"startup-attempt-{transaction_id}.json"
+    )
+    assert selected["environment"][
+        "HERMES_WEBUI_STARTUP_CONFIGURATION_JOURNAL"
+    ] == str(journal_root / f"startup-configuration-{transaction_id}.json")
 
     promoted = selector.promote_candidate(active)
     assert promoted["pending_transaction_id"] is None
@@ -10588,6 +10626,103 @@ def test_candidate_binding_accepts_mutation_free_deferred_startup_checks():
     ) is evidence
 
 
+def test_candidate_binding_allows_newer_generation_only_after_promotion():
+    expected = {
+        "build_id": "candidate-r29",
+        "manifest_sha256": "a" * 64,
+        "agent_manifest_sha256": "b" * 64,
+        "runtime_manifest_sha256": "c" * 64,
+        "selector_generation": 73,
+    }
+    identity = {"pid": 41, "pid_start_token": "candidate-restart"}
+    evidence = {
+        "status": "verified",
+        "launchd_pid": 41,
+        "listener_pid": 41,
+        "signed_health_pid": 41,
+        "pid_start_token": "candidate-restart",
+        "deep_health": {
+            "status": "ok",
+            "build": {
+                "status": "managed",
+                "valid": True,
+                **expected,
+                "selector_generation": 74,
+            },
+            "admission": {"state": "open"},
+        },
+    }
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="selector_generation",
+    ):
+        cutover._require_candidate_binding(
+            evidence,
+            candidate_identity=identity,
+            expected_candidate_identity=expected,
+            admission_state="open",
+        )
+
+    assert cutover._require_candidate_binding(
+        evidence,
+        candidate_identity=identity,
+        expected_candidate_identity=expected,
+        admission_state="open",
+        allow_promoted_generation=True,
+    ) is evidence
+
+
+def test_active_pair_gate_allows_invalid_closed_side_only_for_normalized_restart():
+    invalid_gate = {
+        "status": "invalid",
+        "transaction_id": None,
+        "epoch": None,
+        "owner_hash": None,
+        "payload_sha256": None,
+        "agent": None,
+        "webui": None,
+    }
+    binding = {
+        "deep_health": {
+            "admission": {
+                "state": "open",
+                "effective_state": "pair-gated",
+                "pair_gate": invalid_gate,
+            }
+        }
+    }
+    intent = {
+        "payload": {
+            "transaction_id": "pair-gate-transaction-000000000001",
+            "epoch": 82,
+            "owner_hash": "d" * 64,
+            "agent": {"build_id": "agent"},
+            "webui": {"build_id": "webui"},
+        },
+        "payload_sha256": "e" * 64,
+    }
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="exact shared pair gate",
+    ):
+        cutover._require_webui_pair_gate_state(
+            binding,
+            intent,
+            active=True,
+        )
+
+    adopted = cutover._require_webui_pair_gate_state(
+        binding,
+        intent,
+        active=True,
+        allow_normalized_restart=True,
+    )
+    assert adopted["status"] == "adopted-normalized-restart"
+    assert adopted["pair_gate"] == invalid_gate
+
+
 def test_candidate_binding_rejects_deferred_checks_after_admission_opens():
     expected = {
         "build_id": "candidate-r29",
@@ -11058,6 +11193,13 @@ def test_release_and_launch_paths_bind_only_the_sealed_runtime(tmp_path):
     environment = fallback["EnvironmentVariables"]
     assert environment["HERMES_WEBUI_STARTUP_FENCED"] == "1"
     assert environment["HERMES_WEBUI_STARTUP_TRANSACTION_ID"] == transaction_id
+    journal_root = tmp_path / "private" / "transactions"
+    assert environment["HERMES_WEBUI_STARTUP_ATTEMPT_JOURNAL"] == str(
+        journal_root / f"startup-attempt-{transaction_id}.json"
+    )
+    assert environment["HERMES_WEBUI_STARTUP_CONFIGURATION_JOURNAL"] == str(
+        journal_root / f"startup-configuration-{transaction_id}.json"
+    )
     assert environment["PYTHONHOME"] == release["runtime"]["identity"][
         "python_home_path"
     ]

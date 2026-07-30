@@ -1245,6 +1245,30 @@ def release_pair_id(
     return f"pair_{digest}"
 
 
+def startup_journal_environment(
+    release_root: Path | str,
+    transaction_id: str,
+) -> dict[str, str]:
+    """Bind managed startup replay to private transaction-specific journals."""
+    root = Path(release_root)
+    if (
+        not root.is_absolute()
+        or Path(os.path.abspath(root)) != root
+        or not _TRANSACTION_ID.fullmatch(str(transaction_id or ""))
+    ):
+        raise SelectorError("managed startup journal inputs are invalid")
+    store_root = root.parent.parent if root.parent.name == "selector" else root.parent
+    journal_root = store_root / "private" / "transactions"
+    return {
+        "HERMES_WEBUI_STARTUP_ATTEMPT_JOURNAL": str(
+            journal_root / f"startup-attempt-{transaction_id}.json"
+        ),
+        "HERMES_WEBUI_STARTUP_CONFIGURATION_JOURNAL": str(
+            journal_root / f"startup-configuration-{transaction_id}.json"
+        ),
+    }
+
+
 def _selection_from_state(state: dict, *, selector_path: Path | str) -> dict:
     build_id = state["current"]
     record = state["releases"][build_id]
@@ -1314,6 +1338,9 @@ def _selection_from_state(state: dict, *, selector_path: Path | str) -> dict:
             raise SelectorError("selected candidate startup transaction is invalid")
         environment["HERMES_WEBUI_STARTUP_FENCED"] = "1"
         environment["HERMES_WEBUI_STARTUP_TRANSACTION_ID"] = transaction_id
+        environment.update(
+            startup_journal_environment(state["release_root"], transaction_id)
+        )
     return {
         "build_id": build_id,
         "release_path": Path(identity["release_path"]),

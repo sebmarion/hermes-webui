@@ -426,6 +426,12 @@ def build_direct_fallback_plist(
         environment["HERMES_WEBUI_STARTUP_TRANSACTION_ID"] = str(
             startup_transaction_id
         )
+        environment.update(
+            release_selector.startup_journal_environment(
+                Path(verified["release_path"]).parent,
+                str(startup_transaction_id),
+            )
+        )
     transformed["EnvironmentVariables"] = environment
     return transformed
 
@@ -2558,6 +2564,23 @@ def _promoted_candidate_identity_matches(actual: object, expected: dict) -> bool
     )
 
 
+def _resumable_candidate_identity_matches(
+    actual: object,
+    expected: dict,
+    completed_phases: set[str],
+) -> bool:
+    if _candidate_identity_matches(actual, expected):
+        return True
+    return {
+        "pair_commit_intent",
+        "promoted",
+        "gateway_opened",
+    }.issubset(completed_phases) and _promoted_candidate_identity_matches(
+        actual,
+        expected,
+    )
+
+
 def _require_startup_fenced_admission(
     receipt: dict,
     *,
@@ -2573,7 +2596,18 @@ def _require_startup_fenced_admission(
         or "startup_error" not in admission
         or admission.get("startup_error") is not None
     ):
-        raise ReleaseBuildError("candidate startup fence receipt is invalid")
+        diagnostic = {
+            key: admission.get(key)
+            for key in (
+                "state",
+                "lease_expires_at",
+                "transaction_id",
+                "startup_error",
+            )
+        } if isinstance(admission, dict) else {"type": type(admission).__name__}
+        raise ReleaseBuildError(
+            f"candidate startup fence receipt is invalid: {diagnostic}"
+        )
     return admission
 
 
@@ -2584,6 +2618,7 @@ def _require_candidate_binding(
     expected_candidate_identity: dict,
     admission_state: str = "startup-fenced",
     require_full_health: bool = False,
+    allow_promoted_generation: bool = False,
 ) -> dict:
     if not isinstance(evidence, dict) or evidence.get("status") != "verified":
         raise DrainIdentityMismatch("candidate process binding is unverified")
@@ -2620,7 +2655,21 @@ def _require_candidate_binding(
         "runtime_manifest_sha256",
         "selector_generation",
     ):
-        if key in expected_candidate_identity and build.get(key) != expected_candidate_identity[key]:
+        if key not in expected_candidate_identity:
+            continue
+        observed_value = build.get(key)
+        expected_value = expected_candidate_identity[key]
+        if (
+            key == "selector_generation"
+            and allow_promoted_generation
+            and isinstance(observed_value, int)
+            and not isinstance(observed_value, bool)
+            and isinstance(expected_value, int)
+            and not isinstance(expected_value, bool)
+            and observed_value >= expected_value > 0
+        ):
+            continue
+        if observed_value != expected_value:
             raise DrainIdentityMismatch(
                 f"candidate deep health identity mismatch: {key}"
             )
@@ -2967,9 +3016,10 @@ def run_release_control_cutover(
     def finish_candidate(candidate_inspection: dict) -> dict:
         nonlocal candidate_identity, candidate_may_have_mutated, finished
         candidate_identity_value = candidate_inspection.get("identity")
-        if not _candidate_identity_matches(
+        if not _resumable_candidate_identity_matches(
             candidate_identity_value,
             expected_candidate_identity,
+            completed_phases,
         ):
             raise DrainIdentityMismatch(
                 "startup-fenced candidate identity does not match release"
@@ -3182,6 +3232,7 @@ def run_release_control_cutover(
             expected_candidate_identity=expected_candidate_identity,
             admission_state="open",
             require_full_health=True,
+            allow_promoted_generation="promoted" in completed_phases,
         )
         record_phase(
             "accepted_health_proved",
@@ -3328,9 +3379,10 @@ def run_release_control_cutover(
 
         initial = inspect_with_retry(initial_inspection)
         initial_identity = initial.get("identity")
-        if _candidate_identity_matches(
+        if _resumable_candidate_identity_matches(
             initial_identity,
             expected_candidate_identity,
+            completed_phases,
         ):
             activated = True
             candidate_may_have_started = True
@@ -8220,11 +8272,24 @@ def _run_release_commit_plan_core(
                 expected_candidate_identity=plan["expected_candidate_identity"],
                 admission_state="open",
                 require_full_health=True,
+                allow_promoted_generation=True,
             )
+            webui_gate_kwargs = {"active": True}
+            if (
+                {
+                    "pair_accepted",
+                    "pair_gate_release_intent",
+                }.issubset(phases)
+                and _promoted_candidate_identity_matches(
+                    candidate_identity,
+                    plan["expected_candidate_identity"],
+                )
+            ):
+                webui_gate_kwargs["allow_normalized_restart"] = True
             webui_gate = _require_webui_pair_gate_state(
                 webui_gated,
                 gate_intent,
-                active=True,
+                **webui_gate_kwargs,
             )
         else:
             gateway_gate = {
@@ -8273,6 +8338,7 @@ def _run_release_commit_plan_core(
             expected_candidate_identity=plan["expected_candidate_identity"],
             admission_state="open",
             require_full_health=True,
+            allow_promoted_generation=True,
         )
         webui_released = _require_webui_pair_gate_state(
             webui_open,
@@ -14907,6 +14973,7 @@ def _require_webui_pair_gate_state(
     intent: dict,
     *,
     active: bool,
+    allow_normalized_restart: bool = False,
 ) -> dict:
     deep = binding.get("deep_health") if isinstance(binding, dict) else None
     admission = deep.get("admission") if isinstance(deep, dict) else None
@@ -14915,6 +14982,26 @@ def _require_webui_pair_gate_state(
     if not isinstance(admission, dict) or not isinstance(gate, dict):
         raise ReleaseBuildError("WebUI pair-open admission receipt is missing")
     if active:
+        normalized_restart_gate = {
+            "status": "invalid",
+            "transaction_id": None,
+            "epoch": None,
+            "owner_hash": None,
+            "payload_sha256": None,
+            "agent": None,
+            "webui": None,
+        }
+        if (
+            allow_normalized_restart
+            and admission.get("state") == "open"
+            and admission.get("effective_state") == "pair-gated"
+            and gate == normalized_restart_gate
+        ):
+            return {
+                "status": "adopted-normalized-restart",
+                "effective_state": "pair-gated",
+                "pair_gate": copy.deepcopy(gate),
+            }
         if (
             admission.get("state") != "open"
             or admission.get("effective_state") != "pair-gated"
@@ -14928,7 +15015,11 @@ def _require_webui_pair_gate_state(
             or gate.get("webui") != payload.get("webui")
         ):
             raise DrainIdentityMismatch(
-                "WebUI did not remain closed on the exact shared pair gate"
+                "WebUI did not remain closed on the exact shared pair gate: "
+                f"state={admission.get('state')!r}, "
+                f"effective_state={admission.get('effective_state')!r}, "
+                f"gate={gate!r}, "
+                f"allow_normalized_restart={allow_normalized_restart!r}"
             )
     elif (
         admission.get("state") != "open"

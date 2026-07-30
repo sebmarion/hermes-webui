@@ -105,6 +105,20 @@ def test_after_release_reports_failure_without_raising(tmp_path):
     assert result["error"].startswith("CleanupError:")
 
 
+def test_transaction_loader_ignores_non_release_operational_receipts(
+    tmp_path,
+    monkeypatch,
+):
+    transactions = tmp_path / "transactions"
+    transactions.mkdir(mode=0o700)
+    adoption = transactions / "adopt-live-r75-r72-tx63.json"
+    adoption.write_text('{"schema":"split-adoption"}\n', encoding="utf-8")
+    adoption.chmod(0o600)
+    monkeypatch.setattr(retention, "TRANSACTIONS_ROOT", transactions)
+
+    assert retention.load_journals() == ({}, {})
+
+
 def test_rolling_cleanup_rejects_both_absent_before_deleting_intent(
     tmp_path, monkeypatch
 ):
