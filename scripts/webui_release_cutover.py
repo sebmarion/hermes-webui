@@ -193,7 +193,30 @@ def transform_launchd_target(
         raise ValueError("launchd label does not match the expected WebUI job")
     if arguments[0] != expected_old_interpreter:
         raise ValueError("launchd interpreter does not match the frozen job")
-    if arguments[1] != expected_old_target:
+    if arguments[1] == expected_old_target:
+        inherited_arguments = arguments[2:]
+    elif (
+        len(arguments) >= 3
+        and arguments[1] == "-S"
+        and arguments[2] == expected_old_target
+    ):
+        inherited_arguments = []
+        index = 3
+        managed_options = {
+            "--selector-state",
+            "--selector-lock",
+            "--launchd-label",
+        }
+        while index < len(arguments):
+            argument = arguments[index]
+            if argument in managed_options:
+                if index + 1 >= len(arguments):
+                    raise ValueError("managed launchd control argument is incomplete")
+                index += 2
+                continue
+            inherited_arguments.append(argument)
+            index += 1
+    else:
         raise ValueError("launchd script target does not match the frozen job")
     selector_options = ("--selector-state", "--selector-lock")
     if any(
@@ -202,7 +225,7 @@ def transform_launchd_target(
             argument == option or argument.startswith(f"{option}=")
             for option in selector_options
         )
-        for argument in arguments[2:]
+        for argument in inherited_arguments
     ):
         raise ValueError("launchd job contains an inherited selector control argument")
     _canonical_launch_file(
@@ -245,7 +268,7 @@ def transform_launchd_target(
         str(selector_lock),
         "--launchd-label",
         expected_label,
-        *arguments[2:],
+        *inherited_arguments,
     ]
     transformed_environment = _sanitized_managed_environment(
         plist.get("EnvironmentVariables", {}),
@@ -313,7 +336,28 @@ def build_direct_fallback_plist(
     arguments = plist.get("ProgramArguments")
     if not isinstance(arguments, list) or len(arguments) < 2:
         raise ValueError("launchd ProgramArguments must include interpreter and script")
-    if arguments[:2] != [expected_old_interpreter, expected_old_target]:
+    if arguments[:2] == [expected_old_interpreter, expected_old_target]:
+        inherited_arguments = arguments[2:]
+    elif (
+        len(arguments) >= 3
+        and arguments[:3]
+        == [expected_old_interpreter, "-S", expected_old_target]
+    ):
+        inherited_arguments = []
+        index = 3
+        while index < len(arguments):
+            if arguments[index] in {
+                "--selector-state",
+                "--selector-lock",
+                "--launchd-label",
+            }:
+                if index + 1 >= len(arguments):
+                    raise ValueError("managed launchd control argument is incomplete")
+                index += 2
+                continue
+            inherited_arguments.append(arguments[index])
+            index += 1
+    else:
         raise ValueError("launchd job does not match the frozen source shape")
     _canonical_launch_file(
         expected_old_interpreter,
@@ -366,7 +410,7 @@ def build_direct_fallback_plist(
         managed_interpreter,
         "-S",
         str(bootstrap),
-        *arguments[2:],
+        *inherited_arguments,
     ]
     transformed["WorkingDirectory"] = str(release_path)
     environment = _sanitized_managed_environment(
@@ -10958,10 +11002,16 @@ def _prepared_bootstrap_receipt(plan: dict) -> dict:
         require_git_source=False,
     )
     old_arguments = legacy["program_arguments"]
-    if old_arguments[:2] != [
+    legacy_shape = old_arguments[:2] == [
         plan["expected_old_interpreter"],
         plan["expected_old_target"],
-    ]:
+    ]
+    managed_shape = old_arguments[:3] == [
+        plan["expected_old_interpreter"],
+        "-S",
+        plan["expected_old_target"],
+    ]
+    if not legacy_shape and not managed_shape:
         raise ReleaseBuildError("discovered legacy launch identity changed")
     watchdog_candidate = _file_identity_receipt(plan["watchdog_candidate_script"])
     if watchdog_candidate["sha256"] != plan["watchdog_expected_sha256"]:
