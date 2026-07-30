@@ -12718,7 +12718,7 @@ def _inspect_synthetic_completion_stores(plan: dict) -> dict:
         raise ReleaseBuildError("synthetic async delegation schema is invalid")
     delegation_delivered = 0
     delegation_queued = 0
-    terminal_statuses = {"completed", "error", "lost"}
+    terminal_statuses = {"completed", "error", "interrupted", "lost"}
     for delegation_id, entry in delegation_store["records"].items():
         record = entry.get("record") if isinstance(entry, dict) else None
         entry_status = str((entry or {}).get("status") or "")

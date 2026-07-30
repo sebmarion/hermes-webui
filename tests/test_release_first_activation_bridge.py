@@ -869,6 +869,26 @@ def test_synthetic_terminal_mixed_delivery_is_normalized_and_never_replayed(
         assert quarantine.stat().st_mode & 0o777 == 0o600
 
 
+def test_synthetic_interrupted_delegation_is_terminal(tmp_path):
+    plan, _original = _synthetic_plan(tmp_path, async_mode=0o600)
+    path = Path(plan["synthetic_async_delegations_path"])
+    payload = json.loads(path.read_bytes())
+    entry = payload["records"]["deleg_queued"]
+    entry["status"] = "interrupted"
+    entry["record"]["status"] = "interrupted"
+    entry["delivery_status"] = "delivered"
+    encoded = _write_json(path, payload, mode=0o600)
+    plan["synthetic_async_delegations_expected_sha256"] = hashlib.sha256(
+        encoded
+    ).hexdigest()
+
+    inspected = cutover._inspect_synthetic_completion_stores(plan)
+
+    assert inspected["async_delegations"]["terminal"] == 2
+    assert inspected["async_delegations"]["delivered"] == 2
+    assert inspected["async_delegations"]["running"] == 0
+
+
 def test_synthetic_store_mode_abort_restores_exact_original_bytes_and_mode(
     tmp_path,
 ):
