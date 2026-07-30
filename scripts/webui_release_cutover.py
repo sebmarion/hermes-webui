@@ -2517,7 +2517,7 @@ def _require_expected_last_good_webui_identity(
     if (
         not isinstance(actual, dict)
         or not expected
-        or not _candidate_identity_matches(actual, expected)
+        or not _promoted_candidate_identity_matches(actual, expected)
     ):
         raise _LastGoodWebUIIdentityMismatch(
             "release control process is not the exact last-good WebUI"
@@ -2526,20 +2526,35 @@ def _require_expected_last_good_webui_identity(
 
 
 def _promoted_candidate_identity_matches(actual: object, expected: dict) -> bool:
+    if not isinstance(actual, dict) or not isinstance(expected, dict):
+        return False
     ignored = {
         "selector_generation",
         "startup_fenced",
         "startup_transaction_id",
     }
+    if "selector_generation" not in expected:
+        return _candidate_identity_matches(actual, expected)
+    actual_generation = actual.get("selector_generation")
+    expected_generation = expected.get("selector_generation")
+    actual_pid = actual.get("pid")
+    immutable_expected = {
+        key: value for key, value in expected.items() if key not in ignored
+    }
     return (
-        isinstance(actual, dict)
+        isinstance(actual_generation, int)
+        and not isinstance(actual_generation, bool)
+        and isinstance(expected_generation, int)
+        and not isinstance(expected_generation, bool)
+        and actual_generation >= expected_generation > 0
+        and isinstance(actual_pid, int)
+        and not isinstance(actual_pid, bool)
+        and actual_pid > 1
+        and isinstance(actual.get("pid_start_token"), str)
+        and bool(actual["pid_start_token"])
         and actual.get("startup_fenced") in {None, False}
         and actual.get("startup_transaction_id") in {None, ""}
-        and all(
-            actual.get(key) == value
-            for key, value in expected.items()
-            if key not in ignored
-        )
+        and _candidate_identity_matches(actual, immutable_expected)
     )
 
 

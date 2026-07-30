@@ -556,15 +556,12 @@ def test_candidate_identity_match_projects_full_release_to_signed_process(tmp_pa
 @pytest.mark.parametrize(
     ("field", "changed"),
     [
-        ("selector_generation", 188),
-        ("startup_fenced", False),
-        (
-            "startup_transaction_id",
-            "wrong-origin-transaction-20260729",
-        ),
+        ("build_id", "r74-webui"),
+        ("commit", "c" * 40),
+        ("manifest_sha256", "d" * 64),
     ],
 )
-def test_last_good_webui_identity_requires_retained_startup_markers(
+def test_last_good_webui_identity_accepts_normalized_promoted_runtime(
     field,
     changed,
 ):
@@ -577,12 +574,33 @@ def test_last_good_webui_identity_requires_retained_startup_markers(
         "startup_transaction_id": (
             "r75-clarify-composer-transition-20260729"
         ),
+        "selector_path": "/sealed/control/selector.py",
+        "interpreter_path": "/sealed/runtime/python",
+        "agent_source_commit": "e" * 40,
+        "agent_source_tree": "f" * 40,
+        "agent_source_manifest_sha256": "1" * 64,
     }
     actual = {
         **expected,
+        "agent_commit": expected["agent_source_commit"],
+        "agent_tree": expected["agent_source_tree"],
+        "agent_manifest_sha256": expected[
+            "agent_source_manifest_sha256"
+        ],
+        "selector_generation": 192,
+        "startup_fenced": False,
+        "startup_transaction_id": None,
         "pid": 101,
         "pid_start_token": "r75-start",
     }
+    for release_only_key in (
+        "selector_path",
+        "interpreter_path",
+        "agent_source_commit",
+        "agent_source_tree",
+        "agent_source_manifest_sha256",
+    ):
+        actual.pop(release_only_key)
 
     assert (
         cutover._require_expected_last_good_webui_identity(actual, expected)
@@ -597,6 +615,46 @@ def test_last_good_webui_identity_requires_retained_startup_markers(
             {**actual, field: changed},
             expected,
         )
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="exact last-good WebUI",
+    ):
+        cutover._require_expected_last_good_webui_identity(
+            {
+                **actual,
+                "startup_fenced": True,
+                "startup_transaction_id": "foreign-restart-transaction-00001",
+            },
+            expected,
+        )
+
+
+@pytest.mark.parametrize("generation", [None, True, "192", 0, -1, 186])
+def test_last_good_promoted_runtime_rejects_invalid_generation(generation):
+    expected = {
+        "build_id": "r75-webui",
+        "commit": "a" * 40,
+        "manifest_sha256": "b" * 64,
+        "selector_generation": 187,
+        "startup_fenced": True,
+        "startup_transaction_id": (
+            "r75-clarify-composer-transition-20260729"
+        ),
+    }
+    actual = {
+        **expected,
+        "selector_generation": generation,
+        "startup_fenced": False,
+        "startup_transaction_id": None,
+        "pid": 101,
+        "pid_start_token": "r75-start",
+    }
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="exact last-good WebUI",
+    ):
+        cutover._require_expected_last_good_webui_identity(actual, expected)
 
 
 def test_release_control_rejects_modern_drained_wrong_old_before_mutation(
