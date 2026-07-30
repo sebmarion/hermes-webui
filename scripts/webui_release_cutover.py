@@ -9718,6 +9718,7 @@ def _adopt_or_restage_pre_managed_controls(
 
 def _rollback_exact_owned_selector_activation(
     plan: dict,
+    before: dict,
     owned: dict,
     current_receipt: dict,
 ) -> dict | None:
@@ -9735,6 +9736,23 @@ def _rollback_exact_owned_selector_activation(
         for field in ("mode", "uid")
     ):
         return None
+    backup = Path(str(before.get("backup_path") or ""))
+    try:
+        original_payload, _original_stat = _read_private_regular_bytes(
+            backup,
+            label="pre-managed selector_state backup",
+        )
+        if (
+            before.get("status") != "present"
+            or hashlib.sha256(original_payload).hexdigest()
+            != before.get("sha256")
+            or len(original_payload) != before.get("size")
+        ):
+            return None
+        original_state = json.loads(original_payload)
+        original_last_good = original_state["last_good"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
     def is_owned_transition(state: dict, generation_delta: int) -> bool:
         try:
@@ -9748,6 +9766,7 @@ def _rollback_exact_owned_selector_activation(
         staged_state["current"] = last_good_id
         staged_state["candidate"] = candidate_id
         staged_state["pending_transaction_id"] = transaction_id
+        staged_state["last_good"] = original_last_good
         encoded = (
             json.dumps(staged_state, sort_keys=True, separators=(",", ":")) + "\n"
         ).encode("utf-8")
@@ -9878,6 +9897,7 @@ def _restore_pre_managed_control_state(
             if key == "selector_state":
                 selector_rollback = _rollback_exact_owned_selector_activation(
                     plan,
+                    before,
                     owned,
                     current,
                 )
@@ -19664,13 +19684,21 @@ def _stop_bootstrap_pair_for_rollback(
     authorized = _authorized_bootstrap_runtimes(journal, gateway=False)
     authorized.extend(_authorized_cutover_runtimes(plan, gateway=False))
     if _listener_pid_or_none(int(plan["listener_port"])) is not None:
-        authorized.append(
-            _restored_legacy_runtime_authorization(
-                plan,
-                prepared=journal["phases"]["prepared"],
-                gateway=False,
+        installed_sha256 = sha256_file(Path(plan["installed_plist"]))
+        rollback_sha256 = sha256_file(Path(plan["bootstrap_rollback_plist"]))
+        managed_sha256 = sha256_file(Path(plan["managed_plist"]))
+        if installed_sha256 == rollback_sha256:
+            authorized.append(
+                _restored_legacy_runtime_authorization(
+                    plan,
+                    prepared=journal["phases"]["prepared"],
+                    gateway=False,
+                )
             )
-        )
+        elif installed_sha256 != managed_sha256:
+            raise DrainIdentityMismatch(
+                "rollback WebUI plist is neither managed nor restored legacy"
+            )
     incomplete_runtime = _incomplete_managed_webui_stop_authorization(
         plan,
         journal,
@@ -20789,7 +20817,18 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                     "durable bootstrap boundary evidence is missing"
                 )
             cutover_phases = cutover_journal["phases"]
+            last_good_origin_attestation = (
+                prepared["last_good_split_provenance"]["split_evidence"]
+            )
             bootstrap_cutover_receipts = (
+                (
+                    "last_good_split_attested",
+                    {
+                        "last_good_origin_attestation": (
+                            last_good_origin_attestation
+                        ),
+                    },
+                ),
                 (
                     "gateway_last_good_attested",
                     {
@@ -20800,7 +20839,10 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                                 "pid_start_token"
                             ],
                             "runtime": prepared["gateway"],
-                        }
+                        },
+                        "last_good_origin_attestation": (
+                            last_good_origin_attestation
+                        ),
                     },
                 ),
                 (

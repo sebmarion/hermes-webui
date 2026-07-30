@@ -11387,7 +11387,13 @@ def apply_deferred_startup_configuration():
         raise RunAdmissionClosed(
             "startup configuration mutation requires signed acceptance"
         )
-    if not _managed_release_selected_from_environment():
+    managed_candidate_transaction = str(
+        _RUN_ADMISSION_TRANSACTION_ID or ""
+    ).strip()
+    if (
+        not _managed_release_selected_from_environment()
+        or not managed_candidate_transaction
+    ):
         global _DEFERRED_STARTUP_SETTINGS_TEXT, CLI_TOOLSETS
         settings_rewritten = False
         with _DEFERRED_STARTUP_CONFIG_LOCK:

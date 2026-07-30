@@ -11911,6 +11911,7 @@ def test_pre_managed_control_restore_rolls_back_exact_owned_selector_activation(
 ):
     plan = _pre_managed_control_plan(tmp_path)
     control_root = Path(plan["selector_state"]).parent
+    previous_rollback = _managed_release(control_root, "previous-rollback")
     last_good = _managed_release(control_root, "last-good")
     candidate = _managed_release(control_root, "candidate")
     plan.update(
@@ -11923,13 +11924,39 @@ def test_pre_managed_control_restore_rolls_back_exact_owned_selector_activation(
         plan["selector_state"],
         lock_path=plan["selector_lock"],
         release_root=last_good["release_root"],
-        bootstrap_build_id="last-good",
-        bootstrap_record=last_good["record"],
+        bootstrap_build_id="previous-rollback",
+        bootstrap_record=previous_rollback["record"],
     )
-    staged_state = selector.update_selector_state(
+    current_staged = selector.update_selector_state(
         plan["selector_state"],
         lock_path=plan["selector_lock"],
         expected_generation=0,
+        transition=lambda current: selector.stage_candidate(
+            current,
+            "last-good",
+            last_good["record"],
+            transaction_id="pre-managed-prior-release-transaction-0001",
+        ),
+    )
+    current_activated = selector.update_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+        expected_generation=current_staged["generation"],
+        transition=selector.activate_candidate,
+    )
+    current_state = selector.update_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+        expected_generation=current_activated["generation"],
+        transition=selector.promote_candidate,
+    )
+    Path(plan["managed_plist"]).write_bytes(b"before-plist\n")
+    Path(plan["managed_plist"]).chmod(0o600)
+    captured = cutover._capture_pre_managed_control_state(plan)
+    staged_state = selector.update_selector_state(
+        plan["selector_state"],
+        lock_path=plan["selector_lock"],
+        expected_generation=current_state["generation"],
         transition=lambda current: selector.stage_candidate(
             current,
             "candidate",
@@ -11937,9 +11964,6 @@ def test_pre_managed_control_restore_rolls_back_exact_owned_selector_activation(
             transaction_id=plan["transaction_id"],
         ),
     )
-    Path(plan["managed_plist"]).write_bytes(b"before-plist\n")
-    Path(plan["managed_plist"]).chmod(0o600)
-    captured = cutover._capture_pre_managed_control_state(plan)
     staged = cutover._pre_managed_control_stage_receipt(plan)
     activated_state = selector.update_selector_state(
         plan["selector_state"],
@@ -15709,10 +15733,20 @@ def test_rollback_gateway_stop_intent_drains_restored_legacy_without_managed_wai
 
 def test_bootstrap_rollback_authorizes_exact_restarted_legacy_webui(
     monkeypatch,
+    tmp_path,
 ):
+    installed = tmp_path / "installed.plist"
+    rollback = tmp_path / "rollback.plist"
+    managed = tmp_path / "managed.plist"
+    installed.write_bytes(b"legacy")
+    rollback.write_bytes(b"legacy")
+    managed.write_bytes(b"managed")
     plan = {
         "gateway_listener_port": 8642,
         "listener_port": 8787,
+        "installed_plist": str(installed),
+        "bootstrap_rollback_plist": str(rollback),
+        "managed_plist": str(managed),
     }
     journal = {"phases": {"prepared": {"captured": "legacy"}}}
     restored_runtime = {
@@ -15778,6 +15812,79 @@ def test_bootstrap_rollback_authorizes_exact_restarted_legacy_webui(
 
     assert receipt["webui"] == {"status": "stopped"}
     assert restored_runtime in captured_authorizations
+
+
+def test_bootstrap_rollback_authorizes_managed_webui_without_legacy_plist(
+    monkeypatch,
+    tmp_path,
+):
+    installed = tmp_path / "installed.plist"
+    rollback = tmp_path / "rollback.plist"
+    managed = tmp_path / "managed.plist"
+    installed.write_bytes(b"managed")
+    rollback.write_bytes(b"legacy")
+    managed.write_bytes(b"managed")
+    plan = {
+        "gateway_listener_port": 8642,
+        "listener_port": 8787,
+        "installed_plist": str(installed),
+        "bootstrap_rollback_plist": str(rollback),
+        "managed_plist": str(managed),
+    }
+    managed_runtime = {"pid": 77, "pid_start_token": "managed-start"}
+    journal = {
+        "phases": {
+            "prepared": {"captured": "legacy"},
+            "managed_pair_started": {"managed_runtime": managed_runtime},
+        }
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_acquire_legacy_cron_tick_lock",
+        lambda _plan: {"status": "held"},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_verify_legacy_cron_tick_lock",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: None)
+    monkeypatch.setattr(cutover, "_job_pid", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cutover, "_listener_pid_or_none", lambda _port: 77)
+    monkeypatch.setattr(
+        cutover,
+        "_authorized_cutover_runtimes",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_restored_legacy_runtime_authorization",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("managed plist must not use legacy authorization")
+        ),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_incomplete_managed_webui_stop_authorization",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_stop_current_service",
+        lambda _plan, *, gateway, authorized_receipts: (
+            {"status": "stopped"}
+            if gateway is False and managed_runtime in authorized_receipts
+            else (_ for _ in ()).throw(AssertionError("missing managed authority"))
+        ),
+    )
+
+    receipt = cutover._stop_bootstrap_pair_for_rollback(
+        plan,
+        journal,
+        {"status": "not-running"},
+    )
+
+    assert receipt["webui"] == {"status": "stopped"}
 
 
 def test_restart_or_adopt_restored_legacy_pair_adopts_exact_running_pair(

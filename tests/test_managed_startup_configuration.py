@@ -973,6 +973,29 @@ def test_config_adapter_preserves_unmanaged_deferred_behavior(
         config.verify_deferred_startup_configuration()
 
 
+def test_config_adapter_preserves_promoted_managed_restart_without_transaction(
+    managed_configuration,
+    monkeypatch,
+):
+    _managed, config, settings_file, _epoch = managed_configuration
+    monkeypatch.setattr(
+        config,
+        "_managed_release_selected_from_environment",
+        lambda: True,
+    )
+    monkeypatch.setattr(config, "_RUN_ADMISSION_TRANSACTION_ID", None)
+
+    receipt = config.apply_deferred_startup_configuration()
+
+    assert receipt == {
+        "settings_rewritten": True,
+        "cli_toolsets": ["terminal", "web"],
+    }
+    assert settings_file.read_text(encoding="utf-8") == (
+        '{"default_workspace":"/managed"}'
+    )
+
+
 def test_config_adapter_preserves_unmanaged_legacy_provider_seed(
     managed_configuration,
     monkeypatch,
