@@ -4524,7 +4524,12 @@ def _attest_last_good_identity_split(
             or identity["selector_generation"] <= 0
         ):
             raise ReleaseBuildError(f"{label} provenance is invalid")
-        _attest_expected_release_identity(identity, selector_path=selector_path, label=label)
+        identity_selector_path = str(identity.get("selector_path") or "")
+        _attest_expected_release_identity(
+            identity,
+            selector_path=identity_selector_path,
+            label=label,
+        )
         evidence[name.lower()] = MappingProxyType(
             {"identity": MappingProxyType(copy.deepcopy(identity))}
         )
@@ -4561,9 +4566,13 @@ def _attest_last_good_identity_split(
                 "receipt_sha256": str(adoption_receipt_sha256),
             }
         )
-    if any(
+    if (
+        webui_identity.get("selector_path")
+        != gateway_identity.get("selector_path")
+        or any(
         webui_identity.get(key) != gateway_identity.get(key)
         for key in _LAST_GOOD_SHARED_IDENTITY_KEYS
+        )
     ):
         raise ReleaseBuildError("last-good shared runtime identity changed")
     return MappingProxyType(evidence)
