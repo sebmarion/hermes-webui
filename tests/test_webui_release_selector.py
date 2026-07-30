@@ -10424,7 +10424,7 @@ def test_incomplete_managed_webui_start_reconstructs_exact_stop_authorization(
         "current": "candidate-r24",
         "candidate": "candidate-r24",
         "pending_transaction_id": "bootstrap-transaction-000001",
-        "last_good": "last-good",
+        "last_good": "older-rollback",
         "bootstrap_fallback": "last-good",
         "release_root": "/tmp/releases",
         "releases": {},

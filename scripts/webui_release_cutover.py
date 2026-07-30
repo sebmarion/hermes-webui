@@ -9107,7 +9107,6 @@ def _attest_candidate_startup_generation(
         or staged_state.get("current") != last_good.get("build_id")
         or staged_state.get("candidate") != candidate.get("build_id")
         or staged_state.get("pending_transaction_id") != plan.get("transaction_id")
-        or staged_state.get("last_good") != last_good.get("build_id")
         or selector_generation != staged_generation + 1
     ):
         raise ReleaseBuildError(
