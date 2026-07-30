@@ -1,0 +1,55 @@
+{
+  "schema": "zeus_release_planning_evidence.v1",
+  "collected_at_utc": "2026-07-30T22:24:06Z",
+  "purpose": "Planning evidence only; not a production admission policy.",
+  "repository": {
+    "path": "/Users/seb/hermes-webui",
+    "head": "5b4899958103f07ca94a05ef91e1aea735dd788e",
+    "origin": "git@github.com:nesquena/hermes-webui.git",
+    "release_remote": "git@github.com:sebmarion/hermes-webui.git"
+  },
+  "statistics": {
+    "percentile_rule": "sorted values; index=floor((n-1)*p)",
+    "merged_prs": {
+      "population": "latest 100 merged PR records returned by GitHub CLI",
+      "query": "gh pr list --repo nesquena/hermes-webui --state merged --limit 100 --json number,changedFiles,additions,deletions,mergedAt,title",
+      "canonical_output_sha256": "4134160f47ffd4f0e698fdf94afea384f538530c19350743350fa548f66e1c5d",
+      "changed_files": {"n": 100, "p50": 3, "p75": 6, "p90": 9, "p95": 11, "max": 24},
+      "churn": {"n": 100, "p50": 187, "p75": 405, "p90": 847, "p95": 1590, "max": 5188},
+      "eight_files_four_hundred_lines_admitted": 70
+    },
+    "local_commits": {
+      "population": "latest 100 first-parent non-merge commits at repository HEAD",
+      "query": "git log --first-parent --no-merges --format='%H' -100; git show --numstat per commit",
+      "canonical_output_sha256": "55abffa229e71fde9e59af9bbc3495af780f7fc95fe210436798c95ef590ae00",
+      "changed_files": {"n": 100, "p50": 3, "p75": 5, "p90": 9, "p95": 12, "max": 28},
+      "churn": {"n": 100, "p50": 199, "p75": 766, "p90": 1331, "p95": 2745, "max": 6904},
+      "eight_files_four_hundred_lines_admitted": 57
+    },
+    "test_workflows": {
+      "population": "latest 50 tests.yml runs; completed success/failure runs only",
+      "query": "gh run list --repo nesquena/hermes-webui --workflow tests.yml --limit 50 --json databaseId,status,conclusion,createdAt,updatedAt,event,headSha,displayTitle",
+      "canonical_output_sha256": "d5f28869829c4e59f9994a94567a77c62034b407737d01e6bb99858b720b6293",
+      "completed_runs_used": 37,
+      "duration_seconds": {"p50": 243, "p75": 275, "p90": 291, "p95": 328, "max": 371}
+    },
+    "hermes_sessions": {
+      "population": "session JSON objects excluding _index.json, updated in the preceding 172800 seconds",
+      "cutoff_epoch": 1785277508,
+      "query": "rg --files /Users/seb/.hermes/webui/sessions -g '*.json' | rg -v '/_index\\.json$' | jq select(updated_at >= cutoff)",
+      "canonical_output_sha256": "fc61ccc1bb7335a5aa4789ab8f6f14600ef7ac49ca75f16f066cf582a7fdb53e",
+      "sessions": 31,
+      "nonzero_input_sessions": 25,
+      "messages": 9670,
+      "input_tokens": 250500617,
+      "cache_read_tokens": 244094208,
+      "output_tokens": 448747,
+      "interpretation": "Harness replay evidence; not a local staged-work budget."
+    }
+  },
+  "integrity": {
+    "hash": "sha256",
+    "raw_query_payloads": "not embedded; canonical query hashes and commands are recorded above",
+    "policy_authority": "none; this receipt cannot authorize release"
+  }
+}
