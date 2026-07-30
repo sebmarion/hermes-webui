@@ -2256,40 +2256,168 @@ def wait_for_exact_process_exit(
     raise DrainTimeout("committed release process did not exit")
 
 
-def _release_inspection_is_drained(inspection: dict) -> bool:
+_LEGACY_RELEASE_ACTIVITY_KEYS = {
+    "active_streams",
+    "active_async_delegations",
+    "async_delegations_available",
+    "active_background_memory_commits",
+    "in_flight_memory_commits",
+    "memory_commit_activity_available",
+    "pending_oauth_flows",
+    "oauth_activity_available",
+    "active_terminals",
+    "terminal_activity_available",
+    "process_completion_activity_available",
+}
+_NATIVE_RELEASE_ACTIVITY_KEYS = {
+    *_LEGACY_RELEASE_ACTIVITY_KEYS,
+    "process_checkpoint_available",
+    "process_checkpoint_reason",
+    "running_processes",
+    "finalizing_processes",
+    "durable_undelivered_completions",
+}
+_RELEASE_ACTIVITY_COUNT_KEYS = {
+    "active_streams",
+    "active_async_delegations",
+    "active_background_memory_commits",
+    "in_flight_memory_commits",
+    "pending_oauth_flows",
+    "active_terminals",
+}
+_RELEASE_ACTIVITY_AVAILABILITY_KEYS = {
+    "async_delegations_available",
+    "memory_commit_activity_available",
+    "oauth_activity_available",
+    "terminal_activity_available",
+}
+_NATIVE_PROCESS_ACTIVITY_COUNT_KEYS = {
+    "running_processes",
+    "finalizing_processes",
+    "durable_undelivered_completions",
+}
+_RELEASE_ADMISSION_KEYS = {
+    "state",
+    "effective_state",
+    "pair_gate",
+    "generation",
+    "fenced_at",
+    "lease_expires_at",
+    "transaction_id",
+    "startup_error",
+    "reservations",
+    "reservation_kinds",
+    "active_runs",
+}
+_ABSENT_PAIR_GATE = {
+    "status": "absent",
+    "transaction_id": None,
+    "epoch": None,
+    "owner_hash": None,
+    "payload_sha256": None,
+    "agent": None,
+    "webui": None,
+}
+
+
+def _strict_nonnegative_release_count(value: object) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ReleaseBuildError("release activity counts are invalid")
+    return value
+
+
+def _classify_release_activity_schema(
+    inspection: dict,
+) -> tuple[str, dict, dict]:
     admission = inspection.get("admission")
     activity = inspection.get("activity")
-    if not isinstance(admission, dict) or admission.get("state") != "fenced":
+    if (
+        not isinstance(admission, dict)
+        or set(admission) != _RELEASE_ADMISSION_KEYS
+        or not isinstance(activity, dict)
+    ):
+        raise DrainIdentityMismatch("release activity schema changed")
+    if (
+        admission.get("state") != "fenced"
+        or admission.get("effective_state") != "fenced"
+        or admission.get("pair_gate") != _ABSENT_PAIR_GATE
+        or not isinstance(admission.get("generation"), int)
+        or isinstance(admission.get("generation"), bool)
+        or admission["generation"] < 0
+        or not isinstance(admission.get("fenced_at"), (int, float))
+        or isinstance(admission.get("fenced_at"), bool)
+        or admission["fenced_at"] <= 0
+        or not isinstance(admission.get("lease_expires_at"), (int, float))
+        or isinstance(admission.get("lease_expires_at"), bool)
+        or admission["lease_expires_at"] <= admission["fenced_at"]
+        or not isinstance(admission.get("transaction_id"), str)
+        or not _TRANSACTION_ID.fullmatch(admission["transaction_id"])
+        or admission.get("startup_error") is not None
+        or not isinstance(admission.get("reservation_kinds"), dict)
+    ):
+        raise ReleaseBuildError("release admission proof is invalid")
+    for key in ("active_runs", "reservations"):
+        _strict_nonnegative_release_count(admission.get(key))
+    reservation_kinds = admission["reservation_kinds"]
+    if (
+        any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+            for key, value in reservation_kinds.items()
+        )
+        or sum(reservation_kinds.values()) != admission["reservations"]
+    ):
+        raise ReleaseBuildError("release admission proof is invalid")
+    activity_keys = set(activity)
+    if activity_keys == _LEGACY_RELEASE_ACTIVITY_KEYS:
+        schema = "legacy"
+    elif activity_keys == _NATIVE_RELEASE_ACTIVITY_KEYS:
+        schema = "native"
+    else:
+        raise DrainIdentityMismatch("release activity schema changed")
+    for key in _RELEASE_ACTIVITY_COUNT_KEYS:
+        _strict_nonnegative_release_count(activity.get(key))
+    if any(
+        activity.get(key) is not True
+        for key in _RELEASE_ACTIVITY_AVAILABILITY_KEYS
+    ):
+        raise ReleaseBuildError("release activity availability proof is invalid")
+    process_available = activity.get("process_completion_activity_available")
+    if schema == "legacy":
+        if process_available is not False:
+            raise ReleaseBuildError(
+                "legacy process activity gap is not the known schema mismatch"
+            )
+    else:
+        for key in _NATIVE_PROCESS_ACTIVITY_COUNT_KEYS:
+            _strict_nonnegative_release_count(activity.get(key))
+        if (
+            process_available is not True
+            or activity.get("process_checkpoint_available") is not True
+            or activity.get("process_checkpoint_reason") != "verified"
+        ):
+            raise ReleaseBuildError(
+                "native WebUI process activity proof is invalid"
+            )
+    return schema, admission, activity
+
+
+def _release_inspection_is_drained(inspection: dict) -> bool:
+    schema, admission, activity = _classify_release_activity_schema(inspection)
+    if schema == "legacy":
         return False
-    if not isinstance(activity, dict):
-        return False
-    availability = (
-        "async_delegations_available",
-        "memory_commit_activity_available",
-        "oauth_activity_available",
-        "terminal_activity_available",
-        "process_completion_activity_available",
+    return all(
+        admission[key] == 0 for key in ("active_runs", "reservations")
+    ) and all(
+        activity[key] == 0
+        for key in (
+            *_RELEASE_ACTIVITY_COUNT_KEYS,
+            *_NATIVE_PROCESS_ACTIVITY_COUNT_KEYS,
+        )
     )
-    if any(activity.get(key) is not True for key in availability):
-        return False
-    try:
-        admission_counts = ("active_runs", "reservations")
-        activity_counts = (
-            "active_streams",
-            "active_async_delegations",
-            "active_background_memory_commits",
-            "in_flight_memory_commits",
-            "pending_oauth_flows",
-            "active_terminals",
-            "running_processes",
-            "finalizing_processes",
-            "durable_undelivered_completions",
-        )
-        return all(int(admission.get(key, -1)) == 0 for key in admission_counts) and all(
-            int(activity.get(key, -1)) == 0 for key in activity_counts
-        )
-    except (TypeError, ValueError):
-        return False
 
 
 def _require_bound_control_receipt(
@@ -5210,16 +5338,11 @@ def _bootout_launchd_job(plan: dict, *, required: bool) -> dict:
 
 def _bootstrap_launchd_job(plan: dict, plist_path: Path | str) -> dict:
     plist = _absolute_plan_path(plist_path, label="installed_plist")
-    completed = _run_launchctl(
-        "bootstrap",
-        str(plan["launchd_domain"]),
-        str(plist),
+    return _bootstrap_launchd_job_with_retry(
+        plan,
+        plist,
+        gateway=False,
     )
-    return {
-        "status": "started",
-        "target": _launchd_target(plan),
-        "stdout": completed.stdout.strip(),
-    }
 
 
 def _listener_pid(port: int) -> int:
@@ -5397,12 +5520,80 @@ def _bootout_job(plan: dict, *, gateway: bool, required: bool) -> dict:
 def _bootstrap_job(plan: dict, plist_path: Path | str, *, gateway: bool) -> dict:
     label = "gateway_installed_plist" if gateway else "installed_plist"
     plist = _absolute_plan_path(plist_path, label=label)
+    return _bootstrap_launchd_job_with_retry(
+        plan,
+        plist,
+        gateway=gateway,
+    )
+
+
+def _bootstrap_launchd_job_with_retry(
+    plan: dict,
+    plist: Path,
+    *,
+    gateway: bool,
+) -> dict:
     domain_key = "gateway_launchd_domain" if gateway else "launchd_domain"
-    completed = _run_launchctl("bootstrap", str(plan[domain_key]), str(plist))
+    target = _job_target(plan, gateway=gateway)
+    for attempt in range(1, 21):
+        completed = _run_launchctl(
+            "bootstrap",
+            str(plan[domain_key]),
+            str(plist),
+            check=False,
+        )
+        if completed.returncode == 0:
+            return {
+                "status": "started",
+                "target": target,
+                "stdout": completed.stdout.strip(),
+                "attempts": attempt,
+            }
+        if completed.returncode != 5:
+            raise ReleaseBuildError("launchd cutover command failed")
+        _require_launchd_job_absent(plan, gateway=gateway)
+        if attempt == 20:
+            raise ReleaseBuildError(
+                "launchd cutover command failed after teardown retry"
+            )
+        time.sleep(0.25)
+    raise AssertionError("unreachable launchd bootstrap retry state")
+
+
+def _require_launchd_job_absent(
+    plan: dict,
+    *,
+    gateway: bool,
+) -> dict:
+    target = _job_target(plan, gateway=gateway)
+    completed = _run_launchctl("print", target, check=False)
+    domain, separator, label = target.partition("/")
+    if domain == "gui":
+        user_id, separator, label = label.partition("/")
+        expected_stderr = (
+            "Bad request.\n"
+            f'Could not find service "{label}" in domain for user gui: '
+            f"{user_id}\n"
+        )
+    elif domain == "system" and separator:
+        expected_stderr = (
+            "Bad request.\n"
+            f'Could not find service "{label}" in domain for system\n'
+        )
+    else:
+        raise ReleaseBuildError("launchd job target is invalid")
+    if (
+        completed.returncode != 113
+        or completed.stdout != ""
+        or completed.stderr != expected_stderr
+    ):
+        raise DrainIdentityMismatch(
+            "launchd job absence probe is ambiguous"
+        )
     return {
-        "status": "started",
-        "target": _job_target(plan, gateway=gateway),
-        "stdout": completed.stdout.strip(),
+        "status": "absent",
+        "target": target,
+        "returncode": completed.returncode,
     }
 
 
@@ -14179,79 +14370,33 @@ def _attest_legacy_webui_activity_drain(
     inspect_control: Callable[[], dict],
 ) -> dict | None:
     """Bridge one old signed activity schema with exact durable zero proof."""
-    activity = inspection.get("activity")
-    expected_activity_keys = {
-        "active_streams",
-        "active_async_delegations",
-        "async_delegations_available",
-        "active_background_memory_commits",
-        "in_flight_memory_commits",
-        "memory_commit_activity_available",
-        "pending_oauth_flows",
-        "oauth_activity_available",
-        "active_terminals",
-        "terminal_activity_available",
-        "process_completion_activity_available",
-    }
-    zero_keys = {
-        "active_streams",
-        "active_async_delegations",
-        "active_background_memory_commits",
-        "in_flight_memory_commits",
-        "pending_oauth_flows",
-        "active_terminals",
-    }
-    available_keys = {
-        "async_delegations_available",
-        "memory_commit_activity_available",
-        "oauth_activity_available",
-        "terminal_activity_available",
-    }
-
     def exact_legacy_gap(candidate: object) -> bool:
         if not isinstance(candidate, dict):
             raise ReleaseBuildError(
                 "legacy WebUI activity inspection is invalid"
             )
-        candidate_admission = candidate.get("admission")
-        candidate_activity = candidate.get("activity")
         if (
             candidate.get("status") != "inspected"
             or candidate.get("identity") != identity
-            or not isinstance(candidate_admission, dict)
-            or candidate_admission.get("state") != "fenced"
-            or not isinstance(candidate_activity, dict)
-            or set(candidate_activity) != expected_activity_keys
         ):
             raise DrainIdentityMismatch(
                 "legacy WebUI activity identity or schema changed"
             )
-        try:
-            counts = {
-                "active_runs": int(candidate_admission.get("active_runs", -1)),
-                "reservations": int(candidate_admission.get("reservations", -1)),
-                **{
-                    key: int(candidate_activity.get(key, -1))
-                    for key in zero_keys
-                },
-            }
-        except (TypeError, ValueError) as exc:
-            raise ReleaseBuildError(
-                "legacy WebUI activity counts are invalid"
-            ) from exc
+        schema, candidate_admission, candidate_activity = (
+            _classify_release_activity_schema(candidate)
+        )
+        if schema == "native":
+            return False
+        counts = {
+            "active_runs": candidate_admission["active_runs"],
+            "reservations": candidate_admission["reservations"],
+            **{
+                key: candidate_activity[key]
+                for key in _RELEASE_ACTIVITY_COUNT_KEYS
+            },
+        }
         if any(value != 0 for value in counts.values()):
             return False
-        if any(candidate_activity.get(key) is not True for key in available_keys):
-            return False
-        if (
-            candidate_activity.get(
-                "process_completion_activity_available"
-            )
-            is not False
-        ):
-            raise ReleaseBuildError(
-                "legacy process activity gap is not the known schema mismatch"
-            )
         return True
 
     if not _candidate_identity_matches(
@@ -14359,7 +14504,7 @@ def _attest_legacy_webui_activity_drain(
         "status": "verified",
         "identity": copy.deepcopy(identity),
         "proof": "exact-external-process-barrier",
-        "activity": copy.deepcopy(activity),
+        "activity": copy.deepcopy(inspection["activity"]),
         "durable_activity": durable,
         "outbox": {
             "receipt": outbox_receipt,

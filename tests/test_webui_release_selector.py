@@ -28,6 +28,37 @@ from scripts import webui_release_retention as retention
 from scripts import webui_release_selector as selector
 
 
+def _fenced_release_admission(
+    *,
+    active_runs=0,
+    reservations=0,
+    reservation_kinds=None,
+):
+    return {
+        "state": "fenced",
+        "effective_state": "fenced",
+        "pair_gate": {
+            "status": "absent",
+            "transaction_id": None,
+            "epoch": None,
+            "owner_hash": None,
+            "payload_sha256": None,
+            "agent": None,
+            "webui": None,
+        },
+        "generation": 7,
+        "fenced_at": 100.0,
+        "lease_expires_at": 130.0,
+        "transaction_id": "release-transaction-00000000000001",
+        "startup_error": None,
+        "reservations": reservations,
+        "reservation_kinds": (
+            {} if reservation_kinds is None else reservation_kinds
+        ),
+        "active_runs": active_runs,
+    }
+
+
 @pytest.fixture(autouse=True)
 def _restore_immutable_tmp_permissions(tmp_path):
     """Make fixture-owned immutable release trees removable by pytest."""
@@ -615,11 +646,7 @@ def test_release_control_rejects_modern_drained_wrong_old_before_mutation(
         "status": "inspected",
         "transaction_id": transaction_id,
         "identity": wrong_old,
-        "admission": {
-            "state": "fenced",
-            "active_runs": 0,
-            "reservations": 0,
-        },
+        "admission": _fenced_release_admission(),
         "activity": {
             "active_streams": 0,
             "active_async_delegations": 0,
@@ -635,6 +662,8 @@ def test_release_control_rejects_modern_drained_wrong_old_before_mutation(
             "finalizing_processes": 0,
             "durable_undelivered_completions": 0,
             "process_completion_activity_available": True,
+            "process_checkpoint_available": True,
+            "process_checkpoint_reason": "verified",
         },
     }
     mutations = []
@@ -6612,11 +6641,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(
         "status": "inspected",
         "transaction_id": transaction_id,
         "identity": old_identity,
-        "admission": {
-            "state": "fenced",
-            "reservations": 0,
-            "active_runs": 0,
-        },
+        "admission": _fenced_release_admission(),
         "activity": {
             "active_streams": 0,
             "active_async_delegations": 0,
@@ -6632,6 +6657,8 @@ def test_release_control_driver_commits_pair_before_sequential_open(
             "finalizing_processes": 0,
             "durable_undelivered_completions": 0,
             "process_completion_activity_available": True,
+            "process_checkpoint_available": True,
+            "process_checkpoint_reason": "verified",
         },
     }
     if external_drain:
@@ -6643,6 +6670,8 @@ def test_release_control_driver_commits_pair_before_sequential_open(
                 "running_processes",
                 "finalizing_processes",
                 "durable_undelivered_completions",
+                "process_checkpoint_available",
+                "process_checkpoint_reason",
             }
         }
         drained["activity"]["process_completion_activity_available"] = False
@@ -6945,11 +6974,7 @@ def test_legacy_webui_activity_drain_uses_exact_locked_durable_zero(
     inspection = {
         "status": "inspected",
         "identity": identity,
-        "admission": {
-            "state": "fenced",
-            "active_runs": 0,
-            "reservations": 0,
-        },
+        "admission": _fenced_release_admission(),
         "activity": {
             "active_streams": 0,
             "active_async_delegations": 0,
@@ -7027,6 +7052,23 @@ def test_legacy_webui_activity_drain_uses_exact_locked_durable_zero(
         ("release", "completion"),
         ("release", "admission"),
     ]
+    malformed_repeated = {
+        **inspection,
+        "admission": {
+            **inspection["admission"],
+            "active_runs": "0",
+        },
+    }
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="activity counts are invalid",
+    ):
+        cutover._attest_legacy_webui_activity_drain(
+            plan,
+            identity,
+            inspection,
+            inspect_control=lambda: malformed_repeated,
+        )
     busy = {
         **inspection,
         "activity": {**inspection["activity"], "active_streams": 1},
@@ -7075,6 +7117,201 @@ def test_legacy_webui_activity_drain_uses_exact_locked_durable_zero(
         ("release", "completion"),
         ("release", "admission"),
     ]
+
+
+def test_legacy_webui_activity_drain_defers_to_stronger_process_schema(
+    monkeypatch,
+):
+    identity = {
+        "build_id": "last-good",
+        "pid": 123,
+        "pid_start_token": "old-start",
+    }
+    inspection = {
+        "status": "inspected",
+        "identity": identity,
+        "admission": _fenced_release_admission(),
+        "activity": {
+            "active_streams": 0,
+            "active_async_delegations": 0,
+            "async_delegations_available": True,
+            "active_background_memory_commits": 0,
+            "in_flight_memory_commits": 0,
+            "memory_commit_activity_available": True,
+            "pending_oauth_flows": 0,
+            "oauth_activity_available": True,
+            "active_terminals": 0,
+            "terminal_activity_available": True,
+            "process_completion_activity_available": True,
+            "process_checkpoint_available": True,
+            "process_checkpoint_reason": "verified",
+            "running_processes": 2,
+            "finalizing_processes": 0,
+            "durable_undelivered_completions": 0,
+        },
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_acquire_process_registry_lock",
+        lambda *_args, **_kwargs: pytest.fail(
+            "strong process activity must remain on the native drain path"
+        ),
+    )
+
+    assert (
+        cutover._attest_legacy_webui_activity_drain(
+            {
+                "last_good_identity": {"build_id": "last-good"},
+                "last_good_gateway_identity": {
+                    "build_id": "last-good-gateway"
+                },
+            },
+            identity,
+            inspection,
+            inspect_control=lambda: inspection,
+        )
+        is None
+    )
+
+
+def test_launchd_bootstrap_retries_only_while_exact_job_is_absent(
+    tmp_path,
+    monkeypatch,
+):
+    plist = tmp_path / "com.parantoux.hermes-webui.plist"
+    plist.write_bytes(plistlib.dumps({"Label": "com.parantoux.hermes-webui"}))
+    plan = {
+        "launchd_domain": "gui/501",
+        "launchd_label": "com.parantoux.hermes-webui",
+        "installed_plist": str(plist),
+    }
+    calls = []
+
+    def launchctl(*arguments, check=True):
+        calls.append((arguments, check))
+        if len(calls) == 1:
+            if check:
+                raise cutover.ReleaseBuildError(
+                    "launchd cutover command failed"
+                )
+            return SimpleNamespace(returncode=5, stdout="", stderr="I/O error")
+        if len(calls) == 2:
+            return SimpleNamespace(
+                returncode=113,
+                stdout="",
+                stderr=(
+                    "Bad request.\n"
+                    'Could not find service "com.parantoux.hermes-webui" '
+                    "in domain for user gui: 501\n"
+                ),
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cutover, "_run_launchctl", launchctl)
+    monkeypatch.setattr(cutover.time, "sleep", lambda _seconds: None)
+
+    receipt = cutover._bootstrap_launchd_job(plan, plist)
+
+    assert receipt["status"] == "started"
+    assert receipt["attempts"] == 2
+    assert calls == [
+        (("bootstrap", "gui/501", str(plist)), False),
+        (("print", "gui/501/com.parantoux.hermes-webui"), False),
+        (("bootstrap", "gui/501", str(plist)), False),
+    ]
+
+
+def test_launchd_bootstrap_does_not_retry_after_ambiguous_absence_probe(
+    tmp_path,
+    monkeypatch,
+):
+    plist = tmp_path / "com.parantoux.hermes-webui.plist"
+    plist.write_bytes(plistlib.dumps({"Label": "com.parantoux.hermes-webui"}))
+    plan = {
+        "launchd_domain": "gui/501",
+        "launchd_label": "com.parantoux.hermes-webui",
+        "installed_plist": str(plist),
+    }
+    calls = []
+
+    def launchctl(*arguments, check=True):
+        calls.append((arguments, check))
+        if len(calls) == 1:
+            return SimpleNamespace(returncode=5, stdout="", stderr="I/O error")
+        return SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="Operation not permitted\n",
+        )
+
+    monkeypatch.setattr(cutover, "_run_launchctl", launchctl)
+    monkeypatch.setattr(cutover.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="absence probe is ambiguous",
+    ):
+        cutover._bootstrap_launchd_job(plan, plist)
+
+    assert calls == [
+        (("bootstrap", "gui/501", str(plist)), False),
+        (("print", "gui/501/com.parantoux.hermes-webui"), False),
+    ]
+
+
+def _strong_release_inspection(**activity_overrides):
+    activity = {
+        "active_streams": 0,
+        "active_async_delegations": 0,
+        "async_delegations_available": True,
+        "active_background_memory_commits": 0,
+        "in_flight_memory_commits": 0,
+        "memory_commit_activity_available": True,
+        "pending_oauth_flows": 0,
+        "oauth_activity_available": True,
+        "active_terminals": 0,
+        "terminal_activity_available": True,
+        "process_completion_activity_available": True,
+        "process_checkpoint_available": True,
+        "process_checkpoint_reason": "verified",
+        "running_processes": 0,
+        "finalizing_processes": 0,
+        "durable_undelivered_completions": 0,
+    }
+    activity.update(activity_overrides)
+    return {
+        "admission": _fenced_release_admission(),
+        "activity": activity,
+    }
+
+
+def test_release_drain_rejects_unknown_zero_activity_schema():
+    inspection = _strong_release_inspection(foreign_zero=0)
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="activity schema changed",
+    ):
+        cutover._release_inspection_is_drained(inspection)
+
+
+def test_release_drain_rejects_string_count_in_strong_schema():
+    inspection = _strong_release_inspection(running_processes="0")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="activity counts are invalid",
+    ):
+        cutover._release_inspection_is_drained(inspection)
+
+
+def test_release_drain_accepts_only_zero_strong_activity():
+    assert cutover._release_inspection_is_drained(
+        _strong_release_inspection()
+    )
+    assert not cutover._release_inspection_is_drained(
+        _strong_release_inspection(running_processes=1)
+    )
 
 
 @pytest.mark.parametrize(
@@ -7209,7 +7446,7 @@ def test_release_transaction_resumes_from_each_durable_external_phase(
         "status": "inspected",
         "transaction_id": transaction_id,
         "identity": old_identity,
-        "admission": {"state": "fenced", "reservations": 0, "active_runs": 0},
+        "admission": _fenced_release_admission(),
         "activity": {
             "active_streams": 0,
             "active_async_delegations": 0,
@@ -7225,6 +7462,8 @@ def test_release_transaction_resumes_from_each_durable_external_phase(
             "finalizing_processes": 0,
             "durable_undelivered_completions": 0,
             "process_completion_activity_available": True,
+            "process_checkpoint_available": True,
+            "process_checkpoint_reason": "verified",
         },
     }
     candidate_startup = {
@@ -7525,6 +7764,8 @@ def test_release_early_failure_matrix_always_restores_selector_and_plist(
         "finalizing_processes": 0,
         "durable_undelivered_completions": 0,
         "process_completion_activity_available": True,
+        "process_checkpoint_available": True,
+        "process_checkpoint_reason": "verified",
     }
 
     def inspect_control():
@@ -7537,9 +7778,9 @@ def test_release_early_failure_matrix_always_restores_selector_and_plist(
             "transaction_id": transaction_id,
             "identity": old_identity,
             "admission": {
+                **_fenced_release_admission(),
                 "state": admission_state["value"],
-                "reservations": 0,
-                "active_runs": 0,
+                "effective_state": admission_state["value"],
             },
             "activity": drained_activity,
         }
@@ -8240,7 +8481,7 @@ def test_release_control_driver_surfaces_every_rollback_failure(tmp_path):
         "status": "inspected",
         "transaction_id": transaction_id,
         "identity": identity,
-        "admission": {"state": "fenced", "reservations": 0, "active_runs": 0},
+        "admission": _fenced_release_admission(),
         "activity": {
             "active_streams": 0,
             "active_async_delegations": 0,
@@ -8256,6 +8497,8 @@ def test_release_control_driver_surfaces_every_rollback_failure(tmp_path):
             "finalizing_processes": 0,
             "durable_undelivered_completions": 0,
             "process_completion_activity_available": True,
+            "process_checkpoint_available": True,
+            "process_checkpoint_reason": "verified",
         },
     }
     expected_candidate = {
