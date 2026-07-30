@@ -588,6 +588,35 @@ def cron_receipt_is_scheduled(receipt: object) -> bool:
     )
 
 
+def cron_receipt_is_restored(receipt: object) -> bool:
+    if cron_receipt_is_scheduled(receipt):
+        return True
+    if not isinstance(receipt, dict):
+        return False
+    original = receipt.get("original_controls")
+    return (
+        receipt.get("backend") == "hermes_internal"
+        and receipt.get("control_origin") == "preexisting"
+        and isinstance(original, dict)
+        and set(original)
+        == {"enabled", "state", "paused_at", "paused_reason"}
+        and original.get("enabled") is False
+        and original.get("state") == "paused"
+        and receipt.get("job_enabled") is original["enabled"]
+        and receipt.get("job_state") == original["state"]
+        and isinstance(receipt.get("job_id"), str)
+        and bool(receipt["job_id"])
+        and all(
+            HEX64.fullmatch(str(receipt.get(key) or ""))
+            for key in (
+                "job_sha256",
+                "stable_job_sha256",
+                "crontab_sha256",
+            )
+        )
+    )
+
+
 def managed_terminal_kind(
     phases: dict[str, Any],
     rollback_receipt: dict[str, Any] | None = None,
@@ -655,7 +684,7 @@ def managed_terminal_kind(
         or validated["candidate_gateway_accepted"]["binding"].get("status")
         != "verified"
         or not isinstance(validated["promoted"].get("promotion"), dict)
-        or not cron_receipt_is_scheduled(validated["watchdog_cron_restored"])
+        or not cron_receipt_is_restored(validated["watchdog_cron_restored"])
     ):
         return None
     return "accepted-managed-promotion"
@@ -1061,7 +1090,12 @@ def validate_manifest(
     verify_payload: bool = True,
 ) -> float:
     require_private_regular_file(manifest_path, label="snapshot manifest")
-    if manifest_path.parent != expected_root.parent:
+    embedded_manifest = manifest_path.parent == expected_root.parent
+    external_manifest = (
+        manifest_path.parent == PRIVATE_ROOT / "snapshot-manifests"
+        and expected_root.parent == PRIVATE_ROOT
+    )
+    if not embedded_manifest and not external_manifest:
         raise CleanupError(
             f"snapshot manifest is outside its directory: {manifest_path}"
         )
@@ -1088,7 +1122,13 @@ def validate_manifest(
         raise CleanupError(
             f"snapshot manifest identity is invalid: {manifest_path}"
         )
-    if not canonical_child(expected_root, manifest_path.parent):
+    if (
+        embedded_manifest
+        and not canonical_child(expected_root, manifest_path.parent)
+    ) or (
+        external_manifest
+        and not canonical_child(expected_root, PRIVATE_ROOT)
+    ):
         raise CleanupError(f"snapshot data root is unsafe: {expected_root}")
     if verify_payload:
         verify_snapshot_payload(
@@ -2605,6 +2645,262 @@ def _apply_rolling_release_plan(plan: dict[str, Any]) -> dict[str, Any]:
     return receipt
 
 
+def _accepted_snapshot_plan(
+    *,
+    accepted_transaction_id: str,
+    expected_current_build: str,
+) -> dict[str, Any]:
+    journal = _accepted_release_journal(
+        accepted_transaction_id,
+        expected_current_build,
+    )
+    manifest_root = PRIVATE_ROOT / "snapshot-manifests"
+    require_owned_directory(manifest_root, label="snapshot manifest root")
+    expected: list[tuple[str, str]] = [
+        (
+            str(journal["rollback_receipt"]["state_snapshot_id"]),
+            str(journal["rollback_receipt"]["state_snapshot_sha256"]),
+        )
+    ]
+    paired = journal["phases"].get("paired_state_snapshot_created")
+    if paired is not None:
+        expected.append(
+            (
+                str(paired.get("state_snapshot_id") or ""),
+                str(paired.get("state_snapshot_sha256") or ""),
+            )
+        )
+    protected_roots: list[dict[str, Any]] = []
+    protected_manifests: set[Path] = set()
+    for snapshot_id, manifest_sha256 in expected:
+        matches = [
+            path
+            for path in manifest_root.glob("manifest-*.json")
+            if sha256_file(path) == manifest_sha256
+        ]
+        if len(matches) != 1:
+            raise CleanupError(
+                "accepted rollback snapshot manifest is not exact"
+            )
+        manifest_path = matches[0]
+        manifest = read_json_file(
+            manifest_path,
+            label="accepted rollback snapshot manifest",
+        )
+        root = Path(str(manifest.get("snapshot_root") or ""))
+        if (
+            root.parent != PRIVATE_ROOT
+            or not root.name.startswith("snapshots-")
+            or root.is_symlink()
+        ):
+            raise CleanupError("accepted rollback snapshot root is unsafe")
+        opened = require_owned_directory(
+            root,
+            label="accepted rollback snapshot root",
+        )
+        validate_manifest(
+            manifest_path,
+            root,
+            expected_snapshot_id=snapshot_id,
+            expected_sha256=manifest_sha256,
+            verify_payload=True,
+        )
+        protected_roots.append(
+            {
+                "path": str(root),
+                "device": opened.st_dev,
+                "inode": opened.st_ino,
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": manifest_sha256,
+            }
+        )
+        protected_manifests.add(manifest_path)
+    if len({item["path"] for item in protected_roots}) != len(protected_roots):
+        raise CleanupError("accepted rollback snapshot roots are duplicated")
+
+    candidates: list[dict[str, Any]] = []
+    protected_paths = {Path(item["path"]) for item in protected_roots}
+    for path in sorted(PRIVATE_ROOT.iterdir(), key=lambda item: item.name):
+        if path in protected_paths or not path.name.startswith("snapshots-"):
+            continue
+        opened = require_owned_directory(path, label="obsolete snapshot root")
+        if (
+            path.is_symlink()
+            or path.parent != PRIVATE_ROOT
+            or re.fullmatch(r"snapshots-[A-Za-z0-9][A-Za-z0-9._-]{0,190}", path.name)
+            is None
+        ):
+            raise CleanupError(f"obsolete snapshot root is unsafe: {path}")
+        candidates.append(
+            {
+                "kind": "snapshot-root",
+                "path": str(path),
+                "device": opened.st_dev,
+                "inode": opened.st_ino,
+            }
+        )
+    unknown_manifests: list[str] = []
+    for path in sorted(manifest_root.iterdir(), key=lambda item: item.name):
+        if path in protected_manifests:
+            continue
+        if re.fullmatch(r"manifest-[A-Za-z0-9][A-Za-z0-9._-]{0,190}\.json", path.name):
+            opened = require_private_regular_file(
+                path,
+                label="obsolete snapshot manifest",
+            )
+            candidates.append(
+                {
+                    "kind": "snapshot-manifest",
+                    "path": str(path),
+                    "device": opened.st_dev,
+                    "inode": opened.st_ino,
+                }
+            )
+        else:
+            unknown_manifests.append(str(path))
+    state = release_selector.read_selector_state(
+        SELECTOR_STATE,
+        lock_path=SELECTOR_LOCK,
+    )
+    plan = {
+        "transaction_id": accepted_transaction_id,
+        "expected_current_build": expected_current_build,
+        "selector_generation": state["generation"],
+        "selector_state_sha256": release_selector.selector_state_sha256(state),
+        "protected_roots": protected_roots,
+        "candidates": candidates,
+        "unknown_manifests": unknown_manifests,
+    }
+    plan["plan_sha256"] = hashlib.sha256(
+        canonical_json_bytes(plan)
+    ).hexdigest()
+    return plan
+
+
+def _apply_accepted_snapshot_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    RECEIPTS_ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    receipt_path = (
+        RECEIPTS_ROOT
+        / f"rolling-snapshot-cleanup-{plan['transaction_id']}.json"
+    )
+    operations = [
+        {
+            "source": item["path"],
+            "destination": str(
+                Path(item["path"]).with_name(
+                    ".hermes-snapshot-retention-"
+                    f"{plan['transaction_id']}-{index:04d}-"
+                    f"{Path(item['path']).name}"
+                )
+            ),
+            "device": item["device"],
+            "inode": item["inode"],
+            "state": "intent",
+        }
+        for index, item in enumerate(plan["candidates"])
+    ]
+    if receipt_path.exists():
+        receipt = read_json_file(
+            receipt_path,
+            label="rolling snapshot cleanup receipt",
+        )
+        if receipt.get("plan") != plan:
+            raise CleanupError("rolling snapshot cleanup receipt changed")
+        if receipt.get("status") == "completed":
+            return receipt
+    else:
+        receipt = {
+            "version": 1,
+            "status": "planned",
+            "plan": plan,
+            "operations": operations,
+            "disk_free_before_bytes": shutil.disk_usage(PRIVATE_ROOT).free,
+        }
+        create_receipt(receipt_path, receipt)
+    current = release_selector.read_selector_state(
+        SELECTOR_STATE,
+        lock_path=SELECTOR_LOCK,
+    )
+    if (
+        current["generation"] != plan["selector_generation"]
+        or release_selector.selector_state_sha256(current)
+        != plan["selector_state_sha256"]
+    ):
+        raise CleanupError("selector changed during snapshot retention")
+    for protected in plan["protected_roots"]:
+        root = Path(protected["path"])
+        opened = require_owned_directory(
+            root,
+            label="protected rollback snapshot",
+        )
+        if (
+            opened.st_dev != protected["device"]
+            or opened.st_ino != protected["inode"]
+        ):
+            raise CleanupError("protected rollback snapshot changed")
+        validate_manifest(
+            Path(protected["manifest_path"]),
+            root,
+            expected_snapshot_id=plan["transaction_id"],
+            expected_sha256=protected["manifest_sha256"],
+            verify_payload=True,
+        )
+    receipt["status"] = "quarantining"
+    atomic_receipt(receipt_path, receipt)
+    for operation in receipt["operations"]:
+        source = Path(operation["source"])
+        destination = Path(operation["destination"])
+        if source.exists() and not destination.exists():
+            if lsof_open_rows(source):
+                raise CleanupError(
+                    f"obsolete snapshot artifact has open files: {source}"
+                )
+            opened = source.lstat()
+            if (
+                stat.S_ISLNK(opened.st_mode)
+                or opened.st_dev != operation["device"]
+                or opened.st_ino != operation["inode"]
+            ):
+                raise CleanupError(
+                    f"obsolete snapshot artifact changed: {source}"
+                )
+            os.replace(source, destination)
+            fsync_directory(source.parent)
+        elif destination.exists() and not source.exists():
+            opened = destination.lstat()
+            if (
+                stat.S_ISLNK(opened.st_mode)
+                or opened.st_dev != operation["device"]
+                or opened.st_ino != operation["inode"]
+            ):
+                raise CleanupError("snapshot quarantine identity changed")
+        elif operation.get("state") != "deleted":
+            raise CleanupError("snapshot quarantine state is ambiguous")
+        operation["state"] = "quarantined"
+        atomic_receipt(receipt_path, receipt)
+    receipt["status"] = "deleting"
+    atomic_receipt(receipt_path, receipt)
+    for operation in receipt["operations"]:
+        destination = Path(operation["destination"])
+        if destination.exists():
+            if destination.is_dir():
+                remove_sealed_tree(destination)
+            else:
+                destination.unlink()
+            fsync_directory(destination.parent)
+        operation["state"] = "deleted"
+        atomic_receipt(receipt_path, receipt)
+    receipt["status"] = "completed"
+    receipt["disk_free_after_bytes"] = shutil.disk_usage(PRIVATE_ROOT).free
+    receipt["disk_free_delta_bytes"] = (
+        receipt["disk_free_after_bytes"]
+        - receipt["disk_free_before_bytes"]
+    )
+    receipt["receipt_path"] = str(receipt_path)
+    atomic_receipt(receipt_path, receipt)
+    return receipt
+
+
 def run_after_release(
     selector_state: Path | str,
     selector_lock: Path | str,
@@ -2639,20 +2935,21 @@ def run_after_release(
                 expected_current_build=expected_current_build,
             )
         rolling_receipt = _apply_rolling_release_plan(rolling_plan)
-        preview = dry_run()
-        receipt = apply_cleanup(preview["plan_sha256"])
+        snapshot_plan = _accepted_snapshot_plan(
+            accepted_transaction_id=accepted_transaction_id,
+            expected_current_build=expected_current_build,
+        )
+        receipt = _apply_accepted_snapshot_plan(snapshot_plan)
         retained = [
-            row["path"]
-            for row in receipt.get("inventory", [])
-            if row.get("reason") == "previous-rollback"
+            item["path"] for item in snapshot_plan["protected_roots"]
         ]
         return {
             "status": receipt["status"],
             "receipt_path": receipt["receipt_path"],
             "retained_rollback_roots": retained,
-            "deleted_payload_trees": len(receipt.get("deleted", [])),
+            "deleted_payload_trees": len(snapshot_plan["candidates"]),
             "disk_free_delta_bytes": receipt.get("disk_free_delta_bytes", 0),
-            "plan_sha256": receipt["plan_sha256"],
+            "plan_sha256": snapshot_plan["plan_sha256"],
             "rolling_release_receipt": rolling_receipt["receipt_path"],
             "rolling_deleted": len(rolling_receipt["operations"]),
             "unknown_legacy_artifacts": rolling_plan["unknown_protected"],

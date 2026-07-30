@@ -60,6 +60,63 @@ def test_refuses_cleanup_without_a_verified_terminal_rollback():
         retention.select_rolling_candidates(rows)
 
 
+def test_managed_promotion_is_terminal_when_prepaused_watchdog_is_restored(
+    monkeypatch,
+):
+    phases = {name: {} for name in retention.MANAGED_SUCCESS_REQUIRED}
+    phases.update(
+        {
+            "pair_accepted": {
+                "admission": {"state": "open"},
+                "binding": {
+                    "health_status": "ok",
+                    "build": {"valid": True},
+                },
+            },
+            "pair_released": {"status": "released"},
+            "pair_opened": {"status": "verified"},
+            "gateway_dispatcher_lock_released": {"status": "released"},
+            "candidate_gateway_accepted": {
+                "binding": {"status": "verified"}
+            },
+            "promoted": {"promotion": {}},
+            "watchdog_cron_restored": {
+                "backend": "hermes_internal",
+                "control_origin": "preexisting",
+                "job_id": "watchdog-job",
+                "job_enabled": False,
+                "job_state": "paused",
+                "job_sha256": "a" * 64,
+                "stable_job_sha256": "b" * 64,
+                "crontab_sha256": "c" * 64,
+                "original_controls": {
+                    "enabled": False,
+                    "state": "paused",
+                    "paused_at": None,
+                    "paused_reason": "manual-recovery",
+                },
+            },
+        }
+    )
+    monkeypatch.setattr(
+        retention,
+        "validate_phase_graph",
+        lambda actual, *_args, **_kwargs: actual,
+    )
+
+    receipt = {
+        "state_snapshot_id": "snapshot-1",
+        "state_snapshot_sha256": "d" * 64,
+    }
+    assert (
+        retention.managed_terminal_kind(phases, receipt)
+        == "accepted-managed-promotion"
+    )
+
+    phases["watchdog_cron_restored"]["job_enabled"] = True
+    assert retention.managed_terminal_kind(phases, receipt) is None
+
+
 def test_release_paths_are_derived_from_selector_control_files(tmp_path):
     selector_root = tmp_path / "reliability" / "selector"
     selector_root.mkdir(parents=True)
