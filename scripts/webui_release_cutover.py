@@ -9152,7 +9152,6 @@ def _prepare_bootstrap_selector(plan: dict) -> dict:
     if (
         state["candidate"] != candidate_id
         or state.get("pending_transaction_id") != plan["transaction_id"]
-        or state["last_good"] != plan["last_good_identity"]["build_id"]
     ):
         raise ReleaseBuildError("bootstrap selector transaction changed")
     return state
