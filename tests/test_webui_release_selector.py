@@ -5171,6 +5171,203 @@ def test_internal_watchdog_barrier_pauses_registry_without_gateway_drain(
     assert os_cron_reads
 
 
+def test_internal_watchdog_preserves_prepaused_manual_recovery_controls(
+    tmp_path,
+    monkeypatch,
+):
+    plan, registry = _internal_watchdog_plan(tmp_path)
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["jobs"][0].update(
+        {
+            "enabled": False,
+            "state": "paused",
+            "paused_at": "2026-07-29T12:00:00+00:00",
+            "paused_reason": "manual-recovery",
+        }
+    )
+    registry.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    registry.chmod(0o600)
+    original = copy.deepcopy(payload["jobs"][0])
+    monkeypatch.setattr(cutover, "_read_crontab", lambda: "")
+    writes = []
+    original_write = cutover._write_internal_watchdog_registry
+    monkeypatch.setattr(
+        cutover,
+        "_write_internal_watchdog_registry",
+        lambda *_args, **_kwargs: writes.append(True)
+        or original_write(*_args, **_kwargs),
+    )
+
+    cron = cutover._backup_crontab(plan)
+    assert cron["job_enabled"] is False
+    assert cron["job_state"] == "paused"
+    assert cron["control_origin"] == "preexisting"
+    assert cron["original_controls"] == {
+        "enabled": False,
+        "state": "paused",
+        "paused_at": "2026-07-29T12:00:00+00:00",
+        "paused_reason": "manual-recovery",
+    }
+    cron["drain_intent"] = {
+        "marker": {
+            "path": str(tmp_path / ".drain_request.json"),
+            "payload": {"release_transaction_id": plan["transaction_id"]},
+            "sha256": "a" * 64,
+        }
+    }
+    prepared = {"watchdog_cron": cron, "gateway": {"pid": 99}}
+
+    disabled = cutover._disable_watchdog_cron(plan, prepared)
+
+    assert writes == []
+    assert disabled["status"] == "disabled"
+    assert disabled["control_origin"] == "preexisting"
+    assert disabled["original_controls"] == cron["original_controls"]
+    assert cutover._attest_disabled_watchdog_cron(plan, prepared) == disabled
+    restored = cutover._restore_watchdog_cron(plan, prepared)
+
+    assert writes == []
+    assert restored["job_enabled"] is False
+    assert restored["job_state"] == "paused"
+    assert cutover._cron_receipt_matches_prepared(restored, prepared) is True
+    assert json.loads(registry.read_text(encoding="utf-8"))["jobs"][0] == original
+
+
+def test_internal_watchdog_restore_rejects_post_lock_paused_control_race(
+    tmp_path,
+    monkeypatch,
+):
+    plan, registry = _internal_watchdog_plan(tmp_path)
+    payload = json.loads(registry.read_text(encoding="utf-8"))
+    payload["jobs"][0].update(
+        {
+            "enabled": False,
+            "state": "paused",
+            "paused_at": "2026-07-29T12:00:00+00:00",
+            "paused_reason": "manual-recovery",
+        }
+    )
+    registry.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    registry.chmod(0o600)
+    cron = cutover._backup_crontab(plan)
+    marker_path = tmp_path / ".drain_request.json"
+    marker_path.write_text("{}", encoding="utf-8")
+    cron["drain_intent"] = {
+        "marker": {
+            "path": str(marker_path),
+            "payload": {"release_transaction_id": plan["transaction_id"]},
+            "sha256": "a" * 64,
+        }
+    }
+    prepared = {"watchdog_cron": cron, "gateway": {"pid": 99}}
+
+    def mutate_after_lock(_plan, _intent):
+        changed = json.loads(registry.read_text(encoding="utf-8"))
+        changed["jobs"][0]["paused_reason"] = "other-owner"
+        registry.write_text(
+            json.dumps(changed, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        registry.chmod(0o600)
+
+    monkeypatch.setattr(
+        cutover,
+        "_clear_legacy_gateway_drain_marker",
+        mutate_after_lock,
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="internal watchdog job changed",
+    ):
+        cutover._restore_watchdog_cron(plan, prepared)
+
+
+def test_release_watchdog_restore_replay_uses_prepaused_backend_receipt(
+    tmp_path,
+    monkeypatch,
+):
+    controls = {
+        "enabled": False,
+        "state": "paused",
+        "paused_at": "2026-07-29T12:00:00+00:00",
+        "paused_reason": "manual-recovery",
+    }
+    cron = {
+        "backend": "hermes_internal",
+        "backup_path": str(tmp_path / "watchdog.backup.json"),
+        "backup_sha256": "a" * 64,
+        "crontab_sha256": "b" * 64,
+        "watchdog_command": "hermes-internal:watchdog-job:watchdog.py",
+        "job_id": "watchdog-job",
+        "stable_job_sha256": "c" * 64,
+        "job_sha256": "d" * 64,
+        "job_enabled": False,
+        "job_state": "paused",
+        "control_origin": "preexisting",
+        "original_controls": controls,
+    }
+    prepared = {"watchdog_cron": cron}
+    state = {"sha256": "e" * 64}
+    phases = {
+        "watchdog_cron_disable_intent": {"prepared": prepared},
+        "watchdog_cron_disabled": {"status": "disabled"},
+        "watchdog_state_reconciled": {"state_after": state},
+        "watchdog_cron_restore_intent": {"status": "prepared"},
+    }
+    plan = {
+        "transaction_id": "internal-watchdog-transaction-000001",
+        "transaction_journal": str(tmp_path / "transaction.json"),
+        "watchdog_crontab_rollback": cron["backup_path"],
+        "watchdog_scheduler_backend": "hermes_internal",
+    }
+    receipt = {
+        **cron,
+        "registry_path": str(tmp_path / "jobs.json"),
+    }
+    calls = []
+    monkeypatch.setattr(
+        cutover,
+        "read_transaction_journal",
+        lambda *_args, **_kwargs: {"phases": copy.deepcopy(phases)},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_cron_watchdog_receipt",
+        lambda _plan, *, require_active=True: calls.append(require_active)
+        or copy.deepcopy(receipt),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_read_crontab",
+        lambda: pytest.fail("internal replay must not inspect OS crontab"),
+    )
+    lock = object()
+    monkeypatch.setattr(
+        cutover,
+        "_acquire_watchdog_state_lock",
+        lambda _plan: lock,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_verify_watchdog_state_lock",
+        lambda _plan, actual: {"status": "locked"}
+        if actual is lock
+        else pytest.fail("wrong lock"),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_watchdog_state_receipt",
+        lambda _plan: copy.deepcopy(state),
+    )
+
+    barrier = cutover._begin_release_watchdog_barrier(plan)
+
+    assert calls == [False]
+    assert barrier["prepared"] == prepared
+    assert barrier["state"] == state
+
+
 def test_internal_watchdog_legacy_prepared_receipt_is_upgraded_from_backup(
     tmp_path,
 ):

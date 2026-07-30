@@ -9912,11 +9912,28 @@ def _internal_watchdog_job_receipt(
             raise ReleaseBuildError(
                 "internal watchdog job is not active"
             )
+        if not require_active and (
+            (
+                job.get("enabled") is not True
+                or job.get("state") != "scheduled"
+            )
+            and (
+                job.get("enabled") is not False
+                or job.get("state") != "paused"
+            )
+        ):
+            raise ReleaseBuildError(
+                "internal watchdog job control state is unsupported"
+            )
         canonical = _canonical_internal_watchdog_job(job)
         job_sha256 = hashlib.sha256(canonical).hexdigest()
         job_id = str(plan["watchdog_scheduler_job_id"])
         script_name = Path(str(plan["watchdog_installed_script"])).name
-        return {
+        controls = {
+            key: job.get(key)
+            for key in _INTERNAL_WATCHDOG_CONTROL_FIELDS
+        }
+        receipt = {
             "backend": "hermes_internal",
             "registry_path": str(registry),
             "job_id": job_id,
@@ -9928,6 +9945,14 @@ def _internal_watchdog_job_receipt(
             "watchdog_command": f"hermes-internal:{job_id}:{script_name}",
             "canonical_job": canonical,
         }
+        if not require_active:
+            receipt["control_origin"] = (
+                "active"
+                if job.get("enabled") is True
+                else "preexisting"
+            )
+            receipt["original_controls"] = controls
+        return receipt
     finally:
         handle.close()
 
@@ -9984,10 +10009,17 @@ def _assert_no_os_watchdog_duplicate(plan: dict) -> None:
         )
 
 
-def _cron_watchdog_receipt(plan: dict) -> dict:
+def _cron_watchdog_receipt(
+    plan: dict,
+    *,
+    require_active: bool = True,
+) -> dict:
     if _watchdog_scheduler_backend(plan) == "hermes_internal":
         _assert_no_os_watchdog_duplicate(plan)
-        receipt = _internal_watchdog_job_receipt(plan)
+        receipt = _internal_watchdog_job_receipt(
+            plan,
+            require_active=require_active,
+        )
         receipt.pop("canonical_job")
         return receipt
     crontab = _read_crontab()
@@ -10008,7 +10040,10 @@ def _cron_watchdog_receipt(plan: dict) -> dict:
 def _backup_crontab(plan: dict) -> dict:
     if _watchdog_scheduler_backend(plan) == "hermes_internal":
         _assert_no_os_watchdog_duplicate(plan)
-        receipt = _internal_watchdog_job_receipt(plan)
+        receipt = _internal_watchdog_job_receipt(
+            plan,
+            require_active=False,
+        )
         content = receipt.pop("canonical_job")
         backup = Path(plan["watchdog_crontab_rollback"])
         if backup.exists():
@@ -10236,8 +10271,44 @@ def _internal_watchdog_disabled_receipt(
     job: dict,
 ) -> dict:
     cron = prepared.get("watchdog_cron") if isinstance(prepared, dict) else None
-    pause = _internal_watchdog_pause_fields(plan, prepared)
     stable_sha256 = _internal_watchdog_stable_sha256(job)
+    if isinstance(cron, dict) and cron.get("control_origin") == "preexisting":
+        controls = {
+            key: job.get(key)
+            for key in _INTERNAL_WATCHDOG_CONTROL_FIELDS
+        }
+        canonical_sha256 = hashlib.sha256(
+            _canonical_internal_watchdog_job(job)
+        ).hexdigest()
+        if (
+            stable_sha256 != cron.get("stable_job_sha256")
+            or controls != cron.get("original_controls")
+            or canonical_sha256 != cron.get("job_sha256")
+        ):
+            raise DrainIdentityMismatch(
+                "preexisting internal watchdog controls changed"
+            )
+        marker_sha256 = _canonical_journal_value_sha256(
+            {
+                "control_origin": "preexisting",
+                "job_id": plan["watchdog_scheduler_job_id"],
+                "job_sha256": canonical_sha256,
+                "original_controls": controls,
+                "stable_job_sha256": stable_sha256,
+            }
+        )
+        return {
+            "status": "disabled",
+            "backend": "hermes_internal",
+            "control_origin": "preexisting",
+            "job_id": str(plan["watchdog_scheduler_job_id"]),
+            "job_sha256": canonical_sha256,
+            "original_controls": controls,
+            "stable_job_sha256": stable_sha256,
+            "crontab_sha256": stable_sha256,
+            "marker_sha256": marker_sha256,
+        }
+    pause = _internal_watchdog_pause_fields(plan, prepared)
     if (
         not isinstance(cron, dict)
         or stable_sha256 != cron.get("stable_job_sha256")
@@ -10272,7 +10343,6 @@ def _disable_watchdog_cron(plan: dict, prepared: dict) -> dict:
     if _watchdog_scheduler_backend(plan) == "hermes_internal":
         _assert_no_os_watchdog_duplicate(plan)
         cron = prepared.get("watchdog_cron") if isinstance(prepared, dict) else None
-        pause = _internal_watchdog_pause_fields(plan, prepared)
         if not isinstance(cron, dict):
             raise ReleaseBuildError(
                 "internal watchdog preparation is missing"
@@ -10289,29 +10359,33 @@ def _disable_watchdog_cron(plan: dict, prepared: dict) -> dict:
                 raise DrainIdentityMismatch(
                     "internal watchdog job configuration changed"
                 )
-            if all(job.get(key) == value for key, value in pause.items()):
+            if cron.get("control_origin") == "preexisting":
                 disabled_job = job
             else:
-                active_claims = any(
-                    job.get(field) is not None
-                    for field in (
-                        "run_claim",
-                        "fire_claim",
-                        "recovery_claim",
+                pause = _internal_watchdog_pause_fields(plan, prepared)
+                if all(job.get(key) == value for key, value in pause.items()):
+                    disabled_job = job
+                else:
+                    active_claims = any(
+                        job.get(field) is not None
+                        for field in (
+                            "run_claim",
+                            "fire_claim",
+                            "recovery_claim",
+                        )
                     )
-                )
-                if (
-                    job.get("enabled") is not True
-                    or job.get("state") != "scheduled"
-                    or active_claims
-                ):
-                    raise DrainTimeout(
-                        "internal watchdog job is active or not schedulable"
-                    )
-                disabled_job = {**job, **pause}
-                jobs[index] = disabled_job
-                payload["jobs"] = jobs
-                _write_internal_watchdog_registry(plan, payload)
+                    if (
+                        job.get("enabled") is not True
+                        or job.get("state") != "scheduled"
+                        or active_claims
+                    ):
+                        raise DrainTimeout(
+                            "internal watchdog job is active or not schedulable"
+                        )
+                    disabled_job = {**job, **pause}
+                    jobs[index] = disabled_job
+                    payload["jobs"] = jobs
+                    _write_internal_watchdog_registry(plan, payload)
             disabled_receipt = _internal_watchdog_disabled_receipt(
                 plan,
                 prepared,
@@ -10457,7 +10531,7 @@ def _restore_watchdog_cron(plan: dict, prepared: dict) -> dict:
             )
         if marker_path.exists() or marker_path.is_symlink():
             _clear_legacy_gateway_drain_marker(plan, intent)
-        current = _cron_watchdog_receipt(plan)
+        current = _watchdog_receipt_for_prepared(plan, prepared)
         if not _cron_receipt_matches_prepared(current, prepared):
             raise DrainIdentityMismatch("internal watchdog job changed")
         return current
@@ -10489,20 +10563,42 @@ def _restore_watchdog_cron(plan: dict, prepared: dict) -> dict:
 def _cron_receipt_matches_prepared(receipt: dict, prepared: dict) -> bool:
     expected = prepared["watchdog_cron"]
     if expected.get("backend") == "hermes_internal":
-        return (
+        common = (
             receipt.get("backend") == "hermes_internal"
             and receipt.get("job_id") == expected.get("job_id")
             and receipt.get("stable_job_sha256")
             == expected.get("stable_job_sha256")
             and receipt.get("watchdog_command")
             == expected.get("watchdog_command")
-            and receipt.get("job_enabled") is True
-            and receipt.get("job_state") == "scheduled"
+            and receipt.get("job_enabled") == expected.get("job_enabled")
+            and receipt.get("job_state") == expected.get("job_state")
         )
+        if not common:
+            return False
+        if expected.get("control_origin") == "preexisting":
+            return (
+                receipt.get("control_origin") == "preexisting"
+                and receipt.get("original_controls")
+                == expected.get("original_controls")
+                and receipt.get("job_sha256") == expected.get("job_sha256")
+            )
+        return True
     return all(
         receipt.get(key) == expected.get(key)
         for key in ("crontab_sha256", "watchdog_command")
     )
+
+
+def _watchdog_receipt_for_prepared(plan: dict, prepared: dict) -> dict:
+    cron = prepared.get("watchdog_cron") if isinstance(prepared, dict) else None
+    preexisting = (
+        _watchdog_scheduler_backend(plan) == "hermes_internal"
+        and isinstance(cron, dict)
+        and cron.get("control_origin") == "preexisting"
+    )
+    if preexisting:
+        return _cron_watchdog_receipt(plan, require_active=False)
+    return _cron_watchdog_receipt(plan)
 
 
 def _watchdog_cron_restore_intent_receipt(
@@ -18262,34 +18358,66 @@ def _begin_release_watchdog_barrier(
             & set(phases)
         )
         if restoring:
-            current_cron = _read_crontab()
-            backup = Path(plan["watchdog_crontab_rollback"])
-            original = backup.read_text(encoding="utf-8")
-            command = durable_prepared["watchdog_cron"]["watchdog_command"]
-            marker = f"# HERMES_CUTOVER_DISABLED {plan['transaction_id']} " + command
-            disabled_content = original.replace(command, marker, 1)
-            if current_cron == disabled_content:
-                disabled = _attest_disabled_watchdog_cron(
-                    plan,
-                    durable_prepared,
-                )
-                if disabled != phases["watchdog_cron_disabled"]:
-                    raise DrainIdentityMismatch(
-                        "watchdog cron barrier changed on release resume"
+            if _watchdog_scheduler_backend(plan) == "hermes_internal":
+                try:
+                    restored = _watchdog_receipt_for_prepared(
+                        plan,
+                        durable_prepared,
                     )
-            elif current_cron == original:
-                restored = _cron_watchdog_receipt(plan)
-                if not _cron_receipt_matches_prepared(
-                    restored,
-                    durable_prepared,
-                ):
-                    raise DrainIdentityMismatch(
-                        "watchdog cron restore adoption changed"
+                except (DrainIdentityMismatch, ReleaseBuildError):
+                    disabled = _attest_disabled_watchdog_cron(
+                        plan,
+                        durable_prepared,
                     )
+                    if disabled != phases["watchdog_cron_disabled"]:
+                        raise DrainIdentityMismatch(
+                            "watchdog cron barrier changed on release resume"
+                        )
+                else:
+                    if not _cron_receipt_matches_prepared(
+                        restored,
+                        durable_prepared,
+                    ):
+                        raise DrainIdentityMismatch(
+                            "watchdog cron restore adoption changed"
+                        )
             else:
-                raise DrainIdentityMismatch(
-                    "watchdog cron changed during restore adoption"
+                current_cron = _read_crontab()
+                backup = Path(plan["watchdog_crontab_rollback"])
+                original = backup.read_text(encoding="utf-8")
+                command = durable_prepared["watchdog_cron"][
+                    "watchdog_command"
+                ]
+                marker = (
+                    f"# HERMES_CUTOVER_DISABLED {plan['transaction_id']} "
+                    + command
                 )
+                disabled_content = original.replace(command, marker, 1)
+                if current_cron == disabled_content:
+                    disabled = _attest_disabled_watchdog_cron(
+                        plan,
+                        durable_prepared,
+                    )
+                    if disabled != phases["watchdog_cron_disabled"]:
+                        raise DrainIdentityMismatch(
+                            "watchdog cron barrier changed on release resume"
+                        )
+                elif current_cron == original:
+                    restored = _watchdog_receipt_for_prepared(
+                        plan,
+                        durable_prepared,
+                    )
+                    if not _cron_receipt_matches_prepared(
+                        restored,
+                        durable_prepared,
+                    ):
+                        raise DrainIdentityMismatch(
+                            "watchdog cron restore adoption changed"
+                        )
+                else:
+                    raise DrainIdentityMismatch(
+                        "watchdog cron changed during restore adoption"
+                    )
         else:
             disabled = _attest_disabled_watchdog_cron(plan, durable_prepared)
             if disabled != phases["watchdog_cron_disabled"]:
@@ -19565,7 +19693,7 @@ def _resume_bootstrap_rollback(plan: dict, journal: dict) -> dict:
         if cli != prepared["legacy"]["cli"]:
             raise ReleaseBuildError("rollback Hermes CLI identity changed")
         if not _cron_receipt_matches_prepared(
-            _cron_watchdog_receipt(plan),
+            _watchdog_receipt_for_prepared(plan, prepared),
             prepared,
         ):
             raise ReleaseBuildError("rollback watchdog cron identity changed")
@@ -20648,7 +20776,7 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
                 raise ReleaseBuildError(
                     "paired release did not durably open before watchdog restore"
                 )
-            live_cron = _cron_watchdog_receipt(plan)
+            live_cron = _watchdog_receipt_for_prepared(plan, prepared)
             if live_cron != restored_cron or not _cron_receipt_matches_prepared(
                 live_cron,
                 prepared,
