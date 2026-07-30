@@ -5863,7 +5863,32 @@ def _source_patch_receipt(cwd: Path) -> dict:
         repo = Path(str(_run_git(cwd, "rev-parse", "--show-toplevel")).strip())
         repo = repo.resolve(strict=True)
     except (OSError, ReleaseBuildError) as exc:
-        raise ReleaseBuildError("legacy WebUI source is not a Git worktree") from exc
+        manifest_path = cwd / release_selector.MANIFEST_NAME
+        if not manifest_path.is_file() or manifest_path.is_symlink():
+            raise ReleaseBuildError(
+                "legacy WebUI source is not a Git worktree"
+            ) from exc
+        manifest_sha256 = sha256_file(manifest_path)
+        try:
+            identity = release_selector.verify_release(
+                cwd,
+                release_root=cwd.parent,
+                expected_manifest_sha256=manifest_sha256,
+                selector_path=None,
+                verify_selector_identity=False,
+            )
+        except release_selector.SelectorError as verify_exc:
+            raise ReleaseBuildError(
+                "managed WebUI source identity is invalid"
+            ) from verify_exc
+        return {
+            "kind": "managed-immutable-release",
+            "path": str(cwd),
+            "build_id": identity["build_id"],
+            "manifest_sha256": manifest_sha256,
+            "commit": identity["commit"],
+            "tree": identity["tree"],
+        }
     if cwd != repo and repo not in cwd.parents:
         raise ReleaseBuildError("legacy WebUI source root is unrelated to process cwd")
     head = str(_run_git(repo, "rev-parse", "HEAD^{commit}")).strip()
