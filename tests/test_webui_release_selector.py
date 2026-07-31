@@ -14094,6 +14094,64 @@ def test_gateway_health_accepts_generated_absent_pair_gate_expectation(
     assert receipt["drain"] == health["drain"]
 
 
+def test_gateway_health_adoption_accepts_exact_verified_open_work(
+    monkeypatch,
+):
+    plan, identity, health = _canonical_gateway_health_fixture(
+        pair_gate_active=False,
+    )
+    health["drain"]["work"]["process_completion_queue_depth"] = 3
+    health["drain"]["quiescence"]["blockers"] = [
+        "admission_not_rejecting",
+        "process_completion_queue_depth",
+    ]
+    monkeypatch.setattr(cutover, "_http_json", lambda *args, **kwargs: health)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="drain receipt is not quiescent",
+    ):
+        cutover._gateway_health_receipt(
+            plan,
+            expected_identity=identity,
+            expected_admission="accepting_new_work",
+        )
+
+    receipt = cutover._gateway_health_receipt(
+        plan,
+        expected_identity=identity,
+        expected_admission="accepting_new_work",
+        require_quiescent_work=False,
+    )
+
+    assert receipt["drain"] == health["drain"]
+
+
+def test_gateway_health_adoption_rejects_unexplained_open_work(
+    monkeypatch,
+):
+    plan, identity, health = _canonical_gateway_health_fixture(
+        pair_gate_active=False,
+    )
+    health["drain"]["work"]["process_completion_queue_depth"] = 3
+    monkeypatch.setattr(cutover, "_http_json", lambda *args, **kwargs: health)
+    monkeypatch.setattr(cutover, "_listener_pid", lambda _port: 41)
+    monkeypatch.setattr(cutover, "_pid_start_token", lambda _pid: "gateway-start")
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="open-admission receipt is invalid",
+    ):
+        cutover._gateway_health_receipt(
+            plan,
+            expected_identity=identity,
+            expected_admission="accepting_new_work",
+            require_quiescent_work=False,
+        )
+
+
 def test_gateway_health_attests_last_good_originating_transaction(monkeypatch):
     plan, identity, health = _canonical_gateway_health_fixture(
         pair_gate_active=False,

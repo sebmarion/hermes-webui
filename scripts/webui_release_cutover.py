@@ -17433,7 +17433,10 @@ def _gateway_health_receipt(
     expected_identity: dict | None = None,
     expected_admission: str = "accepting_new_work",
     expected_pair_gate: str | dict | None = None,
+    require_quiescent_work: bool = True,
 ) -> dict:
+    if not isinstance(require_quiescent_work, bool):
+        raise ValueError("gateway quiescent-work requirement is invalid")
     health = _http_json(
         str(plan["gateway_health_url"]),
         timeout_seconds=max(30.0, float(plan["timeout_seconds"])),
@@ -17613,8 +17616,12 @@ def _gateway_health_receipt(
         or not isinstance(work, dict)
         or set(work) != expected_work
         or any(
-            isinstance(value, bool) or not isinstance(value, int) or value != 0
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
             for value in work.values()
+        )
+        or (
+            require_quiescent_work
+            and any(value != 0 for value in work.values())
         )
         or not isinstance(work_status, dict)
         or set(work_status) != expected_work
@@ -17622,6 +17629,14 @@ def _gateway_health_receipt(
         or not isinstance(quiescence, dict)
         or set(quiescence) != {"verified", "quiescent", "blockers"}
         or quiescence.get("verified") is not True
+        or not isinstance(quiescence.get("quiescent"), bool)
+        or not isinstance(quiescence.get("blockers"), list)
+        or any(
+            not isinstance(blocker, str) or not blocker
+            for blocker in quiescence.get("blockers", [])
+        )
+        or len(set(quiescence.get("blockers", [])))
+        != len(quiescence.get("blockers", []))
         or not isinstance(cron_admission, dict)
         or set(cron_admission) != {
             "schema",
@@ -17650,11 +17665,21 @@ def _gateway_health_receipt(
             or quiescence.get("blockers") != []
         ):
             raise ReleaseBuildError("gateway drain did not reach quiescence")
-    elif (
-        quiescence.get("quiescent") is not False
-        or quiescence.get("blockers") != ["admission_not_rejecting"]
-    ):
-        raise ReleaseBuildError("gateway open-admission receipt is invalid")
+    else:
+        expected_open_blockers = {
+            "admission_not_rejecting",
+            *(
+                key
+                for key, value in work.items()
+                if not require_quiescent_work and value > 0
+            ),
+        }
+        if (
+            quiescence.get("quiescent") is not False
+            or set(quiescence.get("blockers", []))
+            != expected_open_blockers
+        ):
+            raise ReleaseBuildError("gateway open-admission receipt is invalid")
     return {
         "status": "ok",
         "body_sha256": hashlib.sha256(
@@ -17672,6 +17697,7 @@ def _wait_for_gateway_binding(
     expected_identity: dict | None = None,
     expected_admission: str = "accepting_new_work",
     expected_pair_gate: str | dict | None = None,
+    require_quiescent_work: bool = True,
 ) -> dict:
     deadline = time.monotonic() + float(plan["timeout_seconds"])
     last_error: Exception | None = None
@@ -17709,6 +17735,7 @@ def _wait_for_gateway_binding(
                     expected_identity=expected_identity,
                     expected_admission=expected_admission,
                     expected_pair_gate=expected_pair_gate,
+                    require_quiescent_work=require_quiescent_work,
                 ),
                 "runtime": runtime,
             }
@@ -17746,6 +17773,7 @@ def _attest_managed_gateway_binding(
     *,
     expected_admission: str = "accepting_new_work",
     expected_pair_gate: str | dict | None = None,
+    require_quiescent_work: bool = True,
 ) -> dict:
     """Prove the gateway is the exact immutable peer for one WebUI build."""
     binding = _wait_for_gateway_binding(
@@ -17754,6 +17782,7 @@ def _attest_managed_gateway_binding(
         expected_identity=identity,
         expected_admission=expected_admission,
         expected_pair_gate=expected_pair_gate,
+        require_quiescent_work=require_quiescent_work,
     )
     plist_path = Path(plan["gateway_installed_plist"])
     plist = _read_plist(plist_path)
@@ -18300,6 +18329,7 @@ def create_live_split_adoption(
         plan,
         gateway_identity,
         expected_admission="accepting_new_work",
+        require_quiescent_work=False,
     )
     webui_after = _probe_live_adoption_webui_binding(plan, webui_identity)
     if webui_after is None:
@@ -18308,6 +18338,7 @@ def create_live_split_adoption(
         plan,
         gateway_identity,
         expected_admission="accepting_new_work",
+        require_quiescent_work=False,
     )
     selector_after = release_selector.read_selector_state(
         plan["selector_state"],
