@@ -188,6 +188,16 @@ _terminal_reaper_thread: threading.Thread | None = None
 _terminal_reaper_stop = threading.Event()
 
 
+def terminal_activity_snapshot() -> dict:
+    """Return live embedded shells that a release restart must not interrupt."""
+    with _LOCK:
+        active = sum(1 for terminal in _TERMINALS.values() if terminal.is_alive())
+    return {
+        "active_terminals": active,
+        "terminal_activity_available": True,
+    }
+
+
 @dataclass
 class _SpawnRequest:
     kwargs: dict

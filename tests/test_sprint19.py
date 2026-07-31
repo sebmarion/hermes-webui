@@ -71,13 +71,13 @@ def test_login_page_cache_busts_login_script():
     assert "static/login.js?v={{WEBUI_VERSION}}" in routes._LOGIN_PAGE_HTML
 
 
-def test_login_route_injects_webui_version_for_login_script():
-    """The /login route should replace the login.js version placeholder."""
+def test_login_route_injects_asset_version_for_login_script():
+    """The /login route should replace the login.js asset-version placeholder."""
     from pathlib import Path
 
     src = Path(__file__).resolve().parents[1].joinpath("api", "routes.py").read_text(encoding="utf-8")
     login_block = src[src.find('if parsed.path == "/login"'):src.find('if parsed.path == "/api/auth/status"')]
-    assert "WEBUI_VERSION" in login_block
+    assert "WEBUI_ASSET_VERSION" in login_block
     assert "{{WEBUI_VERSION}}" in login_block
 
 

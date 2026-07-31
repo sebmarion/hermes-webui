@@ -202,6 +202,9 @@ function installGlobals(select, redirects, fetchQueue, jsonCalls) {
   globalThis._ensureModelOptionInDropdown = () => {};
   globalThis._refreshOpenModelDropdown = () => {};
   globalThis._modelDropdownRequestSeq = 0;
+  globalThis._restoreCachedModelCatalog = () => false;
+  globalThis._persistModelCatalogCache = () => {};
+  globalThis._invalidateComposerModelDropdown = () => {};
   globalThis._fetchLiveModels = () => {};
   globalThis.console = { warn() {}, debug() {}, log() {} };
   globalThis.fetch = async () => {

@@ -68,7 +68,7 @@ without ruff aren't blocked, while CI (which installs ruff) enforces it. The
 diff-scoped gate runs as the `lint` job in `.github/workflows/tests.yml` and is
 also part of the maintainer pre-release pre-gate.
 
-## Automated browser smoke (runtime brick-class gate)
+## Automated browser smoke (runtime and critical-layout gate)
 
 The ESLint guard above catches `const`-reassign / import-assign statically. The
 **browser smoke** catches the same brick class *dynamically* — plus anything else
@@ -77,62 +77,32 @@ that throws only when a real browser executes the page (e.g. a `function X(){}` 
 
 `tests/browser_smoke.py` boots the real `server.py` (agent-free, on an ephemeral
 port, with an isolated temp state dir) and loads the key pages in headless
-Chromium, failing if **any** console error or uncaught JS exception fires on load.
-It runs in CI (`.github/workflows/browser-smoke.yml`) on every PR and push to
-master, and locally:
+Chromium. It fails if **any** console error or uncaught JS exception fires on
+load, and it exercises pinned critical-layout invariants that require real
+browser geometry. The clarification-card check renders a deliberately tall
+prompt at wide, laptop, breakpoint, and phone sizes, including a live
+desktop-to-phone resize. At the reported `1262x535` failure size, the heading,
+question, hint, response field, and submit control must all remain visible
+together. At every size, the response controls must stay inside the visible
+card scrollport and win hit-testing above the composer, queue, and terminal
+flyouts.
+
+The smoke runs in CI (`.github/workflows/browser-smoke.yml`) on every PR and push
+to master, and locally:
 
 ```bash
 pip install playwright && python -m playwright install chromium
 python tests/browser_smoke.py
 ```
 
+Set `SMOKE_BROWSER_EXECUTABLE` to an existing Chromium-compatible executable
+when the Playwright package is installed but its managed browser is unavailable.
+
 It is intentionally **credential-free**: it strips every `*_API_KEY` from the
 environment before launching the server, needs no secrets, and does not drive a
-real model (it verifies the app *loads and initializes* cleanly — the brick class
-that breaks the page for everyone).
-
-## Public conversation lifecycle gate
-
-`tests/browser_conversation_lifecycle.py` adds a public deterministic
-multi-row lifecycle gate. It drives the real composer and real WebUI server in Chromium,
-while a localhost-only fixture supplies reasoning, tool, process, and final/error
-events through the existing Hermes Gateway Runs API. The gate now covers both
-normal and terminal-error proof-matrix rows, asserting semantic activity during
-live streaming, after settlement, and after hard reload, including
-transcript-backed `activity_scene_v1` persistence and zero unexpected browser
-errors. It uses isolated temporary state and no provider credentials.
-
-```bash
-pip install -r requirements.txt playwright
-python -m playwright install --with-deps chromium
-
-# Normal-path deterministic conversation lifecycle gate.
-python tests/browser_conversation_lifecycle.py
-
-# Terminal-error lifecycle gate (new row in the proof matrix).
-LIFECYCLE_SCENARIO=terminal-error python tests/browser_conversation_lifecycle.py
-```
-
-To certify that the gate catches its target failure, the test owns an opt-in
-mutation that drops the browser's Anchor-scene persistence request. This command
-must fail at the hard-reload boundary:
-
-```bash
-LIFECYCLE_TEST_BITE=drop-anchor-persistence \
-  python tests/browser_conversation_lifecycle.py
-
-# Terminal-state-specific mutation bite: remove terminal row from persisted scene
-# so hard reload cannot recover terminal status.
-LIFECYCLE_SCENARIO=terminal-error \
-LIFECYCLE_TEST_BITE=drop-terminal-anchor-row \
-  python tests/browser_conversation_lifecycle.py
-```
-
-The dedicated `Conversation lifecycle (informational)` workflow runs both current
-proof rows (`normal` and `terminal-error`) and stays non-blocking while the public
-matrix expands to additional behavior rows. The maintainer's private QA harness
-remains broader; later public slices will add session switching, reconnect/replay,
-cancellation, compression, and recovery.
+real model. A full chat golden-path E2E (send → stream → render → switch →
+reload) lives in the maintainer's private QA harness, which has the agent + a
+mock LLM provider available.
 
 ### Standing-goal continuation recovery gate
 
@@ -335,9 +305,21 @@ For manual verification, use isolated `HERMES_HOME` and
 paints first, five upward-scroll pages preserve the first visible row, and an
 active task stays labeled “Reconnecting to latest turn” until the signed
 checkpoint acknowledgment arrives. Force an invalid or stale cursor and verify
-there is one bounded restart followed by a visible recovery action. The old
-complete-history route may run only after clicking “Load complete legacy
-transcript”; that explicit action can take time for very large tasks.
+there is one bounded restart followed by a visible recovery action. If the
+initial fast window returns a typed `legacy_required` or `stale` state, verify
+the browser retries the bounded fast-window request exactly once. A repeated
+typed fallback must automatically replace the failed window with one bounded
+legacy tail so selecting a task always renders its content without rebuilding
+the complete transcript. Malformed fast payloads and fast-window request
+failures use the same single terminal legacy attempt; they must never loop back
+into the fast path. Complete legacy history remains an explicit user action.
+
+When the current page's tool pairs are already complete, an unrelated hidden
+tool row is the next-page sentinel and must not start another closure
+obligation. Verify that the initial response remains `lazy_tail_v1`, its
+inclusive cursor returns that unrelated row and its partner on continuation,
+and the two pages contain no gaps or duplicate message IDs. Incomplete or
+ambiguous pairs within the current page remain fail-closed.
 
 For rollout timings, collect 40 warm and 20 process-cold opens and record every
 initial and older-page duration. No `/api/session-window` request may exceed
@@ -1727,6 +1709,76 @@ Manual-only for Sprint 6:
 
 
 *Static: static/index.html + static/style.css + static/app.js*
+
+### Immutable release FIRST-activation checks
+
+Run the focused bridge and release-selector suites through the repository
+runner:
+
+```bash
+./scripts/test.sh tests/test_release_first_activation_bridge.py \
+  tests/test_webui_release_selector.py \
+  tests/test_webui_release_retention.py -q
+```
+
+The bridge coverage includes immutable CLI staging, maintenance-gate crash
+adoption, foreign-target and inode-swap refusal, exact legacy-link rollback,
+post-`pair_opened` public activation, private cron tick-lock acquisition and
+resume semantics, reversible legacy `0644` lock/store normalization,
+symlink/hardlink/inode/content-swap rejection, and natural nonzero-to-zero
+gateway shutdown counts. Synthetic-store cases include mixed delivered/queued
+terminal records, running/unknown/non-allowlisted rejection, crash adoption,
+exact quarantine bytes, and rollback that never replays quarantined
+completions. These tests model cooperating writers on a bounded
+single-operator host; they do not assert exclusion of a malicious same-uid
+actor.
+
+Rolling-retention coverage proves that release and bootstrap success, plus
+selector-only promotion, invoke cleanup only after their durable transition;
+dry runs remain non-mutating. Policy tests retain exactly the newest verified
+terminal rollback pair, include abandoned nonterminal payloads in the next
+safe cleanup, reject ambiguous selector control paths, and refuse deletion
+when no verified rollback remains.
+
+Gateway retirement coverage also proves exact launchd override parsing,
+KeepAlive disable-before-SIGINT ordering, PID/start/listener/job rechecks,
+fresh clean-shutdown enforcement, idempotent resume after process exit,
+re-enable-on-error, clean-absence versus ambiguous/probe-error listener
+classification, and pre-snapshot abort recovery for healthy replacement, clean
+absence, foreign-owner cases, and a crash after the cron tick lock was already
+restored but before the abort receipt was durable.
+
+Release acceptance coverage additionally proves that startup-fenced deep
+health accepts only mutation-free deferred session/project/database probes,
+then rejects those deferred results after admission opens. FIRST-activation
+rollback tests distinguish an exact restored legacy gateway from a managed
+candidate without a managed-schema timeout, reuse the durable drain owner, and
+restore the captured legacy pair from the bootstrap handoff receipt. Watchdog
+ordering tests prove that both installed-script reconcile-only calls finish
+while scheduling is disabled and before the state lock is acquired, that the
+locked commit reuses the durable readiness receipt instead of recursively
+contending on the lock, that the cached receipt accepts the matching signed
+process projection with runtime-only fields while rejecting a changed build,
+and that barrier cleanup adopts state drift only after an exact signed
+snapshot rollback has been reverified live. Restored-gateway tests also prove
+that a legacy process may return to its launchd working directory without
+losing rollback authority, while any command, executable, or argv drift still
+fails closed. Resume tests prove that the same transaction may adopt its
+durably activated or promoted selector only when inverse reconstruction
+matches the exact staged selector receipt; foreign mutation and incomplete
+control sets remain rejected. Journal-reconciliation tests also resume an
+exact durable promotion while rejecting a missing pair-commit intent, a
+changed live selector, a changed candidate identity, and an unavailable
+promoted journal. Pair-open tests prove all gateway attestations receive the
+sealed release identity rather than the slimmer signed process identity, and
+that unexpected programming errors are not retried until the binding timeout.
+Startup-fence health tests also prove an accepted WebUI performs its state-backed
+deep probes behind the still-active pair gate, while a not-yet-accepted WebUI
+continues to report mutation-free deferred checks.
+Forward-resume tests cover older accepted candidates that still report deferred
+state checks behind an exact pair gate: unrelated open-admission deferrals stay
+rejected, full deep health is mandatory after gate release, and an already
+released exact owner resumes without repeating the gated preflight.
 
 
 ---

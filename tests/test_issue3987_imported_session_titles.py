@@ -57,7 +57,9 @@ def test_import_cli_queue_helper_is_guarded_and_runs_in_background():
     assert "if not _looks_like_default_cli_title(current_meta):" in block
     assert "generate_session_title_for_session(current)" in block
     assert "require_default_title=True" in block
-    assert "threading.Thread(target=_run, daemon=True" in block
+    assert "api_config.start_admitted_auxiliary_thread(" in block
+    assert 'kind="imported_title"' in block
+    assert "target=_run" in block
 
 
 def test_import_cli_queue_helper_generates_title_once_for_placeholder_session(monkeypatch):

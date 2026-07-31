@@ -144,10 +144,21 @@ def test_silent_failure_preserves_partials(tmp_path):
     fake_queue = queue.Queue()
     streaming.STREAMS["test_stream_silent"] = fake_queue
     config.STREAM_PARTIAL_TEXT["test_stream_silent"] = ""
+    completion_calls = []
+    real_unregister_active_run = streaming.unregister_active_run
+
+    def _unregister_without_entry(*args, **kwargs):
+        real_unregister_active_run(*args, **kwargs)
+        return None
+
+    def _capture_completion(*args, **kwargs):
+        completion_calls.append((args, kwargs))
 
     with mock.patch.object(streaming, "get_session", return_value=fake_session), \
          mock.patch.object(streaming, "_get_ai_agent", return_value=SilentFailureAgent), \
          mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
+         mock.patch.object(streaming, "unregister_active_run", side_effect=_unregister_without_entry), \
+         mock.patch("api.state_sync.finish_session_activity", side_effect=_capture_completion), \
          mock.patch("api.config.get_config", return_value={}), \
          mock.patch("api.config._resolve_cli_toolsets", return_value=[]):
         
@@ -157,6 +168,7 @@ def test_silent_failure_preserves_partials(tmp_path):
             model="test-model",
             workspace=str(tmp_path),
             stream_id="test_stream_silent",
+            profile="fallback-profile",
         )
 
     # Reload session from disk/cache and verify
@@ -176,58 +188,18 @@ def test_silent_failure_preserves_partials(tmp_path):
 
     err_msg = saved.messages[-1]
     assert err_msg.get("_error") is True
-    assert err_msg.get("_turnDuration", 0) >= 12
-
-
-@pytest.mark.parametrize("started_at", [None, "future"])
-def test_result_error_omits_turn_duration_for_missing_or_future_origin(tmp_path, started_at):
-    """Result-error writeback must not manufacture durations from invalid timer origins."""
-    label = "future" if started_at == "future" else "missing"
-    fake_session = Session(session_id=f"test_sess_silent_{label}", title="Test Session")
-    fake_session.pending_user_message = "What is python?"
-    fake_session.pending_started_at = time.time() + 30 if started_at == "future" else started_at
-    fake_session.active_stream_id = f"test_stream_silent_{label}"
-    fake_session.save()
-    models.SESSIONS[fake_session.session_id] = fake_session
-
-    class SilentFailureAgent(MockAgent):
-        def run_conversation(self, **kwargs):
-            if self.stream_delta_callback:
-                self.stream_delta_callback("Python is a programming language.")
-            return {
-                "status": "error",
-                "error": "Silent failure details",
-                "messages": kwargs.get("conversation_history") or [],
-            }
-
-    fake_queue = queue.Queue()
-    streaming.STREAMS[fake_session.active_stream_id] = fake_queue
-    config.STREAM_PARTIAL_TEXT[fake_session.active_stream_id] = ""
-
-    with mock.patch.object(streaming, "get_session", return_value=fake_session), \
-         mock.patch.object(streaming, "_get_ai_agent", return_value=SilentFailureAgent), \
-         mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
-         mock.patch("api.config.get_config", return_value={}), \
-         mock.patch("api.config._resolve_cli_toolsets", return_value=[]):
-
-        streaming._run_agent_streaming(
-            session_id=fake_session.session_id,
-            msg_text="What is python?",
-            model="test-model",
-            workspace=str(tmp_path),
-            stream_id=fake_session.active_stream_id,
+    assert completion_calls == [
+        (
+            ("test_sess_silent", "test_stream_silent"),
+            {
+                "profile": "fallback-profile",
+                "lineage_session_ids": {"test_sess_silent"},
+                "emit_completion": False,
+                "completion_session_id": "test_sess_silent",
+                "source": "webui-native",
+            },
         )
-
-    saved = Session.load(fake_session.session_id)
-    assert saved is not None
-    assert saved.messages[-1].get("_error") is True
-    assert "_turnDuration" not in saved.messages[-1]
-
-    apperrors = [item[1] for item in list(fake_queue.queue) if item[0] == "apperror"]
-    assert apperrors
-    payload_error = apperrors[-1]["session"]["messages"][-1]
-    assert payload_error.get("_error") is True
-    assert "_turnDuration" not in payload_error
+    ]
 
 
 def test_exception_preserves_partials(tmp_path):

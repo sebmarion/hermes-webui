@@ -47,3 +47,13 @@ def test_server_recovers_bestplan_routing_from_stale_browser_tabs():
     assert "bestplan_parts[0].isdigit()" in routes
     assert 'raw_bestplan = body.get("bestplan_config") or recovered_bestplan_config' in routes
     assert 'msg = " ".join(bestplan_parts).strip()' in routes
+
+
+def test_bestplan_stream_withholds_machine_deltas_until_terminal_capture():
+    source = (ROOT / "api" / "streaming.py").read_text()
+    callback = source[source.index("            def on_token(text):"):]
+    callback = callback[:callback.index("\n            def ", 1)]
+
+    gate = callback.index("if bestplan_config is not None:")
+    assert gate < callback.index("STREAM_PARTIAL_TEXT[stream_id] +=")
+    assert gate < callback.index("put('token'")

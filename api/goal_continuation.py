@@ -11,22 +11,34 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import threading
 import time
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Callable
 
 from api import config
+from api.managed_continuation_recovery import (
+    recover_exact,
+    stable_store_snapshot,
+    strict_store_save,
+    strict_store_lock,
+    verify_exact,
+)
+from api.process_identity import process_start_token
 
 logger = logging.getLogger(__name__)
 
 SOURCE = "goal_continuation"
 CONTROL_KEY = "_goal_continuation_control"
 _RECEIPT_VERSION = 1
+_MAX_MANAGED_RECEIPTS = 4096
 _LOCK = threading.RLock()
+_MANAGED_EXACT = ContextVar("goal_continuation_managed_exact", default=False)
 
 
 class GoalContinuationReceiptStoreError(RuntimeError):
@@ -44,6 +56,10 @@ def _lock_path() -> Path:
 @contextmanager
 def _store_lock():
     """Serialize receipt transactions across threads and WebUI processes."""
+    if _MANAGED_EXACT.get():
+        with strict_store_lock(_lock_path(), _LOCK):
+            yield
+        return
     with _LOCK:
         Path(config.SESSION_DIR).mkdir(parents=True, exist_ok=True)
         fp = open(_lock_path(), "a+b")
@@ -71,12 +87,20 @@ def _store_lock():
                 fp.close()
 
 
+@contextmanager
+def _verification_store_lock():
+    with strict_store_lock(_lock_path(), _LOCK, create=False):
+        yield
+
+
 def _empty_store() -> dict:
     return {"version": _RECEIPT_VERSION, "receipts": {}}
 
 
 def _load_store() -> dict:
     path = _receipt_path()
+    if _MANAGED_EXACT.get():
+        return stable_store_snapshot(path)[0]
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -103,6 +127,9 @@ def _load_store() -> dict:
 
 def _save_store(store: dict) -> None:
     path = _receipt_path()
+    if _MANAGED_EXACT.get():
+        strict_store_save(path, store)
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
     try:
@@ -144,6 +171,12 @@ def _pid_is_alive(pid: int | None) -> bool:
     except OSError:
         return False
     return True
+
+
+def _process_start_token(pid: int | None) -> str | None:
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1:
+        return None
+    return process_start_token(pid)
 
 
 def claim_goal_continuation(
@@ -223,14 +256,32 @@ def _reserve_start(key: str) -> tuple[dict | None, str | None]:
             {
                 "state": "starting",
                 "owner_pid": os.getpid(),
+                "owner_start_token": _process_start_token(os.getpid()),
                 "owner_thread": threading.get_ident(),
                 "start_token": token,
+                "launch_phase": "reserved",
                 "starting_at": time.time(),
                 "updated_at": time.time(),
             }
         )
         _save_store(store)
         return copy.deepcopy(receipt), token
+
+
+def _mark_launching(key: str, token: str) -> dict | None:
+    with _store_lock():
+        store = _load_store()
+        receipt = store["receipts"].get(key)
+        if (
+            receipt is None
+            or receipt.get("state") != "starting"
+            or receipt.get("start_token") != token
+        ):
+            return copy.deepcopy(receipt) if receipt else None
+        receipt["launch_phase"] = "launching"
+        receipt["updated_at"] = time.time()
+        _save_store(store)
+        return copy.deepcopy(receipt)
 
 
 def _finish_start(key: str, token: str, response: dict | None) -> dict | None:
@@ -259,6 +310,7 @@ def _finish_start(key: str, token: str, response: dict | None) -> dict | None:
                     "child_stream_id": str(stream_id),
                     "started_at": now,
                     "updated_at": now,
+                    "completed_start_token": token,
                 }
             )
         else:
@@ -267,9 +319,16 @@ def _finish_start(key: str, token: str, response: dict | None) -> dict | None:
             # next idle boundary or process startup can try again.
             receipt.update({"state": "claimed", "updated_at": now})
             receipt.pop("child_stream_id", None)
-        receipt.pop("owner_pid", None)
-        receipt.pop("owner_thread", None)
-        receipt.pop("start_token", None)
+            receipt.pop("completed_start_token", None)
+        for field in (
+            "owner_pid",
+            "owner_start_token",
+            "owner_thread",
+            "start_token",
+            "launch_phase",
+            "starting_at",
+        ):
+            receipt.pop(field, None)
         _save_store(store)
         return copy.deepcopy(receipt)
 
@@ -279,6 +338,8 @@ def settle_goal_continuation(
     parent_run_id: str,
     *,
     start: Callable[[str, str], dict] | None = None,
+    _managed_exact: bool = False,
+    _crash_hook: Callable[[str], None] | None = None,
 ) -> dict | None:
     """Validate and start a receipt after its parent stream has fully settled."""
     key = _claim_key(str(session_id or "").strip(), str(parent_run_id or "").strip())
@@ -308,12 +369,17 @@ def settle_goal_continuation(
     receipt, token = _reserve_start(key)
     if receipt is None or token is None:
         return receipt
+    if _managed_exact and _crash_hook is not None:
+        _crash_hook("claim_committed")
     _attach_control_to_session(receipt)
     starter = start
     if starter is None:
         from api.routes import start_session_turn
 
         starter = lambda sid, text: start_session_turn(sid, text, source=SOURCE)
+    receipt = _mark_launching(key, token)
+    if receipt is None or receipt.get("launch_phase") != "launching":
+        return receipt
     try:
         response = starter(str(receipt["session_id"]), str(receipt["prompt"])) or {}
     except Exception:
@@ -323,7 +389,17 @@ def settle_goal_continuation(
             receipt.get("parent_run_id"),
         )
         response = {"error": "continuation start failed", "_status": 500}
-    return _finish_start(key, token, response)
+    if _managed_exact and _crash_hook is not None:
+        _crash_hook("launch_returned")
+    result = _finish_start(key, token, response)
+    if (
+        _managed_exact
+        and result is not None
+        and result.get("state") == "started"
+        and _crash_hook is not None
+    ):
+        _crash_hook("started_committed")
+    return result
 
 
 def recover_pending_goal_continuations(
@@ -353,6 +429,173 @@ def recover_pending_goal_continuations(
         if result and result.get("state") == "started":
             started += 1
     return started
+
+
+_MANAGED_RECEIPT_FIELDS = {
+    "claim_key", "session_id", "parent_run_id", "prompt", "goal_revision",
+    "profile_home", "state", "claimed_at", "updated_at", "owner_pid",
+    "owner_start_token", "owner_thread", "start_token", "launch_phase",
+    "starting_at", "child_stream_id", "started_at",
+    "completed_start_token", "discarded_reason",
+}
+
+
+def _managed_text(receipt: dict, field: str, *, optional: bool = False) -> str:
+    value = receipt.get(field)
+    if optional and value is None:
+        return ""
+    if not isinstance(value, str) or not value or len(value.encode("utf-8")) > 65536:
+        raise ValueError(f"{field} must be bounded non-empty text")
+    return value
+
+
+def _managed_timestamp(receipt: dict, field: str) -> float:
+    value = receipt.get(field)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a timestamp")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be finite")
+    return value
+
+
+def _validate_managed_store(store: dict, *, max_receipts: int) -> dict:
+    if not isinstance(store, dict) or set(store) != {"version", "receipts"}:
+        raise ValueError("goal continuation store root schema is invalid")
+    if store.get("version") != _RECEIPT_VERSION:
+        raise ValueError("goal continuation store version is invalid")
+    receipts = store.get("receipts")
+    if (
+        not isinstance(receipts, dict)
+        or isinstance(max_receipts, bool)
+        or not isinstance(max_receipts, int)
+        or max_receipts < 1
+        or len(receipts) > max_receipts
+    ):
+        raise ValueError("goal continuation receipt count is invalid")
+    for key, receipt in receipts.items():
+        if not isinstance(receipt, dict) or set(receipt) - _MANAGED_RECEIPT_FIELDS:
+            raise ValueError(f"{key}: goal continuation receipt schema is invalid")
+        claim_key = _managed_text(receipt, "claim_key")
+        session_id = _managed_text(receipt, "session_id")
+        run_id = _managed_text(receipt, "parent_run_id")
+        if (
+            key != claim_key
+            or len(key) != 64
+            or any(character not in "0123456789abcdef" for character in key)
+            or key != _claim_key(session_id, run_id)
+        ):
+            raise ValueError(f"{key}: goal continuation claim identity is invalid")
+        _managed_text(receipt, "prompt")
+        revision = receipt.get("goal_revision")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ValueError(f"{key}: goal_revision is invalid")
+        profile_home = receipt.get("profile_home")
+        if profile_home is not None and (
+            not isinstance(profile_home, str)
+            or len(profile_home.encode("utf-8")) > 65536
+        ):
+            raise ValueError(f"{key}: profile_home is invalid")
+        for field in ("claimed_at", "updated_at"):
+            _managed_timestamp(receipt, field)
+        state = receipt.get("state")
+        if state not in {"claimed", "starting", "started", "discarded"}:
+            raise ValueError(f"{key}: goal continuation state is invalid")
+        if state == "starting":
+            owner_pid = receipt.get("owner_pid")
+            if isinstance(owner_pid, bool) or not isinstance(owner_pid, int) or owner_pid <= 1:
+                raise ValueError(f"{key}: owner_pid is invalid")
+            for field in ("owner_start_token", "start_token"):
+                _managed_text(receipt, field)
+            if receipt.get("launch_phase") not in {"reserved", "launching"}:
+                raise ValueError(f"{key}: launch_phase is invalid")
+            _managed_timestamp(receipt, "starting_at")
+        if state == "started":
+            _managed_text(receipt, "child_stream_id")
+            _managed_text(receipt, "completed_start_token")
+            _managed_timestamp(receipt, "started_at")
+        if state == "discarded":
+            _managed_text(receipt, "discarded_reason")
+    return receipts
+
+
+def recover_managed_goal_continuations_exact(
+    *,
+    transaction_id: str,
+    manifest_sha256: str,
+    start: Callable[[str, str], dict] | None = None,
+    crash_hook: Callable[[str], None] | None = None,
+):
+    """Recover the exact bounded goal store under managed startup authority."""
+    scope = _MANAGED_EXACT.set(True)
+    try:
+        return recover_exact(
+            path=_receipt_path(),
+            store_lock=_store_lock,
+            validate_store=_validate_managed_store,
+            start_one=lambda key: _start_managed_goal_receipt(
+                key,
+                start=start,
+                crash_hook=crash_hook,
+            ),
+            session_id_for=lambda receipt: str(receipt.get("session_id") or ""),
+            terminal_states={"discarded"},
+            transaction_id=transaction_id,
+            manifest_sha256=manifest_sha256,
+            max_receipts=_MAX_MANAGED_RECEIPTS,
+            process_token_lookup=_process_start_token,
+        )
+    finally:
+        _MANAGED_EXACT.reset(scope)
+
+
+def verify_managed_continuations_exact(
+    receipt,
+    *,
+    transaction_id: str,
+    manifest_sha256: str,
+):
+    """Read-only verification of an exact managed goal continuation receipt."""
+    return verify_exact(
+        receipt,
+        path=_receipt_path(),
+        store_lock=_verification_store_lock,
+        validate_store=_validate_managed_store,
+        session_id_for=lambda row: str(row.get("session_id") or ""),
+        terminal_states={"discarded"},
+        transaction_id=transaction_id,
+        manifest_sha256=manifest_sha256,
+        max_receipts=_MAX_MANAGED_RECEIPTS,
+        process_token_lookup=_process_start_token,
+    )
+
+
+def _load_receipt_identity(key: str) -> tuple[str, str]:
+    with _store_lock():
+        receipt = _load_store()["receipts"].get(key)
+        if not isinstance(receipt, dict):
+            return "", ""
+        return (
+            str(receipt.get("session_id") or ""),
+            str(receipt.get("parent_run_id") or ""),
+        )
+
+
+def _start_managed_goal_receipt(
+    key: str,
+    *,
+    start: Callable[[str, str], dict] | None,
+    crash_hook: Callable[[str], None] | None,
+) -> tuple[dict | None, bool]:
+    session_id, parent_run_id = _load_receipt_identity(key)
+    result = settle_goal_continuation(
+        session_id,
+        parent_run_id,
+        start=start,
+        _managed_exact=True,
+        _crash_hook=crash_hook,
+    )
+    return result, bool(result and result.get("state") == "started")
 
 
 def load_receipts() -> dict:

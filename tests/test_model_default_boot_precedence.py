@@ -124,6 +124,9 @@ const window = {_defaultModel: null, _activeProvider: null, _configuredModelBadg
 let _dynamicModelLabels = {};
 let _liveModelFetchPending = new Set();
 let _liveModelCache = {};
+const _restoreCachedModelCatalog = () => false;
+const _persistModelCatalogCache = () => {};
+const _invalidateComposerModelDropdown = () => {};
 
 for (const name of [
   '_getOptionProviderId', '_providerFromModelValue', '_modelStateForSelect',

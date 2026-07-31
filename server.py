@@ -1,7 +1,9 @@
 """Hermes Web UI server entry point."""
+import hashlib
 import logging
 import os
 import re
+import secrets
 import signal
 import socket
 import ssl
@@ -9,6 +11,8 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Ignore SIGPIPE so a dropped client only aborts that write, not the whole WebUI process.
@@ -101,7 +105,17 @@ from urllib.parse import urlparse
 logger = logging.getLogger(__name__)
 
 from api.auth import check_auth, reset_trusted_auth_request_state
-from api.config import HOST, PORT, STATE_DIR, SESSION_DIR, DEFAULT_WORKSPACE
+from api import config as api_config
+from api import process_identity as process_identity_api
+from api.config import (
+    HOST,
+    PORT,
+    STATE_DIR,
+    SESSION_DIR,
+    DEFAULT_WORKSPACE,
+    RunAdmissionClosed,
+    run_admission_scope,
+)
 from api.helpers import (
     j,
     get_profile_cookie,
@@ -113,6 +127,37 @@ from api.routes import handle_delete, handle_get, handle_patch, handle_post, han
 from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
 from api.crash_visibility import install_crash_visibility
+import deferred_release_manifest as release_manifest
+from deferred_startup_replay import (
+    DeferredStartupIndeterminateError,
+    DeferredStartupManifestReceipt,
+    DeferredStartupStep,
+    replay_deferred_startup,
+)
+
+
+_STARTUP_FENCE_ALLOWED_REQUESTS = {
+    ("GET", "/health"),
+    ("POST", "/api/internal/release-control"),
+}
+_STARTUP_FENCE_PAYLOAD = {
+    "error": "WebUI candidate is awaiting release acceptance",
+    "code": "startup_fence",
+    "retryable": True,
+}
+
+
+def _startup_request_allowed(method: str, path: str) -> bool:
+    """Allow only health and authenticated release control before acceptance."""
+    if not api_config.startup_run_admission_is_closed():
+        return True
+    return (str(method or "").upper(), str(path or "")) in (
+        _STARTUP_FENCE_ALLOWED_REQUESTS
+    )
+
+
+def _deny_startup_fenced_request(handler) -> None:
+    j(handler, dict(_STARTUP_FENCE_PAYLOAD), status=503)
 
 
 class QuietHTTPServer(ThreadingHTTPServer):
@@ -374,11 +419,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self._req_t0 = time.time(); reset_trusted_auth_request_state(self)
-        cookie_profile = get_profile_cookie(self)
-        if cookie_profile:
-            set_request_profile(cookie_profile)
         try:
             parsed = urlparse(self.path)
+            if not _startup_request_allowed(self.command, parsed.path):
+                return _deny_startup_fenced_request(self)
+            cookie_profile = get_profile_cookie(self)
+            if cookie_profile:
+                set_request_profile(cookie_profile)
             if not check_auth(self, parsed): return
             result = handle_get(self, parsed)
             if result is False:
@@ -399,15 +446,40 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_write(self, route_func) -> None:
         self._req_t0 = time.time(); reset_trusted_auth_request_state(self)
-        cookie_profile = get_profile_cookie(self)
-        if cookie_profile:
-            set_request_profile(cookie_profile)
+        admission_scope = None
         try:
             parsed = urlparse(self.path)
+            if not _startup_request_allowed(self.command, parsed.path):
+                return _deny_startup_fenced_request(self)
+            cookie_profile = get_profile_cookie(self)
+            if cookie_profile:
+                set_request_profile(cookie_profile)
             _is_csp_report_post = (
                 parsed.path == "/api/csp-report" and self.command == "POST"
             )
             if not _is_csp_report_post and not check_auth(self, parsed): return
+            if parsed.path not in {
+                "/api/internal/release-control",
+                "/api/csp-report",
+            }:
+                admission_scope = run_admission_scope(
+                    kind="http_write",
+                    method=self.command,
+                    path=parsed.path,
+                )
+                try:
+                    admission_scope.__enter__()
+                except RunAdmissionClosed:
+                    admission_scope = None
+                    return j(
+                        self,
+                        {
+                            "error": "WebUI maintenance cutover is in progress",
+                            "code": "maintenance_fence",
+                            "retryable": True,
+                        },
+                        status=503,
+                    )
             result = route_func(self, parsed)
             if result is False:
                 return j(self, {'error': 'not found'}, status=404)
@@ -423,6 +495,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._safe_webui_print(traceback.format_exc())
         finally:
+            if admission_scope is not None:
+                admission_scope.__exit__(None, None, None)
             clear_request_profile()
 
     def do_POST(self) -> None:
@@ -437,6 +511,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         """Handle CORS preflight requests (headers emitted by api.routes)."""
         self._req_t0 = time.time()
+        parsed = urlparse(self.path)
+        if not _startup_request_allowed(self.command, parsed.path):
+            return _deny_startup_fenced_request(self)
         self.send_response(200)
         apply_cors_preflight_headers(self)
         # Frame the empty preflight: without Content-Length an HTTP/1.1 keep-alive
@@ -545,6 +622,651 @@ def _abort_if_already_serving(host: str, port: int) -> None:
         pass
 
 
+_DEFERRED_STARTUP_LOCK = threading.Lock()
+_DEFERRED_STARTUP_COMPLETED: set[str] = set()
+_DEFERRED_STARTUP_REPLAY_DRIVER = None
+_DEFERRED_STARTUP_REPLAY_STEPS: tuple[DeferredStartupStep, ...] | None = None
+_MANAGED_STARTUP_COORDINATOR_LOCK = threading.Lock()
+_MANAGED_STARTUP_COORDINATOR = None
+_MANAGED_STARTUP_ACCEPTANCE_EVIDENCE = None
+_DEFERRED_STARTUP_PROCESS_EPOCH_LOCK = threading.Lock()
+_DEFERRED_STARTUP_PROCESS_EPOCH: str | None = None
+_DEFERRED_STARTUP_PROCESS_EPOCH_DOMAIN = (
+    b"hermes-webui:managed-deferred-startup:process-epoch:v1\x00"
+)
+_DEFERRED_STARTUP_PROCESS_TOKEN_RECEIPT_DOMAIN = (
+    b"hermes-webui:managed-deferred-startup:start-token-receipt:v1\x00"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _ManagedDeferredStartupProcessReceipt(Mapping[str, object]):
+    version: int
+    pid: int
+    process_epoch: str
+    process_start_token_sha256: str
+
+    def __getitem__(self, key: str) -> object:
+        if key == "version":
+            return self.version
+        if key == "pid":
+            return self.pid
+        if key == "process_epoch":
+            return self.process_epoch
+        if key == "process_start_token_sha256":
+            return self.process_start_token_sha256
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(
+            (
+                "version",
+                "pid",
+                "process_epoch",
+                "process_start_token_sha256",
+            )
+        )
+
+    def __len__(self) -> int:
+        return 4
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedStartupAcceptanceEvidence:
+    """Typed process-local evidence from one successful managed startup replay."""
+
+    process_receipt: _ManagedDeferredStartupProcessReceipt
+    driver_attestation: object
+    step_receipt_bundle: object
+
+
+_DEFERRED_STARTUP_PROCESS_RECEIPT: (
+    _ManagedDeferredStartupProcessReceipt | None
+) = None
+_MANAGED_STARTUP_SESSION_RECEIPT = None
+
+
+def _reset_deferred_startup_process_state_after_fork() -> None:
+    global _DEFERRED_STARTUP_LOCK
+    global _DEFERRED_STARTUP_REPLAY_DRIVER
+    global _DEFERRED_STARTUP_REPLAY_STEPS
+    global _MANAGED_STARTUP_COORDINATOR_LOCK
+    global _MANAGED_STARTUP_COORDINATOR
+    global _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE
+    global _DEFERRED_STARTUP_PROCESS_EPOCH_LOCK
+    global _DEFERRED_STARTUP_PROCESS_EPOCH
+    global _DEFERRED_STARTUP_PROCESS_RECEIPT
+    global _MANAGED_STARTUP_SESSION_RECEIPT
+    _DEFERRED_STARTUP_LOCK = threading.Lock()
+    _DEFERRED_STARTUP_REPLAY_DRIVER = None
+    _DEFERRED_STARTUP_REPLAY_STEPS = None
+    _MANAGED_STARTUP_COORDINATOR_LOCK = threading.Lock()
+    _MANAGED_STARTUP_COORDINATOR = None
+    _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE = None
+    _DEFERRED_STARTUP_PROCESS_EPOCH_LOCK = threading.Lock()
+    _DEFERRED_STARTUP_PROCESS_EPOCH = None
+    _DEFERRED_STARTUP_PROCESS_RECEIPT = None
+    _MANAGED_STARTUP_SESSION_RECEIPT = None
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_deferred_startup_process_state_after_fork)
+
+
+def _validate_deferred_startup_process_start_token(
+    value: object,
+    *,
+    pid: int,
+) -> str:
+    if (
+        type(pid) is not int
+        or isinstance(pid, bool)
+        or pid <= 1
+        or type(value) is not str
+        or not value
+        or len(value) > 256
+    ):
+        raise RuntimeError("managed startup process start token is unavailable")
+
+    def exact_positive_decimal(component: str, *, allow_zero: bool = False) -> int:
+        if not component.isascii() or not component.isdecimal():
+            raise RuntimeError("managed startup process start token is invalid")
+        parsed = int(component)
+        if str(parsed) != component or (parsed < 0 if allow_zero else parsed <= 0):
+            raise RuntimeError("managed startup process start token is invalid")
+        return parsed
+
+    parts = value.split(":")
+    if len(parts) == 3 and parts[0] == "procfs":
+        token_pid = exact_positive_decimal(parts[1])
+        exact_positive_decimal(parts[2])
+    elif len(parts) == 4 and parts[0] == "darwin-proc":
+        token_pid = exact_positive_decimal(parts[1])
+        exact_positive_decimal(parts[2])
+        microseconds = exact_positive_decimal(parts[3], allow_zero=True)
+        if microseconds >= 1_000_000:
+            raise RuntimeError("managed startup process start token is invalid")
+    else:
+        raise RuntimeError("managed startup process start token is invalid")
+    if token_pid != pid:
+        raise RuntimeError("managed startup process start token does not match pid")
+    return value
+
+
+def _derive_deferred_startup_process_epoch(
+    *,
+    process_start_token: object,
+    boot_nonce: object,
+    pid: int,
+) -> str:
+    token = _validate_deferred_startup_process_start_token(
+        process_start_token,
+        pid=pid,
+    )
+    if type(boot_nonce) is not bytes or len(boot_nonce) != 32:
+        raise RuntimeError("managed startup boot nonce is invalid")
+    token_bytes = token.encode("ascii")
+    canonical = (
+        _DEFERRED_STARTUP_PROCESS_EPOCH_DOMAIN
+        + len(token_bytes).to_bytes(4, "big")
+        + token_bytes
+        + boot_nonce
+    )
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _new_deferred_startup_boot_nonce() -> bytes:
+    return secrets.token_bytes(32)
+
+
+def _managed_deferred_startup_process_receipt() -> (
+    _ManagedDeferredStartupProcessReceipt
+):
+    global _DEFERRED_STARTUP_PROCESS_EPOCH
+    global _DEFERRED_STARTUP_PROCESS_RECEIPT
+    pid = os.getpid()
+    cached_receipt = _DEFERRED_STARTUP_PROCESS_RECEIPT
+    if cached_receipt is not None and cached_receipt.pid != pid:
+        _reset_deferred_startup_process_state_after_fork()
+    with _DEFERRED_STARTUP_PROCESS_EPOCH_LOCK:
+        pid = os.getpid()
+        cached_receipt = _DEFERRED_STARTUP_PROCESS_RECEIPT
+        if cached_receipt is not None and cached_receipt.pid != pid:
+            _DEFERRED_STARTUP_PROCESS_EPOCH = None
+            _DEFERRED_STARTUP_PROCESS_RECEIPT = None
+        if (
+            _DEFERRED_STARTUP_PROCESS_EPOCH is None
+            or _DEFERRED_STARTUP_PROCESS_RECEIPT is None
+        ):
+            token = process_identity_api.process_start_token(pid)
+            validated_token = _validate_deferred_startup_process_start_token(
+                token,
+                pid=pid,
+            )
+            epoch = _derive_deferred_startup_process_epoch(
+                process_start_token=validated_token,
+                boot_nonce=_new_deferred_startup_boot_nonce(),
+                pid=pid,
+            )
+            token_bytes = validated_token.encode("ascii")
+            token_receipt = hashlib.sha256(
+                _DEFERRED_STARTUP_PROCESS_TOKEN_RECEIPT_DOMAIN
+                + len(token_bytes).to_bytes(4, "big")
+                + token_bytes
+            ).hexdigest()
+            receipt = _ManagedDeferredStartupProcessReceipt(
+                version=1,
+                pid=pid,
+                process_epoch=epoch,
+                process_start_token_sha256=token_receipt,
+            )
+            _DEFERRED_STARTUP_PROCESS_EPOCH = epoch
+            _DEFERRED_STARTUP_PROCESS_RECEIPT = receipt
+        return replace(_DEFERRED_STARTUP_PROCESS_RECEIPT)
+
+
+def _managed_deferred_startup_process_epoch() -> str:
+    return _managed_deferred_startup_process_receipt().process_epoch
+
+
+def configure_managed_deferred_startup_replay(*, driver, steps) -> None:
+    """Install the durable managed-startup seam supplied by release wiring."""
+    global _DEFERRED_STARTUP_REPLAY_DRIVER, _DEFERRED_STARTUP_REPLAY_STEPS
+    required_callbacks = (
+        "read_step_state",
+        "record_intent",
+        "record_completion",
+        "record_indeterminate",
+    )
+    if not all(callable(getattr(driver, name, None)) for name in required_callbacks):
+        raise TypeError("durable deferred startup driver is invalid")
+    if type(steps) is not tuple or not all(
+        type(step) is DeferredStartupStep for step in steps
+    ):
+        raise TypeError("durable deferred startup steps are invalid")
+    with _DEFERRED_STARTUP_LOCK:
+        existing_driver = _DEFERRED_STARTUP_REPLAY_DRIVER
+        existing_steps = _DEFERRED_STARTUP_REPLAY_STEPS
+        if existing_driver is None and existing_steps is None:
+            _DEFERRED_STARTUP_REPLAY_DRIVER = driver
+            _DEFERRED_STARTUP_REPLAY_STEPS = steps
+            return
+        if existing_driver is driver and existing_steps is steps:
+            return
+        raise RuntimeError("durable deferred startup replay is already configured")
+
+
+def managed_startup_acceptance_evidence():
+    """Return stable typed evidence after managed startup completes successfully."""
+    with _DEFERRED_STARTUP_LOCK:
+        return _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE
+
+
+def _configure_production_managed_startup_coordinator():
+    """Build and retain the exact production coordinator once per process."""
+    global _MANAGED_STARTUP_COORDINATOR
+    global _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE
+    with _MANAGED_STARTUP_COORDINATOR_LOCK:
+        coordinator = _MANAGED_STARTUP_COORDINATOR
+        if coordinator is None:
+            from managed_startup_coordinator import (
+                build_production_managed_startup_coordinator,
+            )
+
+            coordinator = build_production_managed_startup_coordinator()
+        driver = _DEFERRED_STARTUP_REPLAY_DRIVER
+        steps = _DEFERRED_STARTUP_REPLAY_STEPS
+        if driver is None and steps is None:
+            configure_managed_deferred_startup_replay(
+                driver=coordinator.driver,
+                steps=coordinator.steps,
+            )
+        elif driver is not coordinator.driver or steps is not coordinator.steps:
+            raise RuntimeError("managed startup coordinator binding changed")
+        _MANAGED_STARTUP_COORDINATOR = coordinator
+        _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE = None
+        return coordinator
+
+
+def _materialize_internal_recovery_key() -> None:
+    from api.atomic_recovery import ensure_internal_recovery_key
+
+    ensure_internal_recovery_key()
+
+
+def _create_state_directories() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    DEFAULT_WORKSPACE.mkdir(parents=True, exist_ok=True)
+
+
+def _managed_startup_session_binding() -> tuple[str, str]:
+    active_transaction = str(
+        getattr(api_config, "_RUN_ADMISSION_TRANSACTION_ID", "") or ""
+    ).strip()
+    selected_transaction = str(
+        os.environ.get("HERMES_WEBUI_STARTUP_TRANSACTION_ID") or ""
+    ).strip()
+    selected_manifest = str(
+        os.environ.get("HERMES_WEBUI_MANIFEST_SHA256") or ""
+    ).strip()
+    canonical_manifest = release_manifest.deferred_release_manifest_sha256()
+    if (
+        not active_transaction
+        or selected_transaction != active_transaction
+        or selected_manifest != canonical_manifest
+    ):
+        raise RuntimeError(
+            "managed startup session binding is absent, partial, or noncanonical"
+        )
+    return active_transaction, canonical_manifest
+
+
+def _recover_startup_sessions():
+    global _MANAGED_STARTUP_SESSION_RECEIPT
+    from api.models import _active_state_db_path
+
+    if (
+        not api_config._managed_release_selected_from_environment()
+        or not str(
+            getattr(api_config, "_RUN_ADMISSION_TRANSACTION_ID", "") or ""
+        ).strip()
+    ):
+        from api.session_recovery import recover_all_sessions_on_startup
+
+        result = recover_all_sessions_on_startup(
+            SESSION_DIR,
+            rebuild_index=True,
+            state_db_path=_active_state_db_path(),
+        )
+        if result.get("restored"):
+            print(
+                f"[recovery] Restored {result['restored']}/{result['scanned']} "
+                "sessions from .bak (see #1558).",
+                flush=True,
+            )
+        return None
+
+    from api.managed_startup_session_recovery import (
+        audit_managed_startup_sessions,
+    )
+
+    transaction_id, manifest_sha256 = _managed_startup_session_binding()
+    receipt = audit_managed_startup_sessions(
+        SESSION_DIR,
+        _active_state_db_path(),
+        transaction_id=transaction_id,
+        manifest_sha256=manifest_sha256,
+    )
+    _MANAGED_STARTUP_SESSION_RECEIPT = receipt
+    return receipt
+
+
+def _reconcile_startup_sessions():
+    from api.managed_startup_session_recovery import (
+        SessionRecoveryOutcome,
+        verify_managed_startup_sessions,
+    )
+    from deferred_startup_replay import Reconciliation
+
+    try:
+        transaction_id, manifest_sha256 = _managed_startup_session_binding()
+        verification = verify_managed_startup_sessions(
+            _MANAGED_STARTUP_SESSION_RECEIPT,
+            transaction_id=transaction_id,
+            manifest_sha256=manifest_sha256,
+        )
+    except Exception:
+        return Reconciliation.AMBIGUOUS
+    if verification.outcome is SessionRecoveryOutcome.PROVED_COMPLETE:
+        return Reconciliation.PROVED_COMPLETE
+    return Reconciliation.AMBIGUOUS
+
+
+def _load_startup_plugins() -> None:
+    from api.plugins import load_plugins
+
+    load_plugins()
+
+
+def _start_startup_background_services() -> None:
+    from api import background_process
+
+    drain_started = background_process.start_drain_thread()
+    drain_worker = getattr(background_process, "_DRAIN_THREAD", None)
+    if drain_worker is None or not drain_worker.is_alive():
+        if drain_started:
+            background_process.stop_drain_thread()
+        raise RuntimeError("bg_task_complete drain thread is not alive")
+    try:
+        reaper_started = background_process.start_session_channel_reaper()
+        reaper_worker = getattr(background_process, "_REAPER_THREAD", None)
+        if reaper_worker is None or not reaper_worker.is_alive():
+            raise RuntimeError("SessionChannel reaper thread is not alive")
+    except Exception:
+        if drain_started:
+            background_process.stop_drain_thread()
+        try:
+            background_process.stop_session_channel_reaper()
+        except Exception:
+            logger.exception("failed to stop rejected SessionChannel reaper")
+        raise
+    if drain_started:
+        print("[ok] bg_task_complete drain thread started", flush=True)
+    if reaper_started:
+        print("[ok] SessionChannel reaper thread started", flush=True)
+
+
+def _require_terminal_recovery_receipt(name: str, receipt: object) -> dict:
+    if not isinstance(receipt, dict) or receipt.get("status") != "complete":
+        raise RuntimeError(f"{name} did not report terminal success")
+    return receipt
+
+
+def _recover_tool_limit_continuations_for_startup() -> dict:
+    from api.routes import _recover_tool_limit_continuations_on_startup
+
+    return _require_terminal_recovery_receipt(
+        "tool-limit continuation recovery",
+        _recover_tool_limit_continuations_on_startup(strict=True),
+    )
+
+
+def _recover_goal_continuations_for_startup() -> dict:
+    from api.routes import _recover_goal_continuations_on_startup
+
+    return _require_terminal_recovery_receipt(
+        "goal continuation recovery",
+        _recover_goal_continuations_on_startup(strict=True),
+    )
+
+
+def _recover_process_completion_notifications() -> dict:
+    from tools.process_registry import process_registry
+
+    recover_processes = getattr(process_registry, "recover_from_checkpoint", None)
+    recover = getattr(process_registry, "recover_completion_notifications", None)
+    snapshot = getattr(process_registry, "completion_activity_snapshot", None)
+    if not all(callable(value) for value in (recover_processes, recover, snapshot)):
+        if api_config.startup_run_admission_is_closed():
+            raise RuntimeError(
+                "paired Agent lacks durable process checkpoint recovery"
+            )
+        logger.warning(
+            "durable process checkpoint recovery unavailable in this Agent build"
+        )
+        return {
+            "status": "unavailable",
+            "recovered": 0,
+            "recovered_processes": 0,
+            "recovered_notifications": 0,
+        }
+    recovered_processes = recover_processes()
+    if (
+        isinstance(recovered_processes, bool)
+        or not isinstance(recovered_processes, int)
+        or recovered_processes < 0
+    ):
+        raise RuntimeError("process checkpoint recovery returned an invalid receipt")
+    checkpoint = snapshot()
+    if (
+        not isinstance(checkpoint, dict)
+        or checkpoint.get("process_checkpoint_available") is not True
+        or checkpoint.get("process_checkpoint_reason") != "verified"
+    ):
+        raise RuntimeError("process checkpoint recovery is not verified")
+    recovered = recover()
+    if isinstance(recovered, bool) or not isinstance(recovered, int) or recovered < 0:
+        raise RuntimeError("process completion recovery returned an invalid receipt")
+    return {
+        "status": "complete",
+        "recovered": recovered,
+        "recovered_processes": recovered_processes,
+        "recovered_notifications": recovered,
+    }
+
+
+def _recover_async_delegation_notifications() -> dict:
+    try:
+        from tools.async_delegation import recover_async_delegations
+    except ImportError:
+        recover_async_delegations = None
+    if not callable(recover_async_delegations):
+        if api_config.startup_run_admission_is_closed():
+            raise RuntimeError(
+                "paired Agent lacks durable async delegation recovery"
+            )
+        logger.warning(
+            "durable async delegation recovery unavailable in this Agent build"
+        )
+        return {"status": "unavailable", "queued": 0, "lost": 0}
+    report = recover_async_delegations()
+    if not isinstance(report, dict) or report.get("error"):
+        raise RuntimeError("async delegation recovery returned a failure receipt")
+    queued = report.get("queued")
+    lost = report.get("lost")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in (queued, lost)
+    ):
+        raise RuntimeError("async delegation recovery returned an invalid receipt")
+    return {"status": "complete", "queued": queued, "lost": lost}
+
+
+def _deferred_startup_steps():
+    """Ordered, individually idempotent process-start mutators."""
+    mutators_by_operation = {
+        "api.startup.fix_credential_permissions": fix_credential_permissions,
+        "server._materialize_internal_recovery_key": (
+            _materialize_internal_recovery_key
+        ),
+        "server._create_state_directories": _create_state_directories,
+        "api.config.apply_startup_profile_state": (
+            api_config.apply_startup_profile_state
+        ),
+        "api.config.seed_startup_provider_models": (
+            api_config.seed_startup_provider_models
+        ),
+        "api.config.apply_deferred_startup_configuration": (
+            api_config.apply_deferred_startup_configuration
+        ),
+        "server._recover_startup_sessions": _recover_startup_sessions,
+        "server._load_startup_plugins": _load_startup_plugins,
+        "server._recover_process_completion_notifications": (
+            _recover_process_completion_notifications
+        ),
+        "server._recover_async_delegation_notifications": (
+            _recover_async_delegation_notifications
+        ),
+        "server._recover_tool_limit_continuations_for_startup": (
+            _recover_tool_limit_continuations_for_startup
+        ),
+        "server._recover_goal_continuations_for_startup": (
+            _recover_goal_continuations_for_startup
+        ),
+        "server._start_startup_background_services": (
+            _start_startup_background_services
+        ),
+    }
+    manifest = release_manifest.deferred_release_manifest()
+    descriptors = release_manifest.webui_startup_descriptors(
+        manifest,
+        startup_admission_closed=api_config.startup_run_admission_is_closed(),
+    )
+    canonical_operations = {
+        descriptor.operation
+        for descriptor in manifest.descriptors
+        if descriptor.owner == "webui_server"
+    }
+    def callable_operation(mutator):
+        if (
+            not callable(mutator)
+            or type(getattr(mutator, "__module__", None)) is not str
+            or type(getattr(mutator, "__name__", None)) is not str
+        ):
+            return None
+        module = "server" if mutator.__module__ == __name__ else mutator.__module__
+        return f"{module}.{mutator.__name__}"
+
+    callables_match_operations = all(
+        callable_operation(mutator) == operation
+        for operation, mutator in mutators_by_operation.items()
+    )
+    if (
+        set(mutators_by_operation) != canonical_operations
+        or not callables_match_operations
+    ):
+        raise RuntimeError("deferred startup callable mapping changed")
+    return tuple(
+        (descriptor.name, mutators_by_operation[descriptor.operation])
+        for descriptor in descriptors
+    )
+
+
+def _run_deferred_startup_mutators() -> dict:
+    """Run each deferred mutator once; preserve progress across a safe retry."""
+    with _DEFERRED_STARTUP_LOCK:
+        for name, mutator in _deferred_startup_steps():
+            if name in _DEFERRED_STARTUP_COMPLETED:
+                continue
+            try:
+                mutator()
+            except Exception as exc:
+                raise RuntimeError(f"deferred startup step failed: {name}") from exc
+            _DEFERRED_STARTUP_COMPLETED.add(name)
+        return {
+            "status": "started",
+            "completed": sorted(_DEFERRED_STARTUP_COMPLETED),
+        }
+
+
+def _run_managed_deferred_startup(transaction_id: str) -> dict:
+    """Replay configured managed steps under durable transaction receipts."""
+    global _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE
+    if (
+        _DEFERRED_STARTUP_REPLAY_DRIVER is None
+        and _DEFERRED_STARTUP_REPLAY_STEPS is None
+    ):
+        _configure_production_managed_startup_coordinator()
+    with _DEFERRED_STARTUP_LOCK:
+        driver = _DEFERRED_STARTUP_REPLAY_DRIVER
+        steps = _DEFERRED_STARTUP_REPLAY_STEPS
+        if driver is None or steps is None:
+            raise RuntimeError("durable deferred startup replay is not configured")
+        canonical_names = tuple(name for name, _mutator in _deferred_startup_steps())
+        if tuple(step.name for step in steps) != canonical_names:
+            raise RuntimeError("durable deferred startup step mapping changed")
+        coordinator = _MANAGED_STARTUP_COORDINATOR
+        if coordinator is not None and (
+            coordinator.driver is not driver or coordinator.steps is not steps
+        ):
+            raise RuntimeError("managed startup coordinator binding changed")
+        receipt = DeferredStartupManifestReceipt(
+            transaction_id=transaction_id,
+            version=release_manifest.MANIFEST_VERSION,
+            sha256=release_manifest.deferred_release_manifest_sha256(),
+        )
+        if coordinator is not None and (
+            coordinator.transaction_id != transaction_id
+            or coordinator.manifest_receipt != receipt
+        ):
+            raise RuntimeError("managed startup coordinator binding changed")
+        process_receipt = _managed_deferred_startup_process_receipt()
+        try:
+            result = replay_deferred_startup(
+                transaction_id=transaction_id,
+                manifest_receipt=receipt,
+                process_epoch=process_receipt.process_epoch,
+                steps=steps,
+                driver=driver,
+            )
+        except DeferredStartupIndeterminateError as exc:
+            raise api_config.RunAdmissionStartupIndeterminate(
+                "deferred startup is indeterminate; candidate remains fenced"
+            ) from exc
+        if coordinator is not None:
+            _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE = ManagedStartupAcceptanceEvidence(
+                process_receipt=process_receipt,
+                driver_attestation=coordinator.driver_attestation(),
+                step_receipt_bundle=coordinator.step_receipt_bundle(),
+            )
+        return {
+            "status": "started",
+            "transaction_id": result.transaction_id,
+            "completed": list(result.completed),
+            "acceptance_evidence": _MANAGED_STARTUP_ACCEPTANCE_EVIDENCE,
+        }
+
+
+def _prepare_startup_mutators() -> str:
+    """Run normal startup now, or register it behind a managed startup fence."""
+    if api_config.startup_run_admission_is_closed():
+        api_config.configure_startup_acceptor(_run_managed_deferred_startup)
+        return "deferred"
+    _run_deferred_startup_mutators()
+    return "started"
+
+
 def main() -> None:
     from api.config import print_startup_config, verify_hermes_imports, _HERMES_FOUND
 
@@ -565,24 +1287,6 @@ def main() -> None:
         )
     elif fd_limit.get("status") == "error":
         print(f"[!!] WARNING: Could not raise file descriptor limit: {fd_limit.get('error')}", flush=True)
-
-    fix_credential_permissions()
-    from api.atomic_recovery import ensure_internal_recovery_key
-    ensure_internal_recovery_key()
-
-    try:
-        from api.models import _active_state_db_path
-        from api.session_recovery import recover_all_sessions_on_startup
-        result = recover_all_sessions_on_startup(
-            SESSION_DIR,
-            rebuild_index=True,
-            state_db_path=_active_state_db_path(),
-        )
-        if result.get("restored"):
-            print(f"[recovery] Restored {result['restored']}/{result['scanned']} sessions from .bak (see #1558).", flush=True)
-    except Exception as exc:
-        # Recovery is best-effort; never block server startup.
-        print(f"[recovery] startup recovery failed: {exc}", flush=True)
 
     within_container = False
     try:
@@ -617,64 +1321,36 @@ def main() -> None:
         print(f'[!!] Warning: Hermes agent found but missing modules: {missing}', flush=True)
         for mod, err in errors.items():
             print(f'     {mod}: {err}', flush=True)
-        print('     Attempting to install missing dependencies from agent requirements.txt...', flush=True)
-        auto_install_agent_deps()
-        ok, missing, errors = verify_hermes_imports()
-        if not ok:
-            print(f'[!!] Still missing after install attempt: {missing}', flush=True)
-            for mod, err in errors.items():
-                print(f'     {mod}: {err}', flush=True)
-            print('     Agent features may not work correctly.', flush=True)
+        if api_config.startup_run_admission_is_closed():
+            print(
+                "[!!] Managed release dependency verification failed; "
+                "automatic installation is disabled and startup remains fenced.",
+                flush=True,
+            )
         else:
-            print('[ok] Agent dependencies installed successfully.', flush=True)
-
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    SESSION_DIR.mkdir(parents=True, exist_ok=True)
-    DEFAULT_WORKSPACE.mkdir(parents=True, exist_ok=True)
-
-    try:
-        from api.plugins import load_plugins
-        load_plugins()
-    except Exception as e:
-        print(f'[!!] WARNING: Plugin loading failed: {e}', flush=True)
+            print('     Attempting to install missing dependencies from agent requirements.txt...', flush=True)
+            auto_install_agent_deps()
+            ok, missing, errors = verify_hermes_imports()
+            if not ok:
+                print(f'[!!] Still missing after install attempt: {missing}', flush=True)
+                for mod, err in errors.items():
+                    print(f'     {mod}: {err}', flush=True)
+                print('     Agent features may not work correctly.', flush=True)
+            else:
+                print('[ok] Agent dependencies installed successfully.', flush=True)
 
     _abort_if_already_serving(HOST, PORT)
     httpd = QuietHTTPServer((HOST, PORT), Handler)
 
     # No side-effecting watcher may claim work until this process owns the
     # listening socket. A second instance must exit without starting consumers.
-    try:
-        from api.gateway_watcher import start_watcher
-
-        def _start_watcher_safe():
-            try:
-                start_watcher()
-            except Exception as e:
-                print(f'[!!] WARNING: Gateway watcher failed to start: {e}', flush=True)
-
-        t = threading.Thread(target=_start_watcher_safe, daemon=True)
-        t.start()
-        t.join(timeout=5)
-        if t.is_alive():
-            print('[tip] Gateway watcher still initializing (non-blocking)', flush=True)
-    except Exception as e:
-        print(f'[!!] WARNING: Gateway watcher failed to start: {e}', flush=True)
-
-    # Single-instance ownership and bind are proven before any durable wakeup
-    # recovery or queue intake can claim work.
-    try:
-        from api.background_process import start_drain_thread
-        if start_drain_thread():
-            print('[ok] bg_task_complete drain thread started', flush=True)
-    except Exception as e:
-        print(f'[!!] WARNING: bg_task_complete drain failed to start: {e}', flush=True)
-
-    try:
-        from api.background_process import start_session_channel_reaper
-        if start_session_channel_reaper():
-            print('[ok] SessionChannel reaper thread started', flush=True)
-    except Exception as e:
-        print(f'[!!] WARNING: SessionChannel reaper failed to start: {e}', flush=True)
+    startup_mutators = _prepare_startup_mutators()
+    if startup_mutators == "deferred":
+        print(
+            "[ok] Managed candidate listening startup-fenced; "
+            "state mutators await signed release acceptance.",
+            flush=True,
+        )
 
     from api.config import TLS_ENABLED, TLS_CERT, TLS_KEY
     scheme = 'https' if TLS_ENABLED else 'http'

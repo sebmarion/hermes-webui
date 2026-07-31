@@ -32,6 +32,20 @@ def _install_fake_skill_bundles(monkeypatch, *, bundles=None, resolver=None, bui
     monkeypatch.setitem(sys.modules, "agent.skill_bundles", skill_bundles)
 
 
+def _install_fake_skill_commands(monkeypatch, *, resolver=None, builder=None):
+    import sys
+
+    agent_pkg = sys.modules.get("agent") or ModuleType("agent")
+    monkeypatch.setattr(agent_pkg, "__path__", [], raising=False)
+    skill_commands = ModuleType("agent.skill_commands")
+    skill_commands.resolve_skill_command_key = resolver or (lambda name: None)
+    skill_commands.build_skill_invocation_message = builder or (
+        lambda key, args: None
+    )
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.skill_commands", skill_commands)
+
+
 def test_bundle_routes_are_wired_through_dedicated_endpoints():
     assert 'if parsed.path == "/api/commands/bundles":' in ROUTES_PY
     assert 'if parsed.path == "/api/commands/bundles/resolve":' in ROUTES_PY
@@ -53,6 +67,13 @@ def test_frontend_checks_agent_ownership_before_bundle_resolution():
     assert agent_idx != -1
     assert bundle_idx != -1
     assert agent_idx < bundle_idx
+
+
+def test_individual_skill_route_and_frontend_dispatch_are_preserved():
+    assert 'if parsed.path == "/api/commands/skills/resolve":' in ROUTES_PY
+    assert "api('/api/commands/skills/resolve'" in COMMANDS_JS
+    assert "await getSkillCommandMetadata(_parsedCmd.name)" in MESSAGES_JS
+    assert "await resolveSkillCommand(text,_skillCmd)" in MESSAGES_JS
 
 
 def test_list_command_bundles_returns_bundle_metadata(monkeypatch):
@@ -141,3 +162,53 @@ def test_resolve_bundle_command_wraps_unexpected_runtime_errors(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Skill bundle command unavailable"):
         commands.resolve_bundle_command("/incident-review investigate this")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_args"),
+    [
+        ("/triage", ""),
+        ("/triage inspect the live failure", "inspect the live failure"),
+    ],
+)
+def test_resolve_skill_command_uses_skill_runtime(monkeypatch, raw, expected_args):
+    seen = {}
+
+    @contextmanager
+    def _profile_scope(purpose):
+        seen["purpose"] = purpose
+        yield
+
+    def _resolve(name):
+        seen["resolve_name"] = name
+        return "/triage" if name == "triage" else None
+
+    def _build(key, args):
+        seen["build"] = (key, args)
+        return "$triage" + (f" {args}" if args else "")
+
+    _install_fake_skill_commands(monkeypatch, resolver=_resolve, builder=_build)
+    monkeypatch.setattr(commands, "_bundle_profile_context", _profile_scope)
+
+    assert commands.resolve_skill_command(raw) == {
+        "name": "triage",
+        "source": "skill",
+        "message": "$triage" + (f" {expected_args}" if expected_args else ""),
+    }
+    assert seen == {
+        "purpose": "/api/commands/skills/resolve",
+        "resolve_name": "triage",
+        "build": ("/triage", expected_args),
+    }
+
+
+def test_resolve_skill_command_rejects_unknown_skill(monkeypatch):
+    _install_fake_skill_commands(monkeypatch)
+    monkeypatch.setattr(
+        commands,
+        "_bundle_profile_context",
+        lambda purpose: nullcontext(),
+    )
+
+    with pytest.raises(KeyError):
+        commands.resolve_skill_command("/does-not-exist")

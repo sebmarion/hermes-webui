@@ -1,6 +1,7 @@
 """Regression checks for #856 background completion unread markers."""
 
 import json
+import subprocess
 from pathlib import Path
 
 
@@ -16,6 +17,116 @@ def _done_block() -> str:
     end = MESSAGES_JS.find("source.addEventListener('stream_end'", start)
     assert end != -1, "stream_end handler not found after done handler"
     return MESSAGES_JS[start:end]
+
+
+def _run_done_handler() -> dict:
+    script = """
+const doneListenerSource = __DONE_LISTENER_SOURCE__;
+const handlers = new Map();
+const completionCandidates = [];
+const noOp = () => undefined;
+const source = {
+  addEventListener(name, handler) {
+    handlers.set(name, handler);
+  },
+};
+const sandboxState = {
+  activeSid: 'active-session',
+  streamId: 'stream-1',
+  _streamFinalized: false,
+  _terminalStateReached: false,
+  _persistTimer: null,
+  assistantBody: null,
+  assistantText: 'final',
+  reasoningText: '',
+  uploaded: [],
+  window: {},
+  S: {
+    session: {
+      session_id: 'active-session',
+      input_tokens: 0,
+      output_tokens: 0,
+      estimated_cost: 0,
+      cache_read_tokens: 0,
+      cache_write_tokens: 0,
+    },
+    messages: [],
+    toolCalls: [],
+    activeStreamId: 'stream-1',
+    busy: true,
+    lastUsage: null,
+  },
+  _clearStreamEndRecovery: noOp,
+  _bailOutOfTerminalEventsFromStaleStream: () => false,
+  _cancelThrottledSnapshotTimer: noOp,
+  _recordCompletionCandidate: (sid, id) => completionCandidates.push([sid, id]),
+  _cancelAnimationFramePendingStreamRender: noOp,
+  _streamFadeCleanupReduceMotionListener: noOp,
+  _smdEndParser: noOp,
+  _flushReasoningToAnchor: noOp,
+  _applyToAnchor: noOp,
+  _scheduleAnchorRegistryCleanup: noOp,
+  _clearAnchorProseIncrementalNode: noOp,
+  _isSessionCurrentPane: () => true,
+  _isSessionActivelyViewed: () => false,
+  _clearOwnerInflightState: noOp,
+  _clearApprovalForOwner: noOp,
+  _clearClarifyForOwner: noOp,
+  _shouldUseLiveProseFade: () => false,
+  _carryForwardEphemeralTurnFields: (_current, completed) => completed,
+  _filterRecoveryControlMessages: messages => messages,
+  _replaceMarkerOnlyAssistantWithStreamError: () => false,
+  _attachProjectedAnchorSceneToLastAssistant: noOp,
+  _latestGoalStatus: null,
+  clearLiveToolCards: noOp,
+  syncTopbar: noOp,
+  renderMessages: noOp,
+  loadDir: noOp,
+  _queueDrainSid: null,
+  renderSessionList: noOp,
+  _setActivePaneIdleIfOwner: noOp,
+  playNotificationSound: noOp,
+  _shouldForceCompletionNotification: () => false,
+  _completionNotificationPreviewText: () => '',
+  sendBrowserNotification: noOp,
+  setTimeout: noOp,
+};
+
+new Function('sandbox', 'source', `with(sandbox){${doneListenerSource}}`)(sandboxState, source);
+let thrown = null;
+try {
+  handlers.get('done')({
+    data: JSON.stringify({
+      status: 'completed',
+      stream_id: 'stream-1',
+      session: {
+        session_id: 'settled-session',
+        message_count: 2,
+        messages: [
+          {role: 'user', content: 'hello'},
+          {role: 'assistant', content: ['final']},
+        ],
+        tool_calls: [],
+      },
+    }),
+  });
+} catch (error) {
+  thrown = {name: error.name, message: error.message};
+}
+console.log(JSON.stringify({
+  thrown,
+  completionCandidates,
+  busy: sandboxState.S.busy,
+}));
+""".replace("__DONE_LISTENER_SOURCE__", json.dumps(_done_block()))
+
+    result = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
 
 
 def _sessions_function_block(name: str, next_name: str) -> str:
@@ -39,6 +150,33 @@ def _function_body(block: str) -> str:
             if depth == 0:
                 return block[brace + 1 : i]
     raise AssertionError("function closing brace not found")
+
+
+def test_done_handler_records_completion_candidate_before_clearing_busy():
+    assert _run_done_handler() == {
+        "thrown": None,
+        "completionCandidates": [["settled-session", "stream-1"]],
+        "busy": False,
+    }
+
+
+def test_done_handler_derives_completion_candidate_session_before_recording_it():
+    done_block = _done_block()
+
+    completed_session_idx = done_block.find(
+        "const completedSession=_doneData.session||{session_id:activeSid};"
+    )
+    completed_sid_idx = done_block.find(
+        "const completedSid=completedSession.session_id||activeSid;"
+    )
+    record_idx = done_block.find(
+        "_recordCompletionCandidate(completedSid, streamId)"
+    )
+
+    assert completed_session_idx != -1
+    assert completed_sid_idx != -1
+    assert record_idx != -1
+    assert completed_session_idx < completed_sid_idx < record_idx
 
 
 def test_background_completion_unread_uses_explicit_marker_not_message_delta():
@@ -65,7 +203,7 @@ def test_background_completion_unread_uses_explicit_marker_not_message_delta():
 def test_background_done_sets_marker_when_session_not_actively_viewed():
     done_block = _done_block()
     assert "const isSessionViewed=_isSessionActivelyViewed(activeSid);" in done_block
-    assert "const completedSession=d.session||{session_id:activeSid};" in done_block
+    assert "const completedSession=_doneData.session||{session_id:activeSid};" in done_block
     assert "const completedSid=completedSession.session_id||activeSid;" in done_block
     assert "const completedMessageCount=completedSession.message_count != null" in done_block
     assert "if(!isSessionViewed && typeof _markSessionCompletionUnread==='function')" in done_block

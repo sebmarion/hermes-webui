@@ -1100,8 +1100,12 @@ class TestCheckpointOrdering:
         import inspect
         source = inspect.getsource(streaming._run_agent_streaming)
 
-        # Find the finally block
-        finally_idx = source.rfind("finally:")
+        # Anchor the outer teardown finally by its stable metering marker. The
+        # function contains nested ``finally`` blocks after this point (for
+        # ephemeral-agent close), so ``rfind`` can select the wrong block.
+        teardown_marker = source.find("# #4633/#2476: symmetric metering teardown")
+        assert teardown_marker != -1, "Could not find outer teardown marker"
+        finally_idx = source.rfind("finally:", 0, teardown_marker)
         assert finally_idx != -1, "Could not find 'finally:' in _run_agent_streaming"
 
         finally_block = source[finally_idx:]

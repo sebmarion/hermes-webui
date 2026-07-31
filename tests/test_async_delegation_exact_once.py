@@ -69,6 +69,8 @@ def _install_start(monkeypatch, responses=None):
 
 
 def _install_tracker(monkeypatch, calls):
+    import tools
+
     module = types.ModuleType("tools.async_delegation")
 
     def mark_async_delegation_delivered(evt):
@@ -77,6 +79,7 @@ def _install_tracker(monkeypatch, calls):
 
     module.mark_async_delegation_delivered = mark_async_delegation_delivered
     monkeypatch.setitem(sys.modules, "tools.async_delegation", module)
+    monkeypatch.setattr(tools, "async_delegation", module, raising=False)
 
 
 def test_idle_and_closed_tab_delivery_persists_then_acks_then_starts(delivery, monkeypatch):
@@ -255,7 +258,6 @@ def test_generic_process_completion_does_not_enter_delegation_store(delivery, mo
     bp, cfg, store = delivery
     calls = []
     monkeypatch.setattr(bp, "_start_server_side_wakeup_turn", lambda *args, **kwargs: calls.append((args, kwargs)))
-    monkeypatch.setattr(bp, "_mark_registry_completion_consumed", lambda _pid: None)
     monkeypatch.setattr(bp, "format_wakeup_prompt", lambda _evt: "[IMPORTANT: process done]")
     fake_registry = types.SimpleNamespace(
         get=lambda _pid: types.SimpleNamespace(session_key="session-a"),

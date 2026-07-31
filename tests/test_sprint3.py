@@ -1,5 +1,5 @@
 """Sprint 3 tests: cron API, skills API, memory API, input validation."""
-import json, pathlib, shutil, tempfile, urllib.request, urllib.error
+import json, pathlib, shutil, tempfile, urllib.request, urllib.error, urllib.parse
 
 from tests._pytest_port import BASE
 
@@ -127,7 +127,8 @@ def test_skills_content_known():
         import pytest
         pytest.skip("No skills visible (likely profile-switch pollution from sibling test)")
     skill_name = skills[0].get("name")
-    data, status = get(f"/api/skills/content?name={skill_name}")
+    encoded_name = urllib.parse.quote(str(skill_name), safe="")
+    data, status = get(f"/api/skills/content?name={encoded_name}")
     assert status == 200, f"Failed to fetch known skill {skill_name!r}: {data}"
     # Endpoint may return the content under 'content' key OR an error key
     if "content" in data:

@@ -118,6 +118,35 @@ def test_no_plan_runs_model_then_captures_bestplan_envelope(tmp_path, monkeypatc
     assert calls["capture"][0][1]["invocation_message"].startswith("[IMPORTANT:")
 
 
+def test_stale_client_task_recovers_bestplan_identity_for_host_capture(
+    tmp_path, monkeypatch,
+):
+    import api.streaming as streaming
+
+    calls = _install_bestplan_module(monkeypatch, resolved=_Resolved(False))
+    invocation = streaming._bestplan_capture_invocation_message(
+        "fix the envelope leak",
+        {"count": 4},
+    )
+    result = streaming._capture_bestplan_result(
+        {
+            "final_response": "receipt plus plan envelope",
+            "messages": [
+                {"role": "assistant", "content": "receipt plus plan envelope"}
+            ],
+        },
+        invocation_message=invocation,
+        session_id="session-stale",
+        profile="coder",
+        workspace="/tmp/work",
+        profile_home=str(tmp_path),
+    )
+
+    assert invocation == "/bestplan 4 fix the envelope leak"
+    assert result["captured"] is True
+    assert calls["capture"][0][1]["invocation_message"] == invocation
+
+
 def test_missing_core_is_transparent_disabled_but_go_fails_closed_enabled(tmp_path, monkeypatch):
     import api.streaming as streaming
 

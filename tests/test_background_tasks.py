@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import pathlib
 import sys
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -39,8 +40,19 @@ class TestGetResultsKeepsRunningTasks(unittest.TestCase):
 
     def setUp(self):
         import api.background as bg
+        self._state_tmp = tempfile.TemporaryDirectory()
+        self._original_tasks_file = getattr(bg, "_BACKGROUND_TASKS_FILE", None)
+        bg._BACKGROUND_TASKS_FILE = pathlib.Path(self._state_tmp.name) / "tasks.json"
+        bg._BACKGROUND_TASKS_LOADED = True
         bg._BACKGROUND_TASKS.clear()
         self.bg = bg
+
+    def tearDown(self):
+        self.bg._BACKGROUND_TASKS.clear()
+        self.bg._BACKGROUND_TASKS_LOADED = True
+        if self._original_tasks_file is not None:
+            self.bg._BACKGROUND_TASKS_FILE = self._original_tasks_file
+        self._state_tmp.cleanup()
 
     def test_running_tasks_survive_get_results_call(self):
         """A running task must remain in the tracker so complete_background()
@@ -112,6 +124,38 @@ class TestGetResultsKeepsRunningTasks(unittest.TestCase):
         self.bg.get_results(parent)
         self.assertNotIn(parent, self.bg._BACKGROUND_TASKS)
 
+    def test_completed_result_survives_process_state_reload(self):
+        parent = "parent-restart"
+        self.bg.track_background(parent, "bg-r", "s-r", "task-r", "persist me")
+        self.bg.complete_background(parent, "task-r", "durable answer")
+
+        self.bg._BACKGROUND_TASKS.clear()
+        self.bg._BACKGROUND_TASKS_LOADED = False
+
+        self.assertEqual(
+            self.bg.get_results(parent),
+            [
+                {
+                    "task_id": "task-r",
+                    "prompt": "persist me",
+                    "answer": "durable answer",
+                    "completed_at": unittest.mock.ANY,
+                }
+            ],
+        )
+
+    def test_running_task_becomes_visible_interruption_after_restart(self):
+        parent = "parent-interrupted"
+        self.bg.track_background(parent, "bg-i", "s-i", "task-i", "long task")
+
+        self.bg._BACKGROUND_TASKS.clear()
+        self.bg._BACKGROUND_TASKS_LOADED = False
+
+        results = self.bg.get_results(parent)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["task_id"], "task-i")
+        self.assertIn("restarted", results[0]["answer"].lower())
+
 
 class TestBackgroundCompletionHookWiring(unittest.TestCase):
     """Static check: the _handle_background worker thread must call
@@ -142,6 +186,8 @@ class TestBackgroundCompletionHookWiring(unittest.TestCase):
             "_run_bg_and_notify must reload the bg session to extract the "
             "final assistant reply so complete_background gets an actual answer"
         ))
+        self.assertIn("background_finalizer", body)
+        self.assertIn("unregister_active_run(finalizer_run_id)", body)
 
 
 if __name__ == "__main__":

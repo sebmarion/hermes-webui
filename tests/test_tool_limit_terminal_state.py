@@ -19,6 +19,7 @@ def _run_streaming_with_fake_agent(
     *,
     prior_messages=None,
     prior_context_messages=None,
+    goal_related=False,
 ):
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
@@ -93,6 +94,7 @@ def _run_streaming_with_fake_agent(
             model="gpt-4o",
             workspace=str(tmp_path),
             stream_id=stream_id,
+            goal_related=goal_related,
         )
 
     events = []

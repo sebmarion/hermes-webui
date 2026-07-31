@@ -12,9 +12,15 @@ import os
 import re
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from api.auth import _is_loopback, _signing_key
+from api.auth import (
+    ManagedSigningKeyCacheReceipt,
+    ManagedSigningKeyPersistenceReceipt,
+    _is_loopback,
+    _signing_key,
+)
 from api.config import LOCK, SESSIONS, _get_session_agent_lock
 
 
@@ -35,9 +41,28 @@ _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _STALE_SIDECAR_SECONDS = 3600
 
 
+@dataclass(frozen=True)
+class ManagedInternalRecoveryKeyReceipt:
+    persistence: ManagedSigningKeyPersistenceReceipt
+    cache: ManagedSigningKeyCacheReceipt
+
+
 def ensure_internal_recovery_key() -> None:
     """Materialize the durable HMAC key before the watchdog can call us."""
     _signing_key()
+
+
+def ensure_managed_internal_recovery_key() -> ManagedInternalRecoveryKeyReceipt:
+    """Strictly establish separate durable-file and process-cache postconditions."""
+
+    from api.auth import strict_load_signing_key_cache, strict_persist_signing_key
+
+    persistence = strict_persist_signing_key()
+    cache = strict_load_signing_key_cache()
+    return ManagedInternalRecoveryKeyReceipt(
+        persistence=persistence,
+        cache=cache,
+    )
 
 
 def _canonical_request_body(body: dict) -> bytes:

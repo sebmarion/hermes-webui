@@ -7428,18 +7428,6 @@ def shared_interactive_sidebar_projection(
             continue
         state_title = str(state_row.get("title") or "").strip()
         overlay_title = str((overlay or {}).get("title") or "").strip()
-        if not state_title and overlay_title and overlay_title.lower() != "untitled":
-            try:
-                from api.state_sync import sync_session_title
-
-                # Existing sidecars are the only durable title source for some
-                # older WebUI rows. Backfill only blank state.db titles; once a
-                # title exists there, state.db remains authoritative for both
-                # clients and a stale sidecar cannot overwrite a Hermes One
-                # rename.
-                sync_session_title(sid, overlay_title, profile=profile)
-            except Exception:
-                logger.debug("Failed to backfill WebUI title %s to state.db", sid, exc_info=True)
         row = {
             "id": sid,
             "session_id": sid,
@@ -7792,10 +7780,6 @@ def _load_cli_sessions_uncached(
         if not _title and _sidecar_meta.get('title'):
             _title = _sidecar_meta['title']
         _archived = bool(row.get('archived') or _sidecar_meta.get('archived'))
-        # When title is NULL and no preview is available, show "Untitled
-        # session" — matching the desktop app's fallback. This replaces the
-        # old ``f'{source.title()} Session'`` label (e.g. "Desktop Session")
-        # which was inconsistent with the desktop app and unhelpful.
         _preview = row.get('preview') or ''
         _display_title = _title or _preview or 'Untitled session'
         cli_sessions.append({

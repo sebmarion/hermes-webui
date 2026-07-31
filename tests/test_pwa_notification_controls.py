@@ -52,7 +52,8 @@ def test_completion_notification_preview_uses_settled_message_not_live_prefix():
     assert "_assistantTurnAnchorSettledFinalAnswer" in MESSAGES_JS
     done_block = _source_between("source.addEventListener('done'", "source.addEventListener('stream_end'")
     assert "let lastAsst=null;" in done_block
-    assert "d.session.messages" in done_block
+    assert "const _terminalDoneMessages=" in done_block
+    assert "_terminalDoneMessages" in done_block
     assert "liveDisplayText:typeof _streamDisplay==='function'?_streamDisplay():assistantText" in done_block
 
 

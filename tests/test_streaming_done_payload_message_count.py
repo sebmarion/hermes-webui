@@ -4,7 +4,10 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from api.streaming import _session_payload_with_full_messages
+from api.streaming import (
+    _session_payload_with_full_messages,
+    _terminal_delta_from_full_payload,
+)
 
 
 STREAMING_SOURCE = Path("api/streaming.py").read_text(encoding="utf-8")
@@ -70,11 +73,90 @@ def test_full_message_payload_includes_todo_state_snapshot():
     assert payload["todo_state"]["ts"] == 101
 
 
-def test_done_payload_uses_full_message_count_helper():
+def test_terminal_delta_payload_omits_full_transcript_and_reports_exact_base():
+    previous = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    terminal = [
+        {"role": "user", "content": "new question"},
+        {"role": "assistant", "content": "new answer"},
+    ]
+    session = _FakeSession(
+        session_id="compact-done",
+        messages=previous + terminal,
+    )
+
+    payload = _terminal_delta_from_full_payload(
+        _session_payload_with_full_messages(session, tool_calls=[]),
+        previous_messages=previous,
+    )
+
+    assert "messages" not in payload
+    assert payload["message_count"] == 4
+    assert payload["terminal_base_message_count"] == 2
+    assert payload["terminal_messages"] == terminal
+    assert payload["tool_calls"] == []
+
+
+def test_terminal_delta_payload_requests_reload_when_prefix_changed():
+    previous = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    session = _FakeSession(
+        session_id="compressed-done",
+        messages=[
+            {"role": "assistant", "content": "compressed summary"},
+            {"role": "user", "content": "new question"},
+            {"role": "assistant", "content": "new answer"},
+        ],
+    )
+
+    payload = _terminal_delta_from_full_payload(
+        _session_payload_with_full_messages(session, tool_calls=[]),
+        previous_messages=previous,
+    )
+
+    assert payload["messages"] == session.messages
+    assert "terminal_messages" not in payload
+    assert payload["terminal_reconcile_required"] is True
+    assert payload["message_count"] == 3
+
+
+def test_terminal_delta_detects_prefix_changes_beyond_message_identity_preview():
+    previous = [{"role": "assistant", "content": ("a" * 600) + "before"}]
+    session = _FakeSession(
+        session_id="long-prefix-rewrite",
+        messages=[
+            {"role": "assistant", "content": ("a" * 600) + "after"},
+            {"role": "assistant", "content": "new answer"},
+        ],
+    )
+
+    payload = _terminal_delta_from_full_payload(
+        _session_payload_with_full_messages(session, tool_calls=[]),
+        previous_messages=previous,
+    )
+
+    assert payload["terminal_reconcile_required"] is True
+    assert payload["messages"] == session.messages
+
+
+def test_done_payload_uses_compact_terminal_delta_helper():
     done_idx = STREAMING_SOURCE.index("put('done', _done_payload)")
-    block_start = STREAMING_SOURCE.rfind("raw_session =", 0, done_idx)
+    block_start = STREAMING_SOURCE.rfind(
+        "raw_session = _session_payload_with_full_messages",
+        0,
+        done_idx,
+    )
     block = STREAMING_SOURCE[block_start:done_idx]
 
+    assert (
+        "_terminal_delta_from_full_payload("
+        in block
+    )
+    assert "previous_messages=_previous_messages" in block
     assert "_session_payload_with_full_messages(s, tool_calls=tool_calls)" in block
     assert "s.compact() | {'messages': s.messages" not in block
 
@@ -88,14 +170,18 @@ def test_apperror_payload_uses_full_message_count_helper():
     assert "s.compact() | {'messages': s.messages" not in block
 
 
-def test_gateway_done_payload_uses_full_message_count_helper():
-    """The gateway-routed chat `done` SSE shares the settled-payload path and
-    must also report a message_count matching the embedded transcript (sibling
-    of the two streaming.py sites)."""
+def test_gateway_done_payload_uses_compact_terminal_delta_helper():
+    """Gateway-routed success uses the same compact terminal delta contract."""
     gateway_source = Path("api/gateway_chat.py").read_text(encoding="utf-8")
     done_idx = gateway_source.index('put_gateway_event("done"')
-    block_start = gateway_source.rfind("gateway_session_payload =", 0, done_idx)
+    block_start = gateway_source.rfind(
+        "gateway_session_payload = _session_payload_with_full_messages",
+        0,
+        done_idx,
+    )
     block = gateway_source[block_start:done_idx]
 
+    assert "_terminal_delta_from_full_payload(" in block
+    assert "previous_messages=previous_messages" in block
     assert "_session_payload_with_full_messages(s, tool_calls=[])" in block
     assert 's.compact() | {"messages": s.messages' not in block

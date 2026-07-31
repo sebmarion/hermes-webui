@@ -2055,8 +2055,8 @@
   .approval-btn.deny:hover{background:rgba(239,83,80,.12);border-color:var(--error);}
   .approval-btn.loading{opacity:.7;cursor:wait;}
   /* ── Clarify card ── */
-  .clarify-card{position:absolute;left:0;right:0;bottom:-24px;max-width:var(--msg-max);margin:0 auto;padding:0 20px;box-sizing:border-box;width:100%;overflow:hidden;pointer-events:none;max-height:clamp(180px,min(68vh,calc(100vh - 220px)),420px);}
-  .clarify-card.visible{pointer-events:auto;}
+  .clarify-card{position:absolute;left:0;right:0;bottom:10px;max-width:var(--msg-max);margin:0 auto;padding:0 20px;box-sizing:border-box;width:100%;overflow:hidden;pointer-events:none;max-height:clamp(180px,min(68vh,calc(100vh - 220px)),420px);}
+  .clarify-card.visible{pointer-events:auto;z-index:5;}
   .clarify-card .clarify-inner{max-height:clamp(180px,min(68vh,calc(100vh - 220px)),420px);overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;box-sizing:border-box;transform:translateY(100%);opacity:0;transition:transform .4s cubic-bezier(.32,.72,.16,1),opacity .25s ease,max-height .2s ease;}
   @supports (height:100dvh){.clarify-card,.clarify-card .clarify-inner{max-height:clamp(180px,min(68dvh,calc(100dvh - 220px)),420px);}}
   .clarify-card.visible .clarify-inner{transform:translateY(0);opacity:1;}
@@ -3226,6 +3226,19 @@
     .composer-left{gap:2px;}
   }
 
+  @media (max-height: 600px) and (min-width: 641px){
+    /* Short desktop windows need the full clarification context and response
+       visible together; reduce vertical chrome before falling back to scroll. */
+    .clarify-card,.clarify-card .clarify-inner{max-height:min(78vh,calc(100vh - 120px),420px);}
+    @supports (height:100dvh){.clarify-card,.clarify-card .clarify-inner{max-height:min(78dvh,calc(100dvh - 120px),420px);}}
+    .clarify-inner{padding:10px 14px 12px;}
+    .clarify-header{margin-bottom:6px;}
+    .clarify-question{font-size:13px;line-height:1.5;margin-bottom:8px;}
+    .clarify-choices{gap:5px;margin-bottom:8px;}
+    .clarify-choice{padding:7px 12px;}
+    .clarify-choice-badge{min-width:20px;height:20px;}
+  }
+
   @media (max-width: 640px){
     /* Match the close (X) glyph to the new-conversation (+) button's 14px size
        (previously 18px — the only 18px panel-head icon, so the X read visibly
@@ -3251,7 +3264,7 @@
     .approval-btn.yolo{grid-column:1 / -1;}
     .approval-kbd{display:none;}
     /* Clarify card */
-    .clarify-card{padding-left:10px;padding-right:10px;overflow:visible;max-height:clamp(180px,min(62vh,calc(100vh - 180px)),360px);}
+    .clarify-card{padding-left:10px;padding-right:10px;bottom:8px;max-height:clamp(180px,min(62vh,calc(100vh - 180px)),360px);}
     .clarify-card .clarify-inner{max-height:clamp(180px,min(62vh,calc(100vh - 180px)),360px);}
     @supports (height:100dvh){.clarify-card,.clarify-card .clarify-inner{max-height:clamp(180px,min(62dvh,calc(100dvh - 180px)),360px);}}
     .clarify-inner{padding:12px 12px 13px;min-width:min(100%,280px);}

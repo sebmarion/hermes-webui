@@ -1712,7 +1712,11 @@ async function loadSession(sid){
     window.__HERMES_CONFIG__ &&
     window.__HERMES_CONFIG__.lazyTailV1===true &&
     !opts.forceLegacyMessagePaging &&
-    (!sameSessionForceReload || !!opts.cursorRestartAttempted)
+    (
+      !sameSessionForceReload ||
+      !!opts.cursorRestartAttempted ||
+      !!opts.lazyTailRestartAttempted
+    )
   );
   const _lazyTailLoadStartedAt = _useLazyTail ? Date.now() : null;
   const _hasInitialMessageData = _useLazyTail || _useBoundedInitialMessagePaging;
@@ -1755,11 +1759,24 @@ async function loadSession(sid){
         _rearmActiveSessionStream();
         return false;
       }
-      _showLazyTailRecovery(sid, 'The fast task window could not be loaded.');
-      _clearSameSessionForceReloadHint(sid);
+      if (!_acceptResult()) {
+        if (_isCurrentLoad()) _loadingSessionId = null;
+        _rearmActiveSessionStream();
+        return false;
+      }
       if (_isCurrentLoad()) _loadingSessionId = null;
-      _rearmActiveSessionStream();
-      return false;
+      if (typeof recordLazyTailEvent === 'function') {
+        recordLazyTailEvent('lazy_tail_legacy_automatic',{
+          session_id:sid,
+          state:'legacy_required',
+          reason:'fast_window_request_failed',
+        });
+      }
+      return loadSession(sid,{
+        ...opts,
+        force:true,
+        forceLegacyMessagePaging:true,
+      });
     }
     const _msgInner = $('msgInner');
     // Stale-load guard (Codex): a newer loadSession() may have started while this
@@ -1841,7 +1858,7 @@ async function loadSession(sid){
   // No self-heal: 401 is transient auth expiry — the session still exists
   // server-side. Clearing localStorage would wipe the saved session id and
   // send users to empty state after re-login (#4028 follow-up).
-  if (!data) {
+  if (data === undefined || (!_useLazyTail && !data)) {
     _clearSameSessionForceReloadHint(sid);
     if (_isCurrentLoad()) _loadingSessionId = null;
     // #2971: re-arm the still-displayed session's stream (defensive — harmless
@@ -1875,18 +1892,34 @@ async function loadSession(sid){
       sid,
       {requireMetadata:true}
     );
-    if (
-      !parsedLazyTail ||
-      !['ready','reconnecting'].includes(parsedLazyTail.window.state)
-    ) {
-      const reason = parsedLazyTail
-        ? (parsedLazyTail.window.status_reason || parsedLazyTail.window.state)
-        : 'The server returned an invalid fast task window.';
-      _showLazyTailRecovery(sid, reason);
-      _clearSameSessionForceReloadHint(sid);
+    const lazyTailDecision = _lazyTailLoadDecision(parsedLazyTail, opts);
+    if (lazyTailDecision.action === 'retry') {
       if (_isCurrentLoad()) _loadingSessionId = null;
-      _rearmActiveSessionStream();
-      return false;
+      return loadSession(sid, {
+        ...opts,
+        force:true,
+        lazyTailRestartAttempted:true,
+      });
+    }
+    if (lazyTailDecision.action === 'legacy') {
+      if (!_isCurrentLoad() || !_acceptResult()) {
+        if (_isCurrentLoad()) _loadingSessionId = null;
+        _rearmActiveSessionStream();
+        return false;
+      }
+      if (_isCurrentLoad()) _loadingSessionId = null;
+      if (typeof recordLazyTailEvent === 'function') {
+        recordLazyTailEvent('lazy_tail_legacy_automatic',{
+          session_id:sid,
+          state:'legacy_required',
+          reason:lazyTailDecision.reason,
+        });
+      }
+      return loadSession(sid,{
+        ...opts,
+        force:true,
+        forceLegacyMessagePaging:true,
+      });
     }
     data = {
       ...data,
@@ -2981,6 +3014,14 @@ function _parseLazyTailPayload(payload, requestedSid, options) {
   if (!windowState || typeof windowState !== 'object' || Array.isArray(windowState)) return null;
   if (windowState.schema !== 'lazy_tail_v1') return null;
   if (!['ready','reconnecting','legacy_required','stale'].includes(windowState.state)) return null;
+  if (!Object.prototype.hasOwnProperty.call(windowState, 'status_reason')) return null;
+  if (
+    windowState.status_reason !== null &&
+    (
+      typeof windowState.status_reason !== 'string' ||
+      !/^[a-z0-9][a-z0-9_.:-]{0,127}$/.test(windowState.status_reason)
+    )
+  ) return null;
   if (String(payload.requested_session_id || '') !== String(requestedSid || '')) return null;
   if (!String(payload.canonical_session_id || '').trim()) return null;
   // A 50-visible-row page may contain its bounded non-counting tool results
@@ -3016,11 +3057,21 @@ function _parseLazyTailPayload(payload, requestedSid, options) {
     if (snapshot !== null) return null;
   }
   const metadata = payload.session_metadata;
-  if (options.requireMetadata) {
+  const hasMetadata = Object.prototype.hasOwnProperty.call(
+    payload,
+    'session_metadata'
+  );
+  const metadataRequired = (
+    !!options.requireMetadata &&
+    ['ready','reconnecting'].includes(windowState.state)
+  );
+  if (hasMetadata) {
     if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
     if (String(metadata.session_id || '') !== String(payload.canonical_session_id || '')) return null;
     if (typeof metadata.read_only !== 'boolean') return null;
     if (metadata.model_provider !== null && typeof metadata.model_provider !== 'string') return null;
+  } else if (metadataRequired) {
+    return null;
   }
   return {
     sourceMode: 'lazy_tail_v1',
@@ -3029,6 +3080,24 @@ function _parseLazyTailPayload(payload, requestedSid, options) {
     runtimeSnapshot: snapshot,
     sessionMetadata: metadata,
   };
+}
+
+function _lazyTailLoadDecision(parsed, options) {
+  options = options || {};
+  if (!parsed) {
+    return {
+      action: 'legacy',
+      reason: 'The server returned an invalid fast task window.',
+    };
+  }
+  if (['ready','reconnecting'].includes(parsed.window.state)) {
+    return {action: 'adopt', reason: null};
+  }
+  const reason = parsed.window.status_reason || parsed.window.state;
+  if (!options.lazyTailRestartAttempted) {
+    return {action: 'retry', reason};
+  }
+  return {action: 'legacy', reason};
 }
 
 function _lazyTailSessionEnvelope(parsed) {

@@ -124,7 +124,7 @@ class TestRuntimeRouteInjection(unittest.TestCase):
         so the WebUI degrades gracefully against older hermes-agent builds.
         """
         for snippet in (
-            "_agent_kwargs['api_mode'] = _rt.get('api_mode')",
+            "_agent_kwargs['api_mode'] = _effective_api_mode",
             "_agent_kwargs['acp_command'] = _rt.get('command')",
             "_agent_kwargs['acp_args'] = _rt.get('args')",
             "_agent_kwargs['credential_pool'] = _rt.get('credential_pool')",

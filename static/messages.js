@@ -2101,6 +2101,39 @@ function closeOtherLiveStreams(activeSid){
   }
 }
 
+function _reconcileTerminalDoneMessages(currentMessages, completedSession, currentOffset=0){
+  const current=Array.isArray(currentMessages)?currentMessages:[];
+  const session=completedSession&&typeof completedSession==='object'?completedSession:{};
+  let next=null;
+  if(Array.isArray(session.terminal_messages)){
+    const base=Number(session.terminal_base_message_count);
+    const offset=Number.isFinite(Number(currentOffset))?Math.max(0,Number(currentOffset)):0;
+    const localBase=Number.isInteger(base)?base-offset:-1;
+    if(localBase>=0&&localBase<=current.length){
+      next=current.slice(0,localBase).concat(
+        session.terminal_messages.filter(m=>m&&m.role)
+      );
+    }
+  }
+  // Explicit correctness fallback for compression/recovery, where the server
+  // detected that the historical prefix changed and a delta is unsafe.
+  if(!next&&session.terminal_reconcile_required&&Array.isArray(session.messages)){
+    next=session.messages.filter(m=>m&&m.role);
+  }
+  // Backward compatibility while a browser tab or server process crosses a
+  // rolling update boundary.
+  if(!next&&Array.isArray(session.messages)){
+    next=session.messages.filter(m=>m&&m.role);
+  }
+  return next
+    ? _carryForwardEphemeralTurnFields(current,next)
+    : current;
+}
+
+if(typeof window!=='undefined'){
+  window._reconcileTerminalDoneMessages=_reconcileTerminalDoneMessages;
+}
+
 function _boundedLazyTailTerminalState(
   currentSession,
   currentMessages,
@@ -5598,6 +5631,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
       _cancelThrottledSnapshotTimer();
       const _doneData=JSON.parse(e.data);
+      const completedSession=_doneData.session||{session_id:activeSid};
+      const completedSid=completedSession.session_id||activeSid;
+      const _terminalDoneMessages=Array.isArray(completedSession.terminal_messages)
+        ? completedSession.terminal_messages
+        : (Array.isArray(completedSession.messages)?completedSession.messages:[]);
       const _lazyTailDone=!!(_doneData&&_doneData.lazy_tail_terminal_v1);
       const _lazyTailDoneMessages=(
         _lazyTailDone &&
@@ -5682,6 +5720,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const _prevCost=(S.session&&S.session.estimated_cost)||0;
           const _prevCacheRead=(S.session&&S.session.cache_read_tokens)||0;
           const _prevCacheWrite=(S.session&&S.session.cache_write_tokens)||0;
+          const _currentDoneOffset=(typeof _oldestIdx!=='undefined'&&Number.isFinite(Number(_oldestIdx)))
+            ? Number(_oldestIdx)
+            : 0;
           if(_lazyTailDone){
             const boundedTerminal=_boundedLazyTailTerminalState(
               S.session,
@@ -5695,6 +5736,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
               boundedTerminal.messages
             );
           }else{
+            const _nextDoneMessages=typeof _reconcileTerminalDoneMessages==='function'
+              ? _reconcileTerminalDoneMessages(S.messages||[],completedSession,_currentDoneOffset)
+              : (Array.isArray(d.session.messages)?d.session.messages:[]);
+            d.session.messages=_nextDoneMessages;
+            if(d.session._messages_offset==null)d.session._messages_offset=_currentDoneOffset;
+            if(d.session._messages_truncated==null&&typeof _messagesTruncated!=='undefined'){
+              d.session._messages_truncated=_messagesTruncated;
+            }
             S.session=d.session;
             S.messages=_carryForwardEphemeralTurnFields(
               S.messages||[],
@@ -5863,8 +5912,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           // TTS auto-read: speak the last assistant response if enabled (#499)
           if(typeof autoReadLastAssistant==='function') setTimeout(()=>autoReadLastAssistant(), 300);
         }
-        if(!lastAsst&&d.session&&Array.isArray(d.session.messages)){
-          lastAsst=[...d.session.messages].reverse().find(m=>m&&m.role==='assistant')||null;
+        if(!lastAsst&&_terminalDoneMessages.length){
+          lastAsst=[..._terminalDoneMessages].reverse().find(m=>m&&m.role==='assistant')||null;
         }
         if(isActiveSession) _queueDrainSid=activeSid;
         renderSessionList();
@@ -8211,6 +8260,7 @@ function _syncClarifyCollapseButton(card) {
 }
 
 let _clarifyResizeListenerReady = false;
+let _clarifyResponseVisibilityTimer = null;
 
 function _clarifyMessagesNearBottom(messages) {
   if (!messages) return false;
@@ -8249,6 +8299,39 @@ function _syncClarifyTranscriptSpace(card, opts) {
   setTimeout(measure, 420);
 }
 
+function _ensureClarifyResponseVisible(card, opts) {
+  opts = opts || {};
+  if (!card || !card.classList.contains("visible") || card.classList.contains("collapsed")) return;
+  const inner = card.querySelector(".clarify-inner");
+  const response = card.querySelector(".clarify-response");
+  if (!inner || !response) return;
+  const reveal = () => {
+    if (!card.classList.contains("visible") || card.classList.contains("collapsed")) return;
+    const cardRect = card.getBoundingClientRect();
+    const innerRect = inner.getBoundingClientRect();
+    const responseRect = response.getBoundingClientRect();
+    const gap = 8;
+    const visibleTop = Math.max(cardRect.top, innerRect.top);
+    const visibleBottom = Math.min(cardRect.bottom, innerRect.bottom);
+    const below = responseRect.bottom - (visibleBottom - gap);
+    const above = (visibleTop + gap) - responseRect.top;
+    if (below > 0) {
+      inner.scrollTop += Math.ceil(below);
+    } else if (above > 0) {
+      inner.scrollTop = Math.max(0, inner.scrollTop - Math.ceil(above));
+    }
+  };
+  if (opts.immediate) reveal();
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(reveal);
+  if (opts.settle) {
+    clearTimeout(_clarifyResponseVisibilityTimer);
+    _clarifyResponseVisibilityTimer = setTimeout(() => {
+      _clarifyResponseVisibilityTimer = null;
+      reveal();
+    }, 240);
+  }
+}
+
 function _ensureClarifyResizeListener() {
   if (_clarifyResizeListenerReady || typeof window === "undefined") return;
   _clarifyResizeListenerReady = true;
@@ -8256,6 +8339,7 @@ function _ensureClarifyResizeListener() {
     const card = $("clarifyCard");
     if (card && card.classList.contains("visible")) {
       _syncClarifyTranscriptSpace(card, {immediate: true});
+      _ensureClarifyResponseVisible(card, {immediate: true, settle: true});
     }
   }, {passive: true});
 }
@@ -8267,6 +8351,7 @@ function toggleClarifyCardCollapsed(forceCollapsed) {
   card.classList.toggle("collapsed", collapsed);
   _syncClarifyCollapseButton(card);
   _syncClarifyTranscriptSpace(card, {immediate: true});
+  _ensureClarifyResponseVisible(card, {immediate: true, settle: true});
 }
 
 function _clearClarifyHideTimer() {
@@ -8512,6 +8597,7 @@ function showClarifyCard(pending) {
   if (input && !sameClarify && document.activeElement !== $('msg')) {
     input.focus({preventScroll: true});
   }
+  if (!sameClarify) _ensureClarifyResponseVisible(card, {immediate: true, settle: true});
   if (typeof syncTopbar === 'function') syncTopbar();
 }
 

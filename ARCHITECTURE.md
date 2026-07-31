@@ -35,6 +35,15 @@ frontend framework. The Python server is split into a routing shell (server.py) 
 business logic modules (api/). The frontend is seven vanilla JS modules loaded from static/.
 This makes the code easy to modify from a terminal or by an agent.
 
+Browser cache identity is deliberately separate from product version identity.
+`api.updates.WEBUI_VERSION` remains the user-facing/update/model-cache version.
+`WEBUI_ASSET_VERSION` is the process-constant token injected into app-shell and
+login asset URLs plus the service-worker cache namespace. In selector mode it
+must equal the full lowercase SHA-256 of the selector-validated immutable
+release manifest; a missing or malformed digest fails startup before bind.
+Git checkouts, Docker images, and other non-selector launches retain the
+existing `WEBUI_VERSION` asset-cache behavior.
+
 Hermes-level chrome is intentionally consolidated: the sidebar has no dedicated brand header.
 Instead, the footer exposes a single "Hermes WebUI" launch button that opens one tabbed
 control-center modal for global preferences, conversation import/export, and clear-conversation
@@ -1913,3 +1922,140 @@ an existing workspace. Strict: path must be under home, in the saved workspace l
 
 The distinction matters because add uses permissive validation to avoid the circular
 dependency: you cannot get a path into the saved list if you need the saved list to add it.
+
+## Immutable release FIRST-activation bridge
+
+The FIRST migration from the legacy launch layout to a managed release uses
+two separate activation boundaries in `scripts/webui_release_cutover.py`:
+
+- The candidate Hermes CLI is staged as an immutable private `0555` shell
+  shim. Before legacy drain starts, the canonical public `hermes` symlink is
+  CAS-switched from its captured legacy target to a transaction-owned `0555`
+  maintenance shim that imports no Python or Hermes modules and exits with a
+  temporary-failure status.
+- The managed gateway plist names the staged candidate shim directly. The
+  public CLI remains maintenance-gated while the WebUI and gateway start,
+  reconcile, and open behind the shared pair gate. Only a durable
+  `pair_opened` receipt authorizes a second CAS switch to the candidate shim.
+  Early abort and rollback restore the captured legacy link only when the live
+  target is the transaction-owned maintenance or candidate shim.
+- A startup-fenced WebUI proves full pre-commit health without opening or
+  repairing shared state. Stream checks must be `ok`; the startup-fence check
+  must be `fenced` and `mutation_free`; session, project, and state-database
+  probes must be `deferred`. After signed acceptance opens admission, those
+  deferred probes are no longer valid and must return `ok` or an allowed
+  `missing` state.
+- FIRST activation installs the exact candidate watchdog and executes both
+  pre-open reconcile-only proofs while watchdog scheduling is durably disabled
+  and before the release transaction acquires the watchdog state lock. The
+  resulting readiness receipt is reused inside the locked pair commit; no
+  watchdog subprocess is launched while its own state lock is held. Reuse
+  binds the full sealed release identity to the signed process-identity
+  projection; runtime-only fields such as PID, start token, and instance ID
+  may be present without making an otherwise exact candidate appear changed.
+  A final candidate-script reconciliation immediately precedes lock
+  acquisition, and the cron schedule is restored only after `pair_opened`.
+  Barrier cleanup accepts a changed watchdog state only when the same
+  transaction has durably restored and reverified its exact signed state
+  snapshot.
+- Legacy cron admission is excluded with an exclusive flock on
+  `~/.hermes/cron/.tick.lock`, not `.jobs.lock`. The canonical cron directory
+  must be private `0700`. A pre-existing same-uid, single-link regular lock may
+  be `0600` or legacy `0644`: the transaction first durably captures its exact
+  inode, bytes, and mode, then normalizes it through the same descriptor to
+  `0600`. An absent lock is durably captured before an exclusive `0600`
+  creation. Every lock open uses `O_NOFOLLOW` and `O_CLOEXEC`. The cutover
+  reacquires this kernel lock after process restart instead of treating a
+  journal phase as live ownership, and holds it from before drain through exact
+  legacy gateway exit and the all-services-stopped receipt. Pre-snapshot abort
+  reacquires the exact inode in either normalized or captured mode before it
+  restores the captured mode and bytes (or removes a transaction-created
+  lock). This makes abort recovery idempotent after a crash between the restore
+  and its durable receipt. Rollback permits an inode rebind only when the
+  signed state-snapshot restore receipt proves the transaction-owned
+  replacement.
+- Legacy gateway retirement does not rely on launchd's default SIGTERM exit
+  timeout. The durable stop intent first captures the exact launchd
+  `print-disabled` state and requires the service to be semantically enabled.
+  At the zero-work retirement boundary, the transaction disables the exact
+  label's KeepAlive restart, rechecks the PID/start token, listener, job, and
+  process checkpoint, sends an exact SIGINT, and waits for a fresh
+  clean-shutdown receipt before booting out the now-inactive job. The label is
+  re-enabled after either success or failure. Crash resume reuses the durable
+  restart-control intent; pre-snapshot abort re-enables it before adopting or
+  exactly restarting the attested legacy binding. Listener probing
+  distinguishes a clean `lsof` no-owner result from multiple owners, malformed
+  output, stderr, and probe failure. Only clean absence authorizes a restart;
+  ambiguity, PID reuse, foreign runtime identity, and malformed launchd
+  override output all fail closed.
+- The same capture/CAS normalization applies to the two synthetic completion
+  stores. Candidate and quarantine JSON is always private `0600`, while an
+  exact legacy `0644` source mode is retained in the journal for abort or
+  rollback. Frozen inspection accepts only the plan-allowlisted terminal
+  process/delegation IDs and exact source SHA. Delivered and queued terminal
+  records are both classified; running, unknown-status, or non-allowlisted
+  records fail closed. Original bytes are moved into private transaction
+  quarantine and are never replayed. Rollback can restore the legacy live-file
+  mode, but the live payload remains the canonical empty store while the exact
+  terminal bytes remain sealed in quarantine.
+- Before the first managed promotion is durable, rollback identity comes from
+  the exact bootstrap handoff receipt, not the managed last-good release
+  schema. The release rollback restores and attests the captured legacy WebUI
+  and gateway pair and clears the original transaction-owned drain marker.
+  If the outer bootstrap rollback observes that already-restored legacy
+  gateway, it classifies it by the restored plist and runtime receipts,
+  re-drains it under the existing transaction intent, and completes state
+  restoration without entering a managed-gateway attestation wait. Gateway
+  rollback authority is bound to the captured command, executable identity,
+  and argv, but not to the live process cwd because the legacy gateway may
+  chdir to a selected workspace after launch. Legacy WebUI rollback remains
+  bound to cwd plus the exact captured git-source and routing receipts.
+- Crash resume after selector activation does not mistake the transaction's
+  own forward progress for foreign pre-managed-control drift. It may adopt only
+  an activated or promoted selector that exactly equals the same transaction's
+  durable journal receipt and whose inverse generation transition reproduces
+  the original staged selector bytes, mode, and owner. A promoted adoption also
+  requires the durable pair-commit intent. Missing controls, another
+  transaction, a changed journal identity, or any selector bytes that cannot
+  reconstruct the staged hash still fail closed.
+- Release-journal reconciliation is likewise phase-aware: staged and activated
+  states retain the previous last-good build, while a promoted state has the
+  candidate as both current and last-good. Promoted reconciliation requires an
+  exact journal candidate identity, durable pair-commit intent, full equality
+  between the live and journaled promoted selector, the expected post-promotion
+  generation, and the sealed candidate release record. It never recreates a
+  missing journal from an already-promoted selector.
+- Rollback payload retention runs synchronously after a successful managed
+  release, bootstrap migration, or selector-only promotion. It does not use a
+  cron job or background agent. Under the selector lock and every transaction
+  lock, it keeps the newest verified terminal rollback pair, removes older
+  terminal payloads and abandoned nonterminal payloads through a receipt-first
+  quarantine, and leaves manifests and transaction journals in place for
+  audit. Ambiguous manifests, journal graphs, ownership, paths, open files, or
+  selector activity fail closed without widening the deletion set. Retention
+  failure is reported in the accepted release result and does not pretend that
+  the already-durable promotion was rolled back.
+- Pair-open gateway attestation always uses the sealed release identity from
+  the cutover plan. The signed WebUI process identity is intentionally slimmer
+  and uses process-facing agent field names, so it remains the PID-bound
+  authorization for WebUI control actions but is never substituted for the
+  full gateway release identity. Gateway binding retries are limited to
+  explicit identity and release-readiness failures; programming errors escape
+  immediately instead of being hidden behind the cutover timeout.
+- Startup acceptance and pair-open admission are separate fences. Before signed
+  startup acceptance, deep health remains mutation-free and defers state-backed
+  probes. After acceptance, those probes run even while the pair-open gate
+  still rejects ordinary work, allowing the controller to prove sessions,
+  projects, and `state.db` before it atomically opens the pair.
+- A controller resuming an older already-accepted candidate may bridge its
+  mutation-free deferred state receipt only when the process reports an exact
+  validated pair gate. The same PID must then pass full state-backed health
+  after the durable gate release and before `pair_opened` is recorded. If a
+  crash occurs after unlinking the gate, the durable release owner is adopted
+  and the post-open identity and full-health proof still run.
+
+This is a bounded single-operator-host contract. Same-FD/path, inode, mode,
+ownership, link-count, and compare-before-replace checks fail closed for
+observed changes, but they do not claim to exclude a malicious concurrent
+process running under the same uid. That limitation is explicit in the durable
+receipts.

@@ -801,6 +801,13 @@ def _build_setup_catalog(cfg: dict) -> dict:
 
     providers = []
     for provider_id, meta in _SUPPORTED_PROVIDER_SETUPS.items():
+        catalog_key = "google" if provider_id == "gemini" else provider_id
+        catalog_models = _PROVIDER_MODELS.get(catalog_key)
+        models = (
+            list(catalog_models)
+            if catalog_models
+            else list(meta.get("models", []))
+        )
         providers.append(
             {
                 "id": provider_id,
@@ -813,7 +820,7 @@ def _build_setup_catalog(cfg: dict) -> dict:
                 # keyless (lmstudio, ollama, custom).  Frontend uses this to
                 # show a "(optional)" hint and allow Continue without a key.
                 "key_optional": bool(meta.get("key_optional")),
-                "models": list(meta.get("models", [])),
+                "models": models,
                 "category": meta.get("category", "easy_start"),
                 "quick": meta.get("quick", False),
                 "oauth_provider": meta.get("oauth_provider") or "",

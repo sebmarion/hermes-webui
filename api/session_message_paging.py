@@ -1583,6 +1583,22 @@ def read_state_db_message_page(
                         sql_count=len(statements),
                         closure_rows_examined=closure_rows_examined,
                     )
+                row_pair_ids = _tool_call_ids_from_row(row)
+                row_result_id = _tool_result_id_from_row(row)
+                if row_result_id:
+                    row_pair_ids.add(row_result_id)
+                if (
+                    not missing_call_ids
+                    and not missing_result_ids
+                    and row_pair_ids.isdisjoint(required_pair_ids)
+                ):
+                    # The current page is already closed. An unrelated hidden
+                    # tool row belongs to the next page just as an unrelated
+                    # visible row does; leave its boundary inclusive instead
+                    # of starting an unbounded chain of adjacent tool pairs.
+                    closure_stop_boundaries = dict(consumed)
+                    pair_scan_pending = False
+                    break
                 if _record_tool_multiplicity(row):
                     return _typed_page_fallback(
                         cursor_supplied=cursor is not None,

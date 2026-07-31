@@ -23,6 +23,19 @@ const fs = require('fs');
 const scenario = JSON.parse(process.argv[2] || '{}');
 const fnSource = fs.readFileSync(process.argv[3], 'utf8');
 
+function serializeNode(node) {
+  if (node.tagName === 'OPTION') {
+    return `<option value="${node.value}">${node.textContent}</option>`;
+  }
+  if (node.tagName === 'OPTGROUP') {
+    const provider = node.dataset.provider
+      ? ` data-provider="${node.dataset.provider}"`
+      : '';
+    return `<optgroup label="${node.label}"${provider}>${node.children.map(serializeNode).join('')}</optgroup>`;
+  }
+  return '';
+}
+
 class FakeStorage {
   constructor(seed = {}) {
     this.store = { ...seed };
@@ -77,6 +90,9 @@ class FakeSelect extends FakeNode {
   }
 
   get innerHTML() {
+    if (this.children.length) {
+      return this.children.map(serializeNode).join('');
+    }
     return this._innerHTML;
   }
 
@@ -124,10 +140,18 @@ function buildHarness(currentScenario) {
   const liveFetchCalls = [];
   const defaultRedirectCalls = [];
   const customRedirectCalls = [];
+  const applyModelCalls = [];
+  const counters = { invalidateCalls: 0, syncModelCalls: 0 };
   const fetchQueue = (currentScenario.fetchResponses || []).map((payload) => buildFetchResponse(
     payload && payload.body ? payload.body : payload,
     payload && payload.status ? payload.status : 200,
   ));
+  const profile = currentScenario.profile || 'default';
+  const storageSeed = {};
+  if (currentScenario.cachedCatalog) {
+    const key = `hermes-webui-model-catalog:${encodeURIComponent(String(profile))}`;
+    storageSeed[key] = JSON.stringify(currentScenario.cachedCatalog);
+  }
 
   globalThis.window = globalThis;
   globalThis.document = {
@@ -138,8 +162,8 @@ function buildHarness(currentScenario) {
   };
   globalThis.location = { href: 'http://localhost/session/abc' };
   globalThis.sessionStorage = new FakeStorage();
-  globalThis.localStorage = new FakeStorage();
-  globalThis.S = { pendingFiles: [] };
+  globalThis.localStorage = new FakeStorage(storageSeed);
+  globalThis.S = { pendingFiles: [], activeProfile: profile };
   globalThis._dynamicModelLabels = {};
   globalThis._modelEndpointErrors = {};
   globalThis._defaultModel = null;
@@ -147,6 +171,7 @@ function buildHarness(currentScenario) {
   globalThis._configuredModelBadges = {};
   globalThis._modelDropdownRequestSeq = 0;
   globalThis._modelCatalogFallbackRetried = false;
+  select.value = currentScenario.initialSelection || '';
   globalThis.$ = (id) => {
     if (id === 'modelSelect') return select;
     if (id === 'composerModelDropdown') return dropdown;
@@ -154,6 +179,11 @@ function buildHarness(currentScenario) {
   };
   globalThis.getModelLabel = (id) => `label:${id}`;
   globalThis._captureModelDropdownSelection = () => null;
+  globalThis._applyModelToDropdown = (model, target, provider) => {
+    applyModelCalls.push([model, target && target.id ? target.id : null, provider]);
+    if (target) target.value = model;
+    return model;
+  };
   globalThis._reconcileModelDropdownSelection = (_sel, data) => {
     const firstGroup = Array.isArray(data.groups) && data.groups.length ? data.groups[0] : null;
     const firstModel = firstGroup && Array.isArray(firstGroup.models) && firstGroup.models.length
@@ -161,7 +191,12 @@ function buildHarness(currentScenario) {
       : null;
     if (firstModel) _sel.value = firstModel.id;
   };
-  globalThis.syncModelChip = () => {};
+  globalThis._invalidateComposerModelDropdown = () => {
+    counters.invalidateCalls += 1;
+  };
+  globalThis.syncModelChip = () => {
+    counters.syncModelCalls += 1;
+  };
   globalThis.renderModelDropdown = () => {};
   globalThis._positionModelDropdown = () => {};
   globalThis._redirectIfUnauth = (res) => {
@@ -178,13 +213,30 @@ function buildHarness(currentScenario) {
     return fetchQueue.shift();
   };
 
-  return { select, fetchCalls, liveFetchCalls, defaultRedirectCalls, customRedirectCalls };
+  return {
+    select,
+    fetchCalls,
+    liveFetchCalls,
+    defaultRedirectCalls,
+    customRedirectCalls,
+    applyModelCalls,
+    counters,
+  };
 }
 
 async function runScenario(currentScenario) {
-  const { select, fetchCalls, liveFetchCalls, defaultRedirectCalls, customRedirectCalls } = buildHarness(currentScenario);
+  const {
+    select,
+    fetchCalls,
+    liveFetchCalls,
+    defaultRedirectCalls,
+    customRedirectCalls,
+    applyModelCalls,
+    counters,
+  } = buildHarness(currentScenario);
   let _modelDropdownRequestSeq = 0;
   let _modelCatalogFallbackRetried = false;
+  let _modelCatalogBrowserCacheRestored = false;
   eval(fnSource);
   const callOpts = { ...(currentScenario.opts || {}) };
   if (currentScenario.useCustomRedirect) {
@@ -203,6 +255,15 @@ async function runScenario(currentScenario) {
     fetchCalls,
     liveFetchCalls,
     optionValues: select.options.map((opt) => opt.value),
+    selectInnerHTML: select.innerHTML,
+    storage: { ...localStorage.store },
+    dynamicModelLabels: { ...globalThis._dynamicModelLabels },
+    activeProvider: globalThis._activeProvider,
+    defaultModel: globalThis._defaultModel,
+    configuredModelBadges: { ...globalThis._configuredModelBadges },
+    applyModelCalls,
+    invalidateCalls: counters.invalidateCalls,
+    syncModelCalls: counters.syncModelCalls,
   };
 }
 
@@ -222,9 +283,11 @@ def driver_path(tmp_path_factory):
     return str(path)
 
 
-def _run(driver_path, scenario):
-    marker = "async function populateModelDropdown("
-    start = UI_JS.index(marker)
+def _extract_js_function(name):
+    markers = (f"function {name}(", f"async function {name}(")
+    starts = [UI_JS.find(marker) for marker in markers]
+    start = min(index for index in starts if index >= 0)
+    marker = next(marker for marker in markers if UI_JS.startswith(marker, start))
     paren_depth = 1
     idx = start + len(marker)
     while idx < len(UI_JS) and paren_depth > 0:
@@ -248,7 +311,20 @@ def _run(driver_path, scenario):
                 fn_source = UI_JS[start : idx + 1]
                 break
     else:
-        raise AssertionError("could not extract populateModelDropdown")
+        raise AssertionError(f"could not extract {name}")
+    return fn_source
+
+
+def _run(driver_path, scenario):
+    fn_source = "\n\n".join(
+        _extract_js_function(name)
+        for name in (
+            "_modelCatalogStorageKey",
+            "_restoreCachedModelCatalog",
+            "_persistModelCatalogCache",
+            "populateModelDropdown",
+        )
+    )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".js", delete=False) as handle:
         handle.write(fn_source)
         fn_source_path = handle.name
@@ -436,3 +512,76 @@ def test_populate_model_dropdown_retry_preserves_custom_redirect_handler(driver_
     assert payload["fetchCalls"][1].endswith("freshness=session_visit")
     assert payload["customRedirectCalls"] == [200, 401]
     assert payload["defaultRedirectCalls"] == []
+
+
+def test_populate_model_dropdown_restores_profile_cache_before_failed_refresh(
+    driver_path,
+):
+    cached = {
+        "version": 1,
+        "html": '<optgroup label="Cached"><option value="cached-model">Cached</option></optgroup>',
+        "labels": {"cached-model": "Cached Model"},
+        "activeProvider": "cached-provider",
+        "defaultModel": "cached-model",
+        "badges": {"cached-model": {"provider": "cached-provider"}},
+    }
+
+    payload = _run(
+        driver_path,
+        {
+            "profile": "deep work",
+            "initialSelection": "cached-model",
+            "cachedCatalog": cached,
+            "fetchResponses": [],
+        },
+    )
+
+    assert payload["selectInnerHTML"] == cached["html"]
+    assert payload["dynamicModelLabels"] == cached["labels"]
+    assert payload["activeProvider"] == "cached-provider"
+    assert payload["defaultModel"] == "cached-model"
+    assert payload["configuredModelBadges"] == cached["badges"]
+    assert payload["applyModelCalls"] == [
+        ["cached-model", "modelSelect", None],
+    ]
+    assert payload["invalidateCalls"] >= 1
+    assert json.loads(
+        payload["storage"]["hermes-webui-model-catalog:deep%20work"]
+    ) == cached
+
+
+def test_populate_model_dropdown_persists_complete_profile_catalog(driver_path):
+    payload = _run(
+        driver_path,
+        {
+            "profile": "deep work",
+            "fetchResponses": [
+                {
+                    "active_provider": "anthropic",
+                    "default_model": "model-a",
+                    "configured_model_badges": {
+                        "model-a": {"provider": "anthropic"},
+                    },
+                    "groups": [
+                        {
+                            "provider": "Anthropic",
+                            "provider_id": "anthropic",
+                            "models": [
+                                {"id": "model-a", "label": "Model A"},
+                            ],
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+
+    cached = json.loads(
+        payload["storage"]["hermes-webui-model-catalog:deep%20work"]
+    )
+    assert cached["version"] == 1
+    assert "model-a" in cached["html"]
+    assert cached["labels"] == {"model-a": "Model A"}
+    assert cached["activeProvider"] == "anthropic"
+    assert cached["defaultModel"] == "model-a"
+    assert cached["badges"] == {"model-a": {"provider": "anthropic"}}

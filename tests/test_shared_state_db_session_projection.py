@@ -915,3 +915,51 @@ def test_compatibility_rest_detail_and_messages_resolve_old_ids(tmp_path, monkey
     body = messages.response_json
     assert body["session_id"] == "tip"
     assert [message["content"] for message in body["messages"]] == ["old", "new"]
+
+
+def test_shared_interactive_sidebar_projection_does_not_backfill_title_when_sidecar_supplies_it(
+    tmp_path,
+    monkeypatch,
+):
+    """Regression: a sidecar row with a non-Untitled title must not trigger
+    a title backfill write to state.db. The returned row must still display
+    the sidecar-supplied title so the UI does not silently discard a rename
+    that the sidecar owns."""
+    import api.models as models
+    import api.state_sync as state_sync
+
+    db = tmp_path / "state.db"
+    _make_db(db)
+    # Blank titles for BOTH root and tip so lineage fallback cannot return
+    # a non-empty Shared title.
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE sessions SET title = '' WHERE id = 'root'")
+        conn.execute("UPDATE sessions SET title = '' WHERE id = 'tip'")
+        conn.commit()
+    (tmp_path / ".webui-shared-pins-state-db-v2.migrated").touch()
+
+    calls = []
+    monkeypatch.setattr(
+        state_sync,
+        "sync_session_title",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: db)
+    monkeypatch.setattr(models, "get_last_workspace", lambda: "/fallback")
+    monkeypatch.setattr(models, "_active_stream_ids", lambda: set())
+
+    rows, _legacy = models.shared_interactive_sidebar_projection(
+        [{"session_id": "tip", "title": "Sidecar Title", "message_count": 1}],
+        profile="default",
+    )
+
+    tip = next(row for row in rows if row["session_id"] == "tip")
+    assert tip["title"] == "Sidecar Title"
+    assert calls == []
+    with sqlite3.connect(db) as conn:
+        titles = dict(
+            conn.execute(
+                "SELECT id, title FROM sessions WHERE id IN ('root', 'tip')"
+            ).fetchall()
+        )
+    assert titles == {"root": "", "tip": ""}

@@ -10,7 +10,10 @@ Discovery order for all paths:
 """
 
 import collections
+from collections.abc import MutableMapping
+from contextlib import contextmanager
 import copy
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
@@ -18,8 +21,11 @@ import math
 import os
 import queue
 import re
+import hmac
+import secrets
 import shutil
 import socket
+import stat
 import sys
 import threading
 import time
@@ -38,6 +44,7 @@ from api.plugin_providers import (
     is_plugin_model_provider as _is_plugin_model_provider,
     plugin_model_provider_profiles as _plugin_model_provider_profiles,
 )
+from api.process_identity import process_start_token
 
 HOME = _paths.HOME
 _hermes_home_has_webui_state = _paths._hermes_home_has_webui_state
@@ -92,6 +99,55 @@ LAST_WORKSPACE_FILE = STATE_DIR / "last_workspace.txt"
 PROJECTS_FILE = STATE_DIR / "projects.json"
 
 logger = logging.getLogger(__name__)
+
+_MANAGED_RELEASE_SELECTION_FROZEN: bool | None = None
+
+
+def _managed_release_selected_from_environment() -> bool:
+    """Return whether this process was selected by the release controller.
+
+    This check intentionally works before the run-admission globals are
+    initialized. A managed candidate imports most of this module before
+    ``initialize_run_admission_from_environment()`` can install the canonical
+    state machine, so import-time callers need the immutable environment as
+    their fail-closed bootstrap signal.
+    """
+    if _MANAGED_RELEASE_SELECTION_FROZEN is not None:
+        return _MANAGED_RELEASE_SELECTION_FROZEN
+    return any(
+        str(os.environ.get(key) or "").strip()
+        for key in (
+            "HERMES_WEBUI_RELEASE_PATH",
+            "HERMES_WEBUI_MANIFEST_SHA256",
+            "HERMES_WEBUI_LAUNCH_MODE",
+        )
+    )
+
+
+def _startup_mutations_are_admitted() -> bool:
+    """Allow startup mutation only unmanaged or inside the signed acceptor."""
+    state = globals().get("_RUN_ADMISSION_STATE")
+    if state is None:
+        return not _managed_release_selected_from_environment()
+    if state == "startup-accepting":
+        local = globals().get("_RUN_ADMISSION_LOCAL")
+        expected_transaction = globals().get("_RUN_ADMISSION_TRANSACTION_ID")
+        return bool(
+            local is not None
+            and expected_transaction
+            and getattr(local, "startup_acceptor_transaction", None)
+            == expected_transaction
+        )
+    if state in {
+        "startup-invalid",
+        "startup-fenced",
+        "startup-accepting",
+    }:
+        return False
+    gate_reader = globals().get("_pair_open_gate_receipt")
+    if callable(gate_reader):
+        return gate_reader()["status"] == "absent"
+    return True
 
 # Keep custom provider /v1/models probes below the frontend's generic request
 # timeout even when one upstream is slow or unreachable. The models cache rebuild
@@ -824,7 +880,24 @@ def _ensure_workspace_dir(path: Path) -> bool:
 
 def resolve_default_workspace(raw: str | Path | None = None) -> Path:
     """Return the first usable workspace path, creating it when possible."""
-    for candidate in _workspace_candidates(raw):
+    candidates = _workspace_candidates(raw)
+    if not _startup_mutations_are_admitted():
+        # A managed candidate must be able to compute its future workspace
+        # without mkdir-ing it before signed acceptance. Prefer an existing
+        # usable candidate, otherwise retain the first deterministic path;
+        # server._create_state_directories materializes it in the acceptor.
+        for candidate in candidates:
+            try:
+                path = candidate.expanduser().resolve()
+                if path.is_dir() and os.access(
+                    path, os.R_OK | os.W_OK | os.X_OK
+                ):
+                    return path
+            except Exception:
+                continue
+        if candidates:
+            return candidates[0].expanduser().resolve()
+    for candidate in candidates:
         if _ensure_workspace_dir(candidate):
             return candidate
     raise RuntimeError(
@@ -1075,19 +1148,42 @@ def _normalize_cli_toolsets(toolsets):
     return normalized
 
 
-def _resolve_cli_toolsets(cfg=None):
+def _resolve_cli_toolsets(cfg=None, *, strict: bool = False):
     """Resolve CLI toolsets using the agent's _get_platform_tools() so that
     MCP server toolsets are automatically included, matching CLI behaviour."""
     if cfg is None:
         cfg = get_config()
+    platform_toolsets = (
+        cfg.get("platform_toolsets", {}) if isinstance(cfg, dict) else {}
+    )
+    if not isinstance(platform_toolsets, dict):
+        platform_toolsets = {}
+    fallback_toolsets = platform_toolsets.get("cli", _DEFAULT_TOOLSETS)
+    if not isinstance(fallback_toolsets, (list, tuple, set)):
+        fallback_toolsets = _DEFAULT_TOOLSETS
+    if not _startup_mutations_are_admitted():
+        # Agent's resolver discovers plugins. Plugin discovery imports the
+        # approval module, whose module-level config load calls
+        # ensure_hermes_home() and creates durable state. Use the already-read
+        # config/fallback until the signed startup acceptor refreshes this.
+        return _normalize_cli_toolsets(fallback_toolsets)
     try:
         from hermes_cli.tools_config import _get_platform_tools
         return _normalize_cli_toolsets(_get_platform_tools(cfg, "cli"))
     except Exception:
+        if strict:
+            raise
         # Fallback: read raw list from config (MCP toolsets will be missing)
-        return _normalize_cli_toolsets(cfg.get("platform_toolsets", {}).get("cli", _DEFAULT_TOOLSETS))
+        return _normalize_cli_toolsets(fallback_toolsets)
 
-CLI_TOOLSETS = _resolve_cli_toolsets()
+from api.managed_startup_configuration import (
+    PendingStartupSettingsFailure,
+    PendingStartupSettingsRecord,
+    StableCliToolsets,
+    capture_pending_startup_settings_record,
+)
+
+CLI_TOOLSETS = StableCliToolsets(tuple(_resolve_cli_toolsets()))
 
 # ── Model / provider discovery ───────────────────────────────────────────────
 
@@ -1619,6 +1715,77 @@ def _provider_is_known_or_configured(
     )
 
 
+class _ProviderModelsCatalog(MutableMapping):
+    """Stable mapping identity with atomically replaceable managed snapshots.
+
+    Unmanaged startup and tests historically mutate the lists returned by this
+    mapping, so ordinary mapping operations deliberately retain that behavior.
+    Managed startup uses the narrow snapshot methods to replace the whole
+    dictionary reference without invalidating cached imports.
+    """
+
+    def __init__(self, initial: dict[str, list[dict]]) -> None:
+        self._snapshot = initial
+        self._mutation_lock = threading.RLock()
+
+    def __getitem__(self, key):
+        return self._snapshot[key]
+
+    def __setitem__(self, key, value) -> None:
+        with self._mutation_lock:
+            replacement = dict(self._snapshot)
+            replacement[key] = value
+            self._snapshot = replacement
+
+    def __delitem__(self, key) -> None:
+        with self._mutation_lock:
+            replacement = dict(self._snapshot)
+            del replacement[key]
+            self._snapshot = replacement
+
+    def __iter__(self):
+        return iter(tuple(self._snapshot))
+
+    def __len__(self) -> int:
+        return len(self._snapshot)
+
+    def get(self, key, default=None):
+        return self._snapshot.get(key, default)
+
+    def keys(self):
+        return self._snapshot.keys()
+
+    def items(self):
+        return self._snapshot.items()
+
+    def values(self):
+        return self._snapshot.values()
+
+    def copy(self):
+        return self._snapshot.copy()
+
+    def __repr__(self) -> str:
+        return repr(self._snapshot)
+
+    def __deepcopy__(self, memo):
+        return copy.deepcopy(self._snapshot, memo)
+
+    def _managed_provider_models_snapshot(self) -> dict[str, list[dict]]:
+        return self._snapshot
+
+    def _replace_managed_provider_models_snapshot(
+        self,
+        replacement: dict[str, list[dict]],
+    ) -> None:
+        if type(replacement) is not dict:
+            raise TypeError("provider-model replacement must be a dictionary")
+        with self._mutation_lock:
+            self._snapshot = replacement
+
+    def _reset_provider_models_lock_after_fork(self) -> None:
+        self._mutation_lock = threading.RLock()
+
+
 # Well-known models per provider (used to populate dropdown for direct API providers)
 _PROVIDER_MODELS = {
     "anthropic": [
@@ -1845,6 +2012,11 @@ _PROVIDER_MODELS = {
         {"id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",  "label": "Global Anthropic Claude Haiku 4.5"},
     ],
 }
+_PROVIDER_MODELS = _ProviderModelsCatalog(_PROVIDER_MODELS)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        after_in_child=_PROVIDER_MODELS._reset_provider_models_lock_after_fork
+    )
 
 
 def _seed_provider_models_from_core() -> None:
@@ -9134,6 +9306,29 @@ ACTIVE_RUNS: dict = {}
 ACTIVE_RUNS_LOCK = threading.Lock()
 LAST_RUN_FINISHED_AT: float | None = None
 SERVER_START_TIME = time.time()
+SERVER_INSTANCE_ID = uuid.uuid4().hex
+_RUN_ADMISSION_RESERVATIONS: dict[str, dict] = {}
+_RUN_ADMISSION_STATE = "open"
+_RUN_ADMISSION_GENERATION = 0
+_RUN_ADMISSION_TOKEN_DIGEST: str | None = None
+_RUN_ADMISSION_TOKEN: str | None = None
+_RUN_ADMISSION_TRANSACTION_ID: str | None = None
+_RUN_ADMISSION_EXPECTED_IDENTITY: dict | None = None
+_RUN_ADMISSION_FENCED_AT: float | None = None
+_RUN_ADMISSION_LEASE_EXPIRES_AT: float | None = None
+_RUN_ADMISSION_LAST_TRANSACTION_ID: str | None = None
+_RUN_ADMISSION_LAST_ACTION: str | None = None
+_RUN_ADMISSION_LAST_TOKEN_DIGEST: str | None = None
+_RUN_ADMISSION_LAST_EXPECTED_IDENTITY: dict | None = None
+_RUN_ADMISSION_STARTUP_ERROR: str | None = None
+_RUN_ADMISSION_STARTUP_ACCEPTOR = None
+_RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID: str | None = None
+_RUN_ADMISSION_STARTUP_EVIDENCE = None
+_RUN_ADMISSION_CHECKPOINT_DEADLINE: dict | None = None
+_RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS: tuple[str, ...] = ()
+_RUN_ADMISSION_MAX_RESERVATIONS = 4096
+RUN_ADMISSION_FENCE_LEASE_SECONDS = 180.0
+_RUN_ADMISSION_LOCAL = threading.local()
 _ACTIVE_ACTIVITY_HEARTBEAT_INTERVAL_SECONDS = 5.0
 _ACTIVE_ACTIVITY_HEARTBEAT_THREAD: threading.Thread | None = None
 _ACTIVE_ACTIVITY_HEARTBEAT_WAKE = threading.Event()
@@ -9141,6 +9336,1280 @@ _SESSION_ACTIVITY_PROFILE_HINTS: dict[str, str] = {}
 _SESSION_ACTIVITY_PROFILE_HINTS_MAX = 1_000
 _ACTIVE_DELEGATION_ACTIVITY_ROWS: dict[str, tuple[str, str, str]] = {}
 _ACTIVE_DELEGATION_ACTIVITY_LOCK = threading.Lock()
+
+
+class RunAdmissionError(RuntimeError):
+    """Base class for fail-closed live-release admission errors."""
+
+
+class RunAdmissionClosed(RunAdmissionError):
+    """New work was refused because a release fence owns admission."""
+
+
+class RunAdmissionConflict(RunAdmissionError):
+    """The requested fence transition does not match the current state."""
+
+
+class RunAdmissionAuthenticationError(RunAdmissionError):
+    """The opaque fence token did not authenticate the transition."""
+
+
+class RunAdmissionIdentityMismatch(RunAdmissionError):
+    """The transition targets a different server process instance."""
+
+
+class RunAdmissionBusy(RunAdmissionError):
+    """Admitted or running work still prevents a safe process exit."""
+
+
+class RunAdmissionStartupIndeterminate(RunAdmissionConflict):
+    """Deferred startup cannot be proved safe to retry or accept."""
+
+
+def _clear_startup_acceptance_evidence_locked() -> None:
+    global _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID
+    global _RUN_ADMISSION_STARTUP_EVIDENCE
+    _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID = None
+    _RUN_ADMISSION_STARTUP_EVIDENCE = None
+
+
+def startup_acceptance_evidence(transaction_id: str):
+    """Return the exact immutable acceptor evidence for one accepted transaction."""
+    normalized = _normalize_run_admission_transaction_id(transaction_id)
+    with ACTIVE_RUNS_LOCK:
+        if (
+            _RUN_ADMISSION_LAST_ACTION != "accept"
+            or _RUN_ADMISSION_LAST_TRANSACTION_ID != normalized
+            or _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID != normalized
+        ):
+            return None
+        return _RUN_ADMISSION_STARTUP_EVIDENCE
+
+
+def _reset_startup_acceptance_evidence_after_fork() -> None:
+    _clear_startup_acceptance_evidence_locked()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        after_in_child=_reset_startup_acceptance_evidence_after_fork
+    )
+
+
+def _normalize_run_admission_identity(identity: dict) -> dict:
+    if not isinstance(identity, dict) or not identity:
+        raise RunAdmissionIdentityMismatch("release process identity is missing")
+    normalized = {}
+    for key, value in identity.items():
+        if not isinstance(key, str) or not key or not isinstance(
+            value, (str, int, float, bool, type(None))
+        ):
+            raise RunAdmissionIdentityMismatch("release process identity is invalid")
+        normalized[key] = value
+    return normalized
+
+
+def _normalize_run_admission_transaction_id(transaction_id: str) -> str:
+    normalized = str(transaction_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", normalized):
+        raise RunAdmissionConflict("release transaction identity is invalid")
+    return normalized
+
+
+_PAIR_OPEN_GATE_FILENAME = ".pair_open_gate.json"
+_PAIR_OPEN_GATE_MAX_BYTES = 64 * 1024
+
+
+def _pair_open_gate_path() -> Path:
+    raw_home = str(os.environ.get("HERMES_HOME") or "").strip()
+    hermes_home = (
+        Path(raw_home).expanduser()
+        if raw_home
+        else Path(_DEFAULT_HERMES_HOME).expanduser()
+    )
+    return hermes_home / _PAIR_OPEN_GATE_FILENAME
+
+
+def _pair_open_gate_expected_owner() -> tuple[str | None, int | None]:
+    transaction_id = (
+        _RUN_ADMISSION_TRANSACTION_ID or _RUN_ADMISSION_LAST_TRANSACTION_ID
+    )
+    if not isinstance(transaction_id, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{32,128}",
+        transaction_id,
+    ):
+        transaction_id = None
+    raw_epoch = str(
+        os.environ.get("HERMES_WEBUI_SELECTOR_GENERATION") or ""
+    ).strip()
+    try:
+        epoch = int(raw_epoch)
+    except (TypeError, ValueError):
+        epoch = None
+    if epoch is not None and (epoch <= 0 or str(epoch) != raw_epoch):
+        epoch = None
+    return transaction_id, epoch
+
+
+def _pair_open_gate_expected_identities(
+    *,
+    epoch: int | None,
+) -> tuple[dict | None, dict | None]:
+    release_path = str(os.environ.get("HERMES_WEBUI_RELEASE_PATH") or "").strip()
+    agent_build_id = str(
+        os.environ.get("HERMES_WEBUI_AGENT_MANIFEST_SHA256") or ""
+    ).strip()
+    release_pair_id = str(
+        os.environ.get("HERMES_WEBUI_RELEASE_PAIR_ID") or ""
+    ).strip()
+    start_time = process_start_token(os.getpid())
+    if (
+        epoch is None
+        or not release_path
+        or not agent_build_id
+        or not release_pair_id
+        or not start_time
+    ):
+        return None, None
+    build_id = Path(release_path).name
+    if not build_id:
+        return None, None
+    agent = {
+        "build_id": agent_build_id,
+        "instance_epoch": release_pair_id,
+    }
+    webui = {
+        "build_id": build_id,
+        "pid": os.getpid(),
+        "start_time": start_time,
+        "instance_epoch": str(epoch),
+    }
+    return agent, webui
+
+
+def _valid_pair_open_gate_identity(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "build_id",
+        "pid",
+        "start_time",
+        "instance_epoch",
+    }:
+        return False
+    pid = value.get("pid")
+    return bool(
+        isinstance(value.get("build_id"), str)
+        and 0 < len(value["build_id"]) <= 512
+        and isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and pid > 1
+        and isinstance(value.get("start_time"), str)
+        and 0 < len(value["start_time"]) <= 512
+        and isinstance(value.get("instance_epoch"), str)
+        and 0 < len(value["instance_epoch"]) <= 512
+    )
+
+
+def _pair_open_gate_receipt() -> dict:
+    """Read and authenticate the shared pair gate from one hardened file handle."""
+    path = _pair_open_gate_path()
+    result = {
+        "status": "invalid",
+        "transaction_id": None,
+        "epoch": None,
+        "owner_hash": None,
+        "payload_sha256": None,
+        "agent": None,
+        "webui": None,
+    }
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        return result
+    flags = os.O_RDONLY | nofollow
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return {
+            "status": "absent",
+            "transaction_id": None,
+            "epoch": None,
+            "owner_hash": None,
+            "payload_sha256": None,
+            "agent": None,
+            "webui": None,
+        }
+    except OSError:
+        return result
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size < 2
+            or opened.st_size > _PAIR_OPEN_GATE_MAX_BYTES
+        ):
+            return result
+        chunks: list[bytes] = []
+        remaining = _PAIR_OPEN_GATE_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > _PAIR_OPEN_GATE_MAX_BYTES:
+            return result
+        try:
+            finished = os.fstat(descriptor)
+        except OSError:
+            return result
+        stable_fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_uid",
+            "st_nlink",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        if any(
+            getattr(finished, field) != getattr(opened, field)
+            for field in stable_fields
+        ):
+            return result
+        try:
+            current = os.lstat(path)
+        except FileNotFoundError:
+            # Atomic unlink is the release linearization point. If it happened
+            # after this descriptor opened, ordinary work may now proceed.
+            return {
+                "status": "absent",
+                "transaction_id": None,
+                "epoch": None,
+                "owner_hash": None,
+                "payload_sha256": None,
+                "agent": None,
+                "webui": None,
+            }
+        except OSError:
+            return result
+        if any(
+            getattr(current, field) != getattr(finished, field)
+            for field in stable_fields
+        ):
+            return result
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return result
+    finally:
+        os.close(descriptor)
+    if not isinstance(decoded, dict) or set(decoded) != {
+        "schema",
+        "action",
+        "transaction_id",
+        "owner_hash",
+        "created_at",
+        "epoch",
+        "agent",
+        "webui",
+    }:
+        return result
+    transaction_id = decoded.get("transaction_id")
+    owner_hash = decoded.get("owner_hash")
+    created_at = decoded.get("created_at")
+    epoch = decoded.get("epoch")
+    if (
+        decoded.get("schema") != "hermes.pair_open_gate.v1"
+        or decoded.get("action") != "hold_pair_open"
+        or not isinstance(transaction_id, str)
+        or not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", transaction_id)
+        or not isinstance(owner_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", owner_hash)
+        or not isinstance(created_at, str)
+        or not _valid_pair_open_gate_identity(decoded.get("agent"))
+        or not _valid_pair_open_gate_identity(decoded.get("webui"))
+        or isinstance(epoch, bool)
+        or not isinstance(epoch, int)
+        or epoch <= 0
+    ):
+        return result
+    try:
+        created = datetime.fromisoformat(created_at)
+    except ValueError:
+        return result
+    if (
+        created.tzinfo is None
+        or created.utcoffset() is None
+        or created.astimezone(timezone.utc).isoformat() != created_at
+    ):
+        return result
+    owner_payload = {
+        key: value for key, value in decoded.items() if key != "owner_hash"
+    }
+    canonical_owner = json.dumps(
+        owner_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    if not hmac.compare_digest(
+        owner_hash,
+        hashlib.sha256(canonical_owner).hexdigest(),
+    ):
+        return result
+    expected_transaction, expected_epoch = _pair_open_gate_expected_owner()
+    if transaction_id != expected_transaction or epoch != expected_epoch:
+        return result
+    expected_agent, expected_webui = _pair_open_gate_expected_identities(
+        epoch=expected_epoch,
+    )
+    agent = decoded["agent"]
+    webui = decoded["webui"]
+    if (
+        expected_agent is None
+        or expected_webui is None
+        or agent.get("build_id") != expected_agent["build_id"]
+        or agent.get("instance_epoch") != expected_agent["instance_epoch"]
+        or webui != expected_webui
+    ):
+        return result
+    return {
+        "status": "active",
+        "transaction_id": transaction_id,
+        "epoch": epoch,
+        "owner_hash": owner_hash,
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        "agent": copy.deepcopy(agent),
+        "webui": copy.deepcopy(webui),
+    }
+
+
+def _checkpoint_active_roster_locked() -> list[dict]:
+    """Return only non-secret ownership fields for release reconciliation."""
+    roster = []
+    seen_streams: set[str] = set()
+    for run_id, raw in (ACTIVE_RUNS or {}).items():
+        entry = raw if isinstance(raw, dict) else {}
+        stream_id = str(entry.get("stream_id") or run_id or "").strip()
+        session_id = str(entry.get("session_id") or "").strip()
+        if not stream_id or not session_id:
+            continue
+        item = {
+            "run_id": str(run_id),
+            "stream_id": stream_id,
+            "session_id": session_id,
+            "backend": str(entry.get("backend") or "local"),
+            "phase": str(entry.get("phase") or "running"),
+        }
+        gateway_run_id = str(entry.get("gateway_run_id") or "").strip()
+        if gateway_run_id:
+            item["gateway_run_id"] = gateway_run_id
+        roster.append(item)
+        seen_streams.add(stream_id)
+    # STREAMS can briefly outlive ACTIVE_RUNS during worker teardown. The
+    # owner map is the authoritative session binding for that gap; include it
+    # so a checkpoint cannot silently miss a still-live stream.
+    with STREAMS_LOCK:
+        live_stream_ids = set(STREAMS or {})
+    with STREAM_SESSION_OWNERS_LOCK:
+        owner_rows = list(STREAM_SESSION_OWNERS.items())
+    for stream_id, session_id in owner_rows:
+        stream_id = str(stream_id or "").strip()
+        session_id = str(session_id or "").strip()
+        if not stream_id or not session_id or stream_id not in live_stream_ids:
+            continue
+        if stream_id in seen_streams:
+            continue
+        roster.append(
+            {
+                "run_id": stream_id,
+                "stream_id": stream_id,
+                "session_id": session_id,
+                "backend": "local",
+                "phase": "stream-only",
+            }
+        )
+    return roster
+
+
+def _run_admission_snapshot_locked() -> dict:
+    kinds: dict[str, int] = {}
+    for entry in _RUN_ADMISSION_RESERVATIONS.values():
+        kind = str((entry or {}).get("kind") or "unknown")
+        kinds[kind] = kinds.get(kind, 0) + 1
+    pair_gate = _pair_open_gate_receipt()
+    effective_state = _RUN_ADMISSION_STATE
+    if effective_state == "open" and pair_gate["status"] != "absent":
+        effective_state = "pair-gated"
+    return {
+        "state": _RUN_ADMISSION_STATE,
+        "effective_state": effective_state,
+        "pair_gate": pair_gate,
+        "generation": _RUN_ADMISSION_GENERATION,
+        "fenced_at": _RUN_ADMISSION_FENCED_AT,
+        "lease_expires_at": _RUN_ADMISSION_LEASE_EXPIRES_AT,
+        "transaction_id": _RUN_ADMISSION_TRANSACTION_ID,
+        "startup_error": _RUN_ADMISSION_STARTUP_ERROR,
+        "reservations": len(_RUN_ADMISSION_RESERVATIONS),
+        "reservation_kinds": dict(sorted(kinds.items())),
+        "active_runs": len(ACTIVE_RUNS),
+        "checkpoint_deadline": copy.deepcopy(_RUN_ADMISSION_CHECKPOINT_DEADLINE),
+        "checkpoint_forced_reservations": list(
+            _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
+        ),
+        "checkpoint_active_roster": _checkpoint_active_roster_locked(),
+    }
+
+
+def run_admission_snapshot() -> dict:
+    """Return redacted fence state without reservation ids or capabilities."""
+    with ACTIVE_RUNS_LOCK:
+        _expire_run_admission_fence_locked()
+        return _run_admission_snapshot_locked()
+
+
+def _expire_run_admission_fence_locked() -> bool:
+    """Expire only a runtime cutover lease; startup fences never fail open."""
+    global _RUN_ADMISSION_STATE, _RUN_ADMISSION_GENERATION
+    global _RUN_ADMISSION_TOKEN_DIGEST, _RUN_ADMISSION_TOKEN
+    global _RUN_ADMISSION_TRANSACTION_ID, _RUN_ADMISSION_EXPECTED_IDENTITY
+    global _RUN_ADMISSION_FENCED_AT, _RUN_ADMISSION_LEASE_EXPIRES_AT
+    global _RUN_ADMISSION_LAST_TRANSACTION_ID, _RUN_ADMISSION_LAST_ACTION
+    global _RUN_ADMISSION_LAST_TOKEN_DIGEST, _RUN_ADMISSION_LAST_EXPECTED_IDENTITY
+    global _RUN_ADMISSION_CHECKPOINT_DEADLINE
+    global _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
+    if (
+        _RUN_ADMISSION_STATE != "fenced"
+        or _RUN_ADMISSION_LEASE_EXPIRES_AT is None
+        or time.time() < _RUN_ADMISSION_LEASE_EXPIRES_AT
+    ):
+        return False
+    _RUN_ADMISSION_LAST_TRANSACTION_ID = _RUN_ADMISSION_TRANSACTION_ID
+    _RUN_ADMISSION_LAST_ACTION = "expired"
+    _RUN_ADMISSION_LAST_TOKEN_DIGEST = _RUN_ADMISSION_TOKEN_DIGEST
+    _RUN_ADMISSION_LAST_EXPECTED_IDENTITY = _RUN_ADMISSION_EXPECTED_IDENTITY
+    _RUN_ADMISSION_STATE = "open"
+    _RUN_ADMISSION_GENERATION += 1
+    _RUN_ADMISSION_TOKEN_DIGEST = None
+    _RUN_ADMISSION_TOKEN = None
+    _RUN_ADMISSION_TRANSACTION_ID = None
+    _RUN_ADMISSION_EXPECTED_IDENTITY = None
+    _RUN_ADMISSION_FENCED_AT = None
+    _RUN_ADMISSION_LEASE_EXPIRES_AT = None
+    _RUN_ADMISSION_CHECKPOINT_DEADLINE = None
+    _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS = ()
+    _clear_startup_acceptance_evidence_locked()
+    return True
+
+
+def initialize_run_admission_from_environment() -> dict:
+    """Install the immutable-release startup fence before any server mutator.
+
+    A managed candidate with either explicit startup marker is closed by
+    default and requires the complete valid marker pair. A promoted immutable
+    last-good release has neither marker and retains normal open admission on
+    controlled restart. Partial or malformed marker pairs stay
+    ``startup-invalid`` and can never accidentally serve ordinary traffic.
+    """
+    global _RUN_ADMISSION_STATE, _RUN_ADMISSION_GENERATION
+    global _RUN_ADMISSION_TOKEN_DIGEST, _RUN_ADMISSION_TOKEN
+    global _RUN_ADMISSION_TRANSACTION_ID, _RUN_ADMISSION_EXPECTED_IDENTITY
+    global _RUN_ADMISSION_FENCED_AT, _RUN_ADMISSION_LEASE_EXPIRES_AT
+    global _RUN_ADMISSION_STARTUP_ERROR
+    global _RUN_ADMISSION_CHECKPOINT_DEADLINE
+    global _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
+    global _MANAGED_RELEASE_SELECTION_FROZEN
+
+    managed_selected = any(
+        str(os.environ.get(key) or "").strip()
+        for key in (
+            "HERMES_WEBUI_RELEASE_PATH",
+            "HERMES_WEBUI_MANIFEST_SHA256",
+            "HERMES_WEBUI_LAUNCH_MODE",
+        )
+    )
+    if _MANAGED_RELEASE_SELECTION_FROZEN is None:
+        _MANAGED_RELEASE_SELECTION_FROZEN = managed_selected
+    elif _MANAGED_RELEASE_SELECTION_FROZEN != managed_selected:
+        managed_selected = _MANAGED_RELEASE_SELECTION_FROZEN
+    with ACTIVE_RUNS_LOCK:
+        _clear_startup_acceptance_evidence_locked()
+        if not managed_selected:
+            return _run_admission_snapshot_locked()
+        startup_fence_present = "HERMES_WEBUI_STARTUP_FENCED" in os.environ
+        startup_transaction_present = (
+            "HERMES_WEBUI_STARTUP_TRANSACTION_ID" in os.environ
+        )
+        if not startup_fence_present and not startup_transaction_present:
+            # A promoted immutable last-good release remains selector-managed,
+            # but has no pending candidate transaction to accept. Preserve the
+            # default/open admission state on this normal controlled restart.
+            # Presence of either marker below makes the contract explicit and
+            # therefore fail-closed unless the pair is complete and valid.
+            return _run_admission_snapshot_locked()
+        requested = str(
+            os.environ.get("HERMES_WEBUI_STARTUP_FENCED") or ""
+        ).strip() == "1"
+        transaction = str(
+            os.environ.get("HERMES_WEBUI_STARTUP_TRANSACTION_ID") or ""
+        ).strip()
+        valid_transaction = bool(
+            re.fullmatch(r"[A-Za-z0-9_-]{32,128}", transaction)
+        )
+        _RUN_ADMISSION_STATE = (
+            "startup-fenced"
+            if requested and valid_transaction
+            else "startup-invalid"
+        )
+        _RUN_ADMISSION_GENERATION += 1
+        _RUN_ADMISSION_TOKEN_DIGEST = None
+        _RUN_ADMISSION_TOKEN = None
+        _RUN_ADMISSION_TRANSACTION_ID = transaction if valid_transaction else None
+        _RUN_ADMISSION_EXPECTED_IDENTITY = None
+        _RUN_ADMISSION_FENCED_AT = time.time()
+        _RUN_ADMISSION_LEASE_EXPIRES_AT = None
+        _RUN_ADMISSION_CHECKPOINT_DEADLINE = None
+        _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS = ()
+        _RUN_ADMISSION_STARTUP_ERROR = (
+            None
+            if _RUN_ADMISSION_STATE == "startup-fenced"
+            else "invalid_startup_fence_environment"
+        )
+        return _run_admission_snapshot_locked()
+
+
+def startup_run_admission_is_closed() -> bool:
+    """Return whether immutable-release startup still denies ordinary work."""
+    with ACTIVE_RUNS_LOCK:
+        return _RUN_ADMISSION_STATE in {
+            "startup-invalid",
+            "startup-fenced",
+            "startup-accepting",
+        } or _pair_open_gate_receipt()["status"] != "absent"
+
+
+def _install_agent_startup_home_guard() -> None:
+    """Make Agent home initialization honor the WebUI startup fence.
+
+    Several Agent modules call ``load_config()`` at import time. Its
+    ``ensure_hermes_home()`` creates directories and SOUL.md, so merely
+    importing server routes could mutate live state before release acceptance.
+    Install the guard before those modules load; after acceptance (including
+    the transaction-scoped acceptor) it delegates to the original unchanged.
+    """
+    try:
+        from hermes_cli import config as agent_config
+    except ImportError:
+        return
+    original = getattr(agent_config, "ensure_hermes_home", None)
+    if not callable(original) or getattr(original, "_webui_startup_guarded", False):
+        return
+
+    def _guarded_ensure_hermes_home(*args, **kwargs):
+        if not _startup_mutations_are_admitted():
+            return None
+        return original(*args, **kwargs)
+
+    _guarded_ensure_hermes_home._webui_startup_guarded = True
+    _guarded_ensure_hermes_home._webui_original = original
+    agent_config.ensure_hermes_home = _guarded_ensure_hermes_home
+
+
+def configure_startup_acceptor(acceptor) -> None:
+    """Register the deferred-start callback that receives the exact transaction."""
+    global _RUN_ADMISSION_STARTUP_ACCEPTOR
+    if not callable(acceptor):
+        raise TypeError("startup acceptor must be callable")
+    with ACTIVE_RUNS_LOCK:
+        _RUN_ADMISSION_STARTUP_ACCEPTOR = acceptor
+        _clear_startup_acceptance_evidence_locked()
+
+
+def reserve_run_admission(*, kind: str, **metadata) -> str:
+    """Linearize a new work item before any durable or thread mutation."""
+    kind = str(kind or "").strip()
+    if not kind:
+        raise ValueError("run admission kind is required")
+    reservation_id = uuid.uuid4().hex
+    entry = dict(metadata or {})
+    entry.update(
+        {
+            "reservation_id": reservation_id,
+            "kind": kind,
+            "phase": "reserved",
+            "reserved_at": time.time(),
+        }
+    )
+    with ACTIVE_RUNS_LOCK:
+        _expire_run_admission_fence_locked()
+        startup_acceptor_transaction = getattr(
+            _RUN_ADMISSION_LOCAL,
+            "startup_acceptor_transaction",
+            None,
+        )
+        startup_internal_admission = (
+            _RUN_ADMISSION_STATE == "startup-accepting"
+            and startup_acceptor_transaction == _RUN_ADMISSION_TRANSACTION_ID
+        )
+        if _RUN_ADMISSION_STATE != "open" and not startup_internal_admission:
+            raise RunAdmissionClosed("run admission is fenced for release")
+        if (
+            not startup_internal_admission
+            and _pair_open_gate_receipt()["status"] != "absent"
+        ):
+            raise RunAdmissionClosed("run admission is fenced by pair-open gate")
+        if len(_RUN_ADMISSION_RESERVATIONS) >= _RUN_ADMISSION_MAX_RESERVATIONS:
+            raise RunAdmissionBusy("run admission reservation capacity is exhausted")
+        _RUN_ADMISSION_RESERVATIONS[reservation_id] = entry
+    return reservation_id
+
+
+def fork_run_admission(
+    parent_reservation_id: str,
+    *,
+    kind: str,
+    **metadata,
+) -> str:
+    """Create a separately tracked child of work admitted before a fence."""
+    kind = str(kind or "").strip()
+    if not kind:
+        raise ValueError("run admission kind is required")
+    child_id = uuid.uuid4().hex
+    with ACTIVE_RUNS_LOCK:
+        if _RUN_ADMISSION_STATE == "checkpoint-stopping":
+            raise RunAdmissionClosed("checkpoint stopping rejects child work")
+        parent = _RUN_ADMISSION_RESERVATIONS.get(str(parent_reservation_id or ""))
+        if parent is None:
+            raise RunAdmissionClosed("parent run admission reservation is missing")
+        if len(_RUN_ADMISSION_RESERVATIONS) >= _RUN_ADMISSION_MAX_RESERVATIONS:
+            raise RunAdmissionBusy("run admission reservation capacity is exhausted")
+        entry = dict(metadata or {})
+        entry.update(
+            {
+                "reservation_id": child_id,
+                "kind": kind,
+                "phase": "reserved",
+                "reserved_at": time.time(),
+                "parent_reservation_id": str(parent_reservation_id),
+            }
+        )
+        _RUN_ADMISSION_RESERVATIONS[child_id] = entry
+    return child_id
+
+
+@contextmanager
+def run_admission_scope(*, kind: str, **metadata):
+    """Share one transferable reservation across nested synchronous layers."""
+    current = getattr(_RUN_ADMISSION_LOCAL, "current", None)
+    if current is not None:
+        yield current
+        return
+
+    reservation_id = reserve_run_admission(kind=kind, **metadata)
+    transfer_state = {"transferred": False}
+    previous = getattr(_RUN_ADMISSION_LOCAL, "current", None)
+    _RUN_ADMISSION_LOCAL.current = (reservation_id, transfer_state)
+    try:
+        yield reservation_id, transfer_state
+    finally:
+        if not transfer_state["transferred"]:
+            release_run_admission(reservation_id)
+        if previous is None:
+            try:
+                del _RUN_ADMISSION_LOCAL.current
+            except AttributeError:
+                pass
+        else:
+            _RUN_ADMISSION_LOCAL.current = previous
+
+
+def release_run_admission(reservation_id: str | None) -> bool:
+    if not reservation_id:
+        return False
+    with ACTIVE_RUNS_LOCK:
+        return _RUN_ADMISSION_RESERVATIONS.pop(str(reservation_id), None) is not None
+
+
+def _run_admission_token_matches_locked(token: str) -> bool:
+    if not _RUN_ADMISSION_TOKEN_DIGEST or not isinstance(token, str):
+        return False
+    supplied = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(supplied, _RUN_ADMISSION_TOKEN_DIGEST)
+
+
+def _validate_run_admission_owner_locked(
+    token: str,
+    expected_identity: dict,
+    transaction_id: str | None = None,
+) -> None:
+    if not _run_admission_token_matches_locked(token):
+        raise RunAdmissionAuthenticationError("release fence authentication failed")
+    normalized = _normalize_run_admission_identity(expected_identity)
+    if normalized != _RUN_ADMISSION_EXPECTED_IDENTITY:
+        raise RunAdmissionIdentityMismatch("release fence process identity changed")
+    if transaction_id is not None:
+        normalized_transaction = _normalize_run_admission_transaction_id(
+            transaction_id
+        )
+        if normalized_transaction != _RUN_ADMISSION_TRANSACTION_ID:
+            raise RunAdmissionConflict("release fence transaction changed")
+
+
+def fence_run_admission(
+    expected_identity: dict,
+    *,
+    transaction_id: str | None = None,
+) -> dict:
+    """Close admission and idempotently bind one external transaction."""
+    global _RUN_ADMISSION_STATE, _RUN_ADMISSION_GENERATION
+    global _RUN_ADMISSION_TOKEN_DIGEST, _RUN_ADMISSION_TOKEN
+    global _RUN_ADMISSION_TRANSACTION_ID, _RUN_ADMISSION_EXPECTED_IDENTITY
+    global _RUN_ADMISSION_FENCED_AT, _RUN_ADMISSION_LEASE_EXPIRES_AT
+    global _RUN_ADMISSION_CHECKPOINT_DEADLINE
+    global _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
+    normalized = _normalize_run_admission_identity(expected_identity)
+    normalized_transaction = _normalize_run_admission_transaction_id(
+        transaction_id or secrets.token_urlsafe(32)
+    )
+    with ACTIVE_RUNS_LOCK:
+        _expire_run_admission_fence_locked()
+        if _RUN_ADMISSION_STATE in {"startup-fenced", "startup-accepting"}:
+            if normalized_transaction != _RUN_ADMISSION_TRANSACTION_ID:
+                raise RunAdmissionConflict("release fence transaction changed")
+            if (
+                _RUN_ADMISSION_EXPECTED_IDENTITY is not None
+                and normalized != _RUN_ADMISSION_EXPECTED_IDENTITY
+            ):
+                raise RunAdmissionIdentityMismatch(
+                    "release fence process identity changed"
+                )
+            if _RUN_ADMISSION_STATE == "startup-accepting":
+                raise RunAdmissionBusy("startup acceptance is already in progress")
+            if _RUN_ADMISSION_EXPECTED_IDENTITY is None:
+                _RUN_ADMISSION_EXPECTED_IDENTITY = normalized
+                token = secrets.token_urlsafe(32)
+                _RUN_ADMISSION_TOKEN_DIGEST = hashlib.sha256(
+                    token.encode("utf-8")
+                ).hexdigest()
+                _RUN_ADMISSION_TOKEN = token
+                _RUN_ADMISSION_GENERATION += 1
+            return {
+                "token": _RUN_ADMISSION_TOKEN,
+                "admission": _run_admission_snapshot_locked(),
+            }
+        if _RUN_ADMISSION_STATE == "startup-invalid":
+            raise RunAdmissionConflict("managed startup fence is invalid")
+        if _RUN_ADMISSION_STATE != "open":
+            if (
+                _RUN_ADMISSION_TRANSACTION_ID == normalized_transaction
+                and _RUN_ADMISSION_EXPECTED_IDENTITY == normalized
+                and _RUN_ADMISSION_TOKEN
+            ):
+                return {
+                    "token": _RUN_ADMISSION_TOKEN,
+                    "admission": _run_admission_snapshot_locked(),
+                }
+            raise RunAdmissionConflict("run admission is already fenced")
+        token = secrets.token_urlsafe(32)
+        _clear_startup_acceptance_evidence_locked()
+        _RUN_ADMISSION_STATE = "fenced"
+        _RUN_ADMISSION_GENERATION += 1
+        _RUN_ADMISSION_TOKEN_DIGEST = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        _RUN_ADMISSION_TOKEN = token
+        _RUN_ADMISSION_TRANSACTION_ID = normalized_transaction
+        _RUN_ADMISSION_EXPECTED_IDENTITY = normalized
+        _RUN_ADMISSION_FENCED_AT = time.time()
+        _RUN_ADMISSION_LEASE_EXPIRES_AT = (
+            _RUN_ADMISSION_FENCED_AT + RUN_ADMISSION_FENCE_LEASE_SECONDS
+        )
+        _RUN_ADMISSION_CHECKPOINT_DEADLINE = None
+        _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS = ()
+        snapshot = _run_admission_snapshot_locked()
+    return {"token": token, "admission": snapshot}
+
+
+def pin_run_admission_checkpoint(
+    token: str,
+    *,
+    expected_identity: dict,
+    transaction_id: str,
+    deadline: dict,
+) -> dict:
+    """Pin one fenced transaction beyond the legacy runtime lease."""
+    global _RUN_ADMISSION_STATE, _RUN_ADMISSION_GENERATION
+    global _RUN_ADMISSION_LEASE_EXPIRES_AT
+    global _RUN_ADMISSION_CHECKPOINT_DEADLINE
+    with ACTIVE_RUNS_LOCK:
+        _expire_run_admission_fence_locked()
+        if _RUN_ADMISSION_STATE == "checkpoint-fenced":
+            _validate_run_admission_owner_locked(
+                token,
+                expected_identity,
+                transaction_id,
+            )
+            if _RUN_ADMISSION_CHECKPOINT_DEADLINE != deadline:
+                raise RunAdmissionConflict("checkpoint deadline changed")
+            return _run_admission_snapshot_locked()
+        if _RUN_ADMISSION_STATE != "fenced":
+            raise RunAdmissionConflict("run admission fence cannot pin checkpoint")
+        _validate_run_admission_owner_locked(
+            token,
+            expected_identity,
+            transaction_id,
+        )
+        if not isinstance(deadline, dict):
+            raise ValueError("checkpoint deadline is invalid")
+        required = {
+            "wall_started_at",
+            "wall_deadline",
+            "monotonic_started_at",
+            "monotonic_deadline",
+            "boot_id",
+        }
+        if set(deadline) != required:
+            raise ValueError("checkpoint deadline fields are invalid")
+        try:
+            wall_started_at = float(deadline["wall_started_at"])
+            wall_deadline = float(deadline["wall_deadline"])
+            monotonic_started_at = float(deadline["monotonic_started_at"])
+            monotonic_deadline = float(deadline["monotonic_deadline"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("checkpoint deadline values are invalid") from exc
+        boot_id = str(deadline["boot_id"] or "").strip()
+        if (
+            not math.isfinite(wall_started_at)
+            or not math.isfinite(wall_deadline)
+            or not math.isfinite(monotonic_started_at)
+            or not math.isfinite(monotonic_deadline)
+            or not boot_id
+            or wall_deadline - wall_started_at != 300.0
+            or monotonic_deadline - monotonic_started_at != 300.0
+        ):
+            raise ValueError("checkpoint deadline values are invalid")
+        _RUN_ADMISSION_CHECKPOINT_DEADLINE = {
+            "wall_started_at": wall_started_at,
+            "wall_deadline": wall_deadline,
+            "monotonic_started_at": monotonic_started_at,
+            "monotonic_deadline": monotonic_deadline,
+            "boot_id": boot_id,
+        }
+        _RUN_ADMISSION_STATE = "checkpoint-fenced"
+        _RUN_ADMISSION_GENERATION += 1
+        _RUN_ADMISSION_LEASE_EXPIRES_AT = None
+        return _run_admission_snapshot_locked()
+
+
+def stop_run_admission_checkpoint(
+    token: str,
+    *,
+    expected_identity: dict,
+    transaction_id: str,
+    forced: bool = False,
+) -> dict:
+    """Close the target population without allowing late reservation upgrades."""
+    global _RUN_ADMISSION_STATE, _RUN_ADMISSION_GENERATION
+    global _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
+    with ACTIVE_RUNS_LOCK:
+        if _RUN_ADMISSION_STATE == "checkpoint-stopping":
+            _validate_run_admission_owner_locked(
+                token,
+                expected_identity,
+                transaction_id,
+            )
+            return _run_admission_snapshot_locked()
+        if _RUN_ADMISSION_STATE != "checkpoint-fenced":
+            raise RunAdmissionConflict("checkpoint population cannot close")
+        _validate_run_admission_owner_locked(
+            token,
+            expected_identity,
+            transaction_id,
+        )
+        if _RUN_ADMISSION_RESERVATIONS and not forced:
+            raise RunAdmissionBusy("checkpoint reservations have not drained")
+        _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS = tuple(
+            sorted(_RUN_ADMISSION_RESERVATIONS) if forced else ()
+        )
+        _RUN_ADMISSION_RESERVATIONS.clear()
+        _RUN_ADMISSION_STATE = "checkpoint-stopping"
+        _RUN_ADMISSION_GENERATION += 1
+        return _run_admission_snapshot_locked()
+
+
+def accept_startup_run_admission(
+    token: str,
+    *,
+    expected_identity: dict,
+    transaction_id: str,
+    evidence_validator=None,
+) -> dict:
+    """Start deferred services, then open the exact claimed startup fence.
+
+    The callback runs outside ``ACTIVE_RUNS_LOCK`` because it may initialize
+    modules with their own locks. Admission remains ``startup-accepting`` and
+    therefore closed throughout. A failure returns the same transaction to
+    ``startup-fenced`` so the controller can repair/retry without duplicating
+    deferred steps that already completed.
+    """
+    global _RUN_ADMISSION_STATE, _RUN_ADMISSION_GENERATION
+    global _RUN_ADMISSION_TOKEN_DIGEST, _RUN_ADMISSION_TOKEN
+    global _RUN_ADMISSION_TRANSACTION_ID, _RUN_ADMISSION_EXPECTED_IDENTITY
+    global _RUN_ADMISSION_FENCED_AT, _RUN_ADMISSION_LEASE_EXPIRES_AT
+    global _RUN_ADMISSION_LAST_TRANSACTION_ID, _RUN_ADMISSION_LAST_ACTION
+    global _RUN_ADMISSION_LAST_TOKEN_DIGEST, _RUN_ADMISSION_LAST_EXPECTED_IDENTITY
+    global _RUN_ADMISSION_CHECKPOINT_DEADLINE
+    global _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
+    global _RUN_ADMISSION_STARTUP_ERROR
+    global _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID
+    global _RUN_ADMISSION_STARTUP_EVIDENCE
+
+    requested_transaction = _normalize_run_admission_transaction_id(transaction_id)
+    normalized_identity = _normalize_run_admission_identity(expected_identity)
+    if evidence_validator is not None and not callable(evidence_validator):
+        raise TypeError("startup evidence validator must be callable")
+    with ACTIVE_RUNS_LOCK:
+        supplied_digest = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+        if _RUN_ADMISSION_STATE == "open":
+            if (
+                _RUN_ADMISSION_LAST_ACTION == "accept"
+                and requested_transaction == _RUN_ADMISSION_LAST_TRANSACTION_ID
+                and normalized_identity == _RUN_ADMISSION_LAST_EXPECTED_IDENTITY
+                and _RUN_ADMISSION_LAST_TOKEN_DIGEST
+                and hmac.compare_digest(
+                    supplied_digest,
+                    _RUN_ADMISSION_LAST_TOKEN_DIGEST,
+                )
+            ):
+                evidence = (
+                    _RUN_ADMISSION_STARTUP_EVIDENCE
+                    if _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID
+                    == requested_transaction
+                    else None
+                )
+                if evidence_validator is not None:
+                    evidence_validator(evidence)
+                return _run_admission_snapshot_locked()
+            raise RunAdmissionConflict("startup fence cannot be accepted")
+        if _RUN_ADMISSION_STATE == "startup-invalid":
+            raise RunAdmissionConflict("managed startup fence is invalid")
+        if _RUN_ADMISSION_STATE == "startup-accepting":
+            raise RunAdmissionBusy("startup acceptance is already in progress")
+        if _RUN_ADMISSION_STATE != "startup-fenced":
+            raise RunAdmissionConflict("startup fence cannot be accepted")
+        _validate_run_admission_owner_locked(
+            token,
+            normalized_identity,
+            requested_transaction,
+        )
+        if _RUN_ADMISSION_STARTUP_ERROR == "deferred_startup_indeterminate":
+            raise RunAdmissionStartupIndeterminate(
+                "deferred startup remains indeterminate; explicit repair is required"
+            )
+        acceptor = _RUN_ADMISSION_STARTUP_ACCEPTOR
+        if not callable(acceptor):
+            raise RunAdmissionBusy("deferred startup is not configured")
+        _RUN_ADMISSION_STATE = "startup-accepting"
+        _RUN_ADMISSION_GENERATION += 1
+        _RUN_ADMISSION_STARTUP_ERROR = None
+        _clear_startup_acceptance_evidence_locked()
+
+    previous_startup_transaction = getattr(
+        _RUN_ADMISSION_LOCAL,
+        "startup_acceptor_transaction",
+        None,
+    )
+    _RUN_ADMISSION_LOCAL.startup_acceptor_transaction = requested_transaction
+    acceptance_evidence = None
+    try:
+        try:
+            acceptor_receipt = acceptor(requested_transaction)
+            if type(acceptor_receipt) is dict:
+                if acceptor_receipt.get("transaction_id") != requested_transaction:
+                    raise RunAdmissionConflict(
+                        "startup acceptor transaction receipt changed"
+                    )
+                acceptance_evidence = acceptor_receipt.get(
+                    "acceptance_evidence"
+                )
+            if evidence_validator is not None:
+                evidence_validator(acceptance_evidence)
+        except RunAdmissionStartupIndeterminate:
+            with ACTIVE_RUNS_LOCK:
+                if (
+                    _RUN_ADMISSION_STATE == "startup-accepting"
+                    and _RUN_ADMISSION_TRANSACTION_ID == requested_transaction
+                    and _RUN_ADMISSION_EXPECTED_IDENTITY == normalized_identity
+                ):
+                    _RUN_ADMISSION_STATE = "startup-fenced"
+                    _RUN_ADMISSION_GENERATION += 1
+                    _RUN_ADMISSION_STARTUP_ERROR = (
+                        "deferred_startup_indeterminate"
+                    )
+                    _clear_startup_acceptance_evidence_locked()
+            raise
+        except Exception as exc:
+            with ACTIVE_RUNS_LOCK:
+                if (
+                    _RUN_ADMISSION_STATE == "startup-accepting"
+                    and _RUN_ADMISSION_TRANSACTION_ID == requested_transaction
+                    and _RUN_ADMISSION_EXPECTED_IDENTITY == normalized_identity
+                ):
+                    _RUN_ADMISSION_STATE = "startup-fenced"
+                    _RUN_ADMISSION_GENERATION += 1
+                    _RUN_ADMISSION_STARTUP_ERROR = "deferred_startup_failed"
+                    _clear_startup_acceptance_evidence_locked()
+            raise RunAdmissionBusy(
+                "deferred startup failed; candidate remains fenced"
+            ) from exc
+    finally:
+        if previous_startup_transaction is None:
+            try:
+                del _RUN_ADMISSION_LOCAL.startup_acceptor_transaction
+            except AttributeError:
+                pass
+        else:
+            _RUN_ADMISSION_LOCAL.startup_acceptor_transaction = (
+                previous_startup_transaction
+            )
+
+    with ACTIVE_RUNS_LOCK:
+        if _RUN_ADMISSION_STATE != "startup-accepting":
+            raise RunAdmissionConflict("startup fence changed during acceptance")
+        _validate_run_admission_owner_locked(
+            token,
+            normalized_identity,
+            requested_transaction,
+        )
+        _RUN_ADMISSION_LAST_TRANSACTION_ID = _RUN_ADMISSION_TRANSACTION_ID
+        _RUN_ADMISSION_LAST_ACTION = "accept"
+        _RUN_ADMISSION_LAST_TOKEN_DIGEST = _RUN_ADMISSION_TOKEN_DIGEST
+        _RUN_ADMISSION_LAST_EXPECTED_IDENTITY = _RUN_ADMISSION_EXPECTED_IDENTITY
+        _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID = requested_transaction
+        _RUN_ADMISSION_STARTUP_EVIDENCE = acceptance_evidence
+        _RUN_ADMISSION_STATE = "open"
+        _RUN_ADMISSION_GENERATION += 1
+        _RUN_ADMISSION_TOKEN_DIGEST = None
+        _RUN_ADMISSION_TOKEN = None
+        _RUN_ADMISSION_TRANSACTION_ID = None
+        _RUN_ADMISSION_EXPECTED_IDENTITY = None
+        _RUN_ADMISSION_FENCED_AT = None
+        _RUN_ADMISSION_LEASE_EXPIRES_AT = None
+        _RUN_ADMISSION_STARTUP_ERROR = None
+        return _run_admission_snapshot_locked()
+
+
+# This must execute during api.config import, before server.main can perform
+# credential, recovery, plugin, directory, or background-thread mutations.
+initialize_run_admission_from_environment()
+_install_agent_startup_home_guard()
+
+
+def abort_run_admission(
+    token: str,
+    *,
+    expected_identity: dict,
+    transaction_id: str | None = None,
+) -> dict:
+    """Reopen only the exact fenced process and invalidate its transaction token."""
+    global _RUN_ADMISSION_STATE, _RUN_ADMISSION_GENERATION
+    global _RUN_ADMISSION_TOKEN_DIGEST, _RUN_ADMISSION_TOKEN
+    global _RUN_ADMISSION_TRANSACTION_ID, _RUN_ADMISSION_EXPECTED_IDENTITY
+    global _RUN_ADMISSION_FENCED_AT, _RUN_ADMISSION_LEASE_EXPIRES_AT
+    global _RUN_ADMISSION_LAST_TRANSACTION_ID, _RUN_ADMISSION_LAST_ACTION
+    global _RUN_ADMISSION_LAST_TOKEN_DIGEST, _RUN_ADMISSION_LAST_EXPECTED_IDENTITY
+    with ACTIVE_RUNS_LOCK:
+        _expire_run_admission_fence_locked()
+        normalized_identity = _normalize_run_admission_identity(expected_identity)
+        requested_transaction = (
+            _normalize_run_admission_transaction_id(transaction_id)
+            if transaction_id is not None
+            else _RUN_ADMISSION_TRANSACTION_ID
+        )
+        if _RUN_ADMISSION_STATE == "open":
+            supplied_digest = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+            if (
+                _RUN_ADMISSION_LAST_ACTION == "abort"
+                and requested_transaction == _RUN_ADMISSION_LAST_TRANSACTION_ID
+                and normalized_identity == _RUN_ADMISSION_LAST_EXPECTED_IDENTITY
+                and _RUN_ADMISSION_LAST_TOKEN_DIGEST
+                and hmac.compare_digest(
+                    supplied_digest, _RUN_ADMISSION_LAST_TOKEN_DIGEST
+                )
+            ):
+                return _run_admission_snapshot_locked()
+            raise RunAdmissionConflict("run admission fence cannot be aborted")
+        if _RUN_ADMISSION_STATE not in {"fenced", "committing", "checkpoint-fenced"}:
+            raise RunAdmissionConflict("run admission fence cannot be aborted")
+        _validate_run_admission_owner_locked(
+            token,
+            expected_identity,
+            requested_transaction,
+        )
+        _RUN_ADMISSION_LAST_TRANSACTION_ID = _RUN_ADMISSION_TRANSACTION_ID
+        _RUN_ADMISSION_LAST_ACTION = "abort"
+        _RUN_ADMISSION_LAST_TOKEN_DIGEST = _RUN_ADMISSION_TOKEN_DIGEST
+        _RUN_ADMISSION_LAST_EXPECTED_IDENTITY = _RUN_ADMISSION_EXPECTED_IDENTITY
+        _RUN_ADMISSION_STATE = "open"
+        _RUN_ADMISSION_GENERATION += 1
+        _RUN_ADMISSION_TOKEN_DIGEST = None
+        _RUN_ADMISSION_TOKEN = None
+        _RUN_ADMISSION_TRANSACTION_ID = None
+        _RUN_ADMISSION_EXPECTED_IDENTITY = None
+        _RUN_ADMISSION_FENCED_AT = None
+        _RUN_ADMISSION_LEASE_EXPIRES_AT = None
+        _RUN_ADMISSION_CHECKPOINT_DEADLINE = None
+        _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS = ()
+        _clear_startup_acceptance_evidence_locked()
+        return _run_admission_snapshot_locked()
+
+
+def commit_run_admission(
+    token: str,
+    *,
+    expected_identity: dict,
+    transaction_id: str | None = None,
+) -> dict:
+    """Mark a drained fence committing after one final atomic run check."""
+    global _RUN_ADMISSION_STATE, _RUN_ADMISSION_GENERATION
+    global _RUN_ADMISSION_LEASE_EXPIRES_AT
+    with ACTIVE_RUNS_LOCK:
+        _expire_run_admission_fence_locked()
+        requested_transaction = (
+            _normalize_run_admission_transaction_id(transaction_id)
+            if transaction_id is not None
+            else _RUN_ADMISSION_TRANSACTION_ID
+        )
+        if _RUN_ADMISSION_STATE == "committing":
+            _validate_run_admission_owner_locked(
+                token,
+                expected_identity,
+                requested_transaction,
+            )
+            return _run_admission_snapshot_locked()
+        if _RUN_ADMISSION_STATE != "fenced":
+            raise RunAdmissionConflict("run admission fence cannot commit")
+        _validate_run_admission_owner_locked(
+            token,
+            expected_identity,
+            requested_transaction,
+        )
+        if _RUN_ADMISSION_RESERVATIONS or ACTIVE_RUNS:
+            raise RunAdmissionBusy("admitted or active runs have not drained")
+        _RUN_ADMISSION_STATE = "committing"
+        _RUN_ADMISSION_GENERATION += 1
+        _RUN_ADMISSION_LEASE_EXPIRES_AT = (
+            time.time() + RUN_ADMISSION_FENCE_LEASE_SECONDS
+        )
+        return _run_admission_snapshot_locked()
+
+
+def revert_run_admission_commit(
+    token: str,
+    *,
+    expected_identity: dict,
+    transaction_id: str | None = None,
+) -> dict:
+    """Return a failed external drain recheck to fenced, never to open."""
+    global _RUN_ADMISSION_STATE, _RUN_ADMISSION_GENERATION
+    with ACTIVE_RUNS_LOCK:
+        if _RUN_ADMISSION_STATE != "committing":
+            raise RunAdmissionConflict("run admission commit cannot be reverted")
+        _validate_run_admission_owner_locked(
+            token,
+            expected_identity,
+            transaction_id,
+        )
+        _RUN_ADMISSION_STATE = "fenced"
+        _RUN_ADMISSION_GENERATION += 1
+        return _run_admission_snapshot_locked()
+
+
+def start_admitted_auxiliary_thread(
+    *,
+    kind: str,
+    target,
+    args: tuple = (),
+    kwargs: dict | None = None,
+    name: str,
+    daemon: bool = True,
+    registration_timeout: float = 0.1,
+) -> bool:
+    """Start a tracked auxiliary worker or skip it when release-fenced.
+
+    The short registration handshake prevents a mocked, failed, or unscheduled
+    thread from leaking a reservation. A genuinely starved optional worker is
+    refused rather than becoming invisible to the cutover barrier.
+    """
+    try:
+        reservation_id = reserve_run_admission(kind=kind)
+    except RunAdmissionError:
+        return False
+    ready = threading.Event()
+    run_id = f"aux:{kind}:{reservation_id[:8]}"
+    startup_acceptor_transaction = getattr(
+        _RUN_ADMISSION_LOCAL,
+        "startup_acceptor_transaction",
+        None,
+    )
+
+    def admitted_target():
+        previous_startup_transaction = getattr(
+            _RUN_ADMISSION_LOCAL,
+            "startup_acceptor_transaction",
+            None,
+        )
+        if startup_acceptor_transaction is not None:
+            _RUN_ADMISSION_LOCAL.startup_acceptor_transaction = (
+                startup_acceptor_transaction
+            )
+        try:
+            try:
+                register_active_run(
+                    run_id,
+                    admission_reservation_id=reservation_id,
+                    phase="auxiliary-running",
+                    source=kind,
+                )
+            except RunAdmissionClosed:
+                release_run_admission(reservation_id)
+                ready.set()
+                return
+            ready.set()
+            try:
+                target(*args, **(kwargs or {}))
+            finally:
+                unregister_active_run(run_id)
+        finally:
+            if previous_startup_transaction is None:
+                try:
+                    del _RUN_ADMISSION_LOCAL.startup_acceptor_transaction
+                except AttributeError:
+                    pass
+            else:
+                _RUN_ADMISSION_LOCAL.startup_acceptor_transaction = (
+                    previous_startup_transaction
+                )
+
+    worker = threading.Thread(
+        target=admitted_target,
+        name=name,
+        daemon=daemon,
+    )
+    try:
+        worker.start()
+    except Exception:
+        release_run_admission(reservation_id)
+        raise
+    if not ready.wait(max(0.0, float(registration_timeout))):
+        release_run_admission(reservation_id)
+        return False
+    return True
 
 
 def _remember_session_activity_profile_locked(entry: dict) -> None:
@@ -9306,7 +10775,12 @@ def _ensure_active_activity_heartbeat_thread() -> None:
     thread.start()
 
 
-def register_active_run(stream_id: str, **metadata) -> None:
+def register_active_run(
+    stream_id: str,
+    *,
+    admission_reservation_id: str | None = None,
+    **metadata,
+) -> None:
     """Mark a WebUI agent worker as alive until its outer finally exits."""
     if not stream_id:
         return
@@ -9316,9 +10790,41 @@ def register_active_run(stream_id: str, **metadata) -> None:
     entry.setdefault("started_at", now)
     entry.setdefault("phase", "running")
     with ACTIVE_RUNS_LOCK:
+        _expire_run_admission_fence_locked()
+        if _RUN_ADMISSION_STATE == "checkpoint-stopping":
+            raise RunAdmissionClosed("checkpoint stopping rejects worker upgrade")
+        reservation = None
+        if admission_reservation_id:
+            reservation = _RUN_ADMISSION_RESERVATIONS.pop(
+                str(admission_reservation_id), None
+            )
+            if reservation is None:
+                raise RunAdmissionClosed("run admission reservation is missing")
+        elif _RUN_ADMISSION_STATE != "open":
+            raise RunAdmissionClosed("unreserved worker cannot start while fenced")
+        if reservation:
+            inherited = {
+                key: value
+                for key, value in reservation.items()
+                if key not in {"reservation_id", "phase", "reserved_at", "kind"}
+            }
+            inherited.update(entry)
+            entry = inherited
         ACTIVE_RUNS[stream_id] = entry
         _remember_session_activity_profile_locked(entry)
-    _ensure_active_activity_heartbeat_thread()
+    try:
+        _ensure_active_activity_heartbeat_thread()
+    except Exception as exc:
+        # The reservation was consumed above, so a failed heartbeat startup
+        # must also roll back the row. Otherwise release admission sees a
+        # permanent phantom run that no worker can ever unregister. Protect a
+        # same-id replacement by removing only the exact entry we inserted.
+        with ACTIVE_RUNS_LOCK:
+            if ACTIVE_RUNS.get(stream_id) is entry:
+                ACTIVE_RUNS.pop(stream_id, None)
+        raise RunAdmissionClosed(
+            "active-run heartbeat could not be started"
+        ) from exc
     _sync_active_run_activity(entry)
     _publish_active_run_activity_change(entry)
 
@@ -9957,6 +11463,167 @@ def _current_umask() -> int:
     return umask
 
 
+_DEFERRED_STARTUP_SETTINGS_TEXT: (
+    PendingStartupSettingsRecord | PendingStartupSettingsFailure | str | None
+) = None
+_DEFERRED_STARTUP_SETTINGS_GENERATION = 0
+_DEFERRED_STARTUP_CONFIG_LOCK = threading.Lock()
+
+
+def _managed_pending_settings_failure(exc: BaseException):
+    if not _managed_release_selected_from_environment():
+        return None
+    return PendingStartupSettingsFailure(
+        type(exc).__name__,
+        str(exc)[:1024],
+    )
+
+
+def apply_startup_profile_state():
+    """Apply the strict process-epoch-bound startup profile snapshot."""
+    if not _startup_mutations_are_admitted():
+        raise RunAdmissionClosed(
+            "startup profile initialization requires signed acceptance"
+        )
+    if not _managed_release_selected_from_environment():
+        from api.profiles import init_profile_state
+
+        init_profile_state()
+        return {"status": "initialized"}
+    try:
+        from api.managed_startup_profile import (
+            apply_managed_startup_profile_state,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict startup profile reconciler is unavailable"
+        ) from exc
+    return apply_managed_startup_profile_state()
+
+
+def verify_startup_profile_state(receipt=None):
+    """Return the strict four-way startup profile verification result."""
+
+    if not _managed_release_selected_from_environment():
+        raise RuntimeError(
+            "strict startup profile verification requires a managed release"
+        )
+    try:
+        from api.managed_startup_profile import (
+            verify_managed_startup_profile_state,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict startup profile verifier is unavailable"
+        ) from exc
+    return verify_managed_startup_profile_state(receipt)
+
+
+def seed_startup_provider_models():
+    """Apply the strict process-epoch provider-model snapshot."""
+    if not _startup_mutations_are_admitted():
+        raise RunAdmissionClosed(
+            "provider model seeding requires signed acceptance"
+        )
+    if not _managed_release_selected_from_environment():
+        try:
+            _seed_provider_models_from_core()
+        except ImportError:
+            return {"status": "unavailable"}
+        except Exception:
+            logger.warning("provider-model seeder failed", exc_info=True)
+            return {"status": "failed"}
+        return {"status": "seeded"}
+    try:
+        from managed_startup_provider_models import (
+            reconcile_managed_startup_provider_models,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict provider-model reconciler is unavailable"
+        ) from exc
+    return reconcile_managed_startup_provider_models()
+
+
+def verify_startup_provider_models(receipt=None):
+    """Return the strict four-way provider-model verification result."""
+
+    if not _managed_release_selected_from_environment():
+        raise RuntimeError(
+            "strict provider-model verification requires a managed release"
+        )
+    try:
+        from managed_startup_provider_models import (
+            verify_managed_startup_provider_models,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict provider-model verifier is unavailable"
+        ) from exc
+    return verify_managed_startup_provider_models(receipt)
+
+
+def apply_deferred_startup_configuration():
+    """Apply the strict deferred settings and CLI-toolset snapshot."""
+    if not _startup_mutations_are_admitted():
+        raise RunAdmissionClosed(
+            "startup configuration mutation requires signed acceptance"
+        )
+    managed_candidate_transaction = str(
+        _RUN_ADMISSION_TRANSACTION_ID or ""
+    ).strip()
+    if (
+        not _managed_release_selected_from_environment()
+        or not managed_candidate_transaction
+    ):
+        global _DEFERRED_STARTUP_SETTINGS_TEXT, CLI_TOOLSETS
+        settings_rewritten = False
+        with _DEFERRED_STARTUP_CONFIG_LOCK:
+            pending_text = _DEFERRED_STARTUP_SETTINGS_TEXT
+            if pending_text is not None:
+                if isinstance(pending_text, PendingStartupSettingsRecord):
+                    pending_text = pending_text.desired_bytes.decode("utf-8")
+                _atomic_write_settings_text(SETTINGS_FILE, pending_text)
+                _DEFERRED_STARTUP_SETTINGS_TEXT = None
+                settings_rewritten = True
+            resolved_toolsets = tuple(_resolve_cli_toolsets())
+            if isinstance(CLI_TOOLSETS, StableCliToolsets):
+                CLI_TOOLSETS.publish(resolved_toolsets)
+            else:
+                CLI_TOOLSETS = list(resolved_toolsets)
+        return {
+            "settings_rewritten": settings_rewritten,
+            "cli_toolsets": list(CLI_TOOLSETS),
+        }
+    try:
+        from api.managed_startup_configuration import (
+            apply_managed_startup_configuration,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict startup configuration reconciler is unavailable"
+        ) from exc
+    return apply_managed_startup_configuration()
+
+
+def verify_deferred_startup_configuration(receipt=None):
+    """Return strict deferred startup configuration verification."""
+
+    if not _managed_release_selected_from_environment():
+        raise RuntimeError(
+            "strict startup configuration verification requires a managed release"
+        )
+    try:
+        from api.managed_startup_configuration import (
+            verify_managed_startup_configuration,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "strict startup configuration verifier is unavailable"
+        ) from exc
+    return verify_managed_startup_configuration(receipt)
+
+
 def _coerce_provider_cost_budget(value: Any) -> float | None:
     """Normalize a monthly budget to the persisted two-decimal representation."""
     try:
@@ -10159,40 +11826,38 @@ if _settings_file_exists:
             startup_persisted_speech_keys = _extract_persisted_speech_keys(
                 _read_raw_settings_file()
             )
-            _atomic_write_settings_text(
-                SETTINGS_FILE,
-                json.dumps(
-                    _settings_payload_for_write(
-                        _startup_settings, startup_persisted_speech_keys
-                    ),
-                    ensure_ascii=False,
-                    indent=2,
+            startup_settings_text = json.dumps(
+                _settings_payload_for_write(
+                    _startup_settings, startup_persisted_speech_keys
                 ),
+                ensure_ascii=False,
+                indent=2,
             )
-        except Exception:
-            pass
+            if _startup_mutations_are_admitted():
+                _atomic_write_settings_text(SETTINGS_FILE, startup_settings_text)
+            else:
+                with _DEFERRED_STARTUP_CONFIG_LOCK:
+                    _DEFERRED_STARTUP_SETTINGS_GENERATION += 1
+                    _DEFERRED_STARTUP_SETTINGS_TEXT = (
+                        capture_pending_startup_settings_record(
+                            SETTINGS_FILE,
+                            startup_settings_text,
+                            _DEFERRED_STARTUP_SETTINGS_GENERATION,
+                        )
+                    )
+        except Exception as exc:
+            failure = _managed_pending_settings_failure(exc)
+            if failure is not None:
+                _DEFERRED_STARTUP_SETTINGS_TEXT = failure
 
 # ── SESSIONS in-memory cache (LRU OrderedDict) ───────────────────────────────
 SESSIONS: collections.OrderedDict = collections.OrderedDict()
 
-# ── Profile state initialisation ────────────────────────────────────────────
-# Must run after all imports are resolved to correctly patch module-level caches
-try:
-    from api.profiles import init_profile_state
-
-    init_profile_state()
-except ImportError:
-    pass  # hermes_cli not available -- default profile only
-
-
-# Run the provider-model seeder once at import time. Must be at the END of the
-# module because _seed_provider_models_from_core() calls _get_label_for_model,
-# which is defined ~3000 lines above. Placing the invocation earlier (e.g. right
-# after the seeder's def) caused a NameError that the bare except silently
-# swallowed — exactly when the seeder had real work to do (#4413).
-try:
-    _seed_provider_models_from_core()
-except ImportError:
-    pass  # hermes_cli not available (standalone deployment)
-except Exception:
-    logger.warning("provider-model seeder failed", exc_info=True)
+# ── Profile/provider startup initialization ─────────────────────────────────
+# Unmanaged launches preserve the historical import-time initialization.
+# Managed releases defer both paths until the signed acceptor: profile setup
+# imports cron/Agent modules and provider seeding imports the Agent catalog, so
+# neither dependency tree gets preaccept mutation authority merely by import.
+if _startup_mutations_are_admitted():
+    apply_startup_profile_state()
+    seed_startup_provider_models()

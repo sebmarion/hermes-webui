@@ -34,6 +34,8 @@ from api.config import (
     LOCK, SESSIONS, SESSIONS_MAX, SESSION_DIR,
     _get_session_agent_lock, _set_thread_env, _clear_thread_env,
     register_active_run, update_active_run, unregister_active_run,
+    release_run_admission, RunAdmissionClosed,
+    start_admitted_auxiliary_thread,
     unregister_stream_owner,
     SESSION_AGENT_LOCKS, SESSION_AGENT_LOCKS_LOCK,
     resolve_model_provider,
@@ -83,6 +85,59 @@ def _session_payload_with_full_messages(session, *, tool_calls=None):
     attach_todo_state(raw, messages)
     if tool_calls is not None:
         raw['tool_calls'] = tool_calls
+    return raw
+
+
+def _terminal_delta_from_full_payload(
+    full_payload,
+    *,
+    previous_messages=None,
+):
+    """Replace an embedded transcript with only the messages appended by this turn.
+
+    Successful live streams already projected the turn into the browser. Sending
+    the entire historical transcript again at ``done`` makes terminal latency
+    grow with session age and can freeze the UI while a multi-megabyte SSE frame
+    is parsed. The previous transcript is captured before the turn begins, so a
+    stable prefix lets the client replace only its optimistic/live tail.
+
+    Compression or recovery may rewrite the historical prefix. In that uncommon
+    case correctness wins: mark the payload and include the full transcript so
+    the browser can reconcile canonically without a second request.
+    """
+    raw = dict(full_payload or {})
+    messages = list(raw.pop('messages', None) or [])
+    previous = list(previous_messages or [])
+
+    prefix_matches = len(previous) <= len(messages)
+    if prefix_matches:
+        for idx, expected in enumerate(previous):
+            current = messages[idx]
+            expected_identity = _message_identity(expected)
+            current_identity = _message_identity(current)
+            if expected_identity is None or current_identity is None:
+                if expected != current:
+                    prefix_matches = False
+                    break
+            elif expected_identity != current_identity:
+                prefix_matches = False
+                break
+            else:
+                expected_text = _message_text(expected.get('content', ''))
+                current_text = _message_text(current.get('content', ''))
+                if str(expected.get('role') or '') == 'user':
+                    expected_text = _strip_workspace_prefix(expected_text, include_legacy=True)
+                    current_text = _strip_workspace_prefix(current_text, include_legacy=True)
+                if expected_text != current_text:
+                    prefix_matches = False
+                    break
+
+    if prefix_matches:
+        raw['terminal_base_message_count'] = len(previous)
+        raw['terminal_messages'] = messages[len(previous):]
+    else:
+        raw['terminal_reconcile_required'] = True
+        raw['messages'] = messages
     return raw
 
 
@@ -2333,6 +2388,17 @@ def _capture_bestplan_result(
         return capture_bestplan_agent_result(result, **kwargs)
 
 
+def _bestplan_capture_invocation_message(
+    message: str,
+    bestplan_config: Optional[dict],
+) -> str:
+    """Restore host command identity after the route strips stale-client syntax."""
+    if bestplan_config is None:
+        return str(message)
+    count = bestplan_config.get("count", 3)
+    return f"/bestplan {count} {str(message).strip()}".strip()
+
+
 def _run_agent_with_bestplan_ingress(
     agent,
     *,
@@ -2417,21 +2483,125 @@ def _format_process_notification(evt: dict) -> str:
     )
 
 
-def _mark_process_completion_consumed(process_registry, process_id: str) -> None:
-    """Best-effort bridge to the agent registry's private completion marker."""
+def _finish_process_completion_delivery(
+    process_registry,
+    event: dict,
+    *,
+    committed: bool,
+) -> bool:
+    """Finish delivery for the exact stable Agent outbox event."""
+    if not isinstance(event, dict):
+        return False
+    event_type = event.get("type")
+    if event_type == "completion":
+        stable_id = str(event.get("event_id") or "").strip()
+    elif event_type == "async_delegation":
+        stable_id = str(event.get("delegation_id") or "").strip()
+    else:
+        stable_id = ""
+    if not stable_id:
+        return False
     try:
-        with process_registry._lock:
-            process_registry._completion_consumed.add(process_id)
+        return bool(
+            process_registry.finish_notification_delivery(event, committed)
+        )
     except Exception:
-        logger.debug("Failed to mark process completion consumed", exc_info=True)
+        logger.warning(
+            "Failed to finish durable process completion delivery",
+            exc_info=True,
+        )
+        return False
 
 
-def _drain_webui_process_notifications(session_id: str) -> list[str]:
+def _release_process_completion_seen(events: list[dict]) -> None:
+    """Release the proactive-drain in-flight claim after a requeue."""
+    try:
+        from api import config as _process_cfg
+
+        with _process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
+            for event in events:
+                delivery_id = str(
+                    (event or {}).get("event_id")
+                    or (event or {}).get("delegation_id")
+                    or (event or {}).get("session_id")
+                    or ""
+                ).strip()
+                process_id = str((event or {}).get("session_id") or "").strip()
+                if not delivery_id:
+                    continue
+                for owner, seen in list(
+                    _process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN.items()
+                ):
+                    seen.discard(delivery_id)
+                    if process_id:
+                        seen.discard(process_id)
+                    if not seen:
+                        _process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN.pop(owner, None)
+    except Exception:
+        logger.warning(
+            "Failed to release process completion retry claim",
+            exc_info=True,
+        )
+
+
+def _validated_process_completion_events(
+    events: list[dict] | None,
+    *,
+    session_id: str,
+) -> list[dict]:
+    """Accept unique stable events bound to this exact WebUI session."""
+    accepted: list[dict] = []
+    seen_ids: set[str] = set()
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        if event_type == "completion":
+            event_id = str(event.get("event_id") or "").strip()
+        elif event_type == "async_delegation":
+            event_id = str(event.get("delegation_id") or "").strip()
+        else:
+            continue
+        event_owner = str(event.get("session_key") or "").strip()
+        if not event_id or event_owner != str(session_id or ""):
+            continue
+        if event_id in seen_ids:
+            continue
+        seen_ids.add(event_id)
+        accepted.append(event)
+    return accepted
+
+
+def _finalize_process_completion_claims(
+    process_registry,
+    events: list[dict],
+    *,
+    committed: bool,
+) -> bool:
+    """ACK durable claims or requeue every exact event after a failed writeback."""
+    all_finished = True
+    for event in events:
+        finished = _finish_process_completion_delivery(
+            process_registry,
+            event,
+            committed=committed,
+        )
+        all_finished = finished and all_finished
+    if not all_finished:
+        _release_process_completion_seen(events)
+    return all_finished
+
+
+def _drain_webui_process_notifications(
+    session_id: str,
+    *,
+    claimed_events: list[dict] | None = None,
+) -> list[str]:
     """Return completion notifications that belong to this WebUI session.
 
-    The agent registry completion queue is process-wide and events do not carry
-    the WebUI session key directly. Look up the live process session before
-    delivery so completions from other tabs remain queued for their owners.
+    The Agent registry queue is process-wide. Stable durable events carry the
+    owning WebUI session key, so delivery must not depend on the originating
+    process still being present in the in-memory registry.
     """
     if not session_id:
         return []
@@ -2442,6 +2612,7 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
 
     notifications: list[str] = []
     skipped_events: list[dict] = []
+    uncommitted_events: list[dict] = []
     completion_queue = getattr(process_registry, 'completion_queue', None)
     if completion_queue is None:
         return []
@@ -2460,42 +2631,73 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
             break
 
         evt_sid = str(evt.get('session_id') or '') if isinstance(evt, dict) else ''
-        if not evt_sid:
+        event_id = str(evt.get('event_id') or '') if isinstance(evt, dict) else ''
+        event_session_key = (
+            str(evt.get('session_key') or '') if isinstance(evt, dict) else ''
+        )
+        if not evt_sid or not event_id or not event_session_key:
             skipped_events.append(evt)
             continue
+        if event_session_key != session_id:
+            skipped_events.append(evt)
+            continue
+
+        # The primary WebUI drain may already own this stable event in the
+        # deferred-wakeup inbox while deliberately leaving its durable outbox
+        # record unacknowledged until a replacement turn is accepted. A raced
+        # duplicate queue entry must not be injected into a human turn.
         try:
-            if process_registry.is_completion_consumed(evt_sid):
-                continue
-            proc = process_registry.get(evt_sid)
+            from api import config as _process_cfg
+
+            with _process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
+                if event_id in _process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN.get(
+                    session_id, set()
+                ):
+                    continue
         except Exception:
-            proc = None
-        if getattr(proc, 'session_key', None) != session_id:
-            skipped_events.append(evt)
-            continue
+            logger.debug(
+                "Failed to inspect claimed process completions",
+                exc_info=True,
+            )
 
         # Age-gate stale completions: a completion that fires long after the
         # user moved on must not be prepended to an unrelated later turn
         # (nesquena/hermes-webui#4029). Drop (consume, do not requeue) any
         # completion whose enqueue time is older than the configured cap.
-        # Events without a 'completed_at' (older agent builds) are never
-        # dropped here, preserving backward-compatible behavior.
+        # Events without a durable 'created_at' are never dropped here.
         if stale_completion_max_age > 0 and isinstance(evt, dict):
-            completed_at = evt.get('completed_at')
-            if isinstance(completed_at, (int, float)) and completed_at > 0:
-                age = time.time() - completed_at
+            created_at = evt.get('created_at')
+            if isinstance(created_at, (int, float)) and created_at > 0:
+                age = time.time() - created_at
                 if age > stale_completion_max_age:
                     logger.info(
                         "Dropping stale background-process completion for "
                         "session %s (age %.0fs > cap %.0fs)",
                         evt_sid, age, stale_completion_max_age,
                     )
-                    _mark_process_completion_consumed(process_registry, evt_sid)
+                    _finish_process_completion_delivery(
+                        process_registry,
+                        evt,
+                        committed=True,
+                    )
                     continue
 
+        already_claimed = bool(
+            claimed_events is not None
+            and any(
+                str(claimed.get("event_id") or "") == event_id
+                for claimed in claimed_events
+            )
+        )
+        if already_claimed:
+            continue
         notification = _format_process_notification(evt)
         if notification:
             notifications.append(notification)
-            _mark_process_completion_consumed(process_registry, evt_sid)
+            if claimed_events is None:
+                uncommitted_events.append(evt)
+            else:
+                claimed_events.append(evt)
 
     for evt in skipped_events:
         try:
@@ -2503,6 +2705,12 @@ def _drain_webui_process_notifications(session_id: str) -> list[str]:
         except Exception:
             logger.debug("Failed to requeue process completion event", exc_info=True)
             break
+    if uncommitted_events:
+        _finalize_process_completion_claims(
+            process_registry,
+            uncommitted_events,
+            committed=False,
+        )
     return notifications
 
 
@@ -4344,11 +4552,12 @@ def _maybe_schedule_title_refresh(session, put_event, agent):
     last_u, last_a = _latest_exchange_snippets(session.messages)
     if not last_u and not last_a:
         return
-    threading.Thread(
+    start_admitted_auxiliary_thread(
+        kind="adaptive_title",
         target=_run_background_title_refresh,
         args=(session.session_id, last_u, last_a, current_title, put_event, agent),
-        daemon=True,
-    ).start()
+        name=f"adaptive-title-{session.session_id}",
+    )
 
 
 def _strip_native_image_parts_from_content(content):
@@ -7311,6 +7520,9 @@ def _run_agent_streaming(
     moa_config=None,
     bestplan_config=None,
     profile=None,
+    admission_reservation_id=None,
+    process_completion_events=None,
+    worker_accept_callback=None,
 ):
     """Run agent in background thread, writing SSE events to STREAMS[stream_id].
 
@@ -7319,24 +7531,114 @@ def _run_agent_streaming(
     """
     _turn_route_model = model
     _turn_route_provider = model_provider
+    _provided_process_completion_events = _validated_process_completion_events(
+        process_completion_events,
+        session_id=session_id,
+    )
     q = STREAMS.get(stream_id)
     if q is None:
         # The stream was cancelled before the worker started; the route layer
         # already registered the stream owner, so release it here to avoid
         # leaking a STREAM_SESSION_OWNERS entry that the teardown finally never sees.
+        if _provided_process_completion_events:
+            try:
+                from tools.process_registry import process_registry
+
+                _finalize_process_completion_claims(
+                    process_registry,
+                    _provided_process_completion_events,
+                    committed=False,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to requeue completion claims for an absent stream",
+                    exc_info=True,
+                )
         unregister_stream_owner(stream_id)
+        release_run_admission(admission_reservation_id)
         return
-    register_active_run(
-        stream_id,
-        session_id=session_id,
-        started_at=time.time(),
-        phase="starting",
-        workspace=str(workspace),
-        model=model,
-        provider=model_provider,
-        ephemeral=bool(ephemeral),
-        profile=profile,
-    )
+    try:
+        register_active_run(
+            stream_id,
+            admission_reservation_id=admission_reservation_id,
+            session_id=session_id,
+            started_at=time.time(),
+            phase="starting",
+            workspace=str(workspace),
+            model=model,
+            provider=model_provider,
+            ephemeral=bool(ephemeral),
+            profile=profile,
+        )
+    except RunAdmissionClosed:
+        if _provided_process_completion_events:
+            try:
+                from tools.process_registry import process_registry
+
+                _finalize_process_completion_claims(
+                    process_registry,
+                    _provided_process_completion_events,
+                    committed=False,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to requeue completion claims after closed admission",
+                    exc_info=True,
+                )
+        with STREAMS_LOCK:
+            STREAMS.pop(stream_id, None)
+        unregister_stream_owner(stream_id)
+        release_run_admission(admission_reservation_id)
+        return
+    if worker_accept_callback is not None:
+        try:
+            worker_accepted = bool(worker_accept_callback())
+        except Exception:
+            worker_accepted = False
+            logger.exception(
+                "Delegation worker acceptance callback failed for %s",
+                stream_id,
+            )
+        if not worker_accepted:
+            if _provided_process_completion_events:
+                try:
+                    from tools.process_registry import process_registry
+
+                    _finalize_process_completion_claims(
+                        process_registry,
+                        _provided_process_completion_events,
+                        committed=False,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to requeue completion claims after worker rejection",
+                        exc_info=True,
+                    )
+            with STREAMS_LOCK:
+                STREAMS.pop(stream_id, None)
+            try:
+                with LOCK:
+                    rejected_session = SESSIONS.get(session_id)
+                    if (
+                        rejected_session is not None
+                        and getattr(rejected_session, "active_stream_id", None)
+                        == stream_id
+                    ):
+                        rejected_session.active_stream_id = None
+                        rejected_session.pending_user_message = None
+                        rejected_session.pending_attachments = []
+                        rejected_session.pending_started_at = None
+                        rejected_session.pending_user_source = None
+                        rejected_session.pending_server_instance_id = None
+                        rejected_session.save(touch_updated_at=False)
+            except Exception:
+                logger.warning(
+                    "Failed to clear rejected delegation stream state",
+                    exc_info=True,
+                )
+            unregister_active_run(stream_id)
+            unregister_stream_owner(stream_id)
+            return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
     except Exception:
@@ -7678,6 +7980,9 @@ def _run_agent_streaming(
     _metering_thread = threading.Thread(target=_metering_ticker, daemon=True)
 
     _success_writeback_committed = False
+    _process_completion_claims: list[dict] = list(
+        _provided_process_completion_events
+    )
     _continuation_pending = False
 
     def put(event, data):
@@ -8232,6 +8537,16 @@ def _run_agent_streaming(
                 # token would add real contention against readers copying large buffers
                 # and would entangle the documented LOCK -> STREAMS_LOCK ordering — not
                 # worth it for a recoverable staleness window.
+                if bestplan_config is not None:
+                    # BestPlan output can contain a machine-readable envelope.
+                    # Withhold planning deltas from both the live SSE path and
+                    # cancellation-partial storage. The terminal session payload
+                    # carries the validated, stripped result.
+                    _token_sent = True
+                    _metering_output_deltas[0] += 1
+                    meter().record_token(stream_id, _metering_output_deltas[0])
+                    _emit_metering()
+                    return
                 if stream_id in STREAM_PARTIAL_TEXT:
                     STREAM_PARTIAL_TEXT[stream_id] += str(text)
                 put('token', {'text': text})
@@ -9253,7 +9568,10 @@ def _run_agent_streaming(
                 config=_cfg,
             )
             if result is None:
-                _process_notifications = _drain_webui_process_notifications(session_id)
+                _process_notifications = _drain_webui_process_notifications(
+                    session_id,
+                    claimed_events=_process_completion_claims,
+                )
                 _bestplan_invocation_message = _expand_bestplan_skill_invocation(
                     msg_text,
                     session_id=session_id,
@@ -9293,7 +9611,9 @@ def _run_agent_streaming(
                 if str(result.get("final_response") or "").strip():
                     result = _capture_bestplan_result(
                         result,
-                        invocation_message=msg_text,
+                        invocation_message=_bestplan_capture_invocation_message(
+                            msg_text, bestplan_config
+                        ),
                         session_id=session_id,
                         profile=str(getattr(s, "profile", None) or ""),
                         workspace=str(s.workspace),
@@ -9827,7 +10147,9 @@ def _run_agent_streaming(
                                 # Retry succeeded — replace result and skip error
                                 result = _capture_bestplan_result(
                                     _heal_result,
-                                    invocation_message=msg_text,
+                                    invocation_message=_bestplan_capture_invocation_message(
+                                        msg_text, bestplan_config
+                                    ),
                                     session_id=session_id,
                                     profile=str(getattr(s, "profile", None) or ""),
                                     workspace=str(s.workspace),
@@ -10601,6 +10923,21 @@ def _run_agent_streaming(
                         put('cancel', _cancel_event_payload('Cancelled by user'))
                         return
                 _success_writeback_committed = True
+            if _process_completion_claims:
+                try:
+                    from tools.process_registry import process_registry
+
+                    _finalize_process_completion_claims(
+                        process_registry,
+                        _process_completion_claims,
+                        committed=True,
+                    )
+                    _process_completion_claims.clear()
+                except Exception:
+                    logger.warning(
+                        "Failed to finalize durable process completion claims",
+                        exc_info=True,
+                    )
             usage = {
                 'input_tokens': input_tokens,
                 'output_tokens': output_tokens,
@@ -10842,6 +11179,10 @@ def _run_agent_streaming(
                 logger.debug("Goal continuation hook failed for session %s: %s", session_id, _goal_exc)
             with _stream_writeback_stage(_writeback_timings, "done_payload"):
                 raw_session = _session_payload_with_full_messages(s, tool_calls=tool_calls)
+                raw_session = _terminal_delta_from_full_payload(
+                    raw_session,
+                    previous_messages=_previous_messages,
+                )
                 _done_payload = {'session': redact_session_data(raw_session), 'usage': usage}
                 if _guardrail_terminal is not None:
                     _done_payload['terminal_state'] = 'guardrail_blocked'
@@ -10874,11 +11215,19 @@ def _run_agent_streaming(
                 # background-title thread spawn below. (#4923 gate hardening)
                 pass
             if _should_bg_title and _u0 and _a0:
-                threading.Thread(
+                start_admitted_auxiliary_thread(
+                    kind="initial_title",
                     target=_run_background_title_update,
-                    args=(s.session_id, _u0, _a0, str(s.title or '').strip(), put, agent),
-                    daemon=True,
-                ).start()
+                    args=(
+                        s.session_id,
+                        _u0,
+                        _a0,
+                        str(s.title or '').strip(),
+                        put,
+                        agent,
+                    ),
+                    name=f"initial-title-{s.session_id}",
+                )
             else:
                 # Use the original session_id parameter (never reassigned), not s.session_id
                 # which may be rotated during context compression. The client captured
@@ -11238,6 +11587,26 @@ def _run_agent_streaming(
             _error_payload['old_session_id'] = session_id
         put('apperror', _error_payload)
     finally:
+        # A durable Agent outbox event is ACKed only after this turn's
+        # transcript writeback committed. Every other exit path explicitly
+        # requeues the exact claimed event for retry. If the success-path ACK
+        # itself failed, its helper already converted that failure into a
+        # requeue and cleared the local claim list.
+        if _process_completion_claims:
+            try:
+                from tools.process_registry import process_registry
+
+                _finalize_process_completion_claims(
+                    process_registry,
+                    _process_completion_claims,
+                    committed=_success_writeback_committed,
+                )
+                _process_completion_claims.clear()
+            except Exception:
+                logger.warning(
+                    "Failed to settle durable process completion claims",
+                    exc_info=True,
+                )
         # #4633/#2476: symmetric metering teardown. begin_session() (top of the
         # outer try) had no paired end_session(), so zero-token turns leaked a
         # _sessions[stream_id] entry that get_stats() pruning never reclaims (its
@@ -11313,23 +11682,14 @@ def _run_agent_streaming(
             STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)  # Clean up tool calls (#1361 §B)
             STREAM_GOAL_RELATED.pop(stream_id, None)  # Clean up goal-related flag (#1932)
             STREAM_LAST_EVENT_ID.pop(stream_id, None)  # Clean up event_id pointer (stage-364)
-            # unregister_active_run(stream_id) remains the lifecycle marker
-            # used by source-order regression tests; defer its durable clear
-            # until continuation settlement below.
-            _finished_run_entry = unregister_active_run(
-                stream_id, defer_activity_finish=True
-            )
-
-        # This is the deterministic parent-settled boundary: the stream channel
-        # and ACTIVE_RUNS row are both gone before any successor is started.
+        # Keep ACTIVE_RUNS present through every durable finalizer. Release
+        # commit treats that row as the worker-lifecycle barrier, so removing it
+        # before continuation settlement or completion publication would expose
+        # a false zero and permit SIGTERM during those writes.
         try:
-            from api.goal_continuation import (
-                recover_pending_goal_continuations,
-                settle_goal_continuation,
-            )
+            from api.goal_continuation import settle_goal_continuation
 
             settle_goal_continuation(session_id, stream_id)
-            recover_pending_goal_continuations(session_id=session_id)
         except Exception:
             logger.exception(
                 "goal continuation settle hook failed for session %s stream %s",
@@ -11373,10 +11733,10 @@ def _run_agent_streaming(
                 finish_session_activity,
             )
 
-            _entry = _finished_run_entry or {
+            _entry = {
                 "session_id": session_id,
                 "stream_id": stream_id,
-                "profile": _profile,
+                "profile": profile,
             }
             _completion_session_id = str(getattr(s, "session_id", session_id) or session_id)
             _emit_completion = bool(
@@ -11389,7 +11749,7 @@ def _run_agent_streaming(
             finish_session_activity(
                 str(_entry.get("session_id") or session_id),
                 stream_id,
-                profile=_entry.get("profile") or _profile,
+                profile=_entry.get("profile") or profile,
                 lineage_session_ids={session_id, _completion_session_id},
                 emit_completion=_emit_completion,
                 completion_session_id=_completion_session_id,
@@ -11397,6 +11757,26 @@ def _run_agent_streaming(
             )
         except Exception:
             logger.debug("session completion event finalization failed for %s", session_id, exc_info=True)
+
+        # unregister_active_run(stream_id) remains the lifecycle marker used
+        # by source-order regression tests. It must run outside STREAMS_LOCK and
+        # only after the final durable write above, so release admission never
+        # inverts locks or observes a false idle boundary.
+        unregister_active_run(stream_id, defer_activity_finish=True)
+
+        # Successor recovery runs after the parent row is gone. During a release
+        # fence its own admission is rejected while the durable receipt remains
+        # claimed for the replacement process.
+        try:
+            from api.goal_continuation import recover_pending_goal_continuations
+
+            recover_pending_goal_continuations(session_id=session_id)
+        except Exception:
+            logger.exception(
+                "goal continuation recovery hook failed for session %s stream %s",
+                session_id,
+                stream_id,
+            )
 
         # ── Defer-path fix: turn-teardown idle-hook ────────────────────────
         # The session has just transitioned active→idle: unregister_active_run
@@ -11550,6 +11930,93 @@ def _handle_chat_steer(handler, body: dict) -> bool:
 
     return j(handler, {"accepted": accepted, "fallback": None,
                        "stream_id": active_stream_id})
+
+
+def deliver_release_checkpoint(*, session_id: str, stream_id: str, text: str) -> dict:
+    """Deliver one release checkpoint without browser-steer fallback semantics."""
+    from api import config as _cfg
+
+    sid = str(session_id or "").strip()
+    expected_stream = str(stream_id or "").strip()
+    if not sid or not expected_stream or not str(text or "").strip():
+        return {"status": "unavailable", "reason": "invalid_identity"}
+
+    with _cfg.SESSION_AGENT_CACHE_LOCK:
+        cached = _cfg.SESSION_AGENT_CACHE.get(sid)
+        agent = cached[0] if cached else None
+    if agent is not None and not _cached_agent_matches_session(agent, sid):
+        agent = None
+    try:
+        session = get_session(sid)
+    except KeyError:
+        return {"status": "unavailable", "reason": "session_not_found"}
+    active_stream = str(getattr(session, "active_stream_id", None) or "").strip()
+    if active_stream != expected_stream:
+        return {"status": "owner_changed", "stream_id": active_stream or None}
+    with _cfg.STREAMS_LOCK:
+        if expected_stream not in _cfg.STREAMS:
+            return {"status": "inactive", "stream_id": expected_stream}
+    with _cfg.ACTIVE_RUNS_LOCK:
+        active = dict((_cfg.ACTIVE_RUNS or {}).get(expected_stream) or {})
+    if str(active.get("backend") or "").strip().lower() == "gateway":
+        gateway_run_id = str(active.get("gateway_run_id") or "").strip()
+        if not gateway_run_id:
+            return {"status": "unsupported", "reason": "gateway_run_identity_missing"}
+        try:
+            from api.gateway_chat import _gateway_api_key, _gateway_base_url
+            from urllib.error import HTTPError, URLError
+            from urllib.parse import quote
+            from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+            class _NoRedirect(HTTPRedirectHandler):
+                def redirect_request(self, *args, **kwargs):
+                    return None
+
+            payload = json.dumps({
+                "session_id": sid,
+                "text": str(text).strip(),
+            }).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            gateway_key = _gateway_api_key()
+            if gateway_key:
+                headers["Authorization"] = f"Bearer {gateway_key}"
+            request = Request(
+                f"{_gateway_base_url()}/v1/runs/{quote(gateway_run_id, safe='')}/release-checkpoint",
+                data=payload,
+                headers=headers,
+                method="POST",
+            )
+            opener = build_opener(_NoRedirect)
+            with opener.open(request, timeout=10) as response:  # nosec B310 - operator gateway URL
+                result = json.loads(response.read().decode("utf-8"))
+            return result if isinstance(result, dict) else {
+                "status": "ambiguous",
+                "reason": "gateway_invalid_response",
+            }
+        except HTTPError as exc:
+            if exc.code == 501:
+                return {"status": "unsupported", "reason": "gateway_steer_not_installed"}
+            if exc.code == 409:
+                return {"status": "owner_changed", "reason": "gateway_owner_changed"}
+            return {"status": "ambiguous", "reason": f"gateway_http_{exc.code}"}
+        except (OSError, URLError, ValueError, json.JSONDecodeError):
+            logger.debug("gateway release checkpoint delivery failed", exc_info=True)
+            return {"status": "ambiguous", "reason": "gateway_delivery_failed"}
+    if agent is None:
+        if active.get("backend") == "gateway":
+            return {"status": "unsupported", "reason": "gateway_steer_not_installed"}
+        return {"status": "unavailable", "reason": "no_cached_agent"}
+    if not hasattr(agent, "steer"):
+        return {"status": "unsupported", "reason": "agent_lacks_steer"}
+    try:
+        accepted = bool(agent.steer(str(text).strip()))
+    except Exception:
+        logger.debug("release checkpoint steer failed for session=%s", sid, exc_info=True)
+        return {"status": "ambiguous", "stream_id": expected_stream}
+    return {
+        "status": "accepted" if accepted else "inactive",
+        "stream_id": expected_stream,
+    }
 
 
 def cancel_stream(stream_id: str) -> bool:

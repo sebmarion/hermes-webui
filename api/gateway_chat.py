@@ -25,6 +25,8 @@ from api.config import (
     gateway_approval_unavailable_reason,
     gateway_supports_approval,
     register_active_run,
+    release_run_admission,
+    RunAdmissionClosed,
     unregister_active_run,
     unregister_stream_owner,
     update_active_run,
@@ -586,6 +588,9 @@ def _run_gateway_chat_streaming(
     model_provider=None,
     goal_related=False,
     profile=None,
+    admission_reservation_id=None,
+    process_completion_events=None,
+    worker_accept_callback=None,
 ):
     """Bridge a WebUI chat turn through Hermes Gateway's API server.
 
@@ -595,23 +600,85 @@ def _run_gateway_chat_streaming(
     the configured Gateway API server into those local events and persists the
     final user/assistant turn back into the WebUI session.
     """
+    from api.streaming import (
+        _finalize_process_completion_claims,
+        _validated_process_completion_events,
+    )
+
+    process_completion_claims = _validated_process_completion_events(
+        process_completion_events,
+        session_id=session_id,
+    )
+
+    def _settle_process_completion_claims(*, committed: bool) -> None:
+        if not process_completion_claims:
+            return
+        try:
+            from tools.process_registry import process_registry
+
+            _finalize_process_completion_claims(
+                process_registry,
+                process_completion_claims,
+                committed=committed,
+            )
+            process_completion_claims.clear()
+        except Exception:
+            logger.warning(
+                "Failed to settle gateway process completion claims",
+                exc_info=True,
+            )
+
     q = STREAMS.get(stream_id)
     if q is None:
         # Cancelled before the worker started; release the owner entry the route
         # layer registered so STREAM_SESSION_OWNERS does not leak (no teardown finally runs).
+        _settle_process_completion_claims(committed=False)
         unregister_stream_owner(stream_id)
+        release_run_admission(admission_reservation_id)
         return
-    register_active_run(
-        stream_id,
-        session_id=session_id,
-        started_at=time.time(),
-        phase="gateway-starting",
-        workspace=str(workspace),
-        model=model,
-        provider=model_provider,
-        backend="gateway",
-        profile=profile,
-    )
+    try:
+        register_active_run(
+            stream_id,
+            admission_reservation_id=admission_reservation_id,
+            session_id=session_id,
+            started_at=time.time(),
+            phase="gateway-starting",
+            workspace=str(workspace),
+            model=model,
+            provider=model_provider,
+            backend="gateway",
+            profile=profile,
+        )
+    except RunAdmissionClosed:
+        _settle_process_completion_claims(committed=False)
+        with STREAMS_LOCK:
+            STREAMS.pop(stream_id, None)
+        unregister_stream_owner(stream_id)
+        release_run_admission(admission_reservation_id)
+        return
+    if worker_accept_callback is not None:
+        try:
+            worker_accepted = bool(worker_accept_callback())
+        except Exception:
+            worker_accepted = False
+            logger.exception(
+                "Delegation gateway-worker acceptance callback failed for %s",
+                stream_id,
+            )
+        if not worker_accepted:
+            _settle_process_completion_claims(committed=False)
+            with STREAMS_LOCK:
+                STREAMS.pop(stream_id, None)
+            try:
+                _clear_gateway_pending_state(get_session(session_id), stream_id)
+            except Exception:
+                logger.warning(
+                    "Failed to clear rejected gateway delegation stream state",
+                    exc_info=True,
+                )
+            unregister_active_run(stream_id)
+            unregister_stream_owner(stream_id)
+            return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
     except Exception:
@@ -1134,8 +1201,15 @@ def _run_gateway_chat_streaming(
                 session_id,
                 goal_exc,
             )
-        from api.streaming import _session_payload_with_full_messages
+        from api.streaming import (
+            _session_payload_with_full_messages,
+            _terminal_delta_from_full_payload,
+        )
         gateway_session_payload = _session_payload_with_full_messages(s, tool_calls=[])
+        gateway_session_payload = _terminal_delta_from_full_payload(
+            gateway_session_payload,
+            previous_messages=previous_messages,
+        )
         put_gateway_event("done", {"session": redact_session_data(gateway_session_payload), "usage": usage})
         put_gateway_event("stream_end", {"session_id": session_id})
     except urllib.error.HTTPError as exc:
@@ -1156,6 +1230,9 @@ def _run_gateway_chat_streaming(
             "hint": "Check HERMES_WEBUI_GATEWAY_BASE_URL and Gateway API server health.",
         })
     finally:
+        _settle_process_completion_claims(
+            committed=success_writeback_committed,
+        )
         if s is not None:
             try:
                 with _get_session_agent_lock(session_id):
@@ -1172,17 +1249,10 @@ def _run_gateway_chat_streaming(
             STREAM_LAST_EVENT_ID.pop(stream_id, None)
             STREAMS.pop(stream_id, None)
         _STREAM_RUN_IDS.pop(stream_id, None)
-        _finished_run_entry = unregister_active_run(
-            stream_id, defer_activity_finish=True
-        )
         try:
-            from api.goal_continuation import (
-                recover_pending_goal_continuations,
-                settle_goal_continuation,
-            )
+            from api.goal_continuation import settle_goal_continuation
 
             settle_goal_continuation(session_id, stream_id)
-            recover_pending_goal_continuations(session_id=session_id)
         except Exception:
             logger.exception(
                 "gateway goal continuation settle hook failed for session %s stream %s",
@@ -1195,7 +1265,7 @@ def _run_gateway_chat_streaming(
                 finish_session_activity,
             )
 
-            _entry = _finished_run_entry or {
+            _entry = {
                 "session_id": session_id,
                 "stream_id": stream_id,
                 "profile": profile,
@@ -1215,3 +1285,14 @@ def _run_gateway_chat_streaming(
             )
         except Exception:
             logger.debug("gateway completion event finalization failed for %s", session_id, exc_info=True)
+        unregister_active_run(stream_id, defer_activity_finish=True)
+        try:
+            from api.goal_continuation import recover_pending_goal_continuations
+
+            recover_pending_goal_continuations(session_id=session_id)
+        except Exception:
+            logger.exception(
+                "gateway goal continuation recovery hook failed for session %s stream %s",
+                session_id,
+                stream_id,
+            )

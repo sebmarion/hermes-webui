@@ -5,6 +5,7 @@ Extracted from server.py (Sprint 11) so server.py is a thin shell.
 
 import html as _html
 import copy
+import functools
 import hashlib
 import inspect
 import errno
@@ -79,6 +80,7 @@ from api.session_events import (
     unsubscribe_session_events,
 )
 from api.gateway_restart import restart_active_profile_gateway
+from api.build_identity import get_build_identity
 from api.shares import create_or_refresh_share, load_share, revoke_share
 
 logger = logging.getLogger(__name__)
@@ -223,7 +225,11 @@ def _queue_generated_title_for_imported_session(session, cli_meta: dict | None) 
             except Exception:
                 logger.debug("Failed to generate imported session title for %s", sid, exc_info=True)
 
-        threading.Thread(target=_run, daemon=True, name=f"imported-title-{sid}").start()
+        api_config.start_admitted_auxiliary_thread(
+            kind="imported_title",
+            target=_run,
+            name=f"imported-title-{sid}",
+        )
     except Exception:
         logger.debug(
             "Failed to queue imported session title generation for %s",
@@ -291,6 +297,7 @@ _CLIENT_EVENT_RATE_LIMIT_LOCK = threading.Lock()
 _CLIENT_EVENT_RATE_LIMIT_WINDOW_SECONDS = 60
 _CLIENT_EVENT_RATE_LIMIT_MAX = 30
 _CLIENT_EVENT_MAX_BODY_BYTES = 4 * 1024
+_DELEGATION_WORKER_ACCEPT_TIMEOUT_SECONDS = 10.0
 _EXTENSION_SIDECAR_PROXY_MAX_RESPONSE_BYTES = 512 * 1024
 _CLIENT_EVENT_ALLOWED_FIELDS = {
     "event": 64,
@@ -1793,6 +1800,38 @@ def _run_cron_tracked(
         _mark_cron_done(job_id)
         _publish_session_list_changed("cron_complete", profile=event_profile)
 
+
+def _run_admitted_cron(
+    job,
+    profile_home,
+    execution_profile_home,
+    event_profile,
+    admission_reservation_id,
+):
+    run_id = (
+        f"cron:{str((job or {}).get('id') or 'unknown')}:"
+        f"{str(admission_reservation_id or '')[:8]}"
+    )
+    try:
+        register_active_run(
+            run_id,
+            admission_reservation_id=admission_reservation_id,
+            phase="cron-running",
+            source="manual-cron",
+        )
+    except RunAdmissionClosed:
+        release_run_admission(admission_reservation_id)
+        return
+    try:
+        _run_cron_tracked(
+            job,
+            profile_home,
+            execution_profile_home,
+            event_profile,
+        )
+    finally:
+        unregister_active_run(run_id)
+
 _PROVIDER_ALIASES = {
     "claude": "anthropic",
     "gpt": "openai",
@@ -3294,6 +3333,14 @@ from api.config import (
     get_config_for_profile_home,
     _cfg_lock,
     PENDING_BG_TASK_COMPLETIONS,
+    RunAdmissionClosed,
+    fork_run_admission,
+    register_active_run,
+    release_run_admission,
+    reserve_run_admission,
+    run_admission_scope,
+    start_admitted_auxiliary_thread,
+    unregister_active_run,
 )
 from api import config as api_config
 from api.helpers import (
@@ -5617,12 +5664,16 @@ def _schedule_stale_stream_state_reconciliation(session_rows) -> bool:
             _STALE_STREAM_RECONCILIATION_LOCK.release()
 
     try:
-        threading.Thread(
+        started = start_admitted_auxiliary_thread(
+            kind="session_sidecar_reconciliation",
             target=_run_reconciliation,
             name="stale-stream-reconciliation",
             daemon=True,
-        ).start()
+        )
     except Exception:
+        _STALE_STREAM_RECONCILIATION_LOCK.release()
+        return False
+    if not started:
         _STALE_STREAM_RECONCILIATION_LOCK.release()
         return False
     return True
@@ -5811,6 +5862,7 @@ def _csrf_exempt_path(path: str) -> bool:
         "/api/auth/passkey/login",
         "/api/csp-report",
         "/api/internal/recovery/start",
+        "/api/internal/release-control",
     }
 
 
@@ -11924,6 +11976,37 @@ def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
     if checks["streams_lock"].get("status") != "ok":
         return checks, False
 
+    startup_admission = api_config.run_admission_snapshot()
+    if startup_admission.get("state") in {
+        "startup-invalid",
+        "startup-fenced",
+        "startup-accepting",
+    }:
+        # A selected immutable candidate must be inspectable before acceptance,
+        # but deep health cannot trigger session-index rebuilds, DB opens, file
+        # repair, plugin work, or any other state mutation while startup-fenced.
+        # Report only state that was already loaded during module import. The
+        # pair-open gate remains active after signed acceptance, but must not
+        # masquerade as the startup fence: the controller needs ordinary deep
+        # probes to verify the accepted process before releasing the pair.
+        with LOCK:
+            loaded_sessions = len(SESSIONS)
+        checks.update(
+            {
+                "startup_fence": {
+                    "status": "fenced",
+                    "mutation_free": True,
+                },
+                "sessions": {
+                    "status": "deferred",
+                    "loaded_count": loaded_sessions,
+                },
+                "projects": {"status": "deferred"},
+                "state_db": {"status": "deferred"},
+            }
+        )
+        return checks, True
+
     t0 = time.time()
     try:
         sessions = all_sessions()
@@ -11987,6 +12070,35 @@ def _handle_health(handler, parsed):
     deep = parse_qs(parsed.query or "").get("deep", [""])[0].lower() in {"1", "true", "yes", "on"}
     stream_check = _streams_lock_health()
     run_check = _run_lifecycle_health()
+    build_identity = get_build_identity(refresh=deep)
+    from api.release_control import release_activity_snapshot
+
+    release_activity = release_activity_snapshot()
+    admission = api_config.run_admission_snapshot()
+    admission.pop("transaction_id", None)
+    admission.update(release_activity)
+    public_build_keys = {
+        "status",
+        "valid",
+        "build_id",
+        "commit",
+        "tree",
+        "manifest_sha256",
+        "agent_commit",
+        "agent_tree",
+        "agent_manifest_sha256",
+        "runtime_manifest_sha256",
+        "selector_generation",
+        "launch_mode",
+        "attestation",
+        "verification_age_seconds",
+        "error_code",
+    }
+    public_build_identity = {
+        key: value
+        for key, value in build_identity.items()
+        if key in public_build_keys
+    }
     payload = {
         "status": "ok" if stream_check.get("status") == "ok" else "degraded",
         "sessions": len(SESSIONS),
@@ -11997,7 +12109,11 @@ def _handle_health(handler, parsed):
         "server_started_at": SERVER_START_TIME,
         "uptime_seconds": round(time.time() - SERVER_START_TIME, 1),
         "accept_loop": _accept_loop_health(handler),
+        "build": public_build_identity,
+        "admission": admission,
     }
+    if build_identity.get("status") == "invalid":
+        payload["status"] = "degraded"
     if "oldest_run_age_seconds" in run_check:
         payload["oldest_run_age_seconds"] = run_check["oldest_run_age_seconds"]
     if "idle_seconds_since_last_run" in run_check:
@@ -12373,7 +12489,7 @@ def _render_index_shell_base() -> str:
     extension-tag injection are intentionally NOT applied here — they vary per
     request and are applied by the caller against this base string.
     """
-    from api.updates import WEBUI_VERSION
+    from api.updates import WEBUI_ASSET_VERSION
 
     index_path = api_config.get_index_html_path()
     st = index_path.stat()
@@ -12384,7 +12500,7 @@ def _render_index_shell_base() -> str:
             return cached[1]
     from urllib.parse import quote
 
-    version_token = quote(WEBUI_VERSION, safe="")
+    version_token = quote(WEBUI_ASSET_VERSION, safe="")
     base = (
         index_path.read_text(encoding="utf-8")
         .replace("__WEBUI_VERSION__", version_token)
@@ -13094,8 +13210,8 @@ def handle_get(handler, parsed) -> bool:
             _resolve_login_locale_key(_lang)
         ]
         from urllib.parse import quote
-        from api.updates import WEBUI_VERSION
-        version_token = quote(WEBUI_VERSION, safe="")
+        from api.updates import WEBUI_ASSET_VERSION
+        version_token = quote(WEBUI_ASSET_VERSION, safe="")
         _page = (
             _LOGIN_PAGE_HTML.replace("{{BOT_NAME}}", _bn)
             .replace("{{BOT_NAME_INITIAL}}", _bn[0].upper())
@@ -13122,20 +13238,23 @@ def handle_get(handler, parsed) -> bool:
             parse_qs(parsed.query or "").get("next", [""])[0]
         )
         try:
-            location = build_authorization_redirect(
-                _request_base_url(handler), next_path
-            )
+            with run_admission_scope(kind="oidc_authorization_start"):
+                location = build_authorization_redirect(
+                    _request_base_url(handler), next_path
+                )
+                handler.send_response(302)
+                handler.send_header("Location", location)
+                handler.send_header("Cache-Control", "no-store")
+                handler.send_header("Content-Length", "0")
+                _security_headers(handler)
+                handler.end_headers()
+                return True
         except OIDCConfigError as exc:
             return j(handler, {"error": str(exc)}, status=404)
         except OIDCAuthError as exc:
             return j(handler, {"error": str(exc)}, status=exc.status_code)
-        handler.send_response(302)
-        handler.send_header("Location", location)
-        handler.send_header("Cache-Control", "no-store")
-        handler.send_header("Content-Length", "0")
-        _security_headers(handler)
-        handler.end_headers()
-        return True
+        except RunAdmissionClosed:
+            return j(handler, _maintenance_fence_payload(), status=503)
 
     if parsed.path == "/api/auth/oidc/callback":
         from api.auth import create_session, set_auth_cookie
@@ -13151,25 +13270,28 @@ def handle_get(handler, parsed) -> bool:
         if not state or not code:
             return j(handler, {"error": "Missing OIDC callback state or code"}, status=400)
         try:
-            result = complete_authorization_code_flow(
-                _request_base_url(handler), state, code
-            )
+            with run_admission_scope(kind="oidc_authorization_callback"):
+                result = complete_authorization_code_flow(
+                    _request_base_url(handler), state, code
+                )
+                cookie_val = create_session()
+                handler.send_response(302)
+                handler.send_header(
+                    "Location",
+                    _safe_login_redirect_path(result.get("next_path")),
+                )
+                handler.send_header("Cache-Control", "no-store")
+                _security_headers(handler)
+                set_auth_cookie(handler, cookie_val)
+                handler.send_header("Content-Length", "0")
+                handler.end_headers()
+                return True
         except OIDCConfigError as exc:
             return j(handler, {"error": str(exc)}, status=404)
         except OIDCAuthError as exc:
             return j(handler, {"error": str(exc)}, status=exc.status_code)
-        cookie_val = create_session()
-        handler.send_response(302)
-        handler.send_header(
-            "Location",
-            _safe_login_redirect_path(result.get("next_path")),
-        )
-        handler.send_header("Cache-Control", "no-store")
-        _security_headers(handler)
-        set_auth_cookie(handler, cookie_val)
-        handler.send_header("Content-Length", "0")
-        handler.end_headers()
-        return True
+        except RunAdmissionClosed:
+            return j(handler, _maintenance_fence_payload(), status=503)
 
     if parsed.path == "/api/auth/status":
         from api.auth import (
@@ -13232,11 +13354,11 @@ def handle_get(handler, parsed) -> bool:
         static_root = api_config.get_static_root()
         sw_path = (static_root / "sw.js").resolve()
         if sw_path.exists():
-            # Inject the current git-derived version as the cache name so the
-            # service worker cache busts automatically on every new deploy.
+            # Inject the deployment asset identity as the cache name so the
+            # service worker cache busts automatically on every new release.
             from urllib.parse import quote
-            from api.updates import WEBUI_VERSION
-            version_token = quote(WEBUI_VERSION, safe="")
+            from api.updates import WEBUI_ASSET_VERSION
+            version_token = quote(WEBUI_ASSET_VERSION, safe="")
             text = sw_path.read_text(encoding="utf-8").replace(
                 "__WEBUI_VERSION__", version_token
             )
@@ -15240,34 +15362,18 @@ def handle_get(handler, parsed) -> bool:
     # ── Plugin shared assets (e.g. /plugins/plugin.css) ──
     # Restricted to shared plugin assets only — no cross-plugin file access.
     if parsed.path.startswith("/plugins/"):
-        from api.plugins import _get_plugin_base
-        plugin_base = _get_plugin_base()
+        from api.plugins import serve_plugin_shared_static
         rel = parsed.path[len("/plugins/"):]
-        allowed = {"plugin.css"}
-        if rel not in allowed:
-            return False  # 404
-        safe = (plugin_base / rel).resolve()
-        try:
-            safe.relative_to(plugin_base.resolve())
-        except ValueError:
-            return False  # path traversal — 404
-        if safe.is_file():
-            import os as _os
-            data = safe.read_bytes()
-            ext = _os.path.splitext(rel.lower())[1]
-            ct = {
-                ".css": "text/css; charset=utf-8",
-                ".js": "application/javascript; charset=utf-8",
-                ".json": "application/json; charset=utf-8",
-                ".png": "image/png",
-                ".svg": "image/svg+xml",
-            }.get(ext, "application/octet-stream")
+        result = serve_plugin_shared_static(rel)
+        if result:
+            data, content_type = result
             handler.send_response(200)
-            handler.send_header("Content-Type", ct)
+            handler.send_header("Content-Type", content_type)
             handler.send_header("Content-Length", str(len(data)))
             handler.end_headers()
             handler.wfile.write(data)
             return True
+        return False
 
     # ── Plugin static assets ──
     if parsed.path.startswith("/dashboard-plugins/"):
@@ -15298,32 +15404,20 @@ def handle_get(handler, parsed) -> bool:
                 return True
 
     # ── Plugin pages (HTML shell) ──
-    from api.plugins import PLUGIN_MANIFESTS, _PLUGIN_STATIC_ROOTS
-    for name, manifest in PLUGIN_MANIFESTS.items():
+    from api.plugins import get_plugin_page_material, get_plugin_runtime_snapshot
+    plugin_runtime = get_plugin_runtime_snapshot()
+    for name, manifest in plugin_runtime.manifests.items():
         tab = manifest.get("tab", {})
         tab_path = tab.get("path", f"/{name}")
         if parsed.path == tab_path:
             # Server-side enable-gate (opt-in): a disabled plugin's page 404s.
             if not _dashboard_plugin_enabled(name):
                 return False
-            dashboard_dir = _PLUGIN_STATIC_ROOTS.get(name)
-            if dashboard_dir:
-                # 1) dashboard/dist/index.html (full SPA build)
-                index_html = dashboard_dir / "dist" / "index.html"
-                if index_html.is_file():
-                    data = index_html.read_bytes()
-                    handler.send_response(200)
-                    handler.send_header("Content-Type", "text/html; charset=utf-8")
-                    handler.send_header("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups")
-                    handler.send_header("Content-Length", str(len(data)))
-                    handler.end_headers()
-                    handler.wfile.write(data)
-                    return True
-                # 2) static/index.html in plugin root (content page for IIFE loader)
-                plugin_root = dashboard_dir.parent
-                static_html = plugin_root / "static" / "index.html"
-                if static_html.is_file():
-                    data = static_html.read_bytes()
+            page_material = get_plugin_page_material(name, plugin_runtime)
+            if page_material:
+                # 1/2) validated full SPA or static content page
+                if page_material.html is not None:
+                    data = page_material.html
                     handler.send_response(200)
                     handler.send_header("Content-Type", "text/html; charset=utf-8")
                     handler.send_header("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups")
@@ -15332,8 +15426,7 @@ def handle_get(handler, parsed) -> bool:
                     handler.wfile.write(data)
                     return True
                 # 3) Fallback: generate shell that loads the IIFE bundle
-                index_js = dashboard_dir / "dist" / "index.js"
-                if index_js.is_file():
+                if page_material.has_index_js:
                     import html
                     label = html.escape(manifest.get("label") or name)
                     css = html.escape(manifest.get("css", ""))
@@ -15509,6 +15602,42 @@ def handle_post(handler, parsed) -> bool:
         result = start_atomic_webui_recovery(body)
         status = int(result.pop("_status", 200) or 200)
         return j(handler, result, status=status)
+    if parsed.path == "/api/internal/release-control":
+        from api import config as _release_config
+        from api.release_control import (
+            execute_release_control,
+            verify_release_control_request,
+        )
+
+        allowed, auth_error = verify_release_control_request(handler, body)
+        if not allowed:
+            return bad(
+                handler,
+                auth_error or "Release control authentication failed",
+                status=403,
+            )
+        headers = getattr(handler, "headers", {})
+        fence_token = (
+            headers.get("X-Hermes-Release-Fence")
+            if hasattr(headers, "get")
+            else None
+        )
+        try:
+            result = execute_release_control(body, fence_token=fence_token)
+        except _release_config.RunAdmissionIdentityMismatch as exc:
+            return bad(handler, str(exc), status=409)
+        except _release_config.RunAdmissionAuthenticationError as exc:
+            return bad(handler, str(exc), status=403)
+        except _release_config.RunAdmissionConflict as exc:
+            return bad(handler, str(exc), status=409)
+        except _release_config.RunAdmissionBusy as exc:
+            return bad(handler, str(exc), status=409)
+        except ValueError as exc:
+            return bad(handler, str(exc), status=400)
+        # Commit changes admission state only. The authenticated external
+        # driver owns exact-PID signalling after it has durably recorded the
+        # receipt and activated the selected immutable release.
+        return j(handler, result)
     if not _guard_request_session_visibility(handler, parsed, body=body, method="POST"):
         if diag:
             diag.finish()
@@ -22817,7 +22946,79 @@ def _handle_sessions_cleanup(handler, body, zero_only=False):
     return j(handler, {"ok": True, "cleaned": cleaned})
 
 
-def _handle_btw(handler, body):
+def _maintenance_fence_payload() -> dict:
+    return {
+        "error": "WebUI maintenance cutover is in progress",
+        "code": "maintenance_fence",
+        "retryable": True,
+    }
+
+
+def _admit_stream_start(kind: str):
+    """Reserve before a handler can persist, register streams, or spawn work."""
+    def decorate(function):
+        @functools.wraps(function)
+        def admitted(*args, **kwargs):
+            scope = run_admission_scope(kind=kind)
+            try:
+                reservation_id, transfer_state = scope.__enter__()
+            except RunAdmissionClosed:
+                if kind in {"btw", "background", "cron", "compression"}:
+                    return j(args[0], _maintenance_fence_payload(), status=503)
+                return {**_maintenance_fence_payload(), "_status": 503}
+            kwargs["_admission_reservation_id"] = reservation_id
+            kwargs["_admission_transfer_state"] = transfer_state
+            try:
+                return function(*args, **kwargs)
+            finally:
+                scope.__exit__(None, None, None)
+
+        return admitted
+
+    return decorate
+
+
+def _admit_handler_start(kind: str):
+    """Reserve admission without changing a handler's public signature."""
+    def decorate(function):
+        @functools.wraps(function)
+        def admitted(handler, body):
+            scope = run_admission_scope(kind=kind)
+            try:
+                reservation_id, transfer_state = scope.__enter__()
+            except RunAdmissionClosed:
+                return j(handler, _maintenance_fence_payload(), status=503)
+            handler._run_admission = (reservation_id, transfer_state)
+            try:
+                return function(handler, body)
+            finally:
+                try:
+                    del handler._run_admission
+                except AttributeError:
+                    pass
+                scope.__exit__(None, None, None)
+
+        return admitted
+
+    return decorate
+
+
+def _current_handler_admission(handler):
+    """Return the reservation installed by ``_admit_handler_start``."""
+    current = getattr(handler, "_run_admission", None)
+    if current is None:
+        raise RuntimeError("handler admission context is unavailable")
+    return current
+
+
+@_admit_stream_start("btw")
+def _handle_btw(
+    handler,
+    body,
+    *,
+    _admission_reservation_id=None,
+    _admission_transfer_state=None,
+):
     """POST /api/btw — ephemeral side question using session context.
 
     Creates a temporary hidden session, streams the answer via SSE, then
@@ -22873,14 +23074,23 @@ def _handle_btw(handler, body):
             "ephemeral": True,
             "model_provider": model_provider,
             "profile": getattr(s, "profile", None),
+            "admission_reservation_id": _admission_reservation_id,
         },
         daemon=True,
     )
     thr.start()
+    _admission_transfer_state["transferred"] = True
     return j(handler, {"stream_id": stream_id, "session_id": ephemeral.session_id, "parent_session_id": body["session_id"]})
 
 
-def _handle_background(handler, body):
+@_admit_stream_start("background")
+def _handle_background(
+    handler,
+    body,
+    *,
+    _admission_reservation_id=None,
+    _admission_transfer_state=None,
+):
     """POST /api/background — run prompt in parallel background agent.
 
     Creates a hidden session, starts streaming in a daemon thread.
@@ -22920,6 +23130,12 @@ def _handle_background(handler, body):
     parent_sid = body["session_id"]
     bg_sid = bg.session_id
     track_background(parent_sid, bg_sid, stream_id, task_id, prompt)
+    finalizer_reservation_id = fork_run_admission(
+        _admission_reservation_id,
+        kind="background_finalizer",
+        session_id=bg_sid,
+    )
+    finalizer_run_id = f"background-finalizer:{task_id}"
 
     def _run_bg_and_notify():
         """Run the background agent, then mark the tracked task `done` with the
@@ -22928,48 +23144,67 @@ def _handle_background(handler, body):
         `get_results()` would see a forever-`running` task and return nothing.
         """
         try:
-            _run_agent_streaming(
-                bg_sid,
-                prompt,
-                s.model,
-                s.workspace,
-                stream_id,
-                None,
-                model_provider=model_provider,
-                profile=getattr(s, "profile", None),
+            register_active_run(
+                finalizer_run_id,
+                admission_reservation_id=finalizer_reservation_id,
+                session_id=bg_sid,
+                phase="background-finalizing",
+                source="background-finalizer",
             )
-            # Reload the bg session from disk and extract the final assistant reply.
             try:
-                from api.models import Session as _Session
-                reloaded = _Session.load(bg_sid)
-                _answer = ""
-                for _m in reversed((reloaded.messages if reloaded else None) or []):
-                    if not isinstance(_m, dict) or _m.get("role") != "assistant":
-                        continue
-                    if _m.get("_error"):
-                        continue
-                    _content = str(_m.get("content") or "").strip()
-                    if _content:
-                        _answer = _content
-                        break
-                complete_background(parent_sid, task_id, _answer or "(no answer produced)")
+                _run_agent_streaming(
+                    bg_sid,
+                    prompt,
+                    s.model,
+                    s.workspace,
+                    stream_id,
+                    None,
+                    model_provider=model_provider,
+                    profile=getattr(s, "profile", None),
+                    admission_reservation_id=_admission_reservation_id,
+                )
+                # Reload the bg session from disk and extract the final assistant reply.
+                try:
+                    from api.models import Session as _Session
+                    reloaded = _Session.load(bg_sid)
+                    _answer = ""
+                    for _m in reversed((reloaded.messages if reloaded else None) or []):
+                        if not isinstance(_m, dict) or _m.get("role") != "assistant":
+                            continue
+                        if _m.get("_error"):
+                            continue
+                        _content = str(_m.get("content") or "").strip()
+                        if _content:
+                            _answer = _content
+                            break
+                    complete_background(parent_sid, task_id, _answer or "(no answer produced)")
+                except Exception:
+                    complete_background(parent_sid, task_id, "(background task failed)")
+                # Best-effort cleanup of the hidden bg session file so it doesn't
+                # clutter the sidebar or SESSION_DIR. The index is pruned on the
+                # next rebuild via _index_entry_exists().
+                try:
+                    _delete_session_sidecar_files(SESSION_DIR / f"{bg_sid}.json")
+                except Exception:
+                    pass
             except Exception:
-                complete_background(parent_sid, task_id, "(background task failed)")
-            # Best-effort cleanup of the hidden bg session file so it doesn't
-            # clutter the sidebar or SESSION_DIR. The index is pruned on the
-            # next rebuild via _index_entry_exists().
-            try:
-                _delete_session_sidecar_files(SESSION_DIR / f"{bg_sid}.json")
-            except Exception:
-                pass
-        except Exception:
-            try:
-                complete_background(parent_sid, task_id, "(background task failed)")
-            except Exception:
-                pass
+                try:
+                    complete_background(parent_sid, task_id, "(background task failed)")
+                except Exception:
+                    pass
+        except RunAdmissionClosed:
+            release_run_admission(finalizer_reservation_id)
+            release_run_admission(_admission_reservation_id)
+        finally:
+            unregister_active_run(finalizer_run_id)
 
     thr = threading.Thread(target=_run_bg_and_notify, daemon=True)
-    thr.start()
+    try:
+        thr.start()
+    except Exception:
+        release_run_admission(finalizer_reservation_id)
+        raise
+    _admission_transfer_state["transferred"] = True
     return j(handler, {"task_id": task_id, "stream_id": stream_id, "session_id": bg.session_id})
 
 
@@ -23211,6 +23446,7 @@ def _active_run_stream_for_session(session_id: str | None) -> str | None:
     return None
 
 
+@_admit_stream_start("chat")
 def _start_chat_stream_for_session(
     s,
     *,
@@ -23228,11 +23464,25 @@ def _start_chat_stream_for_session(
     session_lock_held: bool = False,
     recovery_claim_token: str | None = None,
     recovery_fingerprint: str | None = None,
+    _admission_reservation_id=None,
+    _admission_transfer_state=None,
     delegation_id: str = "",
     delegation_turn_id: str = "",
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     attachments = attachments or []
+    process_completion_events: list[dict] = []
+
+    def _claim_process_completion_events_for_worker() -> None:
+        nonlocal process_completion_events
+        if source != "process_wakeup" or process_completion_events:
+            return
+        from api.background_process import claim_staged_process_completion_events
+
+        process_completion_events = claim_staged_process_completion_events(
+            s.session_id
+        )
+
     recovery_assistant_index_before: int | None = None
     if recovery_claim_token or recovery_fingerprint:
         recovery_assistant_index_before = next(
@@ -23312,6 +23562,7 @@ def _start_chat_stream_for_session(
             _goal_guard_error = _claim_goal_continuation_guard()
             if _goal_guard_error:
                 return _goal_guard_error
+            _claim_process_completion_events_for_worker()
             stream_id = uuid.uuid4().hex
             was_hidden_empty_session = _is_hidden_empty_session(s)
             _prepare_chat_start_session_for_stream(
@@ -23349,6 +23600,7 @@ def _start_chat_stream_for_session(
                 _goal_guard_error = _claim_goal_continuation_guard()
                 if _goal_guard_error:
                     return _goal_guard_error
+                _claim_process_completion_events_for_worker()
                 stream_id = uuid.uuid4().hex
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)
@@ -23455,54 +23707,86 @@ def _start_chat_stream_for_session(
             "model_provider": model_provider,
             "goal_related": goal_related,
             "profile": getattr(s, "profile", None),
+            "admission_reservation_id": _admission_reservation_id,
         }
+        if process_completion_events:
+            worker_kwargs["process_completion_events"] = process_completion_events
         if moa_config and not backend_is_gateway:
             worker_kwargs["moa_config"] = moa_config
         if bestplan_config and not backend_is_gateway:
             worker_kwargs["bestplan_config"] = bestplan_config
 
         worker_ready = threading.Event()
-        worker_cancel = threading.Event()
+        worker_start_lock = threading.Lock()
         worker_start = {
-            "ok": not bool(delegation_id),
+            "state": "accepted" if not delegation_id else "pending",
             "event": journal_event,
             "error": None,
         }
 
-        def _durable_worker_target():
-            if delegation_id:
-                try:
-                    from api.turn_journal import mark_delegation_turn_started
+        def _accept_durable_worker() -> bool:
+            if not delegation_id:
+                return True
+            with worker_start_lock:
+                if worker_start["state"] != "pending":
+                    return worker_start["state"] == "accepted"
+                worker_start["state"] = "accepting"
+            try:
+                from api.turn_journal import mark_delegation_turn_started
 
-                    worker_start["event"] = mark_delegation_turn_started(
-                        s.session_id,
-                        delegation_id,
-                        turn_id=str(
-                            delegation_turn_id
-                            or journal_event.get("turn_id")
-                            or ""
-                        ),
-                        stream_id=stream_id,
-                    )
-                    worker_start["ok"] = True
-                except Exception as exc:
-                    worker_start["error"] = exc
-                    logger.exception(
-                        "Failed to persist delegation worker-start boundary"
-                    )
-                finally:
+                accepted = mark_delegation_turn_started(
+                    s.session_id,
+                    delegation_id,
+                    turn_id=str(
+                        delegation_turn_id
+                        or journal_event.get("turn_id")
+                        or ""
+                    ),
+                    stream_id=stream_id,
+                )
+                with worker_start_lock:
+                    worker_start["event"] = accepted
+                    worker_start["state"] = "accepted"
                     worker_ready.set()
-                if not worker_start["ok"] or worker_cancel.is_set():
-                    return
-            worker_target(
-                s.session_id,
-                msg,
-                model,
-                workspace,
-                stream_id,
-                attachments,
-                **worker_kwargs,
-            )
+                    return True
+            except Exception as exc:
+                with worker_start_lock:
+                    worker_start["state"] = "rejected"
+                    worker_start["error"] = exc
+                    worker_ready.set()
+                logger.exception(
+                    "Failed to persist delegation worker-start boundary"
+                )
+                return False
+
+        if delegation_id:
+            worker_kwargs["worker_accept_callback"] = _accept_durable_worker
+
+        def _durable_worker_target():
+            try:
+                worker_target(
+                    s.session_id,
+                    msg,
+                    model,
+                    workspace,
+                    stream_id,
+                    attachments,
+                    **worker_kwargs,
+                )
+            except Exception as exc:
+                if delegation_id and not worker_ready.is_set():
+                    with worker_start_lock:
+                        if worker_start["state"] == "pending":
+                            worker_start["state"] = "rejected"
+                            worker_start["error"] = exc
+                            worker_ready.set()
+                raise
+            finally:
+                # Test adapters and third-party worker targets may return
+                # without implementing the callback. In that case the target
+                # has already run, so persisting acceptance now is truthful.
+                if delegation_id and not worker_ready.is_set():
+                    _accept_durable_worker()
 
         thr = threading.Thread(
             target=_durable_worker_target if delegation_id else worker_target,
@@ -23516,15 +23800,30 @@ def _start_chat_stream_for_session(
         )
         thr.start()
         if delegation_id:
-            if not worker_ready.wait(timeout=10):
-                worker_cancel.set()
-            if not worker_start["ok"]:
+            if not worker_ready.wait(
+                timeout=_DELEGATION_WORKER_ACCEPT_TIMEOUT_SECONDS
+            ):
+                with worker_start_lock:
+                    if worker_start["state"] == "pending":
+                        worker_start["state"] = "rejected"
+                        worker_start["error"] = RuntimeError(
+                            "delegation worker acceptance timed out"
+                        )
+                        worker_ready.set()
+            with worker_start_lock:
+                worker_accepted = worker_start["state"] in {
+                    "accepting",
+                    "accepted",
+                }
+                worker_event = worker_start["event"]
+            if not worker_accepted:
                 _clear_stale_stream_state(s)
                 return {
                     "error": "delegation worker-start boundary could not be persisted",
                     "_status": 503,
                 }
-            journal_event = worker_start["event"]
+            journal_event = worker_event
+        _admission_transfer_state["transferred"] = True
     except Exception:
         if not (recovery_claim_token or recovery_fingerprint):
             raise
@@ -23538,6 +23837,7 @@ def _start_chat_stream_for_session(
         except Exception:
             thread_started = True
         if active_run_exists or thread_started:
+            _admission_transfer_state["transferred"] = True
             # A custom Thread implementation could raise after starting. Keep
             # ownership and reservation intact because launch is uncertain.
             return {
@@ -23658,6 +23958,7 @@ def _runtime_adapter_goal_action(goal_args: str) -> str:
     return "set"
 
 
+@_admit_stream_start("run_dispatch")
 def _start_run(
     s,
     *,
@@ -23675,6 +23976,8 @@ def _start_run(
     session_lock_held: bool = False,
     recovery_claim_token: str | None = None,
     recovery_fingerprint: str | None = None,
+    _admission_reservation_id=None,
+    _admission_transfer_state=None,
     delegation_id: str = "",
     delegation_turn_id: str = "",
 ):
@@ -23696,6 +23999,10 @@ def _start_run(
     returns no adapter is surfaced as ``{"error": str(exc), "_status": 501}``
     so both call sites can map it onto their own HTTP shape.
     """
+    # This outer reservation covers adapter selection and remote dispatch.
+    # Legacy local starts take their own worker-lifetime reservation below;
+    # remote runner work no longer mutates this process after start_run returns.
+    _admission_transfer_state["transferred"] = False
     from api.runtime_adapter import (
         LegacyJournalRuntimeAdapter,
         StartRunRequest,
@@ -23711,6 +24018,29 @@ def _start_run(
         }
 
     if runtime_adapter_enabled() or runtime_adapter_runner_enabled():
+        if source == "process_wakeup" and runtime_adapter_runner_enabled():
+            try:
+                from api.background_process import has_staged_process_completion_events
+
+                if has_staged_process_completion_events(s.session_id):
+                    return {
+                        "error": (
+                            "Durable process-completion wakeups require a local "
+                            "writeback worker"
+                        ),
+                        "code": "durable_completion_runner_unsupported",
+                        "_status": 501,
+                    }
+            except Exception:
+                logger.exception(
+                    "Failed to prove durable process-completion runner ownership"
+                )
+                return {
+                    "error": "Durable process-completion ownership is unavailable",
+                    "code": "durable_completion_owner_unavailable",
+                    "_status": 503,
+                }
+
         def _legacy_start_run(request: StartRunRequest) -> dict:
             return _start_chat_stream_for_session(
                 s,
@@ -23846,11 +24176,14 @@ def _refresh_process_wakeup_pause_credential_fingerprint(session) -> bool:
     return True
 
 
+@_admit_stream_start("run_dispatch")
 def start_session_turn(
     session_id: str,
     message: str,
     *,
     source: str = "process_wakeup",
+    _admission_reservation_id=None,
+    _admission_transfer_state=None,
     delegation_id: str = "",
 ):
     """Start a server-side agent turn for ``session_id`` with ``message``.
@@ -24132,48 +24465,106 @@ def start_session_turn(
     return resp
 
 
-def _recover_tool_limit_continuations_on_startup() -> None:
-    """Best-effort startup recovery for claimed children whose launch did not land."""
-    try:
-        from api.tool_limit_continuation import recover_pending_continuations
+def _recover_tool_limit_continuations_on_startup(
+    *,
+    strict: bool = False,
+    transaction_id: str | None = None,
+    manifest_sha256: str | None = None,
+) -> dict:
+    """Recover claimed children and return a terminal startup receipt.
 
-        recover_pending_continuations(
+    Unmanaged imports retain their historical best-effort detached behavior.
+    Managed startup calls this synchronously with ``strict=True`` so a failed
+    recovery cannot escape the signed acceptance boundary.
+    """
+    try:
+        from api import tool_limit_continuation
+
+        if strict:
+            receipt = tool_limit_continuation.recover_managed_continuations_exact(
+                transaction_id=transaction_id,
+                manifest_sha256=manifest_sha256,
+                start=lambda sid, prompt: start_session_turn(
+                    sid, prompt, source="tool_limit_continuation"
+                ),
+            )
+            if receipt.outcome.value not in {"ABSENT", "COMPLETE"}:
+                raise RuntimeError(
+                    "managed tool-limit continuation recovery was not terminal: "
+                    f"{receipt.outcome.value}"
+                )
+            return receipt.to_dict()
+
+        recovered = tool_limit_continuation.recover_pending_continuations(
             start=lambda sid, prompt: start_session_turn(
                 sid, prompt, source="tool_limit_continuation"
             )
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("tool-limit continuation startup recovery failed")
+        if strict:
+            raise
+        return {"status": "failed", "error": type(exc).__name__}
+    return {"status": "complete", "recovered": int(recovered or 0)}
 
 
-# routes is imported by server.py before serving requests. Recovery is detached
-# so a provider/model initialization can never delay server startup.
-threading.Thread(
+# Unmanaged startup retains the historical detached recovery path. A managed
+# candidate refuses this import-time launch, then server.py replays the same
+# function synchronously inside the signed startup-accept transaction.
+start_admitted_auxiliary_thread(
+    kind="tool_limit_continuation_recovery",
     target=_recover_tool_limit_continuations_on_startup,
     name="tool-limit-continuation-recovery",
     daemon=True,
-).start()
+    registration_timeout=1.0,
+)
 
 
-def _recover_goal_continuations_on_startup() -> None:
-    """Best-effort restart recovery for judged goal turns not yet launched."""
+def _recover_goal_continuations_on_startup(
+    *,
+    strict: bool = False,
+    transaction_id: str | None = None,
+    manifest_sha256: str | None = None,
+) -> dict:
+    """Recover judged goal turns and return a terminal startup receipt."""
     try:
-        from api.goal_continuation import recover_pending_goal_continuations
+        from api import goal_continuation
 
-        recover_pending_goal_continuations(
+        if strict:
+            receipt = goal_continuation.recover_managed_goal_continuations_exact(
+                transaction_id=transaction_id,
+                manifest_sha256=manifest_sha256,
+                start=lambda sid, prompt: start_session_turn(
+                    sid, prompt, source="goal_continuation"
+                ),
+            )
+            if receipt.outcome.value not in {"ABSENT", "COMPLETE"}:
+                raise RuntimeError(
+                    "managed goal continuation recovery was not terminal: "
+                    f"{receipt.outcome.value}"
+                )
+            return receipt.to_dict()
+
+        recovered = goal_continuation.recover_pending_goal_continuations(
             start=lambda sid, prompt: start_session_turn(
                 sid, prompt, source="goal_continuation"
             )
         )
-    except Exception:
+    except Exception as exc:
         logger.exception("goal continuation startup recovery failed")
+        if strict:
+            raise
+        return {"status": "failed", "error": type(exc).__name__}
+    return {"status": "complete", "recovered": int(recovered or 0)}
 
 
-threading.Thread(
+start_admitted_auxiliary_thread(
+    kind="goal_continuation_recovery",
     target=_recover_goal_continuations_on_startup,
     name="goal-continuation-recovery",
     daemon=True,
-).start()
+    registration_timeout=1.0,
+)
 
 
 def _handle_bg_task_complete_ack(handler, body):
@@ -25162,7 +25553,11 @@ def _handle_cron_delete(handler, body):
     return j(handler, {"ok": True, "job_id": body["job_id"]})
 
 
+@_admit_handler_start("cron")
 def _handle_cron_run(handler, body):
+    _admission_reservation_id, _admission_transfer_state = (
+        _current_handler_admission(handler)
+    )
     job_id = body.get("job_id", "")
     if not job_id:
         return bad(handler, "job_id required")
@@ -25194,7 +25589,18 @@ def _handle_cron_run(handler, body):
     _profile_home = get_active_hermes_home()
     _execution_profile_home = _profile_home_for_cron_job(job)
     _event_profile = _event_profile_for_cron_job(job)
-    threading.Thread(target=_run_cron_tracked, args=(job, _profile_home, _execution_profile_home, _event_profile), daemon=True).start()
+    threading.Thread(
+        target=_run_admitted_cron,
+        args=(
+            job,
+            _profile_home,
+            _execution_profile_home,
+            _event_profile,
+            _admission_reservation_id,
+        ),
+        daemon=True,
+    ).start()
+    _admission_transfer_state["transferred"] = True
     return j(handler, {"ok": True, "job_id": job_id, "status": "running"})
 
 
@@ -26648,7 +27054,33 @@ def _run_manual_compression_job(sid, body):
                 )
 
 
-def _handle_session_compress_start(handler, body):
+def _run_admitted_manual_compression(sid, body, admission_reservation_id):
+    run_id = f"compression:{sid}:{str(admission_reservation_id or '')[:8]}"
+    try:
+        register_active_run(
+            run_id,
+            admission_reservation_id=admission_reservation_id,
+            session_id=sid,
+            phase="compression-running",
+            source="manual-compression",
+        )
+    except RunAdmissionClosed:
+        release_run_admission(admission_reservation_id)
+        return
+    try:
+        _run_manual_compression_job(sid, body)
+    finally:
+        unregister_active_run(run_id)
+
+
+@_admit_stream_start("compression")
+def _handle_session_compress_start(
+    handler,
+    body,
+    *,
+    _admission_reservation_id=None,
+    _admission_transfer_state=None,
+):
     try:
         require(body, "session_id")
     except ValueError as e:
@@ -26695,12 +27127,13 @@ def _handle_session_compress_start(handler, body):
         _MANUAL_COMPRESSION_JOBS[sid] = job
 
     worker = threading.Thread(
-        target=_run_manual_compression_job,
-        args=(sid, job_body),
+        target=_run_admitted_manual_compression,
+        args=(sid, job_body, _admission_reservation_id),
         name=f"manual-compress-{sid[:8]}",
         daemon=True,
     )
     worker.start()
+    _admission_transfer_state["transferred"] = True
 
     with _MANUAL_COMPRESSION_JOBS_LOCK:
         return j(handler, _manual_compression_status_payload(_MANUAL_COMPRESSION_JOBS.get(sid, job)))

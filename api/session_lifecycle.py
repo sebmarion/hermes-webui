@@ -57,6 +57,31 @@ _background_commit_threads_lock = threading.Lock()
 _draining = False
 
 
+def background_commit_activity_snapshot() -> dict:
+    """Return the release-barrier view of memory-provider commit work.
+
+    The thread registry covers fire-and-forget session-boundary commits while
+    ``in_flight`` also catches commits initiated by eviction or shutdown paths.
+    Locks are sampled separately so this read-only probe never introduces a
+    new nested lock order into the lifecycle.
+    """
+    with _background_commit_threads_lock:
+        background_count = sum(
+            1 for thread in _background_commit_threads if thread.is_alive()
+        )
+    with _lock:
+        in_flight_count = sum(
+            1
+            for entry in _sessions.values()
+            if isinstance(entry, dict) and entry.get("in_flight") is True
+        )
+    return {
+        "active_background_memory_commits": background_count,
+        "in_flight_memory_commits": in_flight_count,
+        "memory_commit_activity_available": True,
+    }
+
+
 def _register_background_commit_thread(t: threading.Thread) -> bool:
     """Register a fire-and-forget commit thread. Returns True if the caller
     should start it. Returns False when shutdown draining has already begun —

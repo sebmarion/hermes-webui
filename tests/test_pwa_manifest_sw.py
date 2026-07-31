@@ -57,7 +57,7 @@ class TestServiceWorker:
         src = SW.read_text(encoding="utf-8")
         assert "__WEBUI_VERSION__" in src, (
             "sw.js must contain __WEBUI_VERSION__ placeholder for the server "
-            "handler at /sw.js to replace with WEBUI_VERSION at request time"
+            "handler at /sw.js to replace with WEBUI_ASSET_VERSION at request time"
         )
 
     def test_sw_js_has_no_merge_conflict_markers(self):
@@ -164,10 +164,10 @@ class TestPWARoutes:
         assert idx != -1, "routes.py must handle /sw.js"
         block = src[idx:idx + 1000]
         assert "__WEBUI_VERSION__" in block, (
-            "sw.js route must replace __WEBUI_VERSION__ with the current WEBUI_VERSION"
+            "sw.js route must replace __WEBUI_VERSION__ with WEBUI_ASSET_VERSION"
         )
-        assert "WEBUI_VERSION" in block, (
-            "sw.js route must import and use WEBUI_VERSION for cache busting"
+        assert "WEBUI_ASSET_VERSION" in block, (
+            "sw.js route must import and use WEBUI_ASSET_VERSION for cache busting"
         )
 
     def test_sw_route_url_encodes_cache_version(self):
@@ -175,9 +175,9 @@ class TestPWARoutes:
         idx = src.find('"/sw.js"')
         assert idx != -1, "routes.py must handle /sw.js"
         block = src[idx:idx + 1200]
-        assert "quote(WEBUI_VERSION, safe=\"\")" in block, (
-            "sw.js route must URL-encode the injected cache version so unusual git tags "
-            "cannot break the JavaScript string literal"
+        assert "quote(WEBUI_ASSET_VERSION, safe=\"\")" in block, (
+            "sw.js route must URL-encode the injected asset-cache version so "
+            "deployment identities cannot break the JavaScript string literal"
         )
 
     def test_sw_route_sets_service_worker_allowed(self):
@@ -360,7 +360,7 @@ class TestIndexHtmlIntegration:
                 idx = src.find('parsed.path.startswith("/session/")')
             assert idx != -1, "routes.py must handle /, /index.html, and /session/<id>"
             block = src[idx:idx + 800]
-        assert "quote(WEBUI_VERSION, safe=\"\")" in block, (
+        assert "quote(WEBUI_ASSET_VERSION, safe=\"\")" in block, (
             "the app-shell render must URL-encode the cache-busting version token before "
             "injecting it into script src attributes and service worker registration"
         )

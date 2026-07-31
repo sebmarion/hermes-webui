@@ -13,18 +13,14 @@ from api.profiles import _profiles_match
 from api.session_projection import projection_token as _session_list_projection_token
 
 
-_SESSIONS_CACHE_TTL_SECONDS = 2.5
-# #4808: while a turn is actively streaming the frontend polls /api/sessions on a
-# fixed cadence (static/sessions.js `_streamingPollMs`). With the idle TTL of
-# 2.5s, the entry expires between streaming polls, so each poll can find it stale
-# and force a full all_sessions() rebuild on the hot path under the global store
-# LOCK — pinning CPU and starving token rendering on large stores (recurrence of
-# #4672). Hold the sidebar cache steady for longer than one poll interval while
-# streaming; live runtime state (active stream, sort order, pending flags) is
-# overlaid on every response regardless of cache, and structural/settings changes
-# still invalidate immediately. Keep this strictly greater than
-# `_streamingPollMs`/1000 (see tests/test_streaming_cache_ttl_vs_poll.py).
-_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 45.0
+_SESSIONS_CACHE_TTL_SECONDS = 30.0
+# The browser's session-activity poll runs every 5s
+# (static/sessions.js `_sessionActivityPollMs`). Age expiry is only a bounded
+# safety backstop: source-stamp changes and published session-list mutations
+# still invalidate immediately, and live runtime state is overlaid per response.
+# Use the same bound while streaming so client poll cadence never selects a
+# different projection-rebuild policy.
+_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 30.0
 _SESSIONS_CACHE_MAX_ENTRIES = 64
 _SESSIONS_CACHE_WAIT_SECONDS = 0.25
 _SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
@@ -178,8 +174,8 @@ def _session_list_cache_get(
                 return copy.deepcopy(payload), False
             _SESSIONS_CACHE.pop(key, None)
             return None, False
-        # #4808: widen the freshness window while a turn is streaming so the fixed
-        # streaming poll cadence doesn't force a full rebuild on every poll.
+        # Keep the existing streaming branch explicit, but use one bounded age
+        # policy for idle and streaming cache entries.
         ttl = _SESSIONS_CACHE_TTL_SECONDS
         if _session_list_cache_streaming_freeze_marker() is not None:
             ttl = _SESSIONS_CACHE_STREAMING_TTL_SECONDS

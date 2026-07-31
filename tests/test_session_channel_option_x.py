@@ -419,8 +419,8 @@ def test_server_starts_session_channel_reaper():
 def test_server_proves_socket_ownership_before_starting_gateway_watcher():
     src = (REPO_ROOT / "server.py").read_text()
     bind = src.index("httpd = QuietHTTPServer((HOST, PORT), Handler)")
-    watcher = src.index("from api.gateway_watcher import start_watcher")
-    assert bind < watcher
+    startup_mutators = src.index("startup_mutators = _prepare_startup_mutators()")
+    assert bind < startup_mutators
 
 
 def test_frontend_opens_session_stream():

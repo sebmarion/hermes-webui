@@ -522,6 +522,57 @@ def test_tool_pair_crossing_visible_boundary_uses_bounded_closure(tmp_path):
     assert page.serialized_bytes <= 2_621_440
 
 
+def test_complete_page_stops_before_unrelated_hidden_tool_result(tmp_path):
+    from api.session_message_paging import read_state_db_message_page
+
+    db = tmp_path / "state.db"
+    _make_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp, tool_calls) "
+            "VALUES (1, 'tip', 'assistant', '', 1, ?)",
+            ('[{"id":"call-older","type":"function"}]',),
+        )
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp, tool_call_id) "
+            "VALUES (2, 'tip', 'tool', 'older result', 2, 'call-older')"
+        )
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp, tool_calls) "
+            "VALUES (3, 'tip', 'assistant', '', 3, ?)",
+            ('[{"id":"call-newer","type":"function"}]',),
+        )
+        conn.execute(
+            "INSERT INTO messages(id, session_id, role, content, timestamp, tool_call_id) "
+            "VALUES (4, 'tip', 'tool', 'newer result', 4, 'call-newer')"
+        )
+
+    page = read_state_db_message_page(
+        db_path=db,
+        resolution=_resolution(db),
+        visible_limit=1,
+        cursor=None,
+    )
+    continuation = read_state_db_message_page(
+        db_path=db,
+        resolution=_resolution(db),
+        visible_limit=1,
+        cursor=page.before_boundaries,
+    )
+
+    assert page.mode == "cursor_v1"
+    assert [
+        message["_state_db_message_id"]
+        for message in page.messages
+    ] == [3, 4]
+    assert page.has_more is True
+    assert continuation.mode == "cursor_v1"
+    assert [
+        message["_state_db_message_id"]
+        for message in continuation.messages
+    ] == [1, 2]
+
+
 @pytest.mark.parametrize("partner_rank", [257, 320])
 def test_tool_closure_can_use_full_post_budget_allowance(tmp_path, partner_rank):
     from api.session_message_paging import read_state_db_message_page

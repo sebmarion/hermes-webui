@@ -135,3 +135,31 @@ def test_reconcile_stale_stream_state_skips_live_stream_rows(monkeypatch):
 
     assert changed is False
     assert loaded == []
+
+
+def test_stale_stream_reconciliation_is_admission_tracked(monkeypatch):
+    calls = []
+
+    def fake_start_admitted_auxiliary_thread(**kwargs):
+        calls.append(kwargs)
+        kwargs["target"](*kwargs.get("args", ()), **(kwargs.get("kwargs") or {}))
+        return True
+
+    monkeypatch.setattr(
+        routes,
+        "start_admitted_auxiliary_thread",
+        fake_start_admitted_auxiliary_thread,
+    )
+    monkeypatch.setattr(
+        routes,
+        "_reconcile_stale_stream_state_for_session_rows",
+        lambda rows: rows == [{"session_id": "stale"}],
+    )
+
+    assert routes._schedule_stale_stream_state_reconciliation(
+        [{"session_id": "stale"}]
+    ) is True
+    assert len(calls) == 1
+    assert calls[0]["kind"] == "session_sidecar_reconciliation"
+    assert calls[0]["name"] == "stale-stream-reconciliation"
+    assert routes._STALE_STREAM_RECONCILIATION_LOCK.locked() is False

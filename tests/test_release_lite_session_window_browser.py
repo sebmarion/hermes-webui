@@ -254,6 +254,136 @@ console.log(JSON.stringify([
     assert result == [None, None]
 
 
+def test_lazy_tail_parser_allows_metadata_free_typed_fallback_only():
+    parser = _function_source(SESSIONS, "_parseLazyTailPayload")
+    result = _node(
+        parser
+        + """
+const base={
+ requested_session_id:'requested',canonical_session_id:'canonical',messages:[],
+ runtime_snapshot:null,
+ conversation_window:{schema:'lazy_tail_v1',state:'legacy_required',source:'state_db',
+ visible_count:0,has_older:false,older_cursor:null,newest_message_id:null,
+ active_stream_id:null,reconnect_token:null,exact_total_available:false,
+ status_reason:'tool_pair_outside_closure'}
+};
+const stale={...base,conversation_window:{
+  ...base.conversation_window,state:'stale',status_reason:'state_db_changed'
+}};
+const ready={...base,conversation_window:{
+  ...base.conversation_window,state:'ready',status_reason:null
+}};
+console.log(JSON.stringify({
+  legacy:_parseLazyTailPayload(base,'requested',{requireMetadata:true})?.window.state || null,
+  stale:_parseLazyTailPayload(stale,'requested',{requireMetadata:true})?.window.state || null,
+  ready:_parseLazyTailPayload(ready,'requested',{requireMetadata:true})
+}));
+"""
+    )
+
+    assert result == {
+        "legacy": "legacy_required",
+        "stale": "stale",
+        "ready": None,
+    }
+
+
+def test_lazy_tail_parser_rejects_present_but_malformed_fallback_metadata():
+    parser = _function_source(SESSIONS, "_parseLazyTailPayload")
+    result = _node(
+        parser
+        + """
+const payload={
+ requested_session_id:'requested',canonical_session_id:'canonical',
+ session_metadata:null,messages:[],runtime_snapshot:null,
+ conversation_window:{schema:'lazy_tail_v1',state:'legacy_required',source:'state_db',
+ visible_count:0,has_older:false,older_cursor:null,newest_message_id:null,
+ active_stream_id:null,reconnect_token:null,exact_total_available:false,
+ status_reason:'tool_pair_outside_closure'}
+};
+console.log(JSON.stringify(
+  _parseLazyTailPayload(payload,'requested',{requireMetadata:true})
+));
+"""
+    )
+
+    assert result is None
+
+
+def test_lazy_tail_parser_rejects_malformed_fallback_status_reason():
+    parser = _function_source(SESSIONS, "_parseLazyTailPayload")
+    result = _node(
+        parser
+        + """
+const base={
+ requested_session_id:'requested',canonical_session_id:'canonical',
+ messages:[],runtime_snapshot:null,
+ conversation_window:{schema:'lazy_tail_v1',state:'legacy_required',source:'state_db',
+ visible_count:0,has_older:false,older_cursor:null,newest_message_id:null,
+ active_stream_id:null,reconnect_token:null,exact_total_available:false,
+ status_reason:'tool_pair_outside_closure'}
+};
+const missing={...base,conversation_window:{...base.conversation_window}};
+delete missing.conversation_window.status_reason;
+const objectReason={...base,conversation_window:{
+  ...base.conversation_window,status_reason:{secret:'not-a-code'}
+}};
+const oversized={...base,conversation_window:{
+  ...base.conversation_window,status_reason:'x'.repeat(129)
+}};
+const displayText={...base,conversation_window:{
+  ...base.conversation_window,status_reason:'Not a sanitized reason'
+}};
+console.log(JSON.stringify([
+  _parseLazyTailPayload(missing,'requested',{requireMetadata:true}),
+  _parseLazyTailPayload(objectReason,'requested',{requireMetadata:true}),
+  _parseLazyTailPayload(oversized,'requested',{requireMetadata:true}),
+  _parseLazyTailPayload(displayText,'requested',{requireMetadata:true})
+]));
+"""
+    )
+
+    assert result == [None, None, None, None]
+
+
+def test_lazy_tail_load_decision_retries_once_then_uses_legacy():
+    decision = _function_source(SESSIONS, "_lazyTailLoadDecision")
+    result = _node(
+        decision
+        + """
+const fallback={window:{
+  state:'legacy_required',status_reason:'tool_pair_outside_closure'
+}};
+const ready={window:{state:'ready',status_reason:null}};
+console.log(JSON.stringify({
+  first:_lazyTailLoadDecision(fallback,{}),
+  repeated:_lazyTailLoadDecision(fallback,{lazyTailRestartAttempted:true}),
+  ready:_lazyTailLoadDecision(ready,{}),
+  invalid:_lazyTailLoadDecision(null,{})
+}));
+"""
+    )
+
+    assert result == {
+        "first": {
+            "action": "retry",
+            "reason": "tool_pair_outside_closure",
+        },
+        "repeated": {
+            "action": "legacy",
+            "reason": "tool_pair_outside_closure",
+        },
+        "ready": {
+            "action": "adopt",
+            "reason": None,
+        },
+        "invalid": {
+            "action": "legacy",
+            "reason": "The server returned an invalid fast task window.",
+        },
+    }
+
+
 def test_five_older_pages_remain_ordered_and_stable_id_deduped():
     merge = _function_source(SESSIONS, "_mergeLazyTailOlderMessages")
     result = _node(
@@ -278,16 +408,344 @@ console.log(JSON.stringify({
     assert result == {"count": 280, "first": "0", "last": "279", "unique": 280}
 
 
-def test_load_session_uses_lazy_route_and_has_explicit_legacy_only():
+def test_load_session_uses_lazy_route_with_bounded_automatic_legacy():
     load = _function_source(SESSIONS, "loadSession")
     explicit = _function_source(SESSIONS, "loadCompleteLegacyTranscript")
 
     assert "/api/session-window?session_id=${encodeURIComponent(sid)}&msg_limit=5&resolve_model=0" in load
     assert "window.__HERMES_CONFIG__.lazyTailV1===true" in load
+    assert "lazy_tail_legacy_automatic" in load
+    assert "forceLegacyMessagePaging:true" in load
+    assert "completeLegacyTranscript:true" not in load
     assert "forceLegacyMessagePaging" in explicit
     assert "forceLegacyMessagePaging:true,completeLegacyTranscript:true" in explicit
+    assert "lazyTailRestartAttempted" in load
     assert "S.session._modelResolutionDeferred=!_useLazyTail" in SESSIONS
     assert "if(!_useLazyTail) _resolveSessionModelForDisplaySoon(sid)" in SESSIONS
+
+
+def test_load_session_retries_typed_fallback_once_then_loads_legacy():
+    helpers = "\n".join(
+        (
+            "async " + _function_source(SESSIONS, "loadSession"),
+            _function_source(SESSIONS, "_parseLazyTailPayload"),
+            _function_source(SESSIONS, "_lazyTailLoadDecision"),
+        )
+    )
+    result = _node(
+        helpers
+        + """
+let _loadSessionGeneration=0;
+let _loadingSessionId=null;
+let _pendingCarryForwardSnapshot=null;
+let _loadingOlder=false;
+let _messagesTruncated=false;
+let _oldestIdx=0;
+let _messageUserUnpinned=false;
+let _scrollPinned=true;
+let _yoloEnabled=false;
+let S={session:null,messages:[],toolCalls:[],pendingFiles:[]};
+let INFLIGHT={};
+const window={
+  _boundedConversationBrowser:false,
+  __HERMES_CONFIG__:{lazyTailV1:true}
+};
+const fallback={
+  requested_session_id:'task-a',canonical_session_id:'task-a',
+  messages:[],runtime_snapshot:null,
+  conversation_window:{
+    schema:'lazy_tail_v1',state:'legacy_required',source:'state_db',
+    visible_count:0,has_older:false,older_cursor:null,newest_message_id:null,
+    active_stream_id:null,reconnect_token:null,exact_total_available:false,
+    status_reason:'tool_pair_outside_closure'
+  }
+};
+let apiCalls=[];
+let recoveryReasons=[];
+let rearms=0;
+async function api(path){
+  apiCalls.push(path);
+  return path.startsWith('/api/session-window') ? fallback : undefined;
+}
+function _rearmActiveSessionStream(){rearms+=1;}
+function stopApprovalPolling(){}
+function hideApprovalCard(){}
+function stopSessionStream(){}
+function _updateYoloPill(){}
+function stopClarifyPolling(){}
+function hideClarifyCard(){}
+function _clearSameSessionForceReloadHint(){}
+function _resetMessagePaging(){}
+function _showLazyTailRecovery(_sid,reason){recoveryReasons.push(reason);}
+function $(id){return null;}
+(async()=>{
+  const loaded=await loadSession('task-a');
+  console.log(JSON.stringify({
+    loaded,
+    apiCalls,
+    legacyCalls:apiCalls.filter(path=>path.startsWith('/api/session?')),
+    recoveryReasons,
+    rearms,
+    finalLoadingSessionId:_loadingSessionId
+  }));
+})();
+"""
+    )
+
+    assert result == {
+        "apiCalls": [
+            "/api/session-window?session_id=task-a&msg_limit=5&resolve_model=0",
+            "/api/session-window?session_id=task-a&msg_limit=5&resolve_model=0",
+            "/api/session?session_id=task-a&messages=0&resolve_model=0",
+        ],
+        "legacyCalls": [
+            "/api/session?session_id=task-a&messages=0&resolve_model=0",
+        ],
+        "recoveryReasons": [],
+        "rearms": 4,
+        "finalLoadingSessionId": None,
+    }
+
+
+def test_load_session_malformed_fast_payload_loads_legacy_once():
+    helpers = "\n".join(
+        (
+            "async " + _function_source(SESSIONS, "loadSession"),
+            _function_source(SESSIONS, "_parseLazyTailPayload"),
+            _function_source(SESSIONS, "_lazyTailLoadDecision"),
+        )
+    )
+    result = _node(
+        helpers
+        + """
+let _loadSessionGeneration=0;
+let _loadingSessionId=null;
+let _pendingCarryForwardSnapshot=null;
+let _loadingOlder=false;
+let _messagesTruncated=false;
+let _oldestIdx=0;
+let _messageUserUnpinned=false;
+let _scrollPinned=true;
+let _yoloEnabled=false;
+let S={session:null,messages:[],toolCalls:[],pendingFiles:[]};
+let INFLIGHT={};
+const window={
+  _boundedConversationBrowser:false,
+  __HERMES_CONFIG__:{lazyTailV1:true}
+};
+let apiCalls=[];
+let recoveryReasons=[];
+async function api(path){
+  apiCalls.push(path);
+  return path.startsWith('/api/session-window') ? null : undefined;
+}
+function _rearmActiveSessionStream(){}
+function stopApprovalPolling(){}
+function hideApprovalCard(){}
+function stopSessionStream(){}
+function _updateYoloPill(){}
+function stopClarifyPolling(){}
+function hideClarifyCard(){}
+function _clearSameSessionForceReloadHint(){}
+function _resetMessagePaging(){}
+function _showLazyTailRecovery(_sid,reason){recoveryReasons.push(reason);}
+function $(id){return null;}
+(async()=>{
+  await loadSession('task-a');
+  console.log(JSON.stringify({apiCalls,recoveryReasons}));
+})();
+"""
+    )
+
+    assert result == {
+        "apiCalls": [
+            "/api/session-window?session_id=task-a&msg_limit=5&resolve_model=0",
+            "/api/session?session_id=task-a&messages=0&resolve_model=0",
+        ],
+        "recoveryReasons": [],
+    }
+
+
+def test_load_session_undefined_fast_payload_keeps_auth_redirect_exit():
+    load = "async " + _function_source(SESSIONS, "loadSession")
+    result = _node(
+        load
+        + """
+let _loadSessionGeneration=0;
+let _loadingSessionId=null;
+let _pendingCarryForwardSnapshot=null;
+let _loadingOlder=false;
+let _messagesTruncated=false;
+let _oldestIdx=0;
+let _messageUserUnpinned=false;
+let _scrollPinned=true;
+let _yoloEnabled=false;
+let S={session:null,messages:[],toolCalls:[],pendingFiles:[]};
+let INFLIGHT={};
+const window={
+  _boundedConversationBrowser:false,
+  __HERMES_CONFIG__:{lazyTailV1:true}
+};
+let apiCalls=[];
+async function api(path){
+  apiCalls.push(path);
+  return undefined;
+}
+function _rearmActiveSessionStream(){}
+function stopApprovalPolling(){}
+function hideApprovalCard(){}
+function stopSessionStream(){}
+function _updateYoloPill(){}
+function stopClarifyPolling(){}
+function hideClarifyCard(){}
+function _clearSameSessionForceReloadHint(){}
+function _resetMessagePaging(){}
+function $(id){return null;}
+(async()=>{
+  await loadSession('task-a');
+  console.log(JSON.stringify({apiCalls}));
+})();
+"""
+    )
+
+    assert result == {
+        "apiCalls": [
+            "/api/session-window?session_id=task-a&msg_limit=5&resolve_model=0",
+        ],
+    }
+
+
+def test_load_session_fast_request_failure_loads_legacy_once():
+    load = "async " + _function_source(SESSIONS, "loadSession")
+    result = _node(
+        load
+        + """
+let _loadSessionGeneration=0;
+let _loadingSessionId=null;
+let _pendingCarryForwardSnapshot=null;
+let _loadingOlder=false;
+let _messagesTruncated=false;
+let _oldestIdx=0;
+let _messageUserUnpinned=false;
+let _scrollPinned=true;
+let _yoloEnabled=false;
+let S={session:null,messages:[],toolCalls:[],pendingFiles:[]};
+let INFLIGHT={};
+const window={
+  _boundedConversationBrowser:false,
+  __HERMES_CONFIG__:{lazyTailV1:true}
+};
+let apiCalls=[];
+async function api(path){
+  apiCalls.push(path);
+  if(path.startsWith('/api/session-window')) throw new Error('offline');
+  return undefined;
+}
+function _rearmActiveSessionStream(){}
+function stopApprovalPolling(){}
+function hideApprovalCard(){}
+function stopSessionStream(){}
+function _updateYoloPill(){}
+function stopClarifyPolling(){}
+function hideClarifyCard(){}
+function _clearSameSessionForceReloadHint(){}
+function _resetMessagePaging(){}
+function _sessionProfileMismatchFromError(){return null;}
+function $(id){return null;}
+(async()=>{
+  await loadSession('task-a');
+  console.log(JSON.stringify({apiCalls}));
+})();
+"""
+    )
+
+    assert result == {
+        "apiCalls": [
+            "/api/session-window?session_id=task-a&msg_limit=5&resolve_model=0",
+            "/api/session?session_id=task-a&messages=0&resolve_model=0",
+        ],
+    }
+
+
+def test_superseded_typed_fallback_does_not_retry_or_mutate_recovery_ui():
+    helpers = "\n".join(
+        (
+            "async " + _function_source(SESSIONS, "loadSession"),
+            _function_source(SESSIONS, "_parseLazyTailPayload"),
+            _function_source(SESSIONS, "_lazyTailLoadDecision"),
+        )
+    )
+    result = _node(
+        helpers
+        + """
+let _loadSessionGeneration=0;
+let _loadingSessionId=null;
+let _pendingCarryForwardSnapshot=null;
+let _loadingOlder=false;
+let _messagesTruncated=false;
+let _oldestIdx=0;
+let _messageUserUnpinned=false;
+let _scrollPinned=true;
+let _yoloEnabled=false;
+let S={session:null,messages:[],toolCalls:[],pendingFiles:[]};
+let INFLIGHT={};
+const window={
+  _boundedConversationBrowser:false,
+  __HERMES_CONFIG__:{lazyTailV1:true}
+};
+const fallback={
+  requested_session_id:'task-a',canonical_session_id:'task-a',
+  messages:[],runtime_snapshot:null,
+  conversation_window:{
+    schema:'lazy_tail_v1',state:'legacy_required',source:'state_db',
+    visible_count:0,has_older:false,older_cursor:null,newest_message_id:null,
+    active_stream_id:null,reconnect_token:null,exact_total_available:false,
+    status_reason:'tool_pair_outside_closure'
+  }
+};
+let apiCalls=[];
+let recoveryReasons=[];
+let rearms=0;
+async function api(path){
+  apiCalls.push(path);
+  _loadingSessionId='task-b';
+  _loadSessionGeneration+=1;
+  return fallback;
+}
+function _rearmActiveSessionStream(){rearms+=1;}
+function stopApprovalPolling(){}
+function hideApprovalCard(){}
+function stopSessionStream(){}
+function _updateYoloPill(){}
+function stopClarifyPolling(){}
+function hideClarifyCard(){}
+function _clearSameSessionForceReloadHint(){}
+function _resetMessagePaging(){}
+function _showLazyTailRecovery(_sid,reason){recoveryReasons.push(reason);}
+function $(id){return null;}
+(async()=>{
+  const loaded=await loadSession('task-a');
+  console.log(JSON.stringify({
+    loaded,
+    apiCalls,
+    legacyCalls:apiCalls.filter(path=>path.startsWith('/api/session?')),
+    recoveryReasons,
+    rearms,
+    finalLoadingSessionId:_loadingSessionId
+  }));
+})();
+"""
+    )
+
+    assert result == {
+        "apiCalls": [
+            "/api/session-window?session_id=task-a&msg_limit=5&resolve_model=0",
+        ],
+        "legacyCalls": [],
+        "recoveryReasons": [],
+        "rearms": 2,
+        "finalLoadingSessionId": "task-b",
+    }
 
 
 def test_lazy_older_path_uses_single_visible_turn_and_opaque_cursor():

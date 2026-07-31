@@ -476,7 +476,27 @@ def test_frontend_has_goal_slash_command_and_status_event_handler():
     assert "source.addEventListener('goal'" in MESSAGES_JS
     assert "source.addEventListener('goal_continue'" in MESSAGES_JS
     assert "['steer','interrupt','queue','terminal','goal','yolo'].includes(_pc.name)" in MESSAGES_JS
-    assert "queueSessionMessage" in MESSAGES_JS
+    goal_listener = MESSAGES_JS.split("source.addEventListener('goal_continue'", 1)[1].split(
+        "source.addEventListener(", 1
+    )[0]
+    assert "queueSessionMessage" not in goal_listener
+    assert "_pendingGoalContinuation" not in MESSAGES_JS
+
+
+def test_goal_continuation_is_claimed_then_started_at_server_teardown_boundary():
+    assert "claim_goal_continuation" in STREAMING_PY
+    assert "settle_goal_continuation" in STREAMING_PY
+    assert STREAMING_PY.index("claim_goal_continuation") < STREAMING_PY.index(
+        "put('goal_continue'"
+    )
+    settle = STREAMING_PY.index("settle_goal_continuation")
+    finish = STREAMING_PY.index("finish_session_activity(", settle)
+    cleanup = STREAMING_PY.index("unregister_active_run(stream_id", finish)
+    recover = STREAMING_PY.index("recover_pending_goal_continuations", cleanup)
+    assert settle < finish < cleanup < recover
+    assert 'source == "goal_continuation"' in ROUTES_PY
+    assert "_recover_goal_continuations_on_startup" in ROUTES_PY
+    assert "recover_pending_goal_continuations" in ROUTES_PY
 
 
 def test_frontend_goal_evaluating_state_uses_calm_composer_indicator():

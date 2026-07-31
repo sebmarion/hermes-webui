@@ -69,6 +69,7 @@ global.document = {
 global.$ = id => els[id] || null;
 global.api = () => ({ then: () => ({ catch: () => {} }), catch: () => {} });
 var _profileTransitionReasoningContext = null;
+var _currentReasoningMode = '';
 
 function extractFunc(name) {
   const re = new RegExp('function\\s+' + name + '\\s*\\(');

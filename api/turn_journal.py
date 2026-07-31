@@ -27,17 +27,35 @@ _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _DELEGATION_RESERVATION_LOCK = threading.RLock()
 
 
-def _owner_pid_alive(value) -> bool:
+def _process_start_token(pid: int) -> str:
     try:
-        pid = int(value)
+        from api.process_identity import process_start_token
+
+        token = process_start_token(pid)
+        return token if isinstance(token, str) else ""
+    except Exception:
+        return ""
+
+
+def _owner_identity_alive(event: dict | None) -> bool:
+    try:
+        if not isinstance(event, dict):
+            return False
+        pid = int(event.get("owner_pid"))
+        expected_token = str(event.get("owner_pid_start_token") or "")
         if pid <= 0:
             return False
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, TypeError, ValueError):
+        return bool(expected_token and _process_start_token(pid) == expected_token)
+    except (TypeError, ValueError):
         return False
-    except PermissionError:
-        return True
+
+
+def _owner_fields() -> dict:
+    pid = os.getpid()
+    token = _process_start_token(pid)
+    if not token:
+        raise RuntimeError("delegation owner start token is unavailable")
+    return {"owner_pid": pid, "owner_pid_start_token": token}
 
 
 def _default_session_dir() -> Path:
@@ -155,17 +173,16 @@ def reserve_delegation_turn(
                     event for event in journal.get("events") or []
                     if str((event or {}).get("delegation_id") or "") == key
                 ]
-                started = [
-                    event for event in matches
-                    if str((event or {}).get("event") or "") == "worker_started"
-                ]
-                if started:
-                    return started[-1], False
                 latest = matches[-1] if matches else None
                 if (
                     latest is not None
+                    and str(latest.get("event") or "") == "worker_started"
+                ):
+                    return latest, False
+                if (
+                    latest is not None
                     and str(latest.get("event") or "") == "delegation_reserved"
-                    and _owner_pid_alive(latest.get("owner_pid"))
+                    and _owner_identity_alive(latest)
                 ):
                     return latest, False
                 event = append_turn_journal_event(
@@ -173,7 +190,7 @@ def reserve_delegation_turn(
                     {
                         "event": "delegation_reserved",
                         "delegation_id": key,
-                        "owner_pid": os.getpid(),
+                        **_owner_fields(),
                         "recovered": latest is not None,
                         "created_at": time.time(),
                     },
@@ -195,7 +212,7 @@ def release_delegation_turn(
         {
             "event": "delegation_released",
             "delegation_id": str(delegation_id),
-            "owner_pid": os.getpid(),
+            **_owner_fields(),
             "reason": str(reason),
         },
         session_dir=session_dir,
@@ -215,9 +232,14 @@ def find_delegation_turn(
     matches = [
         event for event in journal.get("events") or []
         if str((event or {}).get("delegation_id") or "") == key
-        and str((event or {}).get("event") or "") == "worker_started"
     ]
-    return matches[-1] if matches else None
+    latest = matches[-1] if matches else None
+    return (
+        latest
+        if latest is not None
+        and str(latest.get("event") or "") == "worker_started"
+        else None
+    )
 
 
 def mark_delegation_turn_started(
@@ -236,7 +258,7 @@ def mark_delegation_turn_started(
             "delegation_id": str(delegation_id),
             "turn_id": str(turn_id),
             "stream_id": str(stream_id),
-            "owner_pid": os.getpid(),
+            **_owner_fields(),
         },
         session_dir=session_dir,
     )
