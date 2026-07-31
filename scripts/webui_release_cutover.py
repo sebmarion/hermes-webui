@@ -12951,8 +12951,33 @@ def _inspect_synthetic_completion_stores(plan: dict) -> dict:
             raise ReleaseBuildError(
                 "synthetic process completion record is invalid"
             )
-        session_id = str(event.get("session_id") or "")
-        if event_id != f"process:{session_id}:completion":
+        session_id = event.get("session_id")
+        process_start_token = event.get("process_start_token")
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or len(session_id.encode("utf-8")) > 512
+            or len(event_id.encode("utf-8")) > 1024
+            or (
+                process_start_token is not None
+                and (
+                    not isinstance(process_start_token, str)
+                    or not process_start_token
+                )
+            )
+        ):
+            raise ReleaseBuildError(
+                "synthetic process completion event identity is invalid"
+            )
+        expected_event_id = (
+            "process:"
+            f"{session_id}:"
+            f"{hashlib.sha256(process_start_token.encode('utf-8')).hexdigest()[:24]}:"
+            "completion"
+            if process_start_token is not None
+            else f"process:{session_id}:completion"
+        )
+        if event_id != expected_event_id:
             raise ReleaseBuildError(
                 "synthetic process completion event identity is invalid"
             )
@@ -21547,8 +21572,14 @@ def _run_bootstrap_migration_plan(plan: dict, *, dry_run: bool = False) -> dict:
         ) from original
 
 
-def _emit_json(value: dict) -> None:
-    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+def _emit_json(value: object) -> None:
+    print(
+        json.dumps(
+            _journal_copy_of_immutable_evidence(value),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
 
 def _add_state_paths(parser: argparse.ArgumentParser) -> None:

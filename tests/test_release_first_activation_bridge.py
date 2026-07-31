@@ -869,6 +869,53 @@ def test_synthetic_terminal_mixed_delivery_is_normalized_and_never_replayed(
         assert quarantine.stat().st_mode & 0o777 == 0o600
 
 
+def test_synthetic_process_store_accepts_generation_bound_event_ids(tmp_path):
+    plan, _original = _synthetic_plan(tmp_path, async_mode=0o600)
+    path = Path(plan["synthetic_process_notifications_path"])
+    payload = json.loads(path.read_bytes())
+    legacy_id = "process:proc_delivered:completion"
+    event = payload["events"].pop(legacy_id)
+    process_start_token = "darwin-proc:123:456:789"
+    generation = hashlib.sha256(process_start_token.encode()).hexdigest()[:24]
+    event_id = f"process:proc_delivered:{generation}:completion"
+    event["event_id"] = event_id
+    event["process_start_token"] = process_start_token
+    payload["events"][event_id] = event
+    encoded = _write_json(path, payload, mode=0o600)
+    plan["synthetic_process_notifications_expected_sha256"] = hashlib.sha256(
+        encoded
+    ).hexdigest()
+
+    inspected = cutover._inspect_synthetic_completion_stores(plan)
+
+    assert inspected["process_notifications"]["ids"] == [
+        "proc_delivered",
+        "proc_queued",
+    ]
+
+
+def test_synthetic_process_store_rejects_forged_generation_event_id(tmp_path):
+    plan, _original = _synthetic_plan(tmp_path, async_mode=0o600)
+    path = Path(plan["synthetic_process_notifications_path"])
+    payload = json.loads(path.read_bytes())
+    legacy_id = "process:proc_delivered:completion"
+    event = payload["events"].pop(legacy_id)
+    event_id = "process:proc_delivered:" + ("0" * 24) + ":completion"
+    event["event_id"] = event_id
+    event["process_start_token"] = "darwin-proc:123:456:789"
+    payload["events"][event_id] = event
+    encoded = _write_json(path, payload, mode=0o600)
+    plan["synthetic_process_notifications_expected_sha256"] = hashlib.sha256(
+        encoded
+    ).hexdigest()
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="event identity is invalid",
+    ):
+        cutover._inspect_synthetic_completion_stores(plan)
+
+
 def test_synthetic_interrupted_delegation_is_terminal(tmp_path):
     plan, _original = _synthetic_plan(tmp_path, async_mode=0o600)
     path = Path(plan["synthetic_async_delegations_path"])

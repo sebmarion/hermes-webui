@@ -105,6 +105,22 @@ def _plain_last_good_split_evidence() -> dict:
     }
 
 
+def test_emit_json_materializes_nested_read_only_evidence(capsys):
+    evidence = MappingProxyType(
+        {
+            "rows": (
+                MappingProxyType({"status": "verified"}),
+            ),
+        }
+    )
+
+    cutover._emit_json({"attestation": evidence})
+
+    assert json.loads(capsys.readouterr().out) == {
+        "attestation": {"rows": [{"status": "verified"}]}
+    }
+
+
 def _canonical_test_value_sha256(value: object) -> str:
     return hashlib.sha256(
         json.dumps(
