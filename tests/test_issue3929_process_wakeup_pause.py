@@ -210,6 +210,43 @@ class _RotatingSuccessfulAgent(_SuccessfulAgent):
         return super().run_conversation(**kwargs)
 
 
+class _AuthSelfHealingAgent(_SuccessfulAgent):
+    run_calls = 0
+
+    def run_conversation(self, **kwargs):
+        type(self).run_calls += 1
+        if type(self).run_calls == 1:
+            raise RuntimeError("HTTP 401: authentication token is invalid")
+        return super().run_conversation(**kwargs)
+
+
+class _AuthSelfHealErrorAgent(_MockAgent):
+    run_calls = 0
+
+    def run_conversation(self, **kwargs):
+        type(self).run_calls += 1
+        if type(self).run_calls == 1:
+            raise RuntimeError("HTTP 401: authentication token is invalid")
+        return {
+            "messages": list(kwargs.get("conversation_history") or []),
+            "error": {"message": "refreshed credential was also rejected"},
+        }
+
+
+class _AuthSelfHealCancellingAgent(_SuccessfulAgent):
+    run_calls = 0
+    stream_id = None
+
+    def run_conversation(self, **kwargs):
+        type(self).run_calls += 1
+        if type(self).run_calls == 1:
+            raise RuntimeError("HTTP 401: authentication token is invalid")
+        cancel_flag = config.CANCEL_FLAGS.get(type(self).stream_id)
+        assert cancel_flag is not None
+        cancel_flag.set()
+        return super().run_conversation(**kwargs)
+
+
 def _make_exact_completion_event(session_id: str, suffix: str) -> dict:
     return {
         "type": "completion",
@@ -533,6 +570,251 @@ def test_successful_process_wakeup_ack_replay_does_not_call_provider_twice(
         for message in replayed.messages
         if isinstance(message, dict)
     ) == 1
+
+
+def test_auth_self_heal_success_commits_receipt_and_replays_without_provider(
+    tmp_path,
+    monkeypatch,
+):
+    from api import background_process
+
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_auth_self_heal_ack_replay",
+        stream_id="stream-native-auth-self-heal-ack-replay",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-auth-self-heal")
+    registry = _install_exact_event_registry(monkeypatch)
+    registry.fail_committed_remaining = 1
+    _AuthSelfHealingAgent.run_calls = 0
+    heal_runtime = {
+        "provider": "test-provider",
+        "api_key": "refreshed-synthetic-key",
+        "base_url": None,
+    }
+
+    with mock.patch.object(
+        streaming,
+        "_attempt_credential_self_heal",
+        return_value=heal_runtime,
+    ):
+        _run_exact_process_wakeup(
+            session,
+            tmp_path,
+            event,
+            _AuthSelfHealingAgent,
+        )
+
+    first_saved = Session.load(session.session_id)
+    assert first_saved is not None
+    assert _AuthSelfHealingAgent.run_calls == 2
+    assert registry.finish_calls == [(event, True)]
+    assert registry.completion_queue.get_nowait() is event
+    terminal_assistants = [
+        message
+        for message in first_saved.messages
+        if isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and message.get("content") == "Stream reply"
+    ]
+    assert len(terminal_assistants) == 1
+    assert terminal_assistants[0][streaming._PROCESS_COMPLETION_RECEIPTS_KEY]
+    assert not any(
+        bool(message.get("_error"))
+        for message in first_saved.messages
+        if isinstance(message, dict)
+    ), first_saved.messages
+
+    transcript_before_replay = copy.deepcopy(first_saved.messages)
+    with background_process._STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+        background_process._STAGED_PROCESS_COMPLETION_EVENTS.clear()
+    try:
+        assert background_process.stage_process_completion_event(
+            session.session_id,
+            event,
+        ) is True
+        monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda _sid: None)
+
+        def _provider_must_not_restart(*_args, **_kwargs):
+            raise AssertionError(
+                "provider preparation reached after auth self-heal receipt commit"
+            )
+
+        monkeypatch.setattr(
+            routes,
+            "_prepare_chat_start_session_for_stream",
+            _provider_must_not_restart,
+        )
+        replay = routes._start_chat_stream_for_session(
+            session,
+            msg="[IMPORTANT: exact process completed]",
+            attachments=[],
+            workspace=session.workspace,
+            model=session.model,
+            source="process_wakeup",
+        )
+    finally:
+        with background_process._STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+            background_process._STAGED_PROCESS_COMPLETION_EVENTS.clear()
+
+    assert replay == {
+        "delivery_already_committed": True,
+        "delivery_acknowledged": True,
+        "_status": 200,
+    }
+    assert registry.finish_calls == [(event, True), (event, True)]
+    assert _AuthSelfHealingAgent.run_calls == 2
+    replayed = Session.load(session.session_id)
+    assert replayed is not None
+    assert replayed.messages == transcript_before_replay
+
+
+def test_auth_self_heal_error_cannot_stamp_prior_assistant_as_terminal(
+    tmp_path,
+    monkeypatch,
+):
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_auth_self_heal_error",
+        stream_id="stream-native-auth-self-heal-error",
+    )
+    prior_assistant = {
+        "role": "assistant",
+        "content": "Prior answer must not become this wakeup's receipt owner",
+        "timestamp": 2.0,
+    }
+    session.messages.append(copy.deepcopy(prior_assistant))
+    session.context_messages.append(copy.deepcopy(prior_assistant))
+    session.save(touch_updated_at=False)
+    event = _make_exact_completion_event(session.session_id, "native-auth-heal-error")
+    registry = _install_exact_event_registry(monkeypatch)
+    _AuthSelfHealErrorAgent.run_calls = 0
+
+    with mock.patch.object(
+        streaming,
+        "_attempt_credential_self_heal",
+        return_value={
+            "provider": "test-provider",
+            "api_key": "still-invalid-synthetic-key",
+            "base_url": None,
+        },
+    ):
+        _run_exact_process_wakeup(
+            session,
+            tmp_path,
+            event,
+            _AuthSelfHealErrorAgent,
+        )
+
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert _AuthSelfHealErrorAgent.run_calls == 2
+    assert registry.finish_calls == [(event, True)]
+    persisted_prior = next(
+        message
+        for message in saved.messages
+        if isinstance(message, dict)
+        and message.get("content") == prior_assistant["content"]
+    )
+    assert streaming._PROCESS_COMPLETION_RECEIPTS_KEY not in persisted_prior
+    terminal = saved.messages[-1]
+    assert terminal.get("role") == "assistant"
+    assert terminal.get("_error") is True
+    assert terminal[streaming._PROCESS_COMPLETION_RECEIPTS_KEY]
+
+
+def test_cancel_during_auth_self_heal_keeps_exact_claim_uncommitted(
+    tmp_path,
+    monkeypatch,
+):
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_auth_self_heal_cancel",
+        stream_id="stream-native-auth-self-heal-cancel",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-auth-heal-cancel")
+    registry = _install_exact_event_registry(monkeypatch)
+    _AuthSelfHealCancellingAgent.run_calls = 0
+    _AuthSelfHealCancellingAgent.stream_id = session.active_stream_id
+
+    with mock.patch.object(
+        streaming,
+        "_attempt_credential_self_heal",
+        return_value={
+            "provider": "test-provider",
+            "api_key": "refreshed-synthetic-key",
+            "base_url": None,
+        },
+    ):
+        emitted = _run_exact_process_wakeup(
+            session,
+            tmp_path,
+            event,
+            _AuthSelfHealCancellingAgent,
+        )
+
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert _AuthSelfHealCancellingAgent.run_calls == 2
+    assert registry.finish_calls == [(event, False)]
+    assert registry.completion_queue.get_nowait() is event
+    assert streaming._durable_process_completion_receipt_status(
+        session.session_id,
+        [event],
+    ) == "absent"
+    assert not any(
+        streaming._PROCESS_COMPLETION_RECEIPTS_KEY in message
+        for message in saved.messages
+        if isinstance(message, dict)
+    )
+    assert any(event_name == "cancel" for event_name, _payload in emitted)
+
+
+def test_ordinary_success_skips_native_terminal_full_session_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="ordinary_success_without_exact_claim",
+        stream_id="stream-ordinary-success-without-exact-claim",
+    )
+    session.pending_user_source = "webui"
+    session.save(touch_updated_at=False)
+    stream_queue = queue.Queue()
+    streaming.STREAMS[session.active_stream_id] = stream_queue
+    config.STREAM_PARTIAL_TEXT[session.active_stream_id] = ""
+    snapshot_spy = mock.Mock(wraps=streaming._snapshot_native_terminal_state)
+
+    with mock.patch.object(streaming, "_get_ai_agent", return_value=_SuccessfulAgent), \
+         mock.patch.object(
+             streaming,
+             "resolve_model_provider",
+             return_value=("test-model", "test-provider", None),
+         ), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]), \
+         mock.patch.object(
+             streaming,
+             "_snapshot_native_terminal_state",
+             snapshot_spy,
+         ):
+        streaming._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text=session.pending_user_message,
+            model=session.model,
+            workspace=str(tmp_path),
+            stream_id=session.active_stream_id,
+        )
+
+    assert snapshot_spy.call_count == 0
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert any(
+        message.get("role") == "assistant"
+        and message.get("content") == "Stream reply"
+        for message in saved.messages
+        if isinstance(message, dict)
+    )
 
 
 def test_cancelled_process_wakeup_claim_remains_uncommitted(

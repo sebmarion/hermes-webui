@@ -11065,7 +11065,8 @@ def _run_agent_streaming(
                             getattr(s, 'active_stream_id', None),
                         )
                         return
-                _native_terminal_state_before = _snapshot_native_terminal_state(s)
+                if _process_completion_claims:
+                    _native_terminal_state_before = _snapshot_native_terminal_state(s)
                 with _stream_writeback_stage(_writeback_timings, "merge_result"):
                     _tool_limit_reached = _agent_result_tool_limit_reached(result)
                     _guardrail_terminal = _agent_result_guardrail_blocked(result)
@@ -12977,6 +12978,76 @@ def _run_agent_streaming(
                                         getattr(s, 'active_stream_id', None),
                                     )
                                     return
+                                if cancel_event.is_set():
+                                    _finalize_cancelled_turn(s, ephemeral=ephemeral)
+                                    if not ephemeral:
+                                        try:
+                                            append_turn_journal_event_for_stream(
+                                                s.session_id,
+                                                stream_id,
+                                                {
+                                                    "event": "interrupted",
+                                                    "created_at": time.time(),
+                                                    "reason": "cancelled",
+                                                },
+                                            )
+                                        except Exception:
+                                            logger.debug(
+                                                "Failed to append cancelled self-heal turn journal event",
+                                                exc_info=True,
+                                            )
+                                    put('cancel', _cancel_event_payload('Cancelled by user'))
+                                    return
+                                _heal_messages = (
+                                    _heal_result.get('messages') or []
+                                    if isinstance(_heal_result, dict)
+                                    else []
+                                )
+                                _heal_error = (
+                                    getattr(_heal_agent, '_last_error', None)
+                                    or (
+                                        _heal_result.get('error')
+                                        if isinstance(_heal_result, dict)
+                                        else "invalid self-heal result"
+                                    )
+                                )
+                                if (
+                                    not isinstance(_heal_result, dict)
+                                    or bool(_heal_error)
+                                    or _agent_result_terminal_failure(_heal_result)
+                                    or not _assistant_reply_added_after_current_turn(
+                                        _heal_messages,
+                                        _previous_context_messages,
+                                        msg_text,
+                                    )
+                                ):
+                                    raise RuntimeError(
+                                        "Credential self-heal retry produced no terminal assistant"
+                                    )
+                                if _merged_transcript_lacks_final_assistant_answer(
+                                    _previous_messages,
+                                    _previous_context_messages,
+                                    _heal_messages,
+                                    msg_text,
+                                    source=(
+                                        getattr(s, 'pending_user_source', None)
+                                        or 'webui'
+                                    ),
+                                ):
+                                    if _process_completion_claims:
+                                        # The retry produced only an unfinished
+                                        # tool-call tail. Nothing terminal may
+                                        # own the receipt, and teardown must not
+                                        # turn the partial state into a save.
+                                        _terminal_cleanup_save_suppressed = True
+                                        return
+                                    raise RuntimeError(
+                                        "Credential self-heal retry has no final assistant answer"
+                                    )
+                                if _process_completion_claims:
+                                    _native_terminal_state_before = (
+                                        _snapshot_native_terminal_state(s)
+                                    )
                                 _result_messages = _heal_result.get('messages')
                                 if _result_messages is None:
                                     _result_messages = _previous_context_messages
@@ -12990,7 +13061,39 @@ def _run_agent_streaming(
                                     _active_turn_identity,
                                 )
                                 _advance_truncation_watermark_after_commit(s)  # #3831
-                                s.save()
+                                s.active_stream_id = None
+                                s.pending_user_message = None
+                                s.pending_attachments = []
+                                s.pending_started_at = None
+                                s.pending_user_source = None
+                                s.pending_server_instance_id = None
+                                if _process_completion_claims:
+                                    _terminal_assistant = next(
+                                        (
+                                            message
+                                            for message in reversed(s.messages or [])
+                                            if isinstance(message, dict)
+                                            and message.get('role') == 'assistant'
+                                        ),
+                                        None,
+                                    )
+                                    if _terminal_assistant is None:
+                                        _restore_native_terminal_state(
+                                            s,
+                                            _native_terminal_state_before,
+                                        )
+                                        _terminal_writeback_uncertain = True
+                                        _terminal_cleanup_save_suppressed = True
+                                        return
+                                    if not _commit_exact_process_completion_terminal(
+                                        s,
+                                        _terminal_assistant,
+                                        _native_terminal_state_before,
+                                    ):
+                                        return
+                                else:
+                                    s.save()
+                                _success_writeback_committed = True
                         logger.info('[webui] self-heal (except path): retry succeeded')
                         return  # skip error emission
                     except Exception as _retry_exc2:
@@ -13086,7 +13189,8 @@ def _run_agent_streaming(
                         s,
                         _native_terminal_state_before,
                     )
-                _native_terminal_state_before = _snapshot_native_terminal_state(s)
+                if _process_completion_claims:
+                    _native_terminal_state_before = _snapshot_native_terminal_state(s)
                 if _turn_pending_source == 'process_wakeup':
                     _recorded_pause = record_process_wakeup_provider_unavailable_pause(
                         s,
