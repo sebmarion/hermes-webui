@@ -516,15 +516,18 @@ def verify_exact(
                         )
                         retryable.append(key)
                 elif state == "started":
-                    classifications.append((key, "started_exact"))
-                    bindings.append(
-                        (
-                            key,
-                            session_id,
-                            row["child_stream_id"],
-                            row["completed_start_token"],
+                    if "completed_start_token" not in row:
+                        classifications.append((key, "started_legacy_inert"))
+                    else:
+                        classifications.append((key, "started_exact"))
+                        bindings.append(
+                            (
+                                key,
+                                session_id,
+                                row["child_stream_id"],
+                                row["completed_start_token"],
+                            )
                         )
-                    )
                 elif state in terminal_states:
                     classifications.append((key, f"terminal_{state}"))
                     bindings.append((key, session_id, "", ""))
@@ -636,15 +639,20 @@ def recover_exact(
                         row_retryable.append(key)
                         row_eligible.append(key)
                 elif state == "started":
-                    row_classifications.append((key, "started_exact"))
-                    row_bindings.append(
-                        (
-                            key,
-                            session_id,
-                            receipt["child_stream_id"],
-                            receipt["completed_start_token"],
+                    if "completed_start_token" not in receipt:
+                        row_classifications.append(
+                            (key, "started_legacy_inert")
                         )
-                    )
+                    else:
+                        row_classifications.append((key, "started_exact"))
+                        row_bindings.append(
+                            (
+                                key,
+                                session_id,
+                                receipt["child_stream_id"],
+                                receipt["completed_start_token"],
+                            )
+                        )
                 elif state in terminal_states:
                     row_classifications.append((key, f"terminal_{state}"))
                     row_bindings.append((key, session_id, "", ""))
@@ -695,8 +703,8 @@ def recover_exact(
                 if before_state == "started" and (
                     after_state != "started"
                     or after["child_stream_id"] != before["child_stream_id"]
-                    or after["completed_start_token"]
-                    != before["completed_start_token"]
+                    or after.get("completed_start_token")
+                    != before.get("completed_start_token")
                 ):
                     raise ValueError(
                         f"{key}: started continuation regressed"

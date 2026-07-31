@@ -25,6 +25,11 @@ def _write(path: Path, receipts: dict) -> None:
     path.chmod(0o600)
 
 
+def _write_root(path: Path, value: dict) -> None:
+    path.write_text(json.dumps(value), encoding="utf-8")
+    path.chmod(0o600)
+
+
 def _goal_claim():
     session_id = "session-goal"
     parent_run_id = "run-goal"
@@ -270,6 +275,74 @@ def test_launch_before_started_write_is_ambiguous(managed_case, monkeypatch):
     assert "launch-before-started-write" in result.errors[0]
 
 
+def test_legacy_started_without_process_token_is_inert_and_verifiable(
+    managed_case,
+):
+    module, recover, key, receipt, _tmp_path = managed_case
+    receipt.update(
+        {
+            "state": "started",
+            "child_stream_id": "legacy-stream",
+            "started_at": 2.0,
+            "updated_at": 2.0,
+        }
+    )
+    receipt.pop("completed_start_token", None)
+    _write(module._receipt_path(), {key: receipt})
+
+    recovered = _recover(
+        recover,
+        start=lambda *_a: pytest.fail("legacy started receipt is historical"),
+    )
+
+    assert recovered.outcome.value == "COMPLETE"
+    assert recovered.receipt_classifications == (
+        (key, "started_legacy_inert"),
+    )
+    assert recovered.receipt_bindings == ()
+    assert recovered.started_receipt_keys == ()
+    assert recovered.retryable_receipt_keys == ()
+    verified = module.verify_managed_continuations_exact(
+        recovered,
+        transaction_id=TRANSACTION,
+        manifest_sha256=MANIFEST,
+    )
+    assert verified.outcome.value == "COMPLETE"
+
+
+def test_known_session_metadata_root_fields_are_inert(managed_case):
+    module, recover, key, receipt, _tmp_path = managed_case
+    if module is goal:
+        receipt.update(
+            {
+                "state": "discarded",
+                "discarded_reason": "historical",
+                "updated_at": 2.0,
+            }
+        )
+        expected = "terminal_discarded"
+    else:
+        receipt.update({"state": "completed", "updated_at": 2.0})
+        expected = "terminal_completed"
+    _write_root(
+        module._receipt_path(),
+        {
+            "version": 1,
+            "receipts": {key: receipt},
+            "pinned": False,
+            "archived": True,
+        },
+    )
+
+    recovered = _recover(
+        recover,
+        start=lambda *_a: pytest.fail("terminal receipt must stay inert"),
+    )
+
+    assert recovered.outcome.value == "COMPLETE"
+    assert recovered.receipt_classifications == ((key, expected),)
+
+
 def test_unknown_store_fields_and_record_bounds_are_ambiguous(
     managed_case, monkeypatch
 ):
@@ -281,6 +354,20 @@ def test_unknown_store_fields_and_record_bounds_are_ambiguous(
     assert result.outcome.value == "AMBIGUOUS"
 
     receipt.pop("unknown")
+    _write_root(
+        module._receipt_path(),
+        {"version": 1, "receipts": {key: receipt}, "unexpected": False},
+    )
+    result = _recover(recover, start=lambda *_a: pytest.fail("unknown root"))
+    assert result.outcome.value == "AMBIGUOUS"
+
+    _write_root(
+        module._receipt_path(),
+        {"version": 1, "receipts": {key: receipt}, "pinned": 1},
+    )
+    result = _recover(recover, start=lambda *_a: pytest.fail("malformed metadata"))
+    assert result.outcome.value == "AMBIGUOUS"
+
     _write(module._receipt_path(), {key: receipt})
     monkeypatch.setattr(module, "_MAX_MANAGED_RECEIPTS", 0)
     result = _recover(recover, start=lambda *_a: pytest.fail("unbounded"))

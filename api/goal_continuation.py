@@ -460,7 +460,16 @@ def _managed_timestamp(receipt: dict, field: str) -> float:
 
 
 def _validate_managed_store(store: dict, *, max_receipts: int) -> dict:
-    if not isinstance(store, dict) or set(store) != {"version", "receipts"}:
+    root_fields = {"version", "receipts", "pinned", "archived"}
+    if (
+        not isinstance(store, dict)
+        or not {"version", "receipts"}.issubset(store)
+        or set(store) - root_fields
+        or any(
+            field in store and type(store[field]) is not bool
+            for field in ("pinned", "archived")
+        )
+    ):
         raise ValueError("goal continuation store root schema is invalid")
     if store.get("version") != _RECEIPT_VERSION:
         raise ValueError("goal continuation store version is invalid")
@@ -512,7 +521,8 @@ def _validate_managed_store(store: dict, *, max_receipts: int) -> dict:
             _managed_timestamp(receipt, "starting_at")
         if state == "started":
             _managed_text(receipt, "child_stream_id")
-            _managed_text(receipt, "completed_start_token")
+            if "completed_start_token" in receipt:
+                _managed_text(receipt, "completed_start_token")
             _managed_timestamp(receipt, "started_at")
         if state == "discarded":
             _managed_text(receipt, "discarded_reason")
