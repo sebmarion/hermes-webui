@@ -362,10 +362,11 @@ def _managed_release(
     build_id: str = "build-1",
     *,
     symlink_interpreter: bool = False,
+    selector_name: str = "webui-release-selector.py",
 ) -> dict:
     agent_source = _agent_source_snapshot(tmp_path)
     runtime = _runtime_snapshot(tmp_path)
-    selector_path = tmp_path / "bin" / "webui-release-selector.py"
+    selector_path = tmp_path / "bin" / selector_name
     interpreter_path = Path(runtime["identity"]["interpreter_path"])
     _write(selector_path, "# trusted selector\n")
     _chmod(selector_path, 0o755)
@@ -4172,11 +4173,31 @@ def test_load_cutover_plan_attests_independent_sealed_last_good_identities(
     assert loaded["last_good_origin_attestation"]["gateway"]["identity"] == gateway
 
 
-def _real_sealed_last_good_split(tmp_path: Path) -> tuple[dict, dict, Path, str, str]:
+def _real_sealed_last_good_split(
+    tmp_path: Path,
+    *,
+    divergent_selectors: bool = False,
+) -> tuple[dict, dict, Path, str, str]:
     root = tmp_path / "control"
     root.mkdir(mode=0o700)
-    webui_release = _managed_release(tmp_path, "r75-webui")
-    gateway_release = _managed_release(tmp_path, "r72-gateway")
+    webui_release = _managed_release(
+        tmp_path,
+        "r75-webui",
+        selector_name=(
+            "webui-release-selector.py"
+            if divergent_selectors
+            else "release-selector.py"
+        ),
+    )
+    gateway_release = _managed_release(
+        tmp_path,
+        "r72-gateway",
+        selector_name=(
+            "gateway-release-selector.py"
+            if divergent_selectors
+            else "release-selector.py"
+        ),
+    )
 
     def identity(release: dict, generation: int, transaction_id: str) -> dict:
         verified = selector.verify_release(
@@ -4244,9 +4265,15 @@ def _write_split_adoption_receipt(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    shared_keys = (
+        cutover._LAST_GOOD_RUNTIME_SHARED_IDENTITY_KEYS
+        if (schema, version)
+        == ("hermes.last_good_split_adoption.v2", 2)
+        else cutover._LAST_GOOD_SHARED_IDENTITY_KEYS
+    )
     shared = {
         key: webui[key]
-        for key in sorted(cutover._LAST_GOOD_SHARED_IDENTITY_KEYS)
+        for key in sorted(shared_keys)
     }
     selector_state = selector_state or {
         "generation": 76,
@@ -4346,7 +4373,7 @@ def test_last_good_split_attester_accepts_exact_unfenced_current_split_v2(
     tmp_path,
 ):
     webui, gateway, root, _webui_sha256, _gateway_sha256 = (
-        _real_sealed_last_good_split(tmp_path)
+        _real_sealed_last_good_split(tmp_path, divergent_selectors=True)
     )
     webui = _unfenced_current_identity(webui)
     selector_state = _current_split_adoption_state(webui, gateway)
@@ -4394,7 +4421,7 @@ def test_last_good_split_attester_accepts_exact_unfenced_current_split_v2(
             lambda state, _webui, gateway: state["releases"][
                 gateway["build_id"]
             ].update(commit="f" * 40),
-            "fallback release identity is invalid",
+            "selector authority is invalid",
         ),
     ),
 )
@@ -4404,7 +4431,7 @@ def test_unfenced_current_split_v2_rejects_selector_or_fallback_drift(
     match,
 ):
     webui, gateway, root, _webui_sha256, _gateway_sha256 = (
-        _real_sealed_last_good_split(tmp_path)
+        _real_sealed_last_good_split(tmp_path, divergent_selectors=True)
     )
     webui = _unfenced_current_identity(webui)
     selector_state = _current_split_adoption_state(webui, gateway)
@@ -4738,7 +4765,7 @@ def test_create_live_split_adoption_writes_v2_for_unfenced_current_split(
     monkeypatch,
 ):
     webui, gateway, root, _webui_sha256, _gateway_sha256 = (
-        _real_sealed_last_good_split(tmp_path)
+        _real_sealed_last_good_split(tmp_path, divergent_selectors=True)
     )
     webui = _unfenced_current_identity(webui)
     selector = _current_split_adoption_state(webui, gateway)

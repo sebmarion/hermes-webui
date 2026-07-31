@@ -4312,6 +4312,14 @@ _LAST_GOOD_SHARED_IDENTITY_KEYS = {
     "agent_source_path", "agent_source_resolved_path", "agent_source_commit",
     "agent_source_tree", "agent_source_manifest_path", "agent_source_manifest_sha256",
 }
+_LAST_GOOD_SELECTOR_IDENTITY_KEYS = {
+    "selector_path",
+    "selector_resolved_path",
+    "selector_verified",
+}
+_LAST_GOOD_RUNTIME_SHARED_IDENTITY_KEYS = (
+    _LAST_GOOD_SHARED_IDENTITY_KEYS - _LAST_GOOD_SELECTOR_IDENTITY_KEYS
+)
 _LAST_GOOD_ORIGIN_IDENTITY_KEYS = _VERIFIED_RELEASE_IDENTITY_KEYS | {
     "selector_generation", "startup_transaction_id", "launchd_label",
 }
@@ -4588,6 +4596,7 @@ def _read_sealed_split_adoption_receipt(
     _validate_split_adoption_selector_authority(
         selector_state,
         webui_identity=webui_identity,
+        gateway_identity=gateway_identity,
         schema_version=schema_version,
     )
     for name, expected_identity, admission in (
@@ -4643,9 +4652,14 @@ def _read_sealed_split_adoption_receipt(
             raise ReleaseBuildError(
                 f"last-good adoption receipt {name} live binding is invalid"
             )
+    shared_identity_keys = (
+        _LAST_GOOD_RUNTIME_SHARED_IDENTITY_KEYS
+        if schema_version == ("hermes.last_good_split_adoption.v2", 2)
+        else _LAST_GOOD_SHARED_IDENTITY_KEYS
+    )
     shared_identity = {
         key: webui_identity.get(key)
-        for key in sorted(_LAST_GOOD_SHARED_IDENTITY_KEYS)
+        for key in sorted(shared_identity_keys)
     }
     if (
         raw["shared_identity_sha256"]
@@ -4661,6 +4675,7 @@ def _validate_split_adoption_selector_authority(
     selector_state: dict,
     *,
     webui_identity: dict,
+    gateway_identity: dict,
     schema_version: tuple[object, object],
 ) -> None:
     """Validate the exact selector/startup state represented by an adoption."""
@@ -4701,6 +4716,10 @@ def _validate_split_adoption_selector_authority(
         key: webui_identity.get(key)
         for key in ("manifest_sha256", "commit", "tree")
     }
+    expected_fallback_record = {
+        key: gateway_identity.get(key)
+        for key in ("manifest_sha256", "commit", "tree")
+    }
     if (
         common_invalid
         or validated_state != selector_state
@@ -4709,6 +4728,11 @@ def _validate_split_adoption_selector_authority(
         or fallback_id == validated_state.get("current")
         or release_path != release_root / str(validated_state.get("current"))
         or current_record != expected_current_record
+        or fallback_id != gateway_identity.get("build_id")
+        or Path(str(gateway_identity.get("release_path") or ""))
+        != release_root / str(fallback_id)
+        or validated_state.get("releases", {}).get(fallback_id)
+        != expected_fallback_record
         or webui_identity.get("startup_fenced") is not False
         or webui_identity.get("startup_transaction_id") is not None
     ):
@@ -4721,7 +4745,7 @@ def _validate_split_adoption_selector_authority(
             release_root / fallback_id,
             release_root=release_root,
             expected_manifest_sha256=fallback_record["manifest_sha256"],
-            selector_path=str(webui_identity.get("selector_path") or ""),
+            selector_path=str(gateway_identity.get("selector_path") or ""),
         )
     except (OSError, release_selector.SelectorError) as exc:
         raise ReleaseBuildError(
@@ -4772,6 +4796,7 @@ def _attest_last_good_identity_split(
     ):
         raise ReleaseBuildError("last-good provenance mode is invalid")
     evidence = {}
+    shared_identity_keys = _LAST_GOOD_SHARED_IDENTITY_KEYS
     for name, identity in (
         ("WebUI", webui_identity),
         ("gateway", gateway_identity),
@@ -4819,6 +4844,8 @@ def _attest_last_good_identity_split(
             webui_identity=webui_identity,
             gateway_identity=gateway_identity,
         )
+        if receipt.get("schema") == "hermes.last_good_split_adoption.v2":
+            shared_identity_keys = _LAST_GOOD_RUNTIME_SHARED_IDENTITY_KEYS
         evidence["provenance"] = MappingProxyType(
             {
                 "kind": "live-split-adoption",
@@ -4826,13 +4853,9 @@ def _attest_last_good_identity_split(
                 "receipt_sha256": str(adoption_receipt_sha256),
             }
         )
-    if (
-        webui_identity.get("selector_path")
-        != gateway_identity.get("selector_path")
-        or any(
+    if any(
         webui_identity.get(key) != gateway_identity.get(key)
-        for key in _LAST_GOOD_SHARED_IDENTITY_KEYS
-        )
+        for key in shared_identity_keys
     ):
         raise ReleaseBuildError("last-good shared runtime identity changed")
     return MappingProxyType(evidence)
@@ -18239,9 +18262,15 @@ def create_live_split_adoption(
         raise ReleaseBuildError(
             "last-good WebUI startup identity is invalid"
         )
+    shared_identity_keys = (
+        _LAST_GOOD_RUNTIME_SHARED_IDENTITY_KEYS
+        if receipt_schema_version
+        == ("hermes.last_good_split_adoption.v2", 2)
+        else _LAST_GOOD_SHARED_IDENTITY_KEYS
+    )
     if any(
         webui_identity.get(key) != gateway_identity.get(key)
-        for key in _LAST_GOOD_SHARED_IDENTITY_KEYS
+        for key in shared_identity_keys
     ):
         raise ReleaseBuildError("last-good shared runtime identity changed")
 
@@ -18257,6 +18286,7 @@ def create_live_split_adoption(
         _validate_split_adoption_selector_authority(
             selector_before,
             webui_identity=webui_identity,
+            gateway_identity=gateway_identity,
             schema_version=receipt_schema_version,
         )
     except ReleaseBuildError as exc:
@@ -18319,7 +18349,7 @@ def create_live_split_adoption(
 
     shared_identity = {
         key: webui_identity.get(key)
-        for key in sorted(_LAST_GOOD_SHARED_IDENTITY_KEYS)
+        for key in sorted(shared_identity_keys)
     }
     receipt = {
         "schema": receipt_schema_version[0],
