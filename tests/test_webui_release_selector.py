@@ -4232,6 +4232,9 @@ def _write_split_adoption_receipt(
     webui: dict,
     gateway: dict,
     adoption_id: str = "adopt-live-split-000000000000001",
+    schema: str = "hermes.last_good_split_adoption.v1",
+    version: int = 1,
+    selector_state: dict | None = None,
 ) -> str:
     identity_sha = lambda value: hashlib.sha256(
         json.dumps(
@@ -4245,7 +4248,7 @@ def _write_split_adoption_receipt(
         key: webui[key]
         for key in sorted(cutover._LAST_GOOD_SHARED_IDENTITY_KEYS)
     }
-    selector_state = {
+    selector_state = selector_state or {
         "generation": 76,
         "current": webui["build_id"],
         "last_good": webui["build_id"],
@@ -4265,8 +4268,8 @@ def _write_split_adoption_receipt(
         },
     }
     payload = {
-        "schema": "hermes.last_good_split_adoption.v1",
-        "version": 1,
+        "schema": schema,
+        "version": version,
         "adoption_id": adoption_id,
         "created_at": "2026-07-30T10:00:00+00:00",
         "selector": {
@@ -4306,6 +4309,125 @@ def _write_split_adoption_receipt(
     path.write_bytes(encoded)
     path.chmod(0o600)
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _current_split_adoption_state(webui: dict, gateway: dict) -> dict:
+    return {
+        "version": 2,
+        "generation": webui["selector_generation"],
+        "release_root": str(Path(webui["release_path"]).parent),
+        "current": webui["build_id"],
+        "candidate": None,
+        "pending_transaction_id": None,
+        "last_good": gateway["build_id"],
+        "bootstrap_fallback": gateway["build_id"],
+        "releases": {
+            webui["build_id"]: {
+                key: webui[key]
+                for key in ("manifest_sha256", "commit", "tree")
+            },
+            gateway["build_id"]: {
+                key: gateway[key]
+                for key in ("manifest_sha256", "commit", "tree")
+            },
+        },
+    }
+
+
+def _unfenced_current_identity(identity: dict) -> dict:
+    return {
+        **identity,
+        "startup_fenced": False,
+        "startup_transaction_id": None,
+    }
+
+
+def test_last_good_split_attester_accepts_exact_unfenced_current_split_v2(
+    tmp_path,
+):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    webui = _unfenced_current_identity(webui)
+    selector_state = _current_split_adoption_state(webui, gateway)
+    receipt = root / "current-split-adoption.json"
+    receipt_sha256 = _write_split_adoption_receipt(
+        receipt,
+        webui=webui,
+        gateway=gateway,
+        schema="hermes.last_good_split_adoption.v2",
+        version=2,
+        selector_state=selector_state,
+    )
+
+    evidence = cutover._attest_last_good_identity_split(
+        webui_identity=webui,
+        gateway_identity=gateway,
+        adoption_receipt=str(receipt),
+        adoption_receipt_sha256=receipt_sha256,
+        trusted_root=root,
+        selector_path=webui["selector_path"],
+    )
+
+    assert evidence["webui"]["identity"]["build_id"] == "r75-webui"
+    assert evidence["provenance"]["adoption_id"] == (
+        "adopt-live-split-000000000000001"
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    (
+        (
+            lambda state, _webui, _gateway: state.update(
+                bootstrap_fallback=state["current"]
+            ),
+            "selector authority is invalid",
+        ),
+        (
+            lambda state, _webui, _gateway: state.update(
+                generation=state["generation"] + 1
+            ),
+            "selector authority is invalid",
+        ),
+        (
+            lambda state, _webui, gateway: state["releases"][
+                gateway["build_id"]
+            ].update(commit="f" * 40),
+            "fallback release identity is invalid",
+        ),
+    ),
+)
+def test_unfenced_current_split_v2_rejects_selector_or_fallback_drift(
+    tmp_path,
+    mutate,
+    match,
+):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    webui = _unfenced_current_identity(webui)
+    selector_state = _current_split_adoption_state(webui, gateway)
+    mutate(selector_state, webui, gateway)
+    receipt = root / "current-split-adoption.json"
+    receipt_sha256 = _write_split_adoption_receipt(
+        receipt,
+        webui=webui,
+        gateway=gateway,
+        schema="hermes.last_good_split_adoption.v2",
+        version=2,
+        selector_state=selector_state,
+    )
+
+    with pytest.raises(cutover.ReleaseBuildError, match=match):
+        cutover._attest_last_good_identity_split(
+            webui_identity=webui,
+            gateway_identity=gateway,
+            adoption_receipt=str(receipt),
+            adoption_receipt_sha256=receipt_sha256,
+            trusted_root=root,
+            selector_path=webui["selector_path"],
+        )
 
 
 def test_last_good_split_attester_accepts_sealed_live_split_adoption(tmp_path):
@@ -4609,6 +4731,70 @@ def test_create_live_split_adoption_writes_exact_files_after_double_check(
         root / "live-split-adoption.json",
     ):
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_create_live_split_adoption_writes_v2_for_unfenced_current_split(
+    tmp_path,
+    monkeypatch,
+):
+    webui, gateway, root, _webui_sha256, _gateway_sha256 = (
+        _real_sealed_last_good_split(tmp_path)
+    )
+    webui = _unfenced_current_identity(webui)
+    selector = _current_split_adoption_state(webui, gateway)
+    selector_reads = []
+    monkeypatch.setattr(
+        cutover.release_selector,
+        "read_selector_state",
+        lambda *_args, **_kwargs: selector_reads.append("read")
+        or copy.deepcopy(selector),
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_probe_live_adoption_webui_binding",
+        lambda _plan, _identity: {
+            "listener_pid": 7501,
+            "pid_start_token": "webui-start",
+            "admission": {"state": "open", "transaction_id": None},
+        },
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda _plan, _identity, **_kwargs: {
+            "listener_pid": 7201,
+            "pid_start_token": "gateway-start",
+            "health": {
+                "drain": {
+                    "admission": {"state": "accepting_new_work"}
+                }
+            },
+        },
+    )
+
+    result = cutover.create_live_split_adoption(
+        {
+            "selector_state": str(root / "selector-state.json"),
+            "selector_lock": str(root / "selector-state.lock"),
+        },
+        webui_identity=webui,
+        gateway_identity=gateway,
+        webui_identity_path=root / "current-webui.json",
+        gateway_identity_path=root / "current-gateway.json",
+        adoption_receipt_path=root / "current-split-adoption.json",
+        adoption_id="adopt-current-split-00000000000001",
+        created_at="2026-07-31T10:00:00+00:00",
+    )
+
+    receipt = json.loads(
+        Path(result["last_good_split_adoption_receipt"]).read_bytes()
+    )
+    assert selector_reads == ["read", "read"]
+    assert (receipt["schema"], receipt["version"]) == (
+        "hermes.last_good_split_adoption.v2",
+        2,
+    )
+    assert receipt["selector"]["state"] == selector
 
 
 def test_create_live_split_adoption_rejects_process_drift_without_writes(

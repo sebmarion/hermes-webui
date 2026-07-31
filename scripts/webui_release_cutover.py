@@ -4519,6 +4519,10 @@ def _read_sealed_split_adoption_receipt(
         raise ReleaseBuildError(
             "last-good adoption receipt JSON is invalid"
         ) from exc
+    schema_version = (
+        raw.get("schema"),
+        raw.get("version"),
+    ) if isinstance(raw, dict) else (None, None)
     if (
         not isinstance(raw, dict)
         or set(raw)
@@ -4532,8 +4536,11 @@ def _read_sealed_split_adoption_receipt(
             "gateway",
             "shared_identity_sha256",
         }
-        or raw.get("schema") != "hermes.last_good_split_adoption.v1"
-        or raw.get("version") != 1
+        or schema_version
+        not in {
+            ("hermes.last_good_split_adoption.v1", 1),
+            ("hermes.last_good_split_adoption.v2", 2),
+        }
         or not _TRANSACTION_ID.fullmatch(str(raw.get("adoption_id") or ""))
         or not re.fullmatch(
             r"[0-9a-f]{64}", str(raw.get("shared_identity_sha256") or "")
@@ -4574,16 +4581,15 @@ def _read_sealed_split_adoption_receipt(
         or not isinstance(selector_state, dict)
         or selector.get("state_sha256")
         != _canonical_journal_value_sha256(selector_state)
-        or selector_state.get("current") != webui_identity.get("build_id")
-        or selector_state.get("last_good") != webui_identity.get("build_id")
-        or selector_state.get("candidate") is not None
-        or selector_state.get("pending_transaction_id") is not None
-        or selector_state.get("generation")
-        != int(webui_identity.get("selector_generation", -1)) + 1
     ):
         raise ReleaseBuildError(
             "last-good adoption receipt selector authority is invalid"
         )
+    _validate_split_adoption_selector_authority(
+        selector_state,
+        webui_identity=webui_identity,
+        schema_version=schema_version,
+    )
     for name, expected_identity, admission in (
         ("webui", webui_identity, "open"),
         ("gateway", gateway_identity, "accepting_new_work"),
@@ -4649,6 +4655,85 @@ def _read_sealed_split_adoption_receipt(
             "last-good adoption receipt shared identity changed"
         )
     return raw
+
+
+def _validate_split_adoption_selector_authority(
+    selector_state: dict,
+    *,
+    webui_identity: dict,
+    schema_version: tuple[object, object],
+) -> None:
+    """Validate the exact selector/startup state represented by an adoption."""
+    try:
+        selector_generation = int(webui_identity.get("selector_generation", -1))
+    except (TypeError, ValueError):
+        selector_generation = -1
+    common_invalid = (
+        selector_state.get("current") != webui_identity.get("build_id")
+        or selector_state.get("candidate") is not None
+        or selector_state.get("pending_transaction_id") is not None
+    )
+    if schema_version == ("hermes.last_good_split_adoption.v1", 1):
+        if (
+            common_invalid
+            or selector_state.get("last_good") != webui_identity.get("build_id")
+            or selector_state.get("generation") != selector_generation + 1
+        ):
+            raise ReleaseBuildError(
+                "last-good adoption receipt selector authority is invalid"
+            )
+        return
+    if schema_version != ("hermes.last_good_split_adoption.v2", 2):
+        raise ReleaseBuildError("last-good adoption receipt schema is invalid")
+    try:
+        validated_state = release_selector._validate_state(selector_state)
+    except (TypeError, ValueError, release_selector.SelectorError) as exc:
+        raise ReleaseBuildError(
+            "last-good adoption receipt selector authority is invalid"
+        ) from exc
+    fallback_id = validated_state.get("last_good")
+    release_root = Path(str(validated_state.get("release_root") or ""))
+    release_path = Path(str(webui_identity.get("release_path") or ""))
+    current_record = validated_state.get("releases", {}).get(
+        webui_identity.get("build_id")
+    )
+    expected_current_record = {
+        key: webui_identity.get(key)
+        for key in ("manifest_sha256", "commit", "tree")
+    }
+    if (
+        common_invalid
+        or validated_state != selector_state
+        or selector_state.get("generation") != selector_generation
+        or fallback_id != validated_state.get("bootstrap_fallback")
+        or fallback_id == validated_state.get("current")
+        or release_path != release_root / str(validated_state.get("current"))
+        or current_record != expected_current_record
+        or webui_identity.get("startup_fenced") is not False
+        or webui_identity.get("startup_transaction_id") is not None
+    ):
+        raise ReleaseBuildError(
+            "last-good adoption receipt selector authority is invalid"
+        )
+    fallback_record = validated_state["releases"][fallback_id]
+    try:
+        verified_fallback = release_selector.verify_release(
+            release_root / fallback_id,
+            release_root=release_root,
+            expected_manifest_sha256=fallback_record["manifest_sha256"],
+            selector_path=str(webui_identity.get("selector_path") or ""),
+        )
+    except (OSError, release_selector.SelectorError) as exc:
+        raise ReleaseBuildError(
+            "last-good adoption receipt fallback release identity is invalid"
+        ) from exc
+    if any(
+        verified_fallback.get(key) != fallback_record.get(key)
+        for key in ("manifest_sha256", "commit", "tree")
+    ):
+        raise ReleaseBuildError(
+            "last-good adoption receipt fallback release identity is invalid"
+        )
 
 
 def _attest_last_good_identity_split(
@@ -18133,13 +18218,26 @@ def create_live_split_adoption(
             label=f"last-good {name}",
         )
     if (
-        webui_identity.get("startup_fenced") is not True
-        or not _TRANSACTION_ID.fullmatch(
+        webui_identity.get("startup_fenced") is True
+        and _TRANSACTION_ID.fullmatch(
             str(webui_identity.get("startup_transaction_id") or "")
         )
     ):
+        receipt_schema_version = (
+            "hermes.last_good_split_adoption.v1",
+            1,
+        )
+    elif (
+        webui_identity.get("startup_fenced") is False
+        and webui_identity.get("startup_transaction_id") is None
+    ):
+        receipt_schema_version = (
+            "hermes.last_good_split_adoption.v2",
+            2,
+        )
+    else:
         raise ReleaseBuildError(
-            "last-good WebUI startup identity is not retained"
+            "last-good WebUI startup identity is invalid"
         )
     if any(
         webui_identity.get(key) != gateway_identity.get(key)
@@ -18151,18 +18249,20 @@ def create_live_split_adoption(
         plan["selector_state"],
         lock_path=plan["selector_lock"],
     )
-    if (
-        not isinstance(selector_before, dict)
-        or selector_before.get("current") != webui_identity["build_id"]
-        or selector_before.get("last_good") != webui_identity["build_id"]
-        or selector_before.get("candidate") is not None
-        or selector_before.get("pending_transaction_id") is not None
-        or selector_before.get("generation")
-        != webui_identity["selector_generation"] + 1
-    ):
+    if not isinstance(selector_before, dict):
         raise ReleaseBuildError(
             "live split selector authority is not idle on adopted build"
         )
+    try:
+        _validate_split_adoption_selector_authority(
+            selector_before,
+            webui_identity=webui_identity,
+            schema_version=receipt_schema_version,
+        )
+    except ReleaseBuildError as exc:
+        raise ReleaseBuildError(
+            "live split selector authority is not idle on adopted build"
+        ) from exc
     webui_before = _probe_live_adoption_webui_binding(plan, webui_identity)
     if webui_before is None:
         raise DrainIdentityMismatch("managed WebUI is absent during adoption")
@@ -18222,8 +18322,8 @@ def create_live_split_adoption(
         for key in sorted(_LAST_GOOD_SHARED_IDENTITY_KEYS)
     }
     receipt = {
-        "schema": "hermes.last_good_split_adoption.v1",
-        "version": 1,
+        "schema": receipt_schema_version[0],
+        "version": receipt_schema_version[1],
         "adoption_id": adoption_id,
         "created_at": timestamp,
         "selector": {
