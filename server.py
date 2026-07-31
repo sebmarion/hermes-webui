@@ -926,11 +926,13 @@ def _recover_startup_sessions():
     global _MANAGED_STARTUP_SESSION_RECEIPT
     from api.models import _active_state_db_path
 
-    if (
-        not api_config._managed_release_selected_from_environment()
-        or not str(
-            getattr(api_config, "_RUN_ADMISSION_TRANSACTION_ID", "") or ""
-        ).strip()
+    managed_selected = api_config._managed_release_selected_from_environment()
+    active_transaction = str(
+        getattr(api_config, "_RUN_ADMISSION_TRANSACTION_ID", "") or ""
+    ).strip()
+    if not managed_selected or (
+        not active_transaction
+        and not api_config.startup_run_admission_is_closed()
     ):
         from api.session_recovery import recover_all_sessions_on_startup
 
@@ -947,12 +949,12 @@ def _recover_startup_sessions():
             )
         return None
 
-    from api.managed_startup_session_recovery import (
-        audit_managed_startup_sessions,
+    from api.managed_startup_session_boundary import (
+        attest_managed_startup_session_boundary,
     )
 
     transaction_id, manifest_sha256 = _managed_startup_session_binding()
-    receipt = audit_managed_startup_sessions(
+    receipt = attest_managed_startup_session_boundary(
         SESSION_DIR,
         _active_state_db_path(),
         transaction_id=transaction_id,
@@ -963,15 +965,15 @@ def _recover_startup_sessions():
 
 
 def _reconcile_startup_sessions():
-    from api.managed_startup_session_recovery import (
+    from api.managed_startup_session_boundary import (
         SessionRecoveryOutcome,
-        verify_managed_startup_sessions,
+        verify_managed_startup_session_boundary,
     )
     from deferred_startup_replay import Reconciliation
 
     try:
         transaction_id, manifest_sha256 = _managed_startup_session_binding()
-        verification = verify_managed_startup_sessions(
+        verification = verify_managed_startup_session_boundary(
             _MANAGED_STARTUP_SESSION_RECEIPT,
             transaction_id=transaction_id,
             manifest_sha256=manifest_sha256,

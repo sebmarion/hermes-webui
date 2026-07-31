@@ -469,11 +469,16 @@ def test_database_empty_missing_sidecars_and_orphan_messages_are_ambiguous(
         )
 
 
-def test_server_routes_unmanaged_to_exact_legacy_and_managed_to_audit(
+def test_server_routes_unmanaged_to_exact_legacy_and_managed_to_boundary(
     tmp_path, monkeypatch
 ):
     import server
-    from api import config, models, session_recovery
+    from api import (
+        config,
+        managed_startup_session_boundary as boundary,
+        models,
+        session_recovery,
+    )
 
     calls = []
     monkeypatch.setattr(server, "SESSION_DIR", tmp_path)
@@ -495,14 +500,34 @@ def test_server_routes_unmanaged_to_exact_legacy_and_managed_to_audit(
         config, "_managed_release_selected_from_environment", lambda: True
     )
     monkeypatch.setattr(config, "_RUN_ADMISSION_TRANSACTION_ID", None)
+    monkeypatch.setattr(
+        config,
+        "startup_run_admission_is_closed",
+        lambda: False,
+    )
     assert server._recover_startup_sessions() is None
     assert calls[-1][0] == "legacy"
 
+    legacy_call_count = len(calls)
+    monkeypatch.setattr(
+        config,
+        "startup_run_admission_is_closed",
+        lambda: True,
+    )
+    with pytest.raises(RuntimeError, match="binding"):
+        server._recover_startup_sessions()
+    assert len(calls) == legacy_call_count
+
     receipt = object()
+    monkeypatch.setattr(
+        boundary,
+        "attest_managed_startup_session_boundary",
+        lambda *_a, **_k: calls.append(("boundary", _a, _k)) or receipt,
+    )
     monkeypatch.setattr(
         managed,
         "audit_managed_startup_sessions",
-        lambda *_a, **_k: calls.append(("managed", _a, _k)) or receipt,
+        lambda *_a, **_k: pytest.fail("managed startup invoked deep audit"),
     )
     canonical_manifest = server.release_manifest.deferred_release_manifest_sha256()
     monkeypatch.setattr(config, "_RUN_ADMISSION_TRANSACTION_ID", TRANSACTION_ID)
@@ -511,7 +536,7 @@ def test_server_routes_unmanaged_to_exact_legacy_and_managed_to_audit(
         "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256", canonical_manifest
     )
     assert server._recover_startup_sessions() is receipt
-    assert calls[-1][0] == "managed"
+    assert calls[-1][0] == "boundary"
     assert calls[-1][2] == {
         "transaction_id": TRANSACTION_ID,
         "manifest_sha256": canonical_manifest,
@@ -567,7 +592,7 @@ def test_server_session_reconciler_retains_and_verifies_receipt(
     monkeypatch,
 ):
     import server
-    from api import config, models
+    from api import config, managed_startup_session_boundary as boundary, models
     from deferred_startup_replay import Reconciliation
 
     receipt = object()
@@ -584,17 +609,17 @@ def test_server_session_reconciler_retains_and_verifies_receipt(
     )
     monkeypatch.setattr(server, "_MANAGED_STARTUP_SESSION_RECEIPT", None)
     monkeypatch.setattr(
-        managed,
-        "audit_managed_startup_sessions",
+        boundary,
+        "attest_managed_startup_session_boundary",
         lambda *_a, **_k: receipt,
     )
     monkeypatch.setattr(
-        managed,
-        "verify_managed_startup_sessions",
+        boundary,
+        "verify_managed_startup_session_boundary",
         lambda observed, **_k: type(
             "Verification",
             (),
-            {"outcome": managed.SessionRecoveryOutcome.PROVED_COMPLETE},
+            {"outcome": boundary.SessionRecoveryOutcome.PROVED_COMPLETE},
         )()
         if observed is receipt
         else pytest.fail("receipt was not retained"),

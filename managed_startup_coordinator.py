@@ -1225,7 +1225,7 @@ def build_production_managed_startup_coordinator(
         goal_continuation,
         managed_startup_configuration,
         managed_continuation_recovery,
-        managed_startup_session_recovery,
+        managed_startup_session_boundary,
         models,
         plugins,
         profiles,
@@ -1233,9 +1233,9 @@ def build_production_managed_startup_coordinator(
         startup,
         tool_limit_continuation,
     )
-    from api.managed_startup_session_recovery import (
-        audit_managed_startup_sessions,
-        verify_managed_startup_sessions,
+    from api.managed_startup_session_boundary import (
+        attest_managed_startup_session_boundary,
+        verify_managed_startup_session_boundary,
     )
     from api import managed_background_workers
     from api import managed_startup_profile
@@ -1375,7 +1375,7 @@ def build_production_managed_startup_coordinator(
         return result.receipt
 
     def session_mutator():
-        return audit_managed_startup_sessions(
+        return attest_managed_startup_session_boundary(
             config.SESSION_DIR,
             models._active_state_db_path(),
             transaction_id=transaction_id,
@@ -1383,7 +1383,7 @@ def build_production_managed_startup_coordinator(
         )
 
     def session_verifier(receipt):
-        return verify_managed_startup_sessions(
+        return verify_managed_startup_session_boundary(
             receipt,
             transaction_id=transaction_id,
             manifest_sha256=manifest_sha,
@@ -1559,7 +1559,7 @@ def build_production_managed_startup_coordinator(
                 "startup_profile_state": "webui.profile-receipt.v1",
                 "provider_model_seed": "webui.provider-models-receipt.v1",
                 "startup_configuration": "webui.configuration-receipt.v1",
-                "session_recovery": "webui.session-receipt.v1",
+                "session_recovery": "webui.session-boundary-receipt.v1",
                 "plugins": "webui.plugins-receipt.v1",
                 "process_completion_recovery": "agent.process-recovery-receipt.v1",
                 "async_delegation_recovery": "agent.async-recovery-receipt.v1",
@@ -1644,12 +1644,12 @@ def build_production_managed_startup_coordinator(
             managed_startup_configuration.ProcessCliToolsetsReceipt,
         ),
         ManagedStartupReceiptCodec(
-            "webui.session-receipt.v1",
-            managed_startup_session_recovery.ManagedStartupSessionReceipt,
+            "webui.session-boundary-receipt.v1",
+            managed_startup_session_boundary.ManagedStartupSessionBoundaryReceipt,
         ),
         ManagedStartupReceiptCodec(
             "webui.session-outcome.v1",
-            managed_startup_session_recovery.SessionRecoveryOutcome,
+            managed_startup_session_boundary.SessionRecoveryOutcome,
         ),
         ManagedStartupReceiptCodec(
             "webui.plugins-receipt.v1",
