@@ -118,6 +118,23 @@ def test_builds_canonical_manifest_order_and_driver_attestation(tmp_path):
     assert coordinator.driver_attestation().transaction_id == TRANSACTION_ID
 
 
+def test_accepts_distinct_package_and_deferred_manifest_bindings(tmp_path):
+    environment = _environment(tmp_path)
+    canonical_deferred = release_manifest.deferred_release_manifest_sha256()
+    environment["HERMES_WEBUI_MANIFEST_SHA256"] = "a" * 64
+    environment["HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256"] = (
+        canonical_deferred
+    )
+
+    coordinator = build_managed_startup_coordinator(
+        environment=environment,
+        operations=_operations(),
+        receipt_codecs=_codecs(),
+    )
+
+    assert coordinator.manifest_receipt.sha256 == canonical_deferred
+
+
 @pytest.mark.parametrize(
     "missing",
     [
