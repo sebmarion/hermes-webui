@@ -44,7 +44,8 @@ class Verification:
 def _environment(tmp_path: Path) -> dict[str, str]:
     return {
         "HERMES_WEBUI_STARTUP_TRANSACTION_ID": TRANSACTION_ID,
-        "HERMES_WEBUI_MANIFEST_SHA256": (
+        "HERMES_WEBUI_MANIFEST_SHA256": "a" * 64,
+        "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256": (
             release_manifest.deferred_release_manifest_sha256()
         ),
         "HERMES_WEBUI_STARTUP_ATTEMPT_JOURNAL": str(
@@ -139,7 +140,7 @@ def test_accepts_distinct_package_and_deferred_manifest_bindings(tmp_path):
     "missing",
     [
         "HERMES_WEBUI_STARTUP_TRANSACTION_ID",
-        "HERMES_WEBUI_MANIFEST_SHA256",
+        "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256",
         "HERMES_WEBUI_STARTUP_ATTEMPT_JOURNAL",
         "HERMES_WEBUI_STARTUP_CONFIGURATION_JOURNAL",
     ],

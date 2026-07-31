@@ -507,7 +507,9 @@ def test_server_routes_unmanaged_to_exact_legacy_and_managed_to_audit(
     canonical_manifest = server.release_manifest.deferred_release_manifest_sha256()
     monkeypatch.setattr(config, "_RUN_ADMISSION_TRANSACTION_ID", TRANSACTION_ID)
     monkeypatch.setenv("HERMES_WEBUI_STARTUP_TRANSACTION_ID", TRANSACTION_ID)
-    monkeypatch.setenv("HERMES_WEBUI_MANIFEST_SHA256", canonical_manifest)
+    monkeypatch.setenv(
+        "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256", canonical_manifest
+    )
     assert server._recover_startup_sessions() is receipt
     assert calls[-1][0] == "managed"
     assert calls[-1][2] == {
@@ -547,10 +549,12 @@ def test_server_managed_session_adapter_rejects_noncanonical_binding(
     else:
         monkeypatch.setenv("HERMES_WEBUI_STARTUP_TRANSACTION_ID", environment)
     if manifest is None:
-        monkeypatch.delenv("HERMES_WEBUI_MANIFEST_SHA256", raising=False)
+        monkeypatch.delenv(
+            "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256", raising=False
+        )
     else:
         monkeypatch.setenv(
-            "HERMES_WEBUI_MANIFEST_SHA256",
+            "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256",
             canonical if manifest == "canonical" else MANIFEST_SHA256,
         )
 
@@ -575,7 +579,9 @@ def test_server_session_reconciler_retains_and_verifies_receipt(
     )
     monkeypatch.setattr(config, "_RUN_ADMISSION_TRANSACTION_ID", TRANSACTION_ID)
     monkeypatch.setenv("HERMES_WEBUI_STARTUP_TRANSACTION_ID", TRANSACTION_ID)
-    monkeypatch.setenv("HERMES_WEBUI_MANIFEST_SHA256", canonical)
+    monkeypatch.setenv(
+        "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256", canonical
+    )
     monkeypatch.setattr(server, "_MANAGED_STARTUP_SESSION_RECEIPT", None)
     monkeypatch.setattr(
         managed,

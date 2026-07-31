@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import platform
 import re
@@ -360,6 +361,10 @@ _MANAGED_BOOTSTRAP_KEYS = (
     "HERMES_WEBUI_SERVER_CWD",
 )
 
+_DEFERRED_RELEASE_MANIFEST_ENV = (
+    "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256"
+)
+
 
 def _managed_bootstrap_python(agent_dir: Path | None) -> str | None:
     """Return the pinned managed interpreter or fail without fallback."""
@@ -409,6 +414,36 @@ def _managed_bootstrap_python(agent_dir: Path | None) -> str | None:
             "Managed interpreter cannot import WebUI and Hermes Agent dependencies"
         )
     return str(configured_python)
+
+
+def _bind_managed_deferred_manifest() -> None:
+    """Bind the canonical deferred-startup manifest for fenced launches."""
+    fenced = os.environ.get("HERMES_WEBUI_STARTUP_FENCED") == "1"
+    transaction_id = os.environ.get("HERMES_WEBUI_STARTUP_TRANSACTION_ID", "")
+    if not fenced:
+        if transaction_id:
+            raise RuntimeError(
+                "Managed startup transaction is present without a startup fence"
+            )
+        return
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", transaction_id):
+        raise RuntimeError("Managed startup transaction is invalid")
+
+    # Import only after managed bootstrap validation: this module is part of
+    # the immutable release whose package identity was just checked.
+    import deferred_release_manifest
+
+    canonical = hashlib.sha256(
+        deferred_release_manifest.canonical_manifest_bytes(
+            deferred_release_manifest.deferred_release_manifest()
+        )
+    ).hexdigest()
+    if not re.fullmatch(r"[0-9a-f]{64}", canonical):
+        raise RuntimeError("Managed deferred startup manifest is invalid")
+    supplied = os.environ.get(_DEFERRED_RELEASE_MANIFEST_ENV)
+    if supplied is not None and supplied != canonical:
+        raise RuntimeError("Managed deferred startup manifest binding changed")
+    os.environ[_DEFERRED_RELEASE_MANIFEST_ENV] = canonical
 
 
 def hermes_command_exists() -> bool:
@@ -638,6 +673,7 @@ def main() -> int:
         python_exe = ensure_python_has_webui_deps(
             discover_launcher_python(agent_dir), agent_dir
         )
+    _bind_managed_deferred_manifest()
     state_dir = Path(
         os.getenv("HERMES_WEBUI_STATE_DIR")
         or Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes")) / "webui"

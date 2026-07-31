@@ -100,6 +100,9 @@ def clean_env(monkeypatch):
         "HERMES_WEBUI_RELEASE_ROOT",
         "HERMES_WEBUI_RELEASE_PATH",
         "HERMES_WEBUI_MANIFEST_SHA256",
+        "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256",
+        "HERMES_WEBUI_STARTUP_FENCED",
+        "HERMES_WEBUI_STARTUP_TRANSACTION_ID",
         "HERMES_WEBUI_SELECTOR_GENERATION",
         "HERMES_WEBUI_SELECTOR_PATH",
         "HERMES_WEBUI_INTERPRETER_PATH",
@@ -117,6 +120,54 @@ def import_bootstrap():
         del sys.modules["bootstrap"]
     import bootstrap as bs
     return bs
+
+
+class TestManagedDeferredManifestBinding:
+    def test_fenced_launch_derives_distinct_deferred_manifest_hash(
+        self, import_bootstrap, clean_env, monkeypatch
+    ):
+        import deferred_release_manifest
+
+        package_hash = "a" * 64
+        canonical = deferred_release_manifest.deferred_release_manifest_sha256()
+        monkeypatch.setenv("HERMES_WEBUI_MANIFEST_SHA256", package_hash)
+        monkeypatch.setenv("HERMES_WEBUI_STARTUP_FENCED", "1")
+        monkeypatch.setenv(
+            "HERMES_WEBUI_STARTUP_TRANSACTION_ID",
+            "managed_startup_transaction_000001",
+        )
+
+        import_bootstrap._bind_managed_deferred_manifest()
+
+        assert os.environ["HERMES_WEBUI_MANIFEST_SHA256"] == package_hash
+        assert os.environ[
+            "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256"
+        ] == canonical
+
+    def test_fenced_launch_rejects_conflicting_deferred_manifest_hash(
+        self, import_bootstrap, clean_env, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_WEBUI_STARTUP_FENCED", "1")
+        monkeypatch.setenv(
+            "HERMES_WEBUI_STARTUP_TRANSACTION_ID",
+            "managed_startup_transaction_000001",
+        )
+        monkeypatch.setenv(
+            "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256", "b" * 64
+        )
+
+        with pytest.raises(RuntimeError, match="manifest binding"):
+            import_bootstrap._bind_managed_deferred_manifest()
+
+    def test_unfenced_launch_does_not_bind_deferred_manifest(
+        self, import_bootstrap, clean_env, monkeypatch
+    ):
+        import_bootstrap._bind_managed_deferred_manifest()
+
+        assert (
+            "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256"
+            not in os.environ
+        )
 
 
 # ---------- argparse coverage ---------------------------------------------

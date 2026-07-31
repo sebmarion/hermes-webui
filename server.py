@@ -908,7 +908,7 @@ def _managed_startup_session_binding() -> tuple[str, str]:
         os.environ.get("HERMES_WEBUI_STARTUP_TRANSACTION_ID") or ""
     ).strip()
     selected_manifest = str(
-        os.environ.get("HERMES_WEBUI_MANIFEST_SHA256") or ""
+        os.environ.get("HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256") or ""
     ).strip()
     canonical_manifest = release_manifest.deferred_release_manifest_sha256()
     if (

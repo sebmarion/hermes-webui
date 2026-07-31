@@ -960,7 +960,9 @@ def build_managed_startup_coordinator(
     receipt_codecs: tuple[ManagedStartupReceiptCodec, ...],
 ) -> ManagedStartupCoordinator:
     transaction_id = environment.get("HERMES_WEBUI_STARTUP_TRANSACTION_ID")
-    manifest_sha = environment.get("HERMES_WEBUI_MANIFEST_SHA256")
+    manifest_sha = environment.get(
+        "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256"
+    )
     if (
         type(transaction_id) is not str
         or _TRANSACTION_RE.fullmatch(transaction_id) is None
@@ -1255,7 +1257,8 @@ def build_production_managed_startup_coordinator(
         not config.startup_run_admission_is_closed()
         or not config._managed_release_selected_from_environment()
         or active_transaction != transaction_id
-        or environment.get("HERMES_WEBUI_MANIFEST_SHA256") != manifest_sha
+        or environment.get("HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256")
+        != manifest_sha
     ):
         raise ManagedStartupBindingError(
             "managed startup admission binding is absent or noncanonical"

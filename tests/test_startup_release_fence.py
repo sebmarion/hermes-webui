@@ -1194,6 +1194,7 @@ def isolated_startup_admission(monkeypatch):
     for key in (
         "HERMES_WEBUI_RELEASE_PATH",
         "HERMES_WEBUI_MANIFEST_SHA256",
+        "HERMES_WEBUI_DEFERRED_RELEASE_MANIFEST_SHA256",
         "HERMES_WEBUI_LAUNCH_MODE",
         "HERMES_WEBUI_STARTUP_FENCED",
         "HERMES_WEBUI_STARTUP_TRANSACTION_ID",
