@@ -813,6 +813,13 @@ _TRANSACTION_PHASE_PREREQUISITES = {
     "staged": (),
     "plist_installed": ("staged",),
     "old_fenced": ("plist_installed",),
+    "pair_checkpoint_fence_intent": ("old_fenced",),
+    "pair_checkpoint_fenced": ("pair_checkpoint_fence_intent",),
+    "thread_checkpoint_dispatched": ("pair_checkpoint_fenced",),
+    "thread_checkpoint_stop_intent": ("thread_checkpoint_dispatched",),
+    "thread_checkpoint_closed": ("thread_checkpoint_stop_intent",),
+    # Legacy transactions retain the original predecessor. New cutovers
+    # enforce the checkpoint predecessor explicitly in the controller below.
     "old_committed": ("old_fenced",),
     "selection_activated": ("old_committed",),
     "old_job_booted_out": ("selection_activated",),
@@ -2183,6 +2190,7 @@ def _release_control_client(
         action: str,
         expected: dict | None,
         fence_token: str | None = None,
+        extra: dict | None = None,
     ) -> dict:
         nonce = secrets.token_urlsafe(32)
         body = {
@@ -2192,6 +2200,10 @@ def _release_control_client(
         }
         if expected is not None:
             body["expected"] = expected
+        if extra is not None:
+            if not isinstance(extra, dict):
+                raise ReleaseBuildError("release control payload is invalid")
+            body.update(copy.deepcopy(extra))
         encoded = json.dumps(
             body,
             sort_keys=True,
@@ -2894,6 +2906,29 @@ def _require_candidate_binding(
     return evidence
 
 
+def _release_checkpoint_boot_id() -> str:
+    """Return a host-boot identity suitable for a persisted deadline."""
+    if sys.platform == "darwin":
+        try:
+            raw = subprocess.check_output(
+                ["sysctl", "-n", "kern.boottime"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2.0,
+            ).strip()
+        except (OSError, subprocess.SubprocessError):
+            raw = ""
+        if raw:
+            return "darwin:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    try:
+        raw = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        raw = ""
+    if raw:
+        return "linux:" + raw
+    raise ReleaseBuildError("host boot identity is unavailable")
+
+
 def run_release_control_cutover(
     *,
     initial_inspection: dict | None = None,
@@ -2931,11 +2966,25 @@ def run_release_control_cutover(
     attest_legacy_activity_drain: (
         Callable[[dict, dict], dict | None] | None
     ) = None,
+    begin_pair_checkpoint: Callable[[dict, dict, str], dict] | None = None,
+    dispatch_pair_checkpoint: Callable[[dict, dict, str], dict] | None = None,
+    poll_pair_checkpoint: Callable[[dict, dict, str], dict] | None = None,
+    close_pair_checkpoint: Callable[[dict, bool, dict, str], dict] | None = None,
     force_restart_on_rollback: bool = False,
 ) -> dict:
     """Replace and accept one exact startup-fenced WebUI process transaction."""
     if timeout_seconds <= 0 or interval_seconds <= 0:
         raise ValueError("release control timing values are invalid")
+    checkpoint_callbacks = (
+        begin_pair_checkpoint,
+        dispatch_pair_checkpoint,
+        poll_pair_checkpoint,
+        close_pair_checkpoint,
+    )
+    if any(callback is not None for callback in checkpoint_callbacks) and not all(
+        callback is not None for callback in checkpoint_callbacks
+    ):
+        raise ValueError("paired checkpoint callbacks must be complete")
     if not _TRANSACTION_ID.fullmatch(str(transaction_id or "")):
         raise ValueError("release control transaction identity is invalid")
     if (
@@ -3078,6 +3127,78 @@ def run_release_control_cutover(
                 "external legacy activity drain receipt is invalid"
             )
         return receipt
+
+    def run_thread_checkpoint() -> None:
+        """Run the paired checkpoint protocol inside one persisted 300s window."""
+        if begin_pair_checkpoint is None:
+            return
+        current = refresh_completed_phases()
+        intent = current["phases"].get("pair_checkpoint_fence_intent")
+        if isinstance(intent, dict):
+            context = intent.get("context")
+            if not isinstance(context, dict):
+                raise ReleaseBuildError("checkpoint deadline receipt is invalid")
+        else:
+            wall_started_at = time.time()
+            monotonic_started_at = monotonic()
+            context = {
+                "transaction_id": transaction_id,
+                "wall_started_at": wall_started_at,
+                "wall_deadline": wall_started_at + 300.0,
+                "monotonic_started_at": monotonic_started_at,
+                "monotonic_deadline": monotonic_started_at + 300.0,
+                "boot_id": _release_checkpoint_boot_id(),
+            }
+            begun = begin_pair_checkpoint(context, identity, token)
+            if not isinstance(begun, dict):
+                raise ReleaseBuildError("paired checkpoint begin receipt is invalid")
+            record_phase(
+                "pair_checkpoint_fence_intent",
+                {"context": context, "begin": begun},
+            )
+        if "pair_checkpoint_fenced" not in completed_phases:
+            record_phase(
+                "pair_checkpoint_fenced",
+                {"context": context},
+            )
+        if "thread_checkpoint_dispatched" not in completed_phases:
+            dispatched = dispatch_pair_checkpoint(context, identity, token)
+            if not isinstance(dispatched, dict):
+                raise ReleaseBuildError("paired checkpoint dispatch receipt is invalid")
+            record_phase(
+                "thread_checkpoint_dispatched",
+                {"context": context, "dispatch": dispatched},
+            )
+        forced = False
+        while True:
+            status = poll_pair_checkpoint(context, identity, token)
+            if not isinstance(status, dict):
+                raise ReleaseBuildError("paired checkpoint status receipt is invalid")
+            if status.get("complete") is True:
+                break
+            if (
+                time.time() >= float(context["wall_deadline"])
+                or monotonic() >= float(context["monotonic_deadline"])
+            ):
+                forced = True
+                break
+            sleep(min(interval_seconds, max(
+                0.01,
+                float(context["monotonic_deadline"]) - monotonic(),
+            )))
+        if "thread_checkpoint_stop_intent" not in completed_phases:
+            record_phase(
+                "thread_checkpoint_stop_intent",
+                {"context": context, "forced": forced},
+            )
+        if "thread_checkpoint_closed" not in completed_phases:
+            closed = close_pair_checkpoint(context, forced, identity, token)
+            if not isinstance(closed, dict):
+                raise ReleaseBuildError("paired checkpoint close receipt is invalid")
+            record_phase(
+                "thread_checkpoint_closed",
+                {"context": context, "forced": forced, "close": closed},
+            )
 
     def require_external_state_attestations() -> None:
         selector_attestation = attest_selector_state()
@@ -3641,6 +3762,7 @@ def run_release_control_cutover(
                     "admission": {"state": "fenced"},
                 },
             )
+            run_thread_checkpoint()
             external_drain: dict | None = None
             inspection: dict = {}
             while True:
@@ -8731,6 +8853,73 @@ def _run_release_commit_plan_core(
             allow_exact_signaled_zombie=True,
         )
 
+    def begin_pair_checkpoint(context: dict, identity: dict, fence_token: str) -> dict:
+        current = read_transaction_journal(
+            plan["transaction_journal"],
+            transaction_id=plan["transaction_id"],
+        )
+        gateway_drained = current["phases"].get("gateway_drained")
+        if not isinstance(gateway_drained, dict):
+            raise ReleaseBuildError(
+                "legacy gateway drain must be durably proved before checkpoint"
+            )
+        return send_control(
+            "begin_checkpoint",
+            identity,
+            fence_token,
+            {"deadline": context},
+        )
+
+    def dispatch_pair_checkpoint(
+        context: dict,
+        identity: dict,
+        fence_token: str,
+    ) -> dict:
+        return send_control(
+            "checkpoint_threads",
+            identity,
+            fence_token,
+        )
+
+    def poll_pair_checkpoint(
+        context: dict,
+        identity: dict,
+        fence_token: str,
+    ) -> dict:
+        status = send_control(
+            "checkpoint_threads_status",
+            identity,
+            fence_token,
+        )
+        admission = status.get("admission")
+        state = status.get("state") if isinstance(status, dict) else None
+        ledger = state.get("ledger") if isinstance(state, dict) else None
+        targets = ledger.get("targets") if isinstance(ledger, dict) else None
+        complete = (
+            isinstance(admission, dict)
+            and int(admission.get("reservations", -1)) == 0
+            and isinstance(targets, dict)
+            and all(
+                isinstance(target, dict)
+                and target.get("state") in {"acknowledged", "settled_without_ack"}
+                for target in targets.values()
+            )
+        )
+        return {"status": status, "complete": complete}
+
+    def close_pair_checkpoint(
+        context: dict,
+        forced: bool,
+        identity: dict,
+        fence_token: str,
+    ) -> dict:
+        return send_control(
+            "checkpoint_threads_close",
+            identity,
+            fence_token,
+            {"forced": bool(forced)},
+        )
+
     result = run_release_control_cutover(
         initial_inspection=initial,
         inspect_control=inspect_control,
@@ -8776,6 +8965,10 @@ def _run_release_commit_plan_core(
                 inspect_control=inspect_control,
             )
         ),
+        begin_pair_checkpoint=begin_pair_checkpoint,
+        dispatch_pair_checkpoint=dispatch_pair_checkpoint,
+        poll_pair_checkpoint=poll_pair_checkpoint,
+        close_pair_checkpoint=close_pair_checkpoint,
         force_restart_on_rollback=True,
     )
     return result

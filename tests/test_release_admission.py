@@ -35,6 +35,8 @@ def isolated_admission(monkeypatch):
     monkeypatch.setattr(config, "_RUN_ADMISSION_LAST_ACTION", None)
     monkeypatch.setattr(config, "_RUN_ADMISSION_LAST_TOKEN_DIGEST", None)
     monkeypatch.setattr(config, "_RUN_ADMISSION_LAST_EXPECTED_IDENTITY", None)
+    monkeypatch.setattr(config, "_RUN_ADMISSION_CHECKPOINT_DEADLINE", None)
+    monkeypatch.setattr(config, "_RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS", ())
     monkeypatch.setattr(config, "_RUN_ADMISSION_LOCAL", threading.local())
     return {"pid": 123, "started_at": 456.0, "instance_id": "instance-a"}
 

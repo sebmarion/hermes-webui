@@ -11932,6 +11932,93 @@ def _handle_chat_steer(handler, body: dict) -> bool:
                        "stream_id": active_stream_id})
 
 
+def deliver_release_checkpoint(*, session_id: str, stream_id: str, text: str) -> dict:
+    """Deliver one release checkpoint without browser-steer fallback semantics."""
+    from api import config as _cfg
+
+    sid = str(session_id or "").strip()
+    expected_stream = str(stream_id or "").strip()
+    if not sid or not expected_stream or not str(text or "").strip():
+        return {"status": "unavailable", "reason": "invalid_identity"}
+
+    with _cfg.SESSION_AGENT_CACHE_LOCK:
+        cached = _cfg.SESSION_AGENT_CACHE.get(sid)
+        agent = cached[0] if cached else None
+    if agent is not None and not _cached_agent_matches_session(agent, sid):
+        agent = None
+    try:
+        session = get_session(sid)
+    except KeyError:
+        return {"status": "unavailable", "reason": "session_not_found"}
+    active_stream = str(getattr(session, "active_stream_id", None) or "").strip()
+    if active_stream != expected_stream:
+        return {"status": "owner_changed", "stream_id": active_stream or None}
+    with _cfg.STREAMS_LOCK:
+        if expected_stream not in _cfg.STREAMS:
+            return {"status": "inactive", "stream_id": expected_stream}
+    with _cfg.ACTIVE_RUNS_LOCK:
+        active = dict((_cfg.ACTIVE_RUNS or {}).get(expected_stream) or {})
+    if str(active.get("backend") or "").strip().lower() == "gateway":
+        gateway_run_id = str(active.get("gateway_run_id") or "").strip()
+        if not gateway_run_id:
+            return {"status": "unsupported", "reason": "gateway_run_identity_missing"}
+        try:
+            from api.gateway_chat import _gateway_api_key, _gateway_base_url
+            from urllib.error import HTTPError, URLError
+            from urllib.parse import quote
+            from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+            class _NoRedirect(HTTPRedirectHandler):
+                def redirect_request(self, *args, **kwargs):
+                    return None
+
+            payload = json.dumps({
+                "session_id": sid,
+                "text": str(text).strip(),
+            }).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            gateway_key = _gateway_api_key()
+            if gateway_key:
+                headers["Authorization"] = f"Bearer {gateway_key}"
+            request = Request(
+                f"{_gateway_base_url()}/v1/runs/{quote(gateway_run_id, safe='')}/release-checkpoint",
+                data=payload,
+                headers=headers,
+                method="POST",
+            )
+            opener = build_opener(_NoRedirect)
+            with opener.open(request, timeout=10) as response:  # nosec B310 - operator gateway URL
+                result = json.loads(response.read().decode("utf-8"))
+            return result if isinstance(result, dict) else {
+                "status": "ambiguous",
+                "reason": "gateway_invalid_response",
+            }
+        except HTTPError as exc:
+            if exc.code == 501:
+                return {"status": "unsupported", "reason": "gateway_steer_not_installed"}
+            if exc.code == 409:
+                return {"status": "owner_changed", "reason": "gateway_owner_changed"}
+            return {"status": "ambiguous", "reason": f"gateway_http_{exc.code}"}
+        except (OSError, URLError, ValueError, json.JSONDecodeError):
+            logger.debug("gateway release checkpoint delivery failed", exc_info=True)
+            return {"status": "ambiguous", "reason": "gateway_delivery_failed"}
+    if agent is None:
+        if active.get("backend") == "gateway":
+            return {"status": "unsupported", "reason": "gateway_steer_not_installed"}
+        return {"status": "unavailable", "reason": "no_cached_agent"}
+    if not hasattr(agent, "steer"):
+        return {"status": "unsupported", "reason": "agent_lacks_steer"}
+    try:
+        accepted = bool(agent.steer(str(text).strip()))
+    except Exception:
+        logger.debug("release checkpoint steer failed for session=%s", sid, exc_info=True)
+        return {"status": "ambiguous", "stream_id": expected_stream}
+    return {
+        "status": "accepted" if accepted else "inactive",
+        "stream_id": expected_stream,
+    }
+
+
 def cancel_stream(stream_id: str) -> bool:
     """Signal an in-flight stream to cancel. Returns True if work was found.
 

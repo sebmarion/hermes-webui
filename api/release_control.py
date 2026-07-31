@@ -39,6 +39,8 @@ _PROCESS_ACTIVITY_COUNT_KEYS = (
     "finalizing_processes",
     "durable_undelivered_completions",
 )
+_CHECKPOINT_LEDGER_DIRNAME = "_release_continuity"
+_CHECKPOINT_LEDGER_LOCK = threading.RLock()
 
 
 def _startup_type_name(value: object) -> str:
@@ -108,6 +110,96 @@ def _canonical_startup_sha256(value: object) -> str:
     except (TypeError, ValueError) as exc:
         raise ValueError("startup receipt is not JSON-safe") from exc
     return hashlib.sha256(payload).hexdigest()
+
+
+def _checkpoint_ledger_path(transaction_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", str(transaction_id or "")):
+        raise ValueError("checkpoint transaction identity is invalid")
+    root = config.STATE_DIR / _CHECKPOINT_LEDGER_DIRNAME
+    if root.exists() and root.is_symlink():
+        raise RuntimeError("checkpoint ledger directory is a symlink")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = root / f"{transaction_id}.json"
+    if path.exists() and path.is_symlink():
+        raise RuntimeError("checkpoint ledger is a symlink")
+    return path
+
+
+def _checkpoint_ledger_write(
+    transaction_id: str,
+    *,
+    phase: str,
+    deadline: dict,
+    ledger,
+) -> dict:
+    path = _checkpoint_ledger_path(transaction_id)
+    payload = {
+        "schema": "hermes.release_checkpoint_state.v1",
+        "transaction_id": transaction_id,
+        "phase": str(phase),
+        "deadline": dict(deadline),
+        "ledger": ledger.export(),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        with open(temporary, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        except OSError:
+            directory_fd = None
+        if directory_fd is not None:
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "phase": str(phase),
+    }
+
+
+def _checkpoint_ledger_read(transaction_id: str):
+    from api.release_thread_continuity import CheckpointLedger
+
+    path = _checkpoint_ledger_path(transaction_id)
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("checkpoint ledger file is unsafe")
+    with open(path, "rb") as handle:
+        encoded = handle.read(256 * 1024)
+    if len(encoded) >= 256 * 1024:
+        raise RuntimeError("checkpoint ledger is too large")
+    payload = json.loads(encoded.decode("utf-8"))
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != "hermes.release_checkpoint_state.v1"
+        or payload.get("transaction_id") != transaction_id
+        or not isinstance(payload.get("phase"), str)
+        or not isinstance(payload.get("deadline"), dict)
+    ):
+        raise RuntimeError("checkpoint ledger schema is invalid")
+    return payload, CheckpointLedger.from_export(payload.get("ledger"))
 
 
 def _validated_startup_evidence(
@@ -581,6 +673,50 @@ def commit_release_control(
     return {"status": "committing", "admission": admission, "activity": after}
 
 
+def _checkpoint_marker(transaction_id: str, target: dict) -> str:
+    return (
+        f"HERMES_RELEASE_PAUSED_V1 transaction={transaction_id} "
+        f"session={target['session_id']} stream={target['stream_id']}"
+    )
+
+
+def _checkpoint_state_receipt(payload: dict, ledger) -> dict:
+    return {
+        "phase": payload.get("phase"),
+        "deadline": dict(payload.get("deadline") or {}),
+        "ledger": ledger.export(),
+    }
+
+
+def _checkpoint_live_status(transaction_id: str, target: dict) -> str:
+    session_id = str(target.get("session_id") or "")
+    stream_id = str(target.get("stream_id") or "")
+    with config.ACTIVE_RUNS_LOCK:
+        live_run = dict((config.ACTIVE_RUNS or {}).get(stream_id) or {})
+    with config.STREAMS_LOCK:
+        stream_live = stream_id in config.STREAMS
+    if live_run or stream_live:
+        return "active"
+    try:
+        from api.models import Session
+
+        session = Session.load(session_id)
+    except Exception:
+        return "unavailable"
+    if session is None:
+        return "unavailable"
+    current_stream = str(getattr(session, "active_stream_id", None) or "")
+    if current_stream and current_stream != stream_id:
+        return "owner_changed"
+    marker = _checkpoint_marker(transaction_id, target)
+    for message in reversed(getattr(session, "messages", None) or []):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        if marker in str(message.get("content") or ""):
+            return "acknowledged"
+    return "settled_without_ack"
+
+
 def execute_release_control(body: dict, *, fence_token: str | None = None) -> dict:
     action = str(body.get("action") or "").strip().lower()
     transaction_id = str(body.get("transaction_id") or "").strip()
@@ -615,6 +751,191 @@ def execute_release_control(body: dict, *, fence_token: str | None = None) -> di
                 "admission": result["admission"],
                 "identity": current,
                 "activity": release_activity_snapshot(),
+            }
+        )
+    if action == "begin_checkpoint":
+        from api.release_thread_continuity import CheckpointLedger
+
+        deadline = body.get("deadline")
+        with _CHECKPOINT_LEDGER_LOCK:
+            existing = _checkpoint_ledger_read(transaction_id)
+            if existing is None:
+                ledger = CheckpointLedger(transaction_id=transaction_id)
+                _checkpoint_ledger_write(
+                    transaction_id,
+                    phase="intent",
+                    deadline=deadline,
+                    ledger=ledger,
+                )
+            else:
+                state, ledger = existing
+                if state.get("deadline") != deadline:
+                    raise config.RunAdmissionConflict("checkpoint deadline changed")
+            admission = config.pin_run_admission_checkpoint(
+                str(fence_token or ""),
+                expected_identity=current,
+                transaction_id=transaction_id,
+                deadline=deadline,
+            )
+            receipt = _checkpoint_ledger_write(
+                transaction_id,
+                phase="checkpoint-fenced",
+                deadline=deadline,
+                ledger=ledger,
+            )
+        return _attest_release_control_response(
+            {
+                "status": str(admission.get("state") or "checkpoint-fenced"),
+                "transaction_id": transaction_id,
+                "request_nonce": request_nonce,
+                "admission": admission,
+                "identity": current,
+                "activity": release_activity_snapshot(),
+                "checkpoint": receipt,
+            }
+        )
+    if action == "checkpoint_threads":
+        from api import streaming as _streaming
+
+        with _CHECKPOINT_LEDGER_LOCK:
+            stored = _checkpoint_ledger_read(transaction_id)
+            if stored is None:
+                raise config.RunAdmissionConflict("checkpoint ledger is missing")
+            state, ledger = stored
+            if state.get("phase") not in {
+                "checkpoint-fenced",
+                "dispatching",
+                "status",
+            }:
+                raise config.RunAdmissionConflict("checkpoint delivery is not open")
+            deadline = state.get("deadline")
+            snapshot = config.run_admission_snapshot()
+            roster = snapshot.get("checkpoint_active_roster") or []
+            delivered = []
+            for raw_target in roster:
+                target = dict(raw_target)
+                target["transaction_id"] = transaction_id
+                target_id = ledger.enroll(
+                    service=target.get("service") or "webui",
+                    session_id=target.get("session_id"),
+                    stream_id=target.get("stream_id"),
+                    backend=target.get("backend") or "local",
+                )
+                if not ledger.mark_delivery_intent(target_id):
+                    delivered.append(
+                        {"target_id": target_id, **ledger.delivery_state(target_id)}
+                    )
+                    continue
+                _checkpoint_ledger_write(
+                    transaction_id,
+                    phase="dispatching",
+                    deadline=deadline,
+                    ledger=ledger,
+                )
+                result = _streaming.deliver_release_checkpoint(
+                    session_id=target["session_id"],
+                    stream_id=target["stream_id"],
+                    text=_checkpoint_marker(transaction_id, target),
+                )
+                delivery_status = str(result.get("status") or "ambiguous")
+                if delivery_status not in {
+                    "accepted",
+                    "inactive",
+                    "ambiguous",
+                    "undelivered",
+                    "unsupported",
+                }:
+                    delivery_status = "ambiguous"
+                if delivery_status == "unsupported":
+                    delivery_status = "undelivered"
+                ledger.record_delivery(target_id, delivery_status)
+                delivered.append(
+                    {
+                        "target_id": target_id,
+                        **ledger.delivery_state(target_id),
+                        "result": result,
+                    }
+                )
+                _checkpoint_ledger_write(
+                    transaction_id,
+                    phase="dispatching",
+                    deadline=deadline,
+                    ledger=ledger,
+                )
+            receipt = _checkpoint_ledger_write(
+                transaction_id,
+                phase="status",
+                deadline=deadline,
+                ledger=ledger,
+            )
+        return _attest_release_control_response(
+            {
+                "status": "checkpoint-dispatched",
+                "transaction_id": transaction_id,
+                "request_nonce": request_nonce,
+                "identity": current,
+                "delivery": delivered,
+                "checkpoint": receipt,
+            }
+        )
+    if action == "checkpoint_threads_status":
+        with _CHECKPOINT_LEDGER_LOCK:
+            stored = _checkpoint_ledger_read(transaction_id)
+            if stored is None:
+                raise config.RunAdmissionConflict("checkpoint ledger is missing")
+            state, ledger = stored
+            deadline = state.get("deadline")
+            for target_id in ledger.target_ids:
+                target = ledger._target(target_id)
+                target["transaction_id"] = transaction_id
+                status = _checkpoint_live_status(transaction_id, target)
+                ledger.record_status(target_id, status)
+            receipt = _checkpoint_ledger_write(
+                transaction_id,
+                phase="status",
+                deadline=deadline,
+                ledger=ledger,
+            )
+            payload = _checkpoint_state_receipt(state, ledger)
+        return _attest_release_control_response(
+            {
+                "status": "checkpoint-status",
+                "transaction_id": transaction_id,
+                "request_nonce": request_nonce,
+                "identity": current,
+                "checkpoint": receipt,
+                "state": payload,
+                "admission": config.run_admission_snapshot(),
+            }
+        )
+    if action == "checkpoint_threads_close":
+        with _CHECKPOINT_LEDGER_LOCK:
+            stored = _checkpoint_ledger_read(transaction_id)
+            if stored is None:
+                raise config.RunAdmissionConflict("checkpoint ledger is missing")
+            state, ledger = stored
+            admission = config.stop_run_admission_checkpoint(
+                str(fence_token or ""),
+                expected_identity=current,
+                transaction_id=transaction_id,
+                forced=bool(body.get("forced", False)),
+            )
+            ledger.close_population(forced=bool(body.get("forced", False)))
+            receipt = _checkpoint_ledger_write(
+                transaction_id,
+                phase="closed",
+                deadline=state.get("deadline"),
+                ledger=ledger,
+            )
+        return _attest_release_control_response(
+            {
+                "status": str(admission.get("state") or "checkpoint-stopping"),
+                "transaction_id": transaction_id,
+                "request_nonce": request_nonce,
+                "admission": admission,
+                "identity": current,
+                "activity": release_activity_snapshot(),
+                "checkpoint": receipt,
             }
         )
     if action == "accept":

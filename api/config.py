@@ -9324,6 +9324,8 @@ _RUN_ADMISSION_STARTUP_ERROR: str | None = None
 _RUN_ADMISSION_STARTUP_ACCEPTOR = None
 _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID: str | None = None
 _RUN_ADMISSION_STARTUP_EVIDENCE = None
+_RUN_ADMISSION_CHECKPOINT_DEADLINE: dict | None = None
+_RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS: tuple[str, ...] = ()
 _RUN_ADMISSION_MAX_RESERVATIONS = 4096
 RUN_ADMISSION_FENCE_LEASE_SECONDS = 180.0
 _RUN_ADMISSION_LOCAL = threading.local()
@@ -9689,6 +9691,54 @@ def _pair_open_gate_receipt() -> dict:
     }
 
 
+def _checkpoint_active_roster_locked() -> list[dict]:
+    """Return only non-secret ownership fields for release reconciliation."""
+    roster = []
+    seen_streams: set[str] = set()
+    for run_id, raw in (ACTIVE_RUNS or {}).items():
+        entry = raw if isinstance(raw, dict) else {}
+        stream_id = str(entry.get("stream_id") or run_id or "").strip()
+        session_id = str(entry.get("session_id") or "").strip()
+        if not stream_id or not session_id:
+            continue
+        item = {
+            "run_id": str(run_id),
+            "stream_id": stream_id,
+            "session_id": session_id,
+            "backend": str(entry.get("backend") or "local"),
+            "phase": str(entry.get("phase") or "running"),
+        }
+        gateway_run_id = str(entry.get("gateway_run_id") or "").strip()
+        if gateway_run_id:
+            item["gateway_run_id"] = gateway_run_id
+        roster.append(item)
+        seen_streams.add(stream_id)
+    # STREAMS can briefly outlive ACTIVE_RUNS during worker teardown. The
+    # owner map is the authoritative session binding for that gap; include it
+    # so a checkpoint cannot silently miss a still-live stream.
+    with STREAMS_LOCK:
+        live_stream_ids = set(STREAMS or {})
+    with STREAM_SESSION_OWNERS_LOCK:
+        owner_rows = list(STREAM_SESSION_OWNERS.items())
+    for stream_id, session_id in owner_rows:
+        stream_id = str(stream_id or "").strip()
+        session_id = str(session_id or "").strip()
+        if not stream_id or not session_id or stream_id not in live_stream_ids:
+            continue
+        if stream_id in seen_streams:
+            continue
+        roster.append(
+            {
+                "run_id": stream_id,
+                "stream_id": stream_id,
+                "session_id": session_id,
+                "backend": "local",
+                "phase": "stream-only",
+            }
+        )
+    return roster
+
+
 def _run_admission_snapshot_locked() -> dict:
     kinds: dict[str, int] = {}
     for entry in _RUN_ADMISSION_RESERVATIONS.values():
@@ -9710,6 +9760,11 @@ def _run_admission_snapshot_locked() -> dict:
         "reservations": len(_RUN_ADMISSION_RESERVATIONS),
         "reservation_kinds": dict(sorted(kinds.items())),
         "active_runs": len(ACTIVE_RUNS),
+        "checkpoint_deadline": copy.deepcopy(_RUN_ADMISSION_CHECKPOINT_DEADLINE),
+        "checkpoint_forced_reservations": list(
+            _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
+        ),
+        "checkpoint_active_roster": _checkpoint_active_roster_locked(),
     }
 
 
@@ -9728,6 +9783,8 @@ def _expire_run_admission_fence_locked() -> bool:
     global _RUN_ADMISSION_FENCED_AT, _RUN_ADMISSION_LEASE_EXPIRES_AT
     global _RUN_ADMISSION_LAST_TRANSACTION_ID, _RUN_ADMISSION_LAST_ACTION
     global _RUN_ADMISSION_LAST_TOKEN_DIGEST, _RUN_ADMISSION_LAST_EXPECTED_IDENTITY
+    global _RUN_ADMISSION_CHECKPOINT_DEADLINE
+    global _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
     if (
         _RUN_ADMISSION_STATE != "fenced"
         or _RUN_ADMISSION_LEASE_EXPIRES_AT is None
@@ -9746,6 +9803,8 @@ def _expire_run_admission_fence_locked() -> bool:
     _RUN_ADMISSION_EXPECTED_IDENTITY = None
     _RUN_ADMISSION_FENCED_AT = None
     _RUN_ADMISSION_LEASE_EXPIRES_AT = None
+    _RUN_ADMISSION_CHECKPOINT_DEADLINE = None
+    _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS = ()
     _clear_startup_acceptance_evidence_locked()
     return True
 
@@ -9764,6 +9823,8 @@ def initialize_run_admission_from_environment() -> dict:
     global _RUN_ADMISSION_TRANSACTION_ID, _RUN_ADMISSION_EXPECTED_IDENTITY
     global _RUN_ADMISSION_FENCED_AT, _RUN_ADMISSION_LEASE_EXPIRES_AT
     global _RUN_ADMISSION_STARTUP_ERROR
+    global _RUN_ADMISSION_CHECKPOINT_DEADLINE
+    global _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
     global _MANAGED_RELEASE_SELECTION_FROZEN
 
     managed_selected = any(
@@ -9814,6 +9875,8 @@ def initialize_run_admission_from_environment() -> dict:
         _RUN_ADMISSION_EXPECTED_IDENTITY = None
         _RUN_ADMISSION_FENCED_AT = time.time()
         _RUN_ADMISSION_LEASE_EXPIRES_AT = None
+        _RUN_ADMISSION_CHECKPOINT_DEADLINE = None
+        _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS = ()
         _RUN_ADMISSION_STARTUP_ERROR = (
             None
             if _RUN_ADMISSION_STATE == "startup-fenced"
@@ -9920,6 +9983,8 @@ def fork_run_admission(
         raise ValueError("run admission kind is required")
     child_id = uuid.uuid4().hex
     with ACTIVE_RUNS_LOCK:
+        if _RUN_ADMISSION_STATE == "checkpoint-stopping":
+            raise RunAdmissionClosed("checkpoint stopping rejects child work")
         parent = _RUN_ADMISSION_RESERVATIONS.get(str(parent_reservation_id or ""))
         if parent is None:
             raise RunAdmissionClosed("parent run admission reservation is missing")
@@ -10007,6 +10072,8 @@ def fence_run_admission(
     global _RUN_ADMISSION_TOKEN_DIGEST, _RUN_ADMISSION_TOKEN
     global _RUN_ADMISSION_TRANSACTION_ID, _RUN_ADMISSION_EXPECTED_IDENTITY
     global _RUN_ADMISSION_FENCED_AT, _RUN_ADMISSION_LEASE_EXPIRES_AT
+    global _RUN_ADMISSION_CHECKPOINT_DEADLINE
+    global _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
     normalized = _normalize_run_admission_identity(expected_identity)
     normalized_transaction = _normalize_run_admission_transaction_id(
         transaction_id or secrets.token_urlsafe(32)
@@ -10062,8 +10129,117 @@ def fence_run_admission(
         _RUN_ADMISSION_LEASE_EXPIRES_AT = (
             _RUN_ADMISSION_FENCED_AT + RUN_ADMISSION_FENCE_LEASE_SECONDS
         )
+        _RUN_ADMISSION_CHECKPOINT_DEADLINE = None
+        _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS = ()
         snapshot = _run_admission_snapshot_locked()
     return {"token": token, "admission": snapshot}
+
+
+def pin_run_admission_checkpoint(
+    token: str,
+    *,
+    expected_identity: dict,
+    transaction_id: str,
+    deadline: dict,
+) -> dict:
+    """Pin one fenced transaction beyond the legacy runtime lease."""
+    global _RUN_ADMISSION_STATE, _RUN_ADMISSION_GENERATION
+    global _RUN_ADMISSION_LEASE_EXPIRES_AT
+    global _RUN_ADMISSION_CHECKPOINT_DEADLINE
+    with ACTIVE_RUNS_LOCK:
+        _expire_run_admission_fence_locked()
+        if _RUN_ADMISSION_STATE == "checkpoint-fenced":
+            _validate_run_admission_owner_locked(
+                token,
+                expected_identity,
+                transaction_id,
+            )
+            if _RUN_ADMISSION_CHECKPOINT_DEADLINE != deadline:
+                raise RunAdmissionConflict("checkpoint deadline changed")
+            return _run_admission_snapshot_locked()
+        if _RUN_ADMISSION_STATE != "fenced":
+            raise RunAdmissionConflict("run admission fence cannot pin checkpoint")
+        _validate_run_admission_owner_locked(
+            token,
+            expected_identity,
+            transaction_id,
+        )
+        if not isinstance(deadline, dict):
+            raise ValueError("checkpoint deadline is invalid")
+        required = {
+            "wall_started_at",
+            "wall_deadline",
+            "monotonic_started_at",
+            "monotonic_deadline",
+            "boot_id",
+        }
+        if set(deadline) != required:
+            raise ValueError("checkpoint deadline fields are invalid")
+        try:
+            wall_started_at = float(deadline["wall_started_at"])
+            wall_deadline = float(deadline["wall_deadline"])
+            monotonic_started_at = float(deadline["monotonic_started_at"])
+            monotonic_deadline = float(deadline["monotonic_deadline"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("checkpoint deadline values are invalid") from exc
+        boot_id = str(deadline["boot_id"] or "").strip()
+        if (
+            not math.isfinite(wall_started_at)
+            or not math.isfinite(wall_deadline)
+            or not math.isfinite(monotonic_started_at)
+            or not math.isfinite(monotonic_deadline)
+            or not boot_id
+            or wall_deadline - wall_started_at != 300.0
+            or monotonic_deadline - monotonic_started_at != 300.0
+        ):
+            raise ValueError("checkpoint deadline values are invalid")
+        _RUN_ADMISSION_CHECKPOINT_DEADLINE = {
+            "wall_started_at": wall_started_at,
+            "wall_deadline": wall_deadline,
+            "monotonic_started_at": monotonic_started_at,
+            "monotonic_deadline": monotonic_deadline,
+            "boot_id": boot_id,
+        }
+        _RUN_ADMISSION_STATE = "checkpoint-fenced"
+        _RUN_ADMISSION_GENERATION += 1
+        _RUN_ADMISSION_LEASE_EXPIRES_AT = None
+        return _run_admission_snapshot_locked()
+
+
+def stop_run_admission_checkpoint(
+    token: str,
+    *,
+    expected_identity: dict,
+    transaction_id: str,
+    forced: bool = False,
+) -> dict:
+    """Close the target population without allowing late reservation upgrades."""
+    global _RUN_ADMISSION_STATE, _RUN_ADMISSION_GENERATION
+    global _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
+    with ACTIVE_RUNS_LOCK:
+        if _RUN_ADMISSION_STATE == "checkpoint-stopping":
+            _validate_run_admission_owner_locked(
+                token,
+                expected_identity,
+                transaction_id,
+            )
+            return _run_admission_snapshot_locked()
+        if _RUN_ADMISSION_STATE != "checkpoint-fenced":
+            raise RunAdmissionConflict("checkpoint population cannot close")
+        _validate_run_admission_owner_locked(
+            token,
+            expected_identity,
+            transaction_id,
+        )
+        if _RUN_ADMISSION_RESERVATIONS and not forced:
+            raise RunAdmissionBusy("checkpoint reservations have not drained")
+        _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS = tuple(
+            sorted(_RUN_ADMISSION_RESERVATIONS) if forced else ()
+        )
+        _RUN_ADMISSION_RESERVATIONS.clear()
+        _RUN_ADMISSION_STATE = "checkpoint-stopping"
+        _RUN_ADMISSION_GENERATION += 1
+        return _run_admission_snapshot_locked()
 
 
 def accept_startup_run_admission(
@@ -10087,6 +10263,8 @@ def accept_startup_run_admission(
     global _RUN_ADMISSION_FENCED_AT, _RUN_ADMISSION_LEASE_EXPIRES_AT
     global _RUN_ADMISSION_LAST_TRANSACTION_ID, _RUN_ADMISSION_LAST_ACTION
     global _RUN_ADMISSION_LAST_TOKEN_DIGEST, _RUN_ADMISSION_LAST_EXPECTED_IDENTITY
+    global _RUN_ADMISSION_CHECKPOINT_DEADLINE
+    global _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS
     global _RUN_ADMISSION_STARTUP_ERROR
     global _RUN_ADMISSION_STARTUP_EVIDENCE_TRANSACTION_ID
     global _RUN_ADMISSION_STARTUP_EVIDENCE
@@ -10266,7 +10444,7 @@ def abort_run_admission(
             ):
                 return _run_admission_snapshot_locked()
             raise RunAdmissionConflict("run admission fence cannot be aborted")
-        if _RUN_ADMISSION_STATE not in {"fenced", "committing"}:
+        if _RUN_ADMISSION_STATE not in {"fenced", "committing", "checkpoint-fenced"}:
             raise RunAdmissionConflict("run admission fence cannot be aborted")
         _validate_run_admission_owner_locked(
             token,
@@ -10285,6 +10463,8 @@ def abort_run_admission(
         _RUN_ADMISSION_EXPECTED_IDENTITY = None
         _RUN_ADMISSION_FENCED_AT = None
         _RUN_ADMISSION_LEASE_EXPIRES_AT = None
+        _RUN_ADMISSION_CHECKPOINT_DEADLINE = None
+        _RUN_ADMISSION_CHECKPOINT_FORCED_RESERVATIONS = ()
         _clear_startup_acceptance_evidence_locked()
         return _run_admission_snapshot_locked()
 
@@ -10611,6 +10791,8 @@ def register_active_run(
     entry.setdefault("phase", "running")
     with ACTIVE_RUNS_LOCK:
         _expire_run_admission_fence_locked()
+        if _RUN_ADMISSION_STATE == "checkpoint-stopping":
+            raise RunAdmissionClosed("checkpoint stopping rejects worker upgrade")
         reservation = None
         if admission_reservation_id:
             reservation = _RUN_ADMISSION_RESERVATIONS.pop(
