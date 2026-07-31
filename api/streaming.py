@@ -2970,29 +2970,32 @@ def _release_process_completion_seen(events: list[dict]) -> None:
         from api import config as _process_cfg
 
         with _process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
-            for event in events:
-                delivery_id = str(
-                    (event or {}).get("event_id")
-                    or (event or {}).get("delegation_id")
-                    or (event or {}).get("session_id")
-                    or ""
-                ).strip()
-                process_id = str((event or {}).get("session_id") or "").strip()
-                if not delivery_id:
-                    continue
-                for owner, seen in list(
-                    _process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN.items()
-                ):
-                    seen.discard(delivery_id)
-                    if process_id:
-                        seen.discard(process_id)
-                    if not seen:
-                        _process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN.pop(owner, None)
+            _release_process_completion_seen_locked(events, _process_cfg)
     except Exception:
         logger.warning(
             "Failed to release process completion retry claim",
             exc_info=True,
         )
+
+
+def _release_process_completion_seen_locked(events: list[dict], process_cfg) -> None:
+    """Remove exact seen ids while the caller owns the seen-state lock."""
+    for event in events:
+        delivery_id = str(
+            (event or {}).get("event_id")
+            or (event or {}).get("delegation_id")
+            or (event or {}).get("session_id")
+            or ""
+        ).strip()
+        process_id = str((event or {}).get("session_id") or "").strip()
+        if not delivery_id:
+            continue
+        for owner, seen in list(process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN.items()):
+            seen.discard(delivery_id)
+            if process_id:
+                seen.discard(process_id)
+            if not seen:
+                process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN.pop(owner, None)
 
 
 _PROCESS_COMPLETION_RECEIPTS_KEY = "_processCompletionReceipts"
@@ -3193,6 +3196,51 @@ def _durable_process_completion_receipt_status(
     return "committed" if all(item in found for item in required) else "absent"
 
 
+def _snapshot_native_terminal_state(session) -> dict:
+    """Capture the complete mutable Session state before terminal writeback."""
+    return copy.deepcopy(getattr(session, "__dict__", {}))
+
+
+def _restore_native_terminal_state(session, snapshot: dict) -> None:
+    """Restore a Session after a terminal sidecar publication provably failed."""
+    if not isinstance(snapshot, dict):
+        return
+    session.__dict__.clear()
+    session.__dict__.update(copy.deepcopy(snapshot))
+
+
+def _save_native_terminal_delivery(
+    session,
+    events: list[dict],
+    *,
+    before: dict,
+) -> str:
+    """Publish one receipt-bearing terminal state and reconcile save errors.
+
+    ``Session.save()`` publishes the sidecar before updating the best-effort
+    sidebar index. An exception therefore does not by itself prove whether the
+    terminal transcript committed. Only a fresh sidecar read may distinguish a
+    pre-publication failure (restore and retry) from a post-publication failure
+    (delivery committed). Unknown or corrupt read-back stays fail-closed.
+    """
+    try:
+        session.save()
+    except Exception as exc:
+        receipt_status = _durable_process_completion_receipt_status(
+            session.session_id,
+            events,
+        )
+        if receipt_status == "absent":
+            _restore_native_terminal_state(session, before)
+        logger.warning(
+            "Native terminal sidecar save raised (error=%s receipt_status=%s)",
+            type(exc).__name__,
+            receipt_status,
+        )
+        return receipt_status
+    return "committed"
+
+
 def _finalize_process_completion_claims(
     process_registry,
     events: list[dict],
@@ -3201,18 +3249,149 @@ def _finalize_process_completion_claims(
     raise_on_error: bool = False,
 ) -> bool:
     """ACK durable claims or requeue every exact event after a failed writeback."""
-    all_finished = True
-    for event in events:
-        finished = _finish_process_completion_delivery(
-            process_registry,
-            event,
-            committed=committed,
-            raise_on_error=raise_on_error,
-        )
-        all_finished = finished and all_finished
-    if not all_finished:
-        _release_process_completion_seen(events)
+    from api import config as _process_cfg
+
+    # ``finish_notification_delivery(False)`` enqueues before returning. Keep
+    # that publication and seen-id removal in one critical section shared with
+    # ``background_process._process_one`` so a fast drain cannot discard the
+    # retry in the enqueue-before-release window.
+    with _process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
+        all_finished = True
+        for event_index, event in enumerate(events):
+            try:
+                finished = _finish_process_completion_delivery(
+                    process_registry,
+                    event,
+                    committed=committed,
+                    raise_on_error=raise_on_error,
+                )
+            except Exception as exc:
+                # Native recovery must queue an event that was not already
+                # ACKed earlier in this batch. Carry the failing suffix without
+                # exposing event identity in logs or changing exception type.
+                try:
+                    exc._process_completion_failed_index = event_index
+                except Exception:
+                    pass
+                raise
+            all_finished = finished and all_finished
+        if not all_finished:
+            _release_process_completion_seen_locked(events, _process_cfg)
     return all_finished
+
+
+def _restage_native_process_completion_claims(events: list[dict]) -> bool:
+    """Best-effort last-resort preservation when live queue requeue fails.
+
+    Staging alone does not schedule another wakeup, so callers must still fail
+    loudly and must not release the proactive-drain seen claim on this path.
+    """
+    try:
+        from api.background_process import stage_process_completion_event
+    except Exception as exc:
+        logger.error(
+            "Native process-completion claim staging is unavailable (error=%s)",
+            type(exc).__name__,
+        )
+        return False
+
+    all_preserved = True
+    for event in events:
+        owner = (
+            str(event.get("session_key") or "").strip()
+            if isinstance(event, dict)
+            else ""
+        )
+        preserved = False
+        if owner:
+            try:
+                preserved = bool(stage_process_completion_event(owner, event))
+            except Exception:
+                preserved = False
+        all_preserved = preserved and all_preserved
+    return all_preserved
+
+
+def _requeue_native_process_completion_claims(
+    process_registry,
+    events: list[dict],
+    *,
+    scheduler_events: list[dict] | None = None,
+) -> bool:
+    """Schedule a whole exact batch after settlement itself raises.
+
+    The whole batch is staged before any live enqueue. A successfully queued
+    event from the failing/unattempted suffix can then schedule a route which
+    atomically claims that staged batch; staging deduplicates the queued event.
+    Queue publication and seen release share the drain's seen-state lock so the
+    scheduler cannot consume the event before it becomes eligible again.
+    """
+    if not _restage_native_process_completion_claims(events):
+        return False
+
+    completion_queue = getattr(process_registry, "completion_queue", None)
+    put_event = getattr(completion_queue, "put", None)
+    if not callable(put_event):
+        logger.error("Native process-completion requeue is unavailable")
+        return False
+
+    from api import config as _process_cfg
+
+    queue_candidates = list(scheduler_events or events)
+    queued_count = 0
+    with _process_cfg.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
+        for event in queue_candidates:
+            try:
+                put_event(event)
+                queued_count += 1
+            except Exception as exc:
+                logger.error(
+                    "Native process-completion live requeue failed (error=%s)",
+                    type(exc).__name__,
+                )
+        if queued_count:
+            _release_process_completion_seen_locked(events, _process_cfg)
+    return queued_count > 0
+
+
+def _settle_native_process_completion_claims(
+    process_registry,
+    events: list[dict],
+    *,
+    committed: bool,
+) -> bool:
+    """Settle native claims or schedule receipt-only replay after exceptions."""
+    try:
+        return _finalize_process_completion_claims(
+            process_registry,
+            events,
+            committed=committed,
+            raise_on_error=True,
+        )
+    except Exception as exc:
+        failed_index = getattr(exc, "_process_completion_failed_index", 0)
+        if not isinstance(failed_index, int) or not (0 <= failed_index < len(events)):
+            failed_index = 0
+        if _requeue_native_process_completion_claims(
+            process_registry,
+            events,
+            scheduler_events=events[failed_index:],
+        ):
+            logger.warning(
+                "Native process-completion settlement raised; claims requeued "
+                "(count=%d error=%s)",
+                len(events),
+                type(exc).__name__,
+            )
+            return False
+        logger.error(
+            "Native process-completion settlement could not requeue claims; "
+            "last-resort staging is incomplete or unscheduled "
+            "(count=%d error=%s)",
+            len(events),
+            type(exc).__name__,
+        )
+        raise
 
 
 def _accept_pending_async_delegations(
@@ -8614,7 +8793,7 @@ def _run_agent_streaming(
             try:
                 from tools.process_registry import process_registry
 
-                _finalize_process_completion_claims(
+                _settle_native_process_completion_claims(
                     process_registry,
                     _provided_process_completion_events,
                     committed=False,
@@ -8646,7 +8825,7 @@ def _run_agent_streaming(
             try:
                 from tools.process_registry import process_registry
 
-                _finalize_process_completion_claims(
+                _settle_native_process_completion_claims(
                     process_registry,
                     _provided_process_completion_events,
                     committed=False,
@@ -8675,7 +8854,7 @@ def _run_agent_streaming(
                 try:
                     from tools.process_registry import process_registry
 
-                    _finalize_process_completion_claims(
+                    _settle_native_process_completion_claims(
                         process_registry,
                         _provided_process_completion_events,
                         committed=False,
@@ -9051,10 +9230,50 @@ def _run_agent_streaming(
     _metering_thread = threading.Thread(target=_metering_ticker, daemon=True)
 
     _success_writeback_committed = False
+    _delivery_writeback_committed = False
+    _terminal_writeback_uncertain = False
+    _terminal_cleanup_save_suppressed = False
+    _native_terminal_state_before = None
+    _process_wakeup_pause_before_clear = None
     _process_completion_claims: list[dict] = list(
         _provided_process_completion_events
     )
     _continuation_pending = False
+
+    def _commit_exact_process_completion_terminal(
+        session,
+        terminal_message: dict,
+        before: dict,
+    ) -> bool | None:
+        """Commit an exact wakeup terminal row without conflating success."""
+        nonlocal _delivery_writeback_committed
+        nonlocal _terminal_writeback_uncertain
+        nonlocal _terminal_cleanup_save_suppressed
+
+        if not _process_completion_claims:
+            return None
+        stamped = _stamp_process_completion_receipts(
+            terminal_message,
+            _process_completion_claims,
+            session_id=session.session_id,
+        )
+        if not stamped:
+            _restore_native_terminal_state(session, before)
+            _terminal_writeback_uncertain = True
+            _terminal_cleanup_save_suppressed = True
+            return False
+        receipt_status = _save_native_terminal_delivery(
+            session,
+            _process_completion_claims,
+            before=before,
+        )
+        if receipt_status == "committed":
+            _delivery_writeback_committed = True
+            return True
+        if receipt_status in {"invalid", "unavailable"}:
+            _terminal_writeback_uncertain = True
+        _terminal_cleanup_save_suppressed = True
+        return False
 
     def put(event, data):
         # If cancelled, drop all further events except the cancel event itself
@@ -10846,6 +11065,7 @@ def _run_agent_streaming(
                             getattr(s, 'active_stream_id', None),
                         )
                         return
+                _native_terminal_state_before = _snapshot_native_terminal_state(s)
                 with _stream_writeback_stage(_writeback_timings, "merge_result"):
                     _tool_limit_reached = _agent_result_tool_limit_reached(result)
                     _guardrail_terminal = _agent_result_guardrail_blocked(result)
@@ -11077,6 +11297,26 @@ def _run_agent_streaming(
                 _compression_continuation_session_id = None
                 _agent_sid = getattr(agent, 'session_id', None)
                 _compressed = False
+                if (
+                    _process_completion_claims
+                    and _agent_sid
+                    and _agent_sid != session_id
+                ):
+                    # Exact claims are bound to the original WebUI owner. A
+                    # compression rotation would publish the terminal row to a
+                    # different sidecar, which the original owner's replay gate
+                    # cannot use as delivery proof. Restore the pre-terminal
+                    # state and leave the claim retryable instead of minting an
+                    # unmatchable receipt.
+                    _restore_native_terminal_state(
+                        s,
+                        _native_terminal_state_before,
+                    )
+                    _terminal_cleanup_save_suppressed = True
+                    logger.warning(
+                        "Skipped exact process-completion writeback after session rotation"
+                    )
+                    return
                 if _agent_sid and _agent_sid != session_id:
                     old_sid = session_id
                     new_sid = _agent_sid
@@ -11535,10 +11775,17 @@ def _run_agent_streaming(
                         elif _err_type == 'tool_limit_reached':
                             _error_message['provider_details_label'] = 'Terminal state details'
                         s.messages.append(_error_message)
-                        try:
-                            s.save()
-                        except Exception:
-                            pass
+                        if _process_completion_claims:
+                            _commit_exact_process_completion_terminal(
+                                s,
+                                _error_message,
+                                _native_terminal_state_before,
+                            )
+                        else:
+                            try:
+                                s.save()
+                            except Exception:
+                                pass
                         _error_payload['session'] = redact_session_data(
                             _session_payload_with_full_messages(s, tool_calls=s.tool_calls)
                         )
@@ -11982,8 +12229,35 @@ def _run_agent_streaming(
                         logger.debug("Failed to append cancelled turn journal event", exc_info=True)
                     put('cancel', _cancel_event_payload('Cancelled by user'))
                     return
-                with _stream_writeback_stage(_writeback_timings, "session_save"):
-                    s.save()
+                if _process_completion_claims:
+                    _terminal_assistant = next(
+                        (
+                            message
+                            for message in reversed(s.messages or [])
+                            if isinstance(message, dict)
+                            and message.get('role') == 'assistant'
+                        ),
+                        None,
+                    )
+                    if _terminal_assistant is None:
+                        _restore_native_terminal_state(
+                            s,
+                            _native_terminal_state_before,
+                        )
+                        _terminal_writeback_uncertain = True
+                        _terminal_cleanup_save_suppressed = True
+                        return
+                    with _stream_writeback_stage(_writeback_timings, "session_save"):
+                        _terminal_committed = _commit_exact_process_completion_terminal(
+                            s,
+                            _terminal_assistant,
+                            _native_terminal_state_before,
+                        )
+                    if not _terminal_committed:
+                        return
+                else:
+                    with _stream_writeback_stage(_writeback_timings, "session_save"):
+                        s.save()
                 if cancel_event.is_set():
                     _finalize_cancelled_turn(s, ephemeral=False)
                     try:
@@ -12115,7 +12389,11 @@ def _run_agent_streaming(
                         exc_info=True,
                     )
                 _process_wakeup_pause_before_clear = dict(getattr(s, 'process_wakeup_pause', {}) or {})
-                if clear_process_wakeup_pause(s, reason='run_completed'):
+                if (
+                    not _terminal_writeback_uncertain
+                    and not _terminal_cleanup_save_suppressed
+                    and clear_process_wakeup_pause(s, reason='run_completed')
+                ):
                     if cancel_event.is_set():
                         s.process_wakeup_pause = dict(_process_wakeup_pause_before_clear)
                         try:
@@ -12138,7 +12416,33 @@ def _run_agent_streaming(
                         put('cancel', _cancel_event_payload('Cancelled by user'))
                         return
                     with _stream_writeback_stage(_writeback_timings, "process_wakeup_pause_clear_save"):
-                        s.save(touch_updated_at=False)
+                        try:
+                            s.save(touch_updated_at=False)
+                        except Exception as _pause_clear_exc:
+                            if not _delivery_writeback_committed:
+                                raise
+                            try:
+                                from api.models import Session as _DurableSession
+
+                                _committed_session = _DurableSession.load(s.session_id)
+                            except Exception:
+                                _committed_session = None
+                            if _committed_session is not None:
+                                _restore_native_terminal_state(
+                                    s,
+                                    _snapshot_native_terminal_state(
+                                        _committed_session
+                                    ),
+                                )
+                            else:
+                                s.process_wakeup_pause = copy.deepcopy(
+                                    _process_wakeup_pause_before_clear
+                                )
+                            logger.warning(
+                                "Failed to persist process-wakeup pause clear "
+                                "after terminal delivery commit (error=%s)",
+                                type(_pause_clear_exc).__name__,
+                            )
                     if cancel_event.is_set():
                         s.process_wakeup_pause = dict(_process_wakeup_pause_before_clear)
                         try:
@@ -12165,10 +12469,10 @@ def _run_agent_streaming(
                 try:
                     from tools.process_registry import process_registry
 
-                    _finalize_process_completion_claims(
+                    _settle_native_process_completion_claims(
                         process_registry,
                         _process_completion_claims,
-                        committed=True,
+                        committed=_delivery_writeback_committed,
                     )
                     _process_completion_claims.clear()
                 except Exception:
@@ -12714,6 +13018,31 @@ def _run_agent_streaming(
             _exc_label, _exc_type, _exc_hint = 'Error', 'error', ''
 
         _error_payload = _provider_error_payload(err_str, _exc_type, _exc_hint)
+        if _delivery_writeback_committed:
+            # A receipt-bearing terminal transcript is the exact-delivery
+            # linearization point. Failures in later success-only cleanup
+            # (for example the pause-clear/index save) must not append a second
+            # terminal row carrying the same receipt or downgrade the claim.
+            _terminal_cleanup_save_suppressed = True
+            if s is not None:
+                try:
+                    from api.models import Session as _DurableSession
+
+                    _committed_session = _DurableSession.load(s.session_id)
+                except Exception:
+                    _committed_session = None
+                if _committed_session is not None:
+                    _restore_native_terminal_state(
+                        s,
+                        _snapshot_native_terminal_state(_committed_session),
+                    )
+                elif isinstance(_process_wakeup_pause_before_clear, dict):
+                    s.process_wakeup_pause = copy.deepcopy(
+                        _process_wakeup_pause_before_clear
+                    )
+                _error_payload['session_id'] = getattr(s, 'session_id', session_id)
+                _error_payload['old_session_id'] = session_id
+            return
         if s is not None:
             if _checkpoint_stop is not None:
                 _checkpoint_stop.set()
@@ -12749,6 +13078,15 @@ def _run_agent_streaming(
                     )
                     return
 
+                if (
+                    _native_terminal_state_before is not None
+                    and not _delivery_writeback_committed
+                ):
+                    _restore_native_terminal_state(
+                        s,
+                        _native_terminal_state_before,
+                    )
+                _native_terminal_state_before = _snapshot_native_terminal_state(s)
                 if _turn_pending_source == 'process_wakeup':
                     _recorded_pause = record_process_wakeup_provider_unavailable_pause(
                         s,
@@ -12802,10 +13140,17 @@ def _run_agent_streaming(
                 elif _exc_type == 'interrupted':
                     _error_message['provider_details_label'] = 'Interruption details'
                 s.messages.append(_error_message)
-                try:
-                    s.save()
-                except Exception:
-                    pass
+                if _process_completion_claims:
+                    _commit_exact_process_completion_terminal(
+                        s,
+                        _error_message,
+                        _native_terminal_state_before,
+                    )
+                else:
+                    try:
+                        s.save()
+                    except Exception:
+                        pass
                 if not ephemeral:
                     try:
                         append_turn_journal_event_for_stream(
@@ -12832,10 +13177,10 @@ def _run_agent_streaming(
             try:
                 from tools.process_registry import process_registry
 
-                _finalize_process_completion_claims(
+                _settle_native_process_completion_claims(
                     process_registry,
                     _process_completion_claims,
-                    committed=_success_writeback_committed,
+                    committed=_delivery_writeback_committed,
                 )
                 _process_completion_claims.clear()
             except Exception:
@@ -12882,7 +13227,9 @@ def _run_agent_streaming(
                 )
             finally:
                 agent = None
-        if (s is not None
+        if (not _terminal_writeback_uncertain
+                and not _terminal_cleanup_save_suppressed
+                and s is not None
                 and getattr(s, 'active_stream_id', None) == stream_id
                 and getattr(s, 'pending_user_message', None)):
             update_active_run(stream_id, phase="finalizing")
@@ -12933,7 +13280,9 @@ def _run_agent_streaming(
                 stream_id,
             )
 
-        if s is not None:
+        if (s is not None
+                and not _terminal_writeback_uncertain
+                and not _terminal_cleanup_save_suppressed):
             try:
                 from api.tool_limit_continuation import handle_terminal
 

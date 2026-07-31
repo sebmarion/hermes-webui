@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 import queue
@@ -126,6 +127,16 @@ class _CredentialPoolEmptyAgent(_MockAgent):
         raise RuntimeError("All 0 credential(s) exhausted for test-provider")
 
 
+class _RateLimitedAgent(_MockAgent):
+    before_terminal_state = None
+
+    def run_conversation(self, **_kwargs):
+        type(self).before_terminal_state = copy.deepcopy(
+            models.SESSIONS[self.session_id].__dict__
+        )
+        raise RuntimeError("HTTP 429: rate limit exceeded")
+
+
 class _StaleCredentialPoolEmptyAgent(_MockAgent):
     def run_conversation(self, **_kwargs):
         session = models.SESSIONS[self.session_id]
@@ -147,6 +158,1146 @@ class _SuccessfulAgent(_MockAgent):
                 {"role": "assistant", "content": "Stream reply"},
             ]
         }
+
+
+class _CountingSuccessfulAgent(_SuccessfulAgent):
+    run_calls = 0
+
+    def run_conversation(self, **kwargs):
+        type(self).run_calls += 1
+        return super().run_conversation(**kwargs)
+
+
+class _CancellingSuccessfulAgent(_SuccessfulAgent):
+    stream_id = None
+
+    def run_conversation(self, **kwargs):
+        cancel_flag = config.CANCEL_FLAGS.get(type(self).stream_id)
+        assert cancel_flag is not None
+        cancel_flag.set()
+        return super().run_conversation(**kwargs)
+
+
+class _StaleRateLimitedAgent(_MockAgent):
+    replacement_stream_id = "stream-newer-owner"
+
+    def run_conversation(self, **_kwargs):
+        session = models.SESSIONS[self.session_id]
+        session.active_stream_id = type(self).replacement_stream_id
+        session.pending_user_message = "newer owner's pending turn"
+        session.pending_user_source = "webui"
+        session.messages.append(
+            {
+                "role": "assistant",
+                "content": "newer owner transcript",
+                "timestamp": 2.0,
+            }
+        )
+        session.context_messages = copy.deepcopy(session.messages)
+        session.save(touch_updated_at=False)
+        raise RuntimeError("HTTP 429: rate limit exceeded")
+
+
+class _RotatingSuccessfulAgent(_SuccessfulAgent):
+    continuation_session_id = "native-rotated-continuation"
+    before_terminal_state = None
+
+    def run_conversation(self, **kwargs):
+        type(self).before_terminal_state = copy.deepcopy(
+            models.SESSIONS[self.session_id].__dict__
+        )
+        self.session_id = type(self).continuation_session_id
+        return super().run_conversation(**kwargs)
+
+
+def _make_exact_completion_event(session_id: str, suffix: str) -> dict:
+    return {
+        "type": "completion",
+        "event_id": f"process:{suffix}:completion",
+        "session_id": f"proc_{suffix}",
+        "session_key": session_id,
+        "command": f"command-{suffix}",
+        "exit_code": 0,
+        "output": f"output-{suffix}",
+        "created_at": 1.0,
+    }
+
+
+def _install_exact_event_registry(monkeypatch):
+    class _ExactEventRegistry:
+        def __init__(self):
+            self.completion_queue = queue.Queue()
+            self.finish_calls = []
+            self.fail_committed_remaining = 0
+            self.raise_on_finish = False
+
+        def finish_notification_delivery(self, event, committed):
+            self.finish_calls.append((event, committed))
+            if self.raise_on_finish:
+                raise RuntimeError("synthetic settlement failure")
+            if committed and self.fail_committed_remaining <= 0:
+                return True
+            if committed:
+                self.fail_committed_remaining -= 1
+            self.completion_queue.put(event)
+            return False
+
+    registry = _ExactEventRegistry()
+    fake_module = types.ModuleType("tools.process_registry")
+    fake_module.process_registry = registry
+    if "tools" not in sys.modules:
+        fake_package = types.ModuleType("tools")
+        fake_package.__path__ = []
+        monkeypatch.setitem(sys.modules, "tools", fake_package)
+    monkeypatch.setitem(sys.modules, "tools.process_registry", fake_module)
+    return registry
+
+
+def _run_exact_process_wakeup(
+    session: Session,
+    tmp_path,
+    event: dict,
+    agent_class,
+):
+    stream_id = str(session.active_stream_id)
+    stream_queue = queue.Queue()
+    streaming.STREAMS[stream_id] = stream_queue
+    config.STREAM_PARTIAL_TEXT[stream_id] = ""
+    with mock.patch.object(streaming, "_get_ai_agent", return_value=agent_class), \
+         mock.patch.object(
+             streaming,
+             "resolve_model_provider",
+             return_value=("test-model", "test-provider", None),
+         ), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]):
+        streaming._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text=session.pending_user_message,
+            model="test-model",
+            model_provider="test-provider",
+            workspace=str(tmp_path),
+            stream_id=stream_id,
+            process_completion_events=[event],
+        )
+    return [(item[0], item[1]) for item in list(stream_queue.queue)]
+
+
+def _new_exact_process_wakeup_session(
+    tmp_path,
+    *,
+    session_id: str,
+    stream_id: str,
+    process_wakeup_pause: dict | None = None,
+) -> Session:
+    session = Session(
+        session_id=session_id,
+        title="Exact process wakeup",
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+        messages=[{"role": "user", "content": "before", "timestamp": 1.0}],
+        context_messages=[{"role": "user", "content": "before"}],
+        active_stream_id=stream_id,
+        pending_user_message="[IMPORTANT: exact process completed]",
+        pending_attachments=[{"name": "pending.txt"}],
+        pending_started_at=1234.0,
+        pending_user_source="process_wakeup",
+        pending_server_instance_id="server-before",
+        process_wakeup_pause=copy.deepcopy(process_wakeup_pause or {}),
+        compression_recovery={"sentinel": "recovery-before"},
+        recommended_recovery_action="recover-before",
+        compression_recovery_source_session_id="source-before",
+        compression_recovery_action="action-before",
+        truncation_watermark={"sentinel": "watermark-before"},
+        truncation_boundary={"sentinel": "boundary-before"},
+    )
+    session.save()
+    models.SESSIONS[session.session_id] = session
+    return session
+
+
+def test_rate_limited_process_wakeup_commits_visible_error_and_settles_exact_event(
+    tmp_path,
+    monkeypatch,
+):
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_rate_limit_commit",
+        stream_id="stream-native-rate-limit-commit",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-rate-limit")
+    registry = _install_exact_event_registry(monkeypatch)
+
+    emitted = _run_exact_process_wakeup(
+        session,
+        tmp_path,
+        event,
+        _RateLimitedAgent,
+    )
+
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert registry.finish_calls == [(event, True)]
+    assert [message["role"] for message in saved.messages[-2:]] == [
+        "user",
+        "assistant",
+    ]
+    assert saved.messages[-1]["_error"] is True
+    assert saved.messages[-1][streaming._PROCESS_COMPLETION_RECEIPTS_KEY]
+    assert event["event_id"] not in json.dumps(saved.messages[-1])
+    assert saved.process_wakeup_pause == {}
+    assert registry.completion_queue.empty()
+    assert any(
+        event_name == "apperror" and payload.get("type") == "rate_limit"
+        for event_name, payload in emitted
+    )
+
+
+def test_rate_limited_process_wakeup_restores_state_when_sidecar_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_rate_limit_prepublication_failure",
+        stream_id="stream-native-rate-limit-prepublication-failure",
+        process_wakeup_pause={"sentinel": "pause-before"},
+    )
+    event = _make_exact_completion_event(session.session_id, "native-prepublish")
+    registry = _install_exact_event_registry(monkeypatch)
+    _RateLimitedAgent.before_terminal_state = None
+    original_safe_replace = models._safe_replace
+
+    def _fail_terminal_sidecar_replace(src, dst):
+        cached = models.SESSIONS.get(session.session_id)
+        is_terminal_error = cached is not None and any(
+            isinstance(message, dict) and message.get("_error")
+            for message in (cached.messages or [])
+        )
+        if Path(dst) == session.path and is_terminal_error:
+            raise OSError("synthetic pre-publication sidecar failure")
+        return original_safe_replace(src, dst)
+
+    monkeypatch.setattr(models, "_safe_replace", _fail_terminal_sidecar_replace)
+
+    _run_exact_process_wakeup(session, tmp_path, event, _RateLimitedAgent)
+
+    before_terminal = _RateLimitedAgent.before_terminal_state
+    assert before_terminal is not None
+    assert models.SESSIONS[session.session_id].__dict__ == before_terminal
+    persisted = Session.load(session.session_id)
+    assert persisted is not None
+    assert persisted.messages == before_terminal["messages"]
+    assert persisted.context_messages == before_terminal["context_messages"]
+    assert persisted.active_stream_id == before_terminal["active_stream_id"]
+    assert persisted.pending_user_message == before_terminal["pending_user_message"]
+    assert persisted.pending_attachments == before_terminal["pending_attachments"]
+    assert persisted.pending_started_at == before_terminal["pending_started_at"]
+    assert persisted.pending_user_source == before_terminal["pending_user_source"]
+    assert persisted.pending_server_instance_id == before_terminal["pending_server_instance_id"]
+    assert persisted.process_wakeup_pause == before_terminal["process_wakeup_pause"]
+    assert persisted.compression_recovery == before_terminal["compression_recovery"]
+    assert persisted.recommended_recovery_action == before_terminal["recommended_recovery_action"]
+    assert persisted.truncation_watermark == before_terminal["truncation_watermark"]
+    assert persisted.truncation_boundary == before_terminal["truncation_boundary"]
+    assert persisted.sidecar_generation == before_terminal["sidecar_generation"]
+    assert not any(
+        message.get("_error")
+        and streaming._PROCESS_COMPLETION_RECEIPTS_KEY in message
+        for message in persisted.messages
+        if isinstance(message, dict)
+    )
+    assert registry.finish_calls == [(event, False)]
+    assert registry.completion_queue.get_nowait() is event
+
+
+def test_rate_limited_process_wakeup_accepts_receipt_after_index_failure(
+    tmp_path,
+    monkeypatch,
+):
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_rate_limit_postpublication_failure",
+        stream_id="stream-native-rate-limit-postpublication-failure",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-postpublish")
+    registry = _install_exact_event_registry(monkeypatch)
+    original_write_index = models._write_session_index
+    terminal_index_failures = {"count": 0}
+
+    def _fail_index_after_terminal_sidecar(updates=None, **kwargs):
+        terminal = any(
+            isinstance(message, dict) and message.get("_error")
+            for candidate in (updates or [])
+            for message in (candidate.messages or [])
+        )
+        if terminal:
+            terminal_index_failures["count"] += 1
+            raise OSError("synthetic post-publication index failure")
+        return original_write_index(updates=updates, **kwargs)
+
+    monkeypatch.setattr(models, "_write_session_index", _fail_index_after_terminal_sidecar)
+
+    _run_exact_process_wakeup(session, tmp_path, event, _RateLimitedAgent)
+
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert terminal_index_failures == {"count": 1}
+    assert streaming._durable_process_completion_receipt_status(
+        session.session_id,
+        [event],
+    ) == "committed"
+    assert registry.finish_calls == [(event, True)]
+    assert registry.completion_queue.empty()
+    assert saved.messages[-1].get("_error") is True
+    assert saved.messages[-1][streaming._PROCESS_COMPLETION_RECEIPTS_KEY]
+    assert saved.active_stream_id is None
+    assert saved.pending_user_message is None
+
+
+def test_successful_process_wakeup_ack_replay_does_not_call_provider_twice(
+    tmp_path,
+    monkeypatch,
+):
+    from api import background_process
+
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_success_ack_replay",
+        stream_id="stream-native-success-ack-replay",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-success")
+    registry = _install_exact_event_registry(monkeypatch)
+    registry.fail_committed_remaining = 1
+    _CountingSuccessfulAgent.run_calls = 0
+
+    emitted = _run_exact_process_wakeup(
+        session,
+        tmp_path,
+        event,
+        _CountingSuccessfulAgent,
+    )
+
+    first_saved = Session.load(session.session_id)
+    assert first_saved is not None
+    assert _CountingSuccessfulAgent.run_calls == 1
+    assert registry.finish_calls == [(event, True)]
+    assert registry.completion_queue.get_nowait() is event
+    terminal_assistant = next(
+        message
+        for message in reversed(first_saved.messages)
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    )
+    assert terminal_assistant[streaming._PROCESS_COMPLETION_RECEIPTS_KEY]
+
+    with background_process._STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+        background_process._STAGED_PROCESS_COMPLETION_EVENTS.clear()
+    try:
+        assert background_process.stage_process_completion_event(
+            session.session_id,
+            event,
+        ) is True
+        monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda _sid: None)
+
+        def _provider_must_not_restart(*_args, **_kwargs):
+            raise AssertionError("provider preparation reached for committed native replay")
+
+        monkeypatch.setattr(
+            routes,
+            "_prepare_chat_start_session_for_stream",
+            _provider_must_not_restart,
+        )
+        replay = routes._start_chat_stream_for_session(
+            session,
+            msg="[IMPORTANT: exact process completed]",
+            attachments=[],
+            workspace=session.workspace,
+            model=session.model,
+            source="process_wakeup",
+        )
+    finally:
+        with background_process._STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+            background_process._STAGED_PROCESS_COMPLETION_EVENTS.clear()
+
+    assert replay == {
+        "delivery_already_committed": True,
+        "delivery_acknowledged": True,
+        "_status": 200,
+    }
+    assert registry.finish_calls == [(event, True), (event, True)]
+    assert _CountingSuccessfulAgent.run_calls == 1
+    replayed = Session.load(session.session_id)
+    assert replayed is not None
+    assert sum(
+        message.get("content") == "Stream reply"
+        for message in replayed.messages
+        if isinstance(message, dict)
+    ) == 1
+
+
+def test_cancelled_process_wakeup_claim_remains_uncommitted(
+    tmp_path,
+    monkeypatch,
+):
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_cancelled_exact_claim",
+        stream_id="stream-native-cancelled-exact-claim",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-cancelled")
+    registry = _install_exact_event_registry(monkeypatch)
+    _CancellingSuccessfulAgent.stream_id = session.active_stream_id
+
+    _run_exact_process_wakeup(
+        session,
+        tmp_path,
+        event,
+        _CancellingSuccessfulAgent,
+    )
+
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert registry.finish_calls == [(event, False)]
+    assert registry.completion_queue.get_nowait() is event
+    assert not any(
+        streaming._PROCESS_COMPLETION_RECEIPTS_KEY in message
+        for message in saved.messages
+        if isinstance(message, dict)
+    )
+    assert not any(
+        message.get("content") == "Stream reply"
+        for message in saved.messages
+        if isinstance(message, dict)
+    )
+
+
+def test_stale_process_wakeup_claim_remains_uncommitted(
+    tmp_path,
+    monkeypatch,
+):
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_stale_exact_claim",
+        stream_id="stream-native-stale-exact-claim",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-stale")
+    registry = _install_exact_event_registry(monkeypatch)
+
+    _run_exact_process_wakeup(
+        session,
+        tmp_path,
+        event,
+        _StaleRateLimitedAgent,
+    )
+
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert registry.finish_calls == [(event, False)]
+    assert registry.completion_queue.get_nowait() is event
+    assert saved.active_stream_id == _StaleRateLimitedAgent.replacement_stream_id
+    assert saved.pending_user_message == "newer owner's pending turn"
+    assert saved.pending_user_source == "webui"
+    assert sum(
+        message.get("content") == "newer owner transcript"
+        for message in saved.messages
+        if isinstance(message, dict)
+    ) == 1
+    assert not any(
+        streaming._PROCESS_COMPLETION_RECEIPTS_KEY in message
+        for message in saved.messages
+        if isinstance(message, dict)
+    )
+
+
+@pytest.mark.parametrize("readback_status", ["unavailable", "invalid"])
+def test_rate_limited_process_wakeup_unreadable_or_invalid_readback_skips_cleanup_save(
+    tmp_path,
+    monkeypatch,
+    readback_status,
+):
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_rate_limit_unavailable_readback",
+        stream_id="stream-native-rate-limit-unavailable-readback",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-unavailable")
+    registry = _install_exact_event_registry(monkeypatch)
+    if readback_status == "invalid":
+        session.messages[0][streaming._PROCESS_COMPLETION_RECEIPTS_KEY] = [
+            "malformed-receipt"
+        ]
+        session.save(touch_updated_at=False)
+    original_safe_replace = models._safe_replace
+    original_load = Session.load
+    failure_state = {"readback_unavailable": False, "terminal_save_attempts": 0}
+
+    def _fail_terminal_sidecar_replace(src, dst):
+        cached = models.SESSIONS.get(session.session_id)
+        has_terminal_receipt = cached is not None and any(
+            isinstance(message, dict)
+            and message.get("_error")
+            and message.get(streaming._PROCESS_COMPLETION_RECEIPTS_KEY)
+            for message in (cached.messages or [])
+        )
+        if Path(dst) == session.path and has_terminal_receipt:
+            failure_state["terminal_save_attempts"] += 1
+            failure_state["readback_unavailable"] = True
+            raise OSError("synthetic terminal sidecar failure")
+        return original_safe_replace(src, dst)
+
+    def _fail_fresh_receipt_load(cls, sid):
+        if (
+            readback_status == "unavailable"
+            and failure_state["readback_unavailable"]
+            and sid == session.session_id
+        ):
+            raise OSError("synthetic receipt read-back failure")
+        return original_load(sid)
+
+    monkeypatch.setattr(models, "_safe_replace", _fail_terminal_sidecar_replace)
+    monkeypatch.setattr(Session, "load", classmethod(_fail_fresh_receipt_load))
+
+    _run_exact_process_wakeup(session, tmp_path, event, _RateLimitedAgent)
+
+    assert failure_state == {
+        "readback_unavailable": True,
+        "terminal_save_attempts": 1,
+    }
+    cached = models.SESSIONS[session.session_id]
+    assert cached.messages[-1].get("_error") is True
+    assert cached.messages[-1][streaming._PROCESS_COMPLETION_RECEIPTS_KEY]
+    assert registry.finish_calls == [(event, False)]
+    assert registry.completion_queue.get_nowait() is event
+
+    failure_state["readback_unavailable"] = False
+    persisted = original_load(session.session_id)
+    assert persisted is not None
+    assert not any(
+        message.get("_error")
+        and streaming._PROCESS_COMPLETION_RECEIPTS_KEY in message
+        for message in persisted.messages
+        if isinstance(message, dict)
+    )
+
+
+def test_late_cancel_after_process_wakeup_receipt_commit_keeps_delivery(
+    tmp_path,
+    monkeypatch,
+):
+    stream_id = "stream-native-late-cancel-after-receipt"
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_late_cancel_after_receipt",
+        stream_id=stream_id,
+    )
+    event = _make_exact_completion_event(session.session_id, "native-late-cancel")
+    registry = _install_exact_event_registry(monkeypatch)
+    original_save = Session.save
+    cancellation = {"set_after_receipt": 0}
+
+    def _save_and_cancel_after_receipt(self, *args, **kwargs):
+        result = original_save(self, *args, **kwargs)
+        has_receipt = any(
+            isinstance(message, dict)
+            and message.get(streaming._PROCESS_COMPLETION_RECEIPTS_KEY)
+            for message in (self.messages or [])
+        )
+        if (
+            self.session_id == session.session_id
+            and has_receipt
+            and cancellation["set_after_receipt"] == 0
+        ):
+            cancellation["set_after_receipt"] += 1
+            config.CANCEL_FLAGS[stream_id].set()
+        return result
+
+    monkeypatch.setattr(Session, "save", _save_and_cancel_after_receipt)
+
+    emitted = _run_exact_process_wakeup(
+        session,
+        tmp_path,
+        event,
+        _CountingSuccessfulAgent,
+    )
+
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert cancellation == {"set_after_receipt": 1}
+    assert registry.finish_calls == [(event, True)]
+    assert registry.completion_queue.empty()
+    assert any(
+        message.get("content") == "Stream reply"
+        and message.get(streaming._PROCESS_COMPLETION_RECEIPTS_KEY)
+        for message in saved.messages
+        if isinstance(message, dict)
+    )
+    assert any(event_name == "cancel" for event_name, _payload in emitted)
+
+
+def test_post_receipt_pause_clear_failure_keeps_first_terminal_commit(
+    tmp_path,
+    monkeypatch,
+):
+    stream_id = "stream-native-pause-clear-after-receipt-failure"
+    previous_pause = {
+        "paused": True,
+        "model": "test-model",
+        "provider": "test-provider",
+        "classification": "credential_pool_empty",
+        "first_paused_at": 1.0,
+        "last_visible_error_at": 1.0,
+        "visible_error_count": 1,
+        "suppressed_count": 0,
+        "credential_state_fingerprint": "fingerprint-before",
+    }
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_pause_clear_after_receipt_failure",
+        stream_id=stream_id,
+        process_wakeup_pause=previous_pause,
+    )
+    event = _make_exact_completion_event(session.session_id, "native-pause-clear")
+    registry = _install_exact_event_registry(monkeypatch)
+    original_save = Session.save
+    saves = {"receipt_published": 0, "pause_clear_failed": 0}
+
+    def _fail_pause_clear_after_receipt(self, *args, **kwargs):
+        has_receipt = any(
+            isinstance(message, dict)
+            and message.get(streaming._PROCESS_COMPLETION_RECEIPTS_KEY)
+            for message in (self.messages or [])
+        )
+        if (
+            self.session_id == session.session_id
+            and has_receipt
+            and not (self.process_wakeup_pause or {})
+            and saves["receipt_published"] == 1
+            and saves["pause_clear_failed"] == 0
+        ):
+            saves["pause_clear_failed"] += 1
+            raise OSError("synthetic pause-clear save failure")
+        result = original_save(self, *args, **kwargs)
+        if self.session_id == session.session_id and has_receipt:
+            saves["receipt_published"] += 1
+            if saves["receipt_published"] == 1:
+                # Keep the stale-owner guard permissive so this regression
+                # proves delivery commitment itself is the linearization point.
+                self.active_stream_id = stream_id
+        return result
+
+    monkeypatch.setattr(Session, "save", _fail_pause_clear_after_receipt)
+
+    emitted = _run_exact_process_wakeup(
+        session,
+        tmp_path,
+        event,
+        _CountingSuccessfulAgent,
+    )
+
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert saves == {"receipt_published": 1, "pause_clear_failed": 1}
+    assert registry.finish_calls == [(event, True)]
+    assert registry.completion_queue.empty()
+    assert saved.process_wakeup_pause == previous_pause
+    assert models.SESSIONS[session.session_id].process_wakeup_pause == previous_pause
+    assert not any(
+        message.get("_error")
+        for message in saved.messages
+        if isinstance(message, dict)
+    )
+    receipt_messages = [
+        message
+        for message in saved.messages
+        if isinstance(message, dict)
+        and message.get(streaming._PROCESS_COMPLETION_RECEIPTS_KEY)
+    ]
+    assert len(receipt_messages) == 1
+    assert receipt_messages[0].get("content") == "Stream reply"
+    assert streaming._durable_process_completion_receipt_status(
+        session.session_id,
+        [event],
+    ) == "committed"
+    assert any(event_name == "done" for event_name, _payload in emitted)
+    assert not any(event_name == "apperror" for event_name, _payload in emitted)
+
+
+def test_rate_limited_process_wakeup_ack_replay_does_not_call_provider_twice(
+    tmp_path,
+    monkeypatch,
+):
+    from api import background_process
+
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_error_ack_replay",
+        stream_id="stream-native-error-ack-replay",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-error-replay")
+    registry = _install_exact_event_registry(monkeypatch)
+    registry.fail_committed_remaining = 1
+
+    _run_exact_process_wakeup(session, tmp_path, event, _RateLimitedAgent)
+
+    assert registry.finish_calls == [(event, True)]
+    assert registry.completion_queue.get_nowait() is event
+    with background_process._STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+        background_process._STAGED_PROCESS_COMPLETION_EVENTS.clear()
+    try:
+        assert background_process.stage_process_completion_event(
+            session.session_id,
+            event,
+        ) is True
+        monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda _sid: None)
+
+        def _provider_must_not_restart(*_args, **_kwargs):
+            raise AssertionError("provider preparation reached for committed error replay")
+
+        monkeypatch.setattr(
+            routes,
+            "_prepare_chat_start_session_for_stream",
+            _provider_must_not_restart,
+        )
+        replay = routes._start_chat_stream_for_session(
+            session,
+            msg="[IMPORTANT: exact process completed]",
+            attachments=[],
+            workspace=session.workspace,
+            model=session.model,
+            source="process_wakeup",
+        )
+    finally:
+        with background_process._STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+            background_process._STAGED_PROCESS_COMPLETION_EVENTS.clear()
+
+    assert replay["delivery_already_committed"] is True
+    assert replay["delivery_acknowledged"] is True
+    assert registry.finish_calls == [(event, True), (event, True)]
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert sum(
+        bool(message.get("_error"))
+        for message in saved.messages
+        if isinstance(message, dict)
+    ) == 1
+
+
+def test_process_wakeup_settlement_exception_requeues_and_replays_without_provider(
+    tmp_path,
+    monkeypatch,
+):
+    from api import background_process
+
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_settlement_exception",
+        stream_id="stream-native-settlement-exception",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-settle-error")
+    registry = _install_exact_event_registry(monkeypatch)
+    registry.raise_on_finish = True
+    replay_responses = []
+    with background_process._STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+        background_process._STAGED_PROCESS_COMPLETION_EVENTS.clear()
+    with config.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
+        config.BG_TASK_COMPLETE_EVENTS_SEEN[session.session_id] = {
+            event["event_id"],
+            event["session_id"],
+        }
+    try:
+        _run_exact_process_wakeup(session, tmp_path, event, _RateLimitedAgent)
+
+        assert registry.finish_calls == [(event, True)]
+        requeued = registry.completion_queue.get_nowait()
+        assert requeued is event
+        assert registry.completion_queue.empty()
+        assert background_process.has_staged_process_completion_events(
+            session.session_id
+        ) is True
+
+        registry.raise_on_finish = False
+        monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda _sid: None)
+
+        def _provider_must_not_restart(*_args, **_kwargs):
+            raise AssertionError(
+                "provider preparation reached after thrown ACK replay"
+            )
+
+        monkeypatch.setattr(
+            routes,
+            "_prepare_chat_start_session_for_stream",
+            _provider_must_not_restart,
+        )
+        monkeypatch.setattr(
+            background_process,
+            "_emit_bg_task_complete_events_coalesced",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            background_process,
+            "_session_has_active_turn",
+            lambda _sid: False,
+        )
+
+        def _replay_from_drain(
+            owner,
+            wakeup_prompt,
+            *,
+            process_id="",
+            async_delegation_id="",
+            completion_event=None,
+        ):
+            assert owner == session.session_id
+            assert completion_event is event
+            assert background_process.stage_process_completion_event(
+                owner,
+                completion_event,
+            ) is True
+            replay_responses.append(
+                routes._start_chat_stream_for_session(
+                    session,
+                    msg=wakeup_prompt,
+                    attachments=[],
+                    workspace=session.workspace,
+                    model=session.model,
+                    source="process_wakeup",
+                )
+            )
+
+        monkeypatch.setattr(
+            background_process,
+            "_start_server_side_wakeup_turn",
+            _replay_from_drain,
+        )
+        background_process._process_one(requeued)
+
+        assert replay_responses == [
+            {
+                "delivery_already_committed": True,
+                "delivery_acknowledged": True,
+                "_status": 200,
+            }
+        ]
+        assert registry.finish_calls == [(event, True), (event, True)]
+        assert background_process.has_staged_process_completion_events(
+            session.session_id
+        ) is False
+    finally:
+        with background_process._STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+            background_process._STAGED_PROCESS_COMPLETION_EVENTS.clear()
+        with config.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
+            config.BG_TASK_COMPLETE_EVENTS_SEEN.pop(session.session_id, None)
+
+
+def test_process_wakeup_partial_live_requeue_uses_unconsumed_suffix_as_scheduler(
+    tmp_path,
+    monkeypatch,
+):
+    from api import background_process
+
+    owner = "native_partial_requeue"
+    events = [
+        _make_exact_completion_event(owner, "native-partial-first"),
+        _make_exact_completion_event(owner, "native-partial-second"),
+        _make_exact_completion_event(owner, "native-partial-third"),
+    ]
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id=owner,
+        stream_id="stream-native-partial-requeue",
+    )
+    terminal = {"role": "assistant", "content": "already committed"}
+    assert len(
+        streaming._stamp_process_completion_receipts(
+            terminal,
+            events,
+            session_id=owner,
+        )
+    ) == len(events)
+    session.messages.append(terminal)
+    session.active_stream_id = None
+    session.pending_user_message = None
+    session.pending_attachments = []
+    session.pending_started_at = None
+    session.pending_user_source = None
+    session.pending_server_instance_id = None
+    session.save()
+    replay_responses = []
+
+    class _PartialQueue:
+        def __init__(self):
+            self.calls = []
+            self.queued = []
+
+        def put(self, event):
+            self.calls.append(event)
+            if event is events[1]:
+                raise RuntimeError("synthetic live queue failure")
+            self.queued.append(event)
+
+    class _RaisingRegistry:
+        def __init__(self):
+            self.completion_queue = _PartialQueue()
+            self.finish_calls = []
+            self.consumed = set()
+            self.raise_on_second = True
+
+        def finish_notification_delivery(self, event, committed):
+            self.finish_calls.append((event, committed))
+            if self.raise_on_second and event is events[1]:
+                raise RuntimeError("synthetic settlement failure")
+            self.consumed.add(event["session_id"])
+            return True
+
+        def is_completion_consumed(self, process_id):
+            return process_id in self.consumed
+
+    registry = _RaisingRegistry()
+    fake_module = types.ModuleType("tools.process_registry")
+    fake_module.process_registry = registry
+    monkeypatch.setitem(sys.modules, "tools.process_registry", fake_module)
+    delivery_ids = {event["event_id"] for event in events}
+    with background_process._STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+        background_process._STAGED_PROCESS_COMPLETION_EVENTS.clear()
+    with config.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
+        config.BG_TASK_COMPLETE_EVENTS_SEEN[owner] = set(delivery_ids)
+    try:
+        assert streaming._settle_native_process_completion_claims(
+            registry,
+            events,
+            committed=True,
+        ) is False
+
+        # Event 0 was already ACKed. Recovery attempts only the throwing and
+        # unattempted suffix; event 2 remains unconsumed and is the scheduler.
+        assert registry.completion_queue.calls == events[1:]
+        assert registry.completion_queue.queued == [events[2]]
+        with config.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
+            assert owner not in config.BG_TASK_COMPLETE_EVENTS_SEEN
+        assert background_process.has_staged_process_completion_events(owner) is True
+
+        registry.raise_on_second = False
+        monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda _sid: None)
+
+        def _provider_must_not_restart(*_args, **_kwargs):
+            raise AssertionError(
+                "provider preparation reached after partial thrown-ACK replay"
+            )
+
+        monkeypatch.setattr(
+            routes,
+            "_prepare_chat_start_session_for_stream",
+            _provider_must_not_restart,
+        )
+        monkeypatch.setattr(
+            background_process,
+            "_emit_bg_task_complete_events_coalesced",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            background_process,
+            "_session_has_active_turn",
+            lambda _sid: False,
+        )
+
+        def _replay_from_drain(
+            replay_owner,
+            wakeup_prompt,
+            *,
+            process_id="",
+            async_delegation_id="",
+            completion_event=None,
+        ):
+            assert replay_owner == owner
+            assert completion_event is events[2]
+            assert background_process.stage_process_completion_event(
+                replay_owner,
+                completion_event,
+            ) is True
+            replay_responses.append(
+                routes._start_chat_stream_for_session(
+                    session,
+                    msg=wakeup_prompt,
+                    attachments=[],
+                    workspace=session.workspace,
+                    model=session.model,
+                    source="process_wakeup",
+                )
+            )
+
+        monkeypatch.setattr(
+            background_process,
+            "_start_server_side_wakeup_turn",
+            _replay_from_drain,
+        )
+        background_process._process_one(registry.completion_queue.queued.pop())
+
+        assert replay_responses == [
+            {
+                "delivery_already_committed": True,
+                "delivery_acknowledged": True,
+                "_status": 200,
+            }
+        ]
+        assert registry.finish_calls == [
+            (events[0], True),
+            (events[1], True),
+            (events[0], True),
+            (events[1], True),
+            (events[2], True),
+        ]
+        assert background_process.has_staged_process_completion_events(owner) is False
+    finally:
+        with background_process._STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+            background_process._STAGED_PROCESS_COMPLETION_EVENTS.clear()
+        with config.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
+            config.BG_TASK_COMPLETE_EVENTS_SEEN.pop(owner, None)
+
+
+def test_returned_false_requeue_cannot_race_ahead_of_seen_release(
+    monkeypatch,
+):
+    from api import background_process
+
+    owner = "native_atomic_false_requeue"
+    event = _make_exact_completion_event(owner, "native-atomic-false")
+    live_queue = queue.Queue()
+    drain_lock_attempted = threading.Event()
+    dispatched = threading.Event()
+    original_seen_lock = config.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK
+
+    class _SignalingSeenLock:
+        def acquire(self, *args, **kwargs):
+            if threading.current_thread().name == "native-fast-drain":
+                drain_lock_attempted.set()
+            return original_seen_lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return original_seen_lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            self.release()
+
+    signaling_seen_lock = _SignalingSeenLock()
+    monkeypatch.setattr(
+        config,
+        "BG_TASK_COMPLETE_EVENTS_SEEN_LOCK",
+        signaling_seen_lock,
+    )
+
+    class _FalseRegistry:
+        completion_queue = live_queue
+
+        def finish_notification_delivery(self, actual, committed):
+            assert actual is event
+            assert committed is False
+            live_queue.put(actual)
+            assert drain_lock_attempted.wait(timeout=2)
+            return False
+
+        def is_completion_consumed(self, _process_id):
+            return False
+
+    registry = _FalseRegistry()
+    fake_module = types.ModuleType("tools.process_registry")
+    fake_module.process_registry = registry
+    monkeypatch.setitem(sys.modules, "tools.process_registry", fake_module)
+    monkeypatch.setattr(
+        background_process,
+        "_emit_bg_task_complete_events_coalesced",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        background_process,
+        "_session_has_active_turn",
+        lambda _sid: False,
+    )
+    monkeypatch.setattr(
+        background_process,
+        "_start_server_side_wakeup_turn",
+        lambda *_args, **_kwargs: dispatched.set(),
+    )
+    with signaling_seen_lock:
+        config.BG_TASK_COMPLETE_EVENTS_SEEN[owner] = {
+            event["event_id"],
+            event["session_id"],
+        }
+    with config.PROCESS_SESSION_INDEX_LOCK:
+        config.PROCESS_SESSION_INDEX[owner] = owner
+
+    drain = threading.Thread(
+        target=lambda: background_process._process_one(
+            live_queue.get(timeout=2)
+        ),
+        name="native-fast-drain",
+    )
+    drain.start()
+    try:
+        assert streaming._finalize_process_completion_claims(
+            registry,
+            [event],
+            committed=False,
+            raise_on_error=True,
+        ) is False
+        drain.join(timeout=2)
+        assert drain.is_alive() is False
+        assert dispatched.is_set() is True
+        with signaling_seen_lock:
+            assert config.BG_TASK_COMPLETE_EVENTS_SEEN[owner] == {
+                event["event_id"]
+            }
+    finally:
+        monkeypatch.setattr(
+            config,
+            "BG_TASK_COMPLETE_EVENTS_SEEN_LOCK",
+            original_seen_lock,
+        )
+        with original_seen_lock:
+            config.BG_TASK_COMPLETE_EVENTS_SEEN.pop(owner, None)
+        with config.PROCESS_SESSION_INDEX_LOCK:
+            config.PROCESS_SESSION_INDEX.pop(owner, None)
+
+
+def test_rotated_process_wakeup_owner_cannot_stamp_or_ack_exact_claim(
+    tmp_path,
+    monkeypatch,
+):
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_rotation_original_owner",
+        stream_id="stream-native-rotation-original-owner",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-rotation")
+    registry = _install_exact_event_registry(monkeypatch)
+    _RotatingSuccessfulAgent.before_terminal_state = None
+
+    _run_exact_process_wakeup(
+        session,
+        tmp_path,
+        event,
+        _RotatingSuccessfulAgent,
+    )
+
+    before_terminal = _RotatingSuccessfulAgent.before_terminal_state
+    assert before_terminal is not None
+    cached = models.SESSIONS.get(session.session_id)
+    assert cached is not None
+    assert cached.__dict__ == before_terminal
+    assert registry.finish_calls == [(event, False)]
+    assert registry.completion_queue.get_nowait() is event
+    assert not (
+        models.SESSION_DIR
+        / f"{_RotatingSuccessfulAgent.continuation_session_id}.json"
+    ).exists()
+    assert not any(
+        streaming._PROCESS_COMPLETION_RECEIPTS_KEY in message
+        for message in cached.messages
+        if isinstance(message, dict)
+    )
 
 
 class _FakeCredentialPoolEntry:
