@@ -3070,10 +3070,27 @@ def _validated_process_completion_events(
     *,
     session_id: str,
 ) -> list[dict]:
-    """Accept a complete unique stable batch bound to this exact session."""
-    if not _process_completion_receipt_digests(events, session_id=session_id):
-        return []
-    return list(events)
+    """Accept unique stable events bound to this exact WebUI session."""
+    accepted: list[dict] = []
+    seen_ids: set[str] = set()
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        event_type = event.get("type")
+        if event_type == "completion":
+            event_id = str(event.get("event_id") or "").strip()
+        elif event_type == "async_delegation":
+            event_id = str(event.get("delegation_id") or "").strip()
+        else:
+            continue
+        event_owner = str(event.get("session_key") or "").strip()
+        if not event_id or event_owner != str(session_id or ""):
+            continue
+        if event_id in seen_ids:
+            continue
+        seen_ids.add(event_id)
+        accepted.append(event)
+    return accepted
 
 
 def _is_process_completion_receipt_digest(value: object) -> bool:
@@ -3112,29 +3129,6 @@ def _stamp_process_completion_receipts(
     merged = list(dict.fromkeys([*existing, *required]))
     message[_PROCESS_COMPLETION_RECEIPTS_KEY] = merged
     return required
-
-
-def _stamp_latest_process_completion_receipts(
-    messages: list[dict] | None,
-    events: list[dict] | None,
-    *,
-    session_id: str,
-) -> list[str]:
-    terminal_assistant = next(
-        (
-            message
-            for message in reversed(messages or [])
-            if isinstance(message, dict) and message.get("role") == "assistant"
-        ),
-        None,
-    )
-    if terminal_assistant is None:
-        return []
-    return _stamp_process_completion_receipts(
-        terminal_assistant,
-        events,
-        session_id=session_id,
-    )
 
 
 def _durable_process_completion_receipt_status(
@@ -11520,11 +11514,6 @@ def _run_agent_streaming(
                             _error_message['provider_details_label'] = 'Interruption details'
                         elif _err_type == 'tool_limit_reached':
                             _error_message['provider_details_label'] = 'Terminal state details'
-                        _stamp_process_completion_receipts(
-                            _error_message,
-                            _process_completion_claims,
-                            session_id=s.session_id,
-                        )
                         s.messages.append(_error_message)
                         try:
                             s.save()
@@ -11973,12 +11962,6 @@ def _run_agent_streaming(
                         logger.debug("Failed to append cancelled turn journal event", exc_info=True)
                     put('cancel', _cancel_event_payload('Cancelled by user'))
                     return
-                if _process_completion_claims and not ephemeral:
-                    _stamp_latest_process_completion_receipts(
-                        s.messages,
-                        _process_completion_claims,
-                        session_id=s.session_id,
-                    )
                 with _stream_writeback_stage(_writeback_timings, "session_save"):
                     s.save()
                 if cancel_event.is_set():
@@ -12683,11 +12666,6 @@ def _run_agent_streaming(
                                     _active_turn_identity,
                                 )
                                 _advance_truncation_watermark_after_commit(s)  # #3831
-                                _stamp_latest_process_completion_receipts(
-                                    s.messages,
-                                    _process_completion_claims,
-                                    session_id=s.session_id,
-                                )
                                 s.save()
                         logger.info('[webui] self-heal (except path): retry succeeded')
                         return  # skip error emission
@@ -12803,11 +12781,6 @@ def _run_agent_streaming(
                     _error_message['provider_details_label'] = 'Cancellation details'
                 elif _exc_type == 'interrupted':
                     _error_message['provider_details_label'] = 'Interruption details'
-                _stamp_process_completion_receipts(
-                    _error_message,
-                    _process_completion_claims,
-                    session_id=s.session_id,
-                )
                 s.messages.append(_error_message)
                 try:
                     s.save()

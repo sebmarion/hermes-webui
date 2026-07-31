@@ -367,10 +367,12 @@ def test_process_completion_receipt_batch_validation_is_all_or_nothing(
     valid = _make_event("valid-batch", time.time(), session_key="batch-owner")
     batch = [valid, *invalid_tail]
 
-    assert streaming._validated_process_completion_events(
+    claimed = streaming._validated_process_completion_events(
         batch,
         session_id="batch-owner",
-    ) == []
+    )
+    assert claimed == [valid]
+    assert claimed[0] is valid
     message = {"role": "assistant", "content": "terminal"}
     assert streaming._stamp_process_completion_receipts(
         message,
@@ -386,14 +388,24 @@ def test_process_completion_receipt_batch_validation_is_all_or_nothing(
 
 def test_process_completion_receipt_rejects_duplicate_batch(streaming):
     valid = _make_event("duplicate", time.time(), session_key="batch-owner")
+    duplicate = dict(valid)
 
-    assert streaming._validated_process_completion_events(
-        [valid, dict(valid)],
+    claimed = streaming._validated_process_completion_events(
+        [valid, duplicate],
+        session_id="batch-owner",
+    )
+    assert claimed == [valid]
+    assert claimed[0] is valid
+    message = {"role": "assistant", "content": "terminal"}
+    assert streaming._stamp_process_completion_receipts(
+        message,
+        [valid, duplicate],
         session_id="batch-owner",
     ) == []
+    assert streaming._PROCESS_COMPLETION_RECEIPTS_KEY not in message
     assert streaming._durable_process_completion_receipt_status(
         "batch-owner",
-        [valid, dict(valid)],
+        [valid, duplicate],
     ) == "invalid"
 
 
