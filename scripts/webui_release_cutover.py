@@ -2319,14 +2319,32 @@ _LEGACY_RELEASE_ACTIVITY_KEYS = {
     "terminal_activity_available",
     "process_completion_activity_available",
 }
+_NATIVE_PROCESS_ACTIVITY_COUNT_KEYS = {
+    "running_processes",
+    "foreign_owner_active_processes",
+    "finalizing_processes",
+    "durable_undelivered_completions",
+}
 _NATIVE_RELEASE_ACTIVITY_KEYS = {
     *_LEGACY_RELEASE_ACTIVITY_KEYS,
     "process_checkpoint_available",
     "process_checkpoint_reason",
-    "running_processes",
-    "finalizing_processes",
-    "durable_undelivered_completions",
+    *_NATIVE_PROCESS_ACTIVITY_COUNT_KEYS,
 }
+_COMPATIBILITY_GAP_RELEASE_ACTIVITY_KEYS = {
+    *_LEGACY_RELEASE_ACTIVITY_KEYS,
+    "process_checkpoint_available",
+    "process_checkpoint_reason",
+}
+_R90_PROCESS_COMPATIBILITY_IDENTITY = (
+    ("build_id", "hermes-candidate-20260730-r90"),
+    ("commit", "fa3e484de3f1e55fa88e3654fe8807be4a272533"),
+    ("tree", "551085ae2ba4ce05ef9ae49cdcd34868b61948c0"),
+    (
+        "manifest_sha256",
+        "97b04a96aad665a5fbafaf946aaf6a9192d1da925dd587011aeb9bc55cc0fa7c",
+    ),
+)
 _RELEASE_ACTIVITY_COUNT_KEYS = {
     "active_streams",
     "active_async_delegations",
@@ -2341,11 +2359,6 @@ _RELEASE_ACTIVITY_AVAILABILITY_KEYS = {
     "oauth_activity_available",
     "terminal_activity_available",
 }
-_NATIVE_PROCESS_ACTIVITY_COUNT_KEYS = {
-    "running_processes",
-    "finalizing_processes",
-    "durable_undelivered_completions",
-}
 _RELEASE_ADMISSION_KEYS = {
     "state",
     "effective_state",
@@ -2359,6 +2372,7 @@ _RELEASE_ADMISSION_KEYS = {
     "reservation_kinds",
     "active_runs",
 }
+_PUBLIC_RELEASE_ADMISSION_KEYS = _RELEASE_ADMISSION_KEYS - {"transaction_id"}
 _ABSENT_PAIR_GATE = {
     "status": "absent",
     "transaction_id": None,
@@ -2374,6 +2388,54 @@ def _strict_nonnegative_release_count(value: object) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ReleaseBuildError("release activity counts are invalid")
     return value
+
+
+def _classify_release_activity_payload(activity: object) -> str:
+    if not isinstance(activity, dict):
+        raise DrainIdentityMismatch("release activity schema changed")
+    activity_keys = set(activity)
+    if activity_keys == _LEGACY_RELEASE_ACTIVITY_KEYS:
+        schema = "legacy"
+    elif activity_keys == _COMPATIBILITY_GAP_RELEASE_ACTIVITY_KEYS:
+        schema = "compatibility-gap"
+    elif activity_keys == _NATIVE_RELEASE_ACTIVITY_KEYS:
+        schema = "native"
+    else:
+        raise DrainIdentityMismatch("release activity schema changed")
+    for key in _RELEASE_ACTIVITY_COUNT_KEYS:
+        _strict_nonnegative_release_count(activity.get(key))
+    if any(
+        activity.get(key) is not True
+        for key in _RELEASE_ACTIVITY_AVAILABILITY_KEYS
+    ):
+        raise ReleaseBuildError("release activity availability proof is invalid")
+    process_available = activity.get("process_completion_activity_available")
+    if schema == "legacy":
+        if process_available is not False:
+            raise ReleaseBuildError(
+                "legacy process activity gap is not the known schema mismatch"
+            )
+    elif schema == "compatibility-gap":
+        if (
+            process_available is not False
+            or activity.get("process_checkpoint_available") is not False
+            or activity.get("process_checkpoint_reason") != "unavailable"
+        ):
+            raise ReleaseBuildError(
+                "compatibility process activity gap is invalid"
+            )
+    else:
+        for key in _NATIVE_PROCESS_ACTIVITY_COUNT_KEYS:
+            _strict_nonnegative_release_count(activity.get(key))
+        if (
+            process_available is not True
+            or activity.get("process_checkpoint_available") is not True
+            or activity.get("process_checkpoint_reason") != "verified"
+        ):
+            raise ReleaseBuildError(
+                "native WebUI process activity proof is invalid"
+            )
+    return schema
 
 
 def _classify_release_activity_schema(
@@ -2421,43 +2483,106 @@ def _classify_release_activity_schema(
         or sum(reservation_kinds.values()) != admission["reservations"]
     ):
         raise ReleaseBuildError("release admission proof is invalid")
-    activity_keys = set(activity)
-    if activity_keys == _LEGACY_RELEASE_ACTIVITY_KEYS:
-        schema = "legacy"
-    elif activity_keys == _NATIVE_RELEASE_ACTIVITY_KEYS:
-        schema = "native"
-    else:
-        raise DrainIdentityMismatch("release activity schema changed")
-    for key in _RELEASE_ACTIVITY_COUNT_KEYS:
-        _strict_nonnegative_release_count(activity.get(key))
-    if any(
-        activity.get(key) is not True
-        for key in _RELEASE_ACTIVITY_AVAILABILITY_KEYS
-    ):
-        raise ReleaseBuildError("release activity availability proof is invalid")
-    process_available = activity.get("process_completion_activity_available")
-    if schema == "legacy":
-        if process_available is not False:
-            raise ReleaseBuildError(
-                "legacy process activity gap is not the known schema mismatch"
-            )
-    else:
-        for key in _NATIVE_PROCESS_ACTIVITY_COUNT_KEYS:
-            _strict_nonnegative_release_count(activity.get(key))
-        if (
-            process_available is not True
-            or activity.get("process_checkpoint_available") is not True
-            or activity.get("process_checkpoint_reason") != "verified"
-        ):
-            raise ReleaseBuildError(
-                "native WebUI process activity proof is invalid"
-            )
+    schema = _classify_release_activity_payload(activity)
     return schema, admission, activity
+
+
+def _require_candidate_release_activity_drained(
+    public_admission: object,
+) -> dict:
+    expected_keys = (
+        _PUBLIC_RELEASE_ADMISSION_KEYS | _NATIVE_RELEASE_ACTIVITY_KEYS
+    )
+    if (
+        not isinstance(public_admission, dict)
+        or set(public_admission) != expected_keys
+    ):
+        raise DrainIdentityMismatch(
+            "candidate release activity schema changed"
+        )
+    if (
+        public_admission.get("state") != "startup-fenced"
+        or public_admission.get("effective_state") != "startup-fenced"
+        or public_admission.get("pair_gate") != _ABSENT_PAIR_GATE
+        or not isinstance(public_admission.get("generation"), int)
+        or isinstance(public_admission.get("generation"), bool)
+        or public_admission["generation"] < 0
+        or not isinstance(public_admission.get("fenced_at"), (int, float))
+        or isinstance(public_admission.get("fenced_at"), bool)
+        or public_admission["fenced_at"] <= 0
+        or public_admission.get("lease_expires_at") is not None
+        or public_admission.get("startup_error") is not None
+        or not isinstance(public_admission.get("reservation_kinds"), dict)
+    ):
+        raise ReleaseBuildError(
+            "candidate release admission proof is invalid"
+        )
+    reservation_kinds = public_admission["reservation_kinds"]
+    if (
+        any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+            for key, value in reservation_kinds.items()
+        )
+        or sum(reservation_kinds.values())
+        != public_admission.get("reservations")
+    ):
+        raise ReleaseBuildError(
+            "candidate release admission proof is invalid"
+        )
+    activity = {
+        key: public_admission[key]
+        for key in _NATIVE_RELEASE_ACTIVITY_KEYS
+    }
+    if _classify_release_activity_payload(activity) != "native":
+        raise ReleaseBuildError(
+            "candidate release activity is not native"
+        )
+    counts = {
+        "active_runs": _strict_nonnegative_release_count(
+            public_admission.get("active_runs")
+        ),
+        "reservations": _strict_nonnegative_release_count(
+            public_admission.get("reservations")
+        ),
+        **{
+            key: _strict_nonnegative_release_count(activity.get(key))
+            for key in (
+                *_RELEASE_ACTIVITY_COUNT_KEYS,
+                *_NATIVE_PROCESS_ACTIVITY_COUNT_KEYS,
+            )
+        },
+    }
+    busy = sorted(key for key, value in counts.items() if value != 0)
+    if busy:
+        raise ReleaseBuildError(
+            "candidate release activity has not drained: "
+            + ", ".join(busy)
+        )
+    return {
+        "status": "verified",
+        "schema": "native",
+        "counts": counts,
+        "availability": {
+            key: activity[key]
+            for key in (
+                *_RELEASE_ACTIVITY_AVAILABILITY_KEYS,
+                "process_completion_activity_available",
+                "process_checkpoint_available",
+            )
+        },
+        "process_checkpoint_reason": activity[
+            "process_checkpoint_reason"
+        ],
+    }
 
 
 def _release_inspection_is_drained(inspection: dict) -> bool:
     schema, admission, activity = _classify_release_activity_schema(inspection)
-    if schema == "legacy":
+    if schema != "native":
         return False
     return all(
         admission[key] == 0 for key in ("active_runs", "reservations")
@@ -3118,11 +3243,17 @@ def run_release_control_cutover(
                 admission_state="startup-fenced",
                 require_full_health=True,
             )
+            candidate_release_barrier = (
+                _require_candidate_release_activity_drained(
+                    fenced_health["deep_health"].get("admission")
+                )
+            )
             record_phase(
                 "candidate_fenced_health_proved",
                 {
                     "identity": candidate_identity,
                     "binding": stable_binding_receipt(fenced_health),
+                    "release_barrier": candidate_release_barrier,
                 },
             )
         elif admission_state == "open":
@@ -14577,6 +14708,13 @@ def _attest_legacy_webui_activity_drain(
         )
         if schema == "native":
             return False
+        if schema == "compatibility-gap" and any(
+            identity.get(key) != expected
+            for key, expected in _R90_PROCESS_COMPATIBILITY_IDENTITY
+        ):
+            raise DrainIdentityMismatch(
+                "compatibility process activity gap is not exact live r90"
+            )
         counts = {
             "active_runs": candidate_admission["active_runs"],
             "reservations": candidate_admission["reservations"],

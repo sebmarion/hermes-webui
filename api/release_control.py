@@ -33,6 +33,12 @@ _STARTUP_TOKEN_RECEIPT_DOMAIN = (
     b"hermes-webui:managed-deferred-startup:start-token-receipt:v1\x00"
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_PROCESS_ACTIVITY_COUNT_KEYS = (
+    "running_processes",
+    "foreign_owner_active_processes",
+    "finalizing_processes",
+    "durable_undelivered_completions",
+)
 
 
 def _startup_type_name(value: object) -> str:
@@ -428,12 +434,7 @@ def _component_activity_snapshot(loader, *, availability_key: str) -> dict:
 
 def _process_completion_activity_snapshot(loader) -> dict:
     """Validate the Agent process barrier without treating metadata as counts."""
-    count_keys = {
-        "running_processes",
-        "finalizing_processes",
-        "durable_undelivered_completions",
-    }
-    expected_keys = count_keys | {
+    expected_keys = set(_PROCESS_ACTIVITY_COUNT_KEYS) | {
         "process_completion_activity_available",
         "process_checkpoint_available",
         "process_checkpoint_reason",
@@ -446,7 +447,7 @@ def _process_completion_activity_snapshot(loader) -> dict:
             not isinstance(snapshot[key], int)
             or isinstance(snapshot[key], bool)
             or snapshot[key] < 0
-            for key in count_keys
+            for key in _PROCESS_ACTIVITY_COUNT_KEYS
         ):
             raise ValueError("process activity source returned an invalid count")
         if not isinstance(
@@ -542,9 +543,7 @@ def _require_external_activity_drained(snapshot: dict) -> None:
         "in_flight_memory_commits",
         "pending_oauth_flows",
         "active_terminals",
-        "running_processes",
-        "finalizing_processes",
-        "durable_undelivered_completions",
+        *_PROCESS_ACTIVITY_COUNT_KEYS,
     )
     busy = [key for key in counts if int(snapshot.get(key, -1)) != 0]
     if busy:

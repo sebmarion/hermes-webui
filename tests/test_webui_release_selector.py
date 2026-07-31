@@ -688,6 +688,177 @@ def test_last_good_promoted_runtime_rejects_invalid_generation(generation):
         cutover._require_expected_last_good_webui_identity(actual, expected)
 
 
+def _native_release_inspection(*, foreign_owner_active_processes=0):
+    return {
+        "admission": _fenced_release_admission(),
+        "activity": {
+            "active_streams": 0,
+            "active_async_delegations": 0,
+            "async_delegations_available": True,
+            "active_background_memory_commits": 0,
+            "in_flight_memory_commits": 0,
+            "memory_commit_activity_available": True,
+            "pending_oauth_flows": 0,
+            "oauth_activity_available": True,
+            "active_terminals": 0,
+            "terminal_activity_available": True,
+            "running_processes": 0,
+            "foreign_owner_active_processes": foreign_owner_active_processes,
+            "finalizing_processes": 0,
+            "durable_undelivered_completions": 0,
+            "process_completion_activity_available": True,
+            "process_checkpoint_available": True,
+            "process_checkpoint_reason": "verified",
+        },
+    }
+
+
+def _compatibility_gap_release_inspection():
+    inspection = _native_release_inspection()
+    activity = inspection["activity"]
+    for key in (
+        "running_processes",
+        "foreign_owner_active_processes",
+        "finalizing_processes",
+        "durable_undelivered_completions",
+    ):
+        activity.pop(key)
+    activity["process_completion_activity_available"] = False
+    activity["process_checkpoint_available"] = False
+    activity["process_checkpoint_reason"] = "unavailable"
+    return inspection
+
+
+def _r90_process_compatibility_identity(**extra):
+    return {
+        "build_id": "hermes-candidate-20260730-r90",
+        "commit": "fa3e484de3f1e55fa88e3654fe8807be4a272533",
+        "tree": "551085ae2ba4ce05ef9ae49cdcd34868b61948c0",
+        "manifest_sha256": (
+            "97b04a96aad665a5fbafaf946aaf6a9192d1da925dd587011"
+            "aeb9bc55cc0fa7c"
+        ),
+        **extra,
+    }
+
+
+def _native_candidate_health_admission(**activity_overrides):
+    inspection = _native_release_inspection()
+    admission = {
+        key: value
+        for key, value in inspection["admission"].items()
+        if key != "transaction_id"
+    }
+    admission.update(inspection["activity"])
+    admission.update(activity_overrides)
+    admission["state"] = "startup-fenced"
+    admission["effective_state"] = "startup-fenced"
+    admission["fenced_at"] = 1.0
+    admission["lease_expires_at"] = None
+    return admission
+
+
+def test_native_release_activity_accepts_zero_foreign_owner_count():
+    inspection = _native_release_inspection()
+
+    schema, _admission, activity = cutover._classify_release_activity_schema(
+        inspection
+    )
+
+    assert schema == "native"
+    assert activity["foreign_owner_active_processes"] == 0
+    assert cutover._release_inspection_is_drained(inspection) is True
+
+
+def test_candidate_release_activity_requires_exact_native_drained_barrier():
+    receipt = cutover._require_candidate_release_activity_drained(
+        _native_candidate_health_admission()
+    )
+
+    assert receipt["status"] == "verified"
+    assert receipt["schema"] == "native"
+    assert set(receipt["counts"].values()) == {0}
+    assert receipt["process_checkpoint_reason"] == "verified"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error", "message"),
+    [
+        (
+            lambda admission: admission.pop(
+                "foreign_owner_active_processes"
+            ),
+            cutover.DrainIdentityMismatch,
+            "candidate release activity schema changed",
+        ),
+        (
+            lambda admission: admission.update(
+                {"foreign_owner_active_processes": 1}
+            ),
+            cutover.ReleaseBuildError,
+            "candidate release activity has not drained",
+        ),
+        (
+            lambda admission: admission.update(
+                {"process_completion_activity_available": False}
+            ),
+            cutover.ReleaseBuildError,
+            "native WebUI process activity proof is invalid",
+        ),
+        (
+            lambda admission: admission.update({"effective_state": "open"}),
+            cutover.ReleaseBuildError,
+            "candidate release admission proof is invalid",
+        ),
+    ],
+)
+def test_candidate_release_activity_fails_closed(mutation, error, message):
+    admission = _native_candidate_health_admission()
+    mutation(admission)
+
+    with pytest.raises(error, match=message):
+        cutover._require_candidate_release_activity_drained(admission)
+
+
+def test_native_release_activity_foreign_owner_blocks_drain():
+    inspection = _native_release_inspection(foreign_owner_active_processes=1)
+
+    assert cutover._release_inspection_is_drained(inspection) is False
+
+
+def test_native_release_activity_requires_foreign_owner_count():
+    inspection = _native_release_inspection()
+    inspection["activity"].pop("foreign_owner_active_processes")
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="release activity schema changed",
+    ):
+        cutover._classify_release_activity_schema(inspection)
+
+
+def test_release_activity_classifies_exact_process_compatibility_gap():
+    inspection = _compatibility_gap_release_inspection()
+
+    schema, _admission, _activity = cutover._classify_release_activity_schema(
+        inspection
+    )
+
+    assert schema == "compatibility-gap"
+    assert cutover._release_inspection_is_drained(inspection) is False
+
+
+def test_release_activity_rejects_inexact_process_compatibility_gap():
+    inspection = _compatibility_gap_release_inspection()
+    inspection["activity"]["process_checkpoint_reason"] = "invalid"
+
+    with pytest.raises(
+        cutover.ReleaseBuildError,
+        match="compatibility process activity gap is invalid",
+    ):
+        cutover._classify_release_activity_schema(inspection)
+
+
 def test_release_control_rejects_modern_drained_wrong_old_before_mutation(
     tmp_path,
 ):
@@ -748,6 +919,7 @@ def test_release_control_rejects_modern_drained_wrong_old_before_mutation(
             "active_terminals": 0,
             "terminal_activity_available": True,
             "running_processes": 0,
+            "foreign_owner_active_processes": 0,
             "finalizing_processes": 0,
             "durable_undelivered_completions": 0,
             "process_completion_activity_available": True,
@@ -6681,10 +6853,13 @@ def test_release_watchdog_barrier_adopts_exact_snapshot_rollback_state(
     ]
 
 
-@pytest.mark.parametrize("external_drain", [False, True])
+@pytest.mark.parametrize(
+    "drain_mode",
+    ["native", "legacy-gap", "compatibility-gap"],
+)
 def test_release_control_driver_commits_pair_before_sequential_open(
     tmp_path,
-    external_drain,
+    drain_mode,
 ):
     transaction_id = "release-transaction-00000000000001"
     old_identity = {
@@ -6750,6 +6925,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(
             "active_terminals": 0,
             "terminal_activity_available": True,
             "running_processes": 0,
+            "foreign_owner_active_processes": 0,
             "finalizing_processes": 0,
             "durable_undelivered_completions": 0,
             "process_completion_activity_available": True,
@@ -6757,20 +6933,25 @@ def test_release_control_driver_commits_pair_before_sequential_open(
             "process_checkpoint_reason": "verified",
         },
     }
-    if external_drain:
+    if drain_mode != "native":
         drained["activity"] = {
             key: value
             for key, value in drained["activity"].items()
             if key
             not in {
                 "running_processes",
+                "foreign_owner_active_processes",
                 "finalizing_processes",
                 "durable_undelivered_completions",
-                "process_checkpoint_available",
-                "process_checkpoint_reason",
             }
         }
         drained["activity"]["process_completion_activity_available"] = False
+        if drain_mode == "legacy-gap":
+            drained["activity"].pop("process_checkpoint_available")
+            drained["activity"].pop("process_checkpoint_reason")
+        else:
+            drained["activity"]["process_checkpoint_available"] = False
+            drained["activity"]["process_checkpoint_reason"] = "unavailable"
     inspection_rows = iter(
         [
             {
@@ -6819,7 +7000,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(
                 "identity": old_identity,
             }
         if action == "commit":
-            assert external_drain is False
+            assert drain_mode == "native"
             assert fence_token == "old-secret-token"
             return {
                 "status": "committing",
@@ -6906,7 +7087,11 @@ def test_release_control_driver_commits_pair_before_sequential_open(
                         )
                     },
                 },
-                "admission": {"state": state},
+                "admission": (
+                    _native_candidate_health_admission()
+                    if state == "startup-fenced"
+                    else {"state": state}
+                ),
                 "checks": checks,
             },
         }
@@ -6987,7 +7172,7 @@ def test_release_control_driver_commits_pair_before_sequential_open(
             "gateway-opened"
         ) or {"status": "opened"},
         attest_legacy_activity_drain=(
-            attest_external_drain if external_drain else None
+            attest_external_drain if drain_mode != "native" else None
         ),
         expected_candidate_identity=expected_candidate,
         expected_last_good_identity=old_identity,
@@ -6999,10 +7184,10 @@ def test_release_control_driver_commits_pair_before_sequential_open(
     )
 
     expected_actions = ["fence", "fence", "accept"]
-    if not external_drain:
+    if drain_mode == "native":
         expected_actions.insert(1, "commit")
     assert [row[0] for row in actions] == expected_actions
-    assert len(external_drain_calls) == int(external_drain)
+    assert len(external_drain_calls) == int(drain_mode != "native")
     assert result["status"] == "accepted"
     assert result["identity"] == candidate_identity
     assert lifecycle[0] == "activated"
@@ -7023,7 +7208,13 @@ def test_release_control_driver_commits_pair_before_sequential_open(
         journal_path,
         transaction_id=transaction_id,
     )
-    if external_drain:
+    assert journal["phases"]["candidate_fenced_health_proved"][
+        "release_barrier"
+    ]["status"] == "verified"
+    assert journal["phases"]["candidate_fenced_health_proved"][
+        "release_barrier"
+    ]["counts"]["foreign_owner_active_processes"] == 0
+    if drain_mode != "native":
         assert journal["phases"]["old_committed"][
             "external_activity_drain"
         ]["proof"] == "exact-external-process-barrier"
@@ -7051,17 +7242,38 @@ def test_release_control_driver_commits_pair_before_sequential_open(
     }
 
 
+@pytest.mark.parametrize(
+    "activity_schema",
+    ["legacy-gap", "compatibility-gap"],
+)
 def test_legacy_webui_activity_drain_uses_exact_locked_durable_zero(
     tmp_path,
     monkeypatch,
+    activity_schema,
 ):
-    identity = {
-        "build_id": "last-good",
-        "pid": 123,
-        "pid_start_token": "old-start",
-    }
+    identity = (
+        _r90_process_compatibility_identity(
+            pid=123,
+            pid_start_token="old-start",
+        )
+        if activity_schema == "compatibility-gap"
+        else {
+            "build_id": "last-good",
+            "pid": 123,
+            "pid_start_token": "old-start",
+        }
+    )
     plan = {
-        "last_good_identity": {"build_id": "last-good"},
+        "last_good_identity": {
+            key: identity[key]
+            for key in (
+                "build_id",
+                "commit",
+                "tree",
+                "manifest_sha256",
+            )
+            if key in identity
+        },
         "last_good_gateway_identity": {"build_id": "last-good-gateway"},
         "synthetic_process_notifications_path": str(
             tmp_path / "process_notifications.json"
@@ -7085,6 +7297,13 @@ def test_legacy_webui_activity_drain_uses_exact_locked_durable_zero(
             "process_completion_activity_available": False,
         },
     }
+    if activity_schema == "compatibility-gap":
+        inspection["activity"].update(
+            {
+                "process_checkpoint_available": False,
+                "process_checkpoint_reason": "unavailable",
+            }
+        )
     events = []
 
     def acquire(_plan, *, kind):
@@ -7215,6 +7434,44 @@ def test_legacy_webui_activity_drain_uses_exact_locked_durable_zero(
     ]
 
 
+def test_compatibility_activity_gap_rejects_non_r90_identity_before_locks(
+    monkeypatch,
+):
+    identity = {
+        "build_id": "not-r90",
+        "pid": 123,
+        "pid_start_token": "old-start",
+    }
+    inspection = {
+        "status": "inspected",
+        "identity": identity,
+        **_compatibility_gap_release_inspection(),
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_acquire_process_registry_lock",
+        lambda *_args, **_kwargs: pytest.fail(
+            "non-r90 compatibility gap must fail before locking"
+        ),
+    )
+
+    with pytest.raises(
+        cutover.DrainIdentityMismatch,
+        match="not exact live r90",
+    ):
+        cutover._attest_legacy_webui_activity_drain(
+            {
+                "last_good_identity": {"build_id": "not-r90"},
+                "last_good_gateway_identity": {
+                    "build_id": "last-good-gateway"
+                },
+            },
+            identity,
+            inspection,
+            inspect_control=lambda: inspection,
+        )
+
+
 def test_legacy_webui_activity_drain_defers_to_stronger_process_schema(
     monkeypatch,
 ):
@@ -7242,6 +7499,7 @@ def test_legacy_webui_activity_drain_defers_to_stronger_process_schema(
             "process_checkpoint_available": True,
             "process_checkpoint_reason": "verified",
             "running_processes": 2,
+            "foreign_owner_active_processes": 0,
             "finalizing_processes": 0,
             "durable_undelivered_completions": 0,
         },
@@ -7371,6 +7629,7 @@ def _strong_release_inspection(**activity_overrides):
         "process_checkpoint_available": True,
         "process_checkpoint_reason": "verified",
         "running_processes": 0,
+        "foreign_owner_active_processes": 0,
         "finalizing_processes": 0,
         "durable_undelivered_completions": 0,
     }
@@ -7555,6 +7814,7 @@ def test_release_transaction_resumes_from_each_durable_external_phase(
             "active_terminals": 0,
             "terminal_activity_available": True,
             "running_processes": 0,
+            "foreign_owner_active_processes": 0,
             "finalizing_processes": 0,
             "durable_undelivered_completions": 0,
             "process_completion_activity_available": True,
@@ -7645,7 +7905,7 @@ def test_release_transaction_resumes_from_each_durable_external_phase(
                     "selector_generation",
                 )
             }},
-            "admission": {"state": "startup-fenced"},
+            "admission": _native_candidate_health_admission(),
         },
     }
     preaccepted_health["deep_health"]["checks"] = {
@@ -7857,6 +8117,7 @@ def test_release_early_failure_matrix_always_restores_selector_and_plist(
         "active_terminals": 0,
         "terminal_activity_available": True,
         "running_processes": 0,
+        "foreign_owner_active_processes": 0,
         "finalizing_processes": 0,
         "durable_undelivered_completions": 0,
         "process_completion_activity_available": True,
@@ -8590,6 +8851,7 @@ def test_release_control_driver_surfaces_every_rollback_failure(tmp_path):
             "active_terminals": 0,
             "terminal_activity_available": True,
             "running_processes": 0,
+            "foreign_owner_active_processes": 0,
             "finalizing_processes": 0,
             "durable_undelivered_completions": 0,
             "process_completion_activity_available": True,

@@ -615,6 +615,7 @@ def test_process_completion_activity_accepts_verified_checkpoint_metadata():
 
     snapshot = {
         "running_processes": 0,
+        "foreign_owner_active_processes": 0,
         "finalizing_processes": 0,
         "durable_undelivered_completions": 0,
         "process_completion_activity_available": True,
@@ -630,6 +631,66 @@ def test_process_completion_activity_accepts_verified_checkpoint_metadata():
             **snapshot,
             "process_checkpoint_reason": "invalid",
         }
+    ) == {
+        "process_completion_activity_available": False,
+        "process_checkpoint_available": False,
+        "process_checkpoint_reason": "unavailable",
+    }
+
+
+@pytest.mark.parametrize(
+    "snapshot_update",
+    [
+        {"foreign_owner_active_processes": True},
+        {"foreign_owner_active_processes": -1},
+        {"foreign_owner_active_processes": "0"},
+    ],
+)
+def test_process_completion_activity_rejects_invalid_foreign_owner_count(
+    snapshot_update,
+):
+    from api import release_control
+
+    snapshot = {
+        "running_processes": 0,
+        "foreign_owner_active_processes": 0,
+        "finalizing_processes": 0,
+        "durable_undelivered_completions": 0,
+        "process_completion_activity_available": True,
+        "process_checkpoint_available": True,
+        "process_checkpoint_reason": "verified",
+        **snapshot_update,
+    }
+
+    assert release_control._process_completion_activity_snapshot(
+        lambda: snapshot
+    ) == {
+        "process_completion_activity_available": False,
+        "process_checkpoint_available": False,
+        "process_checkpoint_reason": "unavailable",
+    }
+
+
+@pytest.mark.parametrize("schema_change", ["missing", "extra"])
+def test_process_completion_activity_rejects_schema_drift(schema_change):
+    from api import release_control
+
+    snapshot = {
+        "running_processes": 0,
+        "foreign_owner_active_processes": 0,
+        "finalizing_processes": 0,
+        "durable_undelivered_completions": 0,
+        "process_completion_activity_available": True,
+        "process_checkpoint_available": True,
+        "process_checkpoint_reason": "verified",
+    }
+    if schema_change == "missing":
+        snapshot.pop("foreign_owner_active_processes")
+    else:
+        snapshot["unknown_process_count"] = 0
+
+    assert release_control._process_completion_activity_snapshot(
+        lambda: snapshot
     ) == {
         "process_completion_activity_available": False,
         "process_checkpoint_available": False,
@@ -657,6 +718,7 @@ def test_release_control_commit_checks_streams_and_delegations(
         "active_terminals": 0,
         "terminal_activity_available": True,
         "running_processes": 0,
+        "foreign_owner_active_processes": 0,
         "finalizing_processes": 0,
         "durable_undelivered_completions": 0,
         "process_completion_activity_available": True,
@@ -668,6 +730,17 @@ def test_release_control_commit_checks_streams_and_delegations(
         release_control,
         "release_activity_snapshot",
         lambda: {**drained_activity, "active_streams": 1},
+    )
+    with pytest.raises(config.RunAdmissionBusy):
+        release_control.commit_release_control(
+            fenced["token"],
+            expected_identity=isolated_admission,
+        )
+
+    monkeypatch.setattr(
+        release_control,
+        "release_activity_snapshot",
+        lambda: {**drained_activity, "foreign_owner_active_processes": 1},
     )
     with pytest.raises(config.RunAdmissionBusy):
         release_control.commit_release_control(
