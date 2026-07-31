@@ -2936,6 +2936,7 @@ def _finish_process_completion_delivery(
     event: dict,
     *,
     committed: bool,
+    raise_on_error: bool = False,
 ) -> bool:
     """Finish delivery for the exact stable Agent outbox event."""
     if not isinstance(event, dict):
@@ -2953,10 +2954,12 @@ def _finish_process_completion_delivery(
         return bool(
             process_registry.finish_notification_delivery(event, committed)
         )
-    except Exception:
+    except Exception as exc:
+        if raise_on_error:
+            raise
         logger.warning(
-            "Failed to finish durable process completion delivery",
-            exc_info=True,
+            "Failed to finish durable process completion delivery (error=%s)",
+            type(exc).__name__,
         )
         return False
 
@@ -3147,10 +3150,10 @@ def _durable_process_completion_receipt_status(
         from api.models import Session
 
         persisted = Session.load(str(session_id or ""))
-    except Exception:
+    except Exception as exc:
         logger.warning(
-            "Failed to load durable process completion receipts",
-            exc_info=True,
+            "Failed to load durable process completion receipts (error=%s)",
+            type(exc).__name__,
         )
         return "unavailable"
     if persisted is None:
@@ -3159,19 +3162,34 @@ def _durable_process_completion_receipt_status(
     messages = getattr(persisted, "messages", None)
     if not isinstance(messages, list):
         return "absent"
+    marker_present = False
     found: set[str] = set()
     for message in messages:
         if not isinstance(message, dict):
             continue
+        if _PROCESS_COMPLETION_RECEIPTS_KEY not in message:
+            continue
+        marker_present = True
         raw_receipts = message.get(_PROCESS_COMPLETION_RECEIPTS_KEY)
-        if not isinstance(raw_receipts, list) or not raw_receipts:
-            continue
-        if not all(
-            _is_process_completion_receipt_digest(item)
-            for item in raw_receipts
+        if (
+            message.get("role") != "assistant"
+            or not isinstance(raw_receipts, list)
+            or not raw_receipts
+            or not all(
+                _is_process_completion_receipt_digest(item)
+                for item in raw_receipts
+            )
         ):
-            continue
-        found.update(raw_receipts)
+            return "invalid"
+        marker_digests = set(raw_receipts)
+        if (
+            len(marker_digests) != len(raw_receipts)
+            or found.intersection(marker_digests)
+        ):
+            return "invalid"
+        found.update(marker_digests)
+    if not marker_present:
+        return "absent"
     return "committed" if all(item in found for item in required) else "absent"
 
 
@@ -3180,6 +3198,7 @@ def _finalize_process_completion_claims(
     events: list[dict],
     *,
     committed: bool,
+    raise_on_error: bool = False,
 ) -> bool:
     """ACK durable claims or requeue every exact event after a failed writeback."""
     all_finished = True
@@ -3188,6 +3207,7 @@ def _finalize_process_completion_claims(
             process_registry,
             event,
             committed=committed,
+            raise_on_error=raise_on_error,
         )
         all_finished = finished and all_finished
     if not all_finished:

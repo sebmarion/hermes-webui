@@ -345,6 +345,111 @@ def test_process_completion_receipt_requires_durable_sidecar(
 
 
 @pytest.mark.parametrize(
+    "stored_case",
+    [
+        "wrong_type",
+        "empty",
+        "invalid_digest",
+        "duplicate_within_message",
+        "duplicate_across_messages",
+        "valid_plus_invalid",
+        "user_role",
+        "tool_role",
+    ],
+)
+def test_malformed_stored_receipt_metadata_restages_claim_without_provider(
+    streaming,
+    monkeypatch,
+    tmp_path,
+    stored_case,
+):
+    bp, _config, _models, routes = _configure_receipt_route_without_provider(
+        monkeypatch,
+        tmp_path,
+        f"provider preparation reached for malformed receipt {stored_case}",
+    )
+    session_id = f"malformed-receipt-{stored_case}"
+    event = _make_event(
+        f"malformed-{stored_case}",
+        time.time(),
+        session_key=session_id,
+    )
+    digest = streaming._process_completion_receipt_digest(
+        event,
+        session_id=session_id,
+    )
+    assert digest is not None
+    key = streaming._PROCESS_COMPLETION_RECEIPTS_KEY
+
+    if stored_case == "wrong_type":
+        messages = [{"role": "assistant", "content": "terminal", key: digest}]
+    elif stored_case == "empty":
+        messages = [{"role": "assistant", "content": "terminal", key: []}]
+    elif stored_case == "invalid_digest":
+        messages = [
+            {"role": "assistant", "content": "terminal", key: ["invalid"]}
+        ]
+    elif stored_case == "duplicate_within_message":
+        messages = [
+            {"role": "assistant", "content": "terminal", key: [digest, digest]}
+        ]
+    elif stored_case == "duplicate_across_messages":
+        messages = [
+            {"role": "assistant", "content": "first", key: [digest]},
+            {"role": "assistant", "content": "second", key: [digest]},
+        ]
+    elif stored_case == "valid_plus_invalid":
+        messages = [
+            {"role": "assistant", "content": "first", key: [digest]},
+            {"role": "assistant", "content": "second", key: ["invalid"]},
+        ]
+    elif stored_case == "user_role":
+        messages = [{"role": "user", "content": "not terminal", key: [digest]}]
+    else:
+        messages = [{"role": "tool", "content": "not terminal", key: [digest]}]
+
+    session = _make_session(tmp_path, session_id, messages=messages)
+    session.save(skip_index=True)
+    _clear_staged_process_completion_events()
+    try:
+        assert bp.stage_process_completion_event(session_id, event) is True
+        response = _call_process_wakeup_start(routes, session)
+        assert response == {
+            "error": "Durable process-completion receipt is unavailable",
+            "code": "durable_completion_receipt_unavailable",
+            "retryable": True,
+            "_status": 503,
+        }
+        preserved = bp.claim_staged_process_completion_events(session_id)
+        assert preserved == [event]
+        assert preserved[0] is event
+    finally:
+        _clear_staged_process_completion_events()
+
+
+def test_valid_unrelated_assistant_receipt_is_absent(streaming, monkeypatch, tmp_path):
+    from api import models
+
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    session_id = "unrelated-receipt-owner"
+    required = _make_event("required-receipt", time.time(), session_key=session_id)
+    unrelated = _make_event("unrelated-receipt", time.time(), session_key=session_id)
+    terminal = {"role": "assistant", "content": "different completion"}
+    assert streaming._stamp_process_completion_receipts(
+        terminal,
+        [unrelated],
+        session_id=session_id,
+    )
+    session = _make_session(tmp_path, session_id, messages=[terminal])
+    session.save(skip_index=True)
+
+    assert streaming._durable_process_completion_receipt_status(
+        session_id,
+        [required],
+    ) == "absent"
+
+
+@pytest.mark.parametrize(
     "invalid_tail",
     [
         ["malformed"],
@@ -474,6 +579,116 @@ def test_replayed_committed_wakeup_retries_ack_without_provider(
         assert session.path.read_bytes() == transcript_before
     finally:
         _clear_staged_process_completion_events()
+
+
+@pytest.mark.parametrize("exception_index", [0, 1])
+def test_committed_receipt_settlement_exception_preserves_every_claim(
+    streaming,
+    monkeypatch,
+    tmp_path,
+    caplog,
+    exception_index,
+):
+    bp, _config, _models, routes = _configure_receipt_route_without_provider(
+        monkeypatch,
+        tmp_path,
+        "provider preparation reached after settlement exception",
+    )
+    session_id = "settlement-exception-owner"
+    events = [
+        _make_event("settlement-first", time.time(), session_key=session_id),
+        _make_event("settlement-second", time.time(), session_key=session_id),
+    ]
+    terminal = {"role": "assistant", "content": "already committed"}
+    assert len(
+        streaming._stamp_process_completion_receipts(
+            terminal,
+            events,
+            session_id=session_id,
+        )
+    ) == 2
+    session = _make_session(tmp_path, session_id, messages=[terminal])
+    session.save(skip_index=True)
+    reg = _install_fake_registry(monkeypatch, [])
+    settlement_calls = []
+
+    def fail_selected_settlement(event, committed):
+        settlement_calls.append((event, committed))
+        if len(settlement_calls) - 1 == exception_index:
+            raise RuntimeError(f"{event['event_id']} {event['session_key']}")
+        return True
+
+    reg.finish_notification_delivery = fail_selected_settlement
+    _clear_staged_process_completion_events()
+    try:
+        for event in events:
+            assert bp.stage_process_completion_event(session_id, event) is True
+        with caplog.at_level("WARNING"):
+            response = _call_process_wakeup_start(routes, session)
+        assert response == {
+            "error": "Durable process-completion receipt is unavailable",
+            "code": "durable_completion_receipt_unavailable",
+            "retryable": True,
+            "_status": 503,
+        }
+        assert settlement_calls == [
+            (event, True) for event in events[: exception_index + 1]
+        ]
+        preserved = bp.claim_staged_process_completion_events(session_id)
+        assert preserved == events
+        assert all(actual is expected for actual, expected in zip(preserved, events))
+        assert session_id not in caplog.text
+        assert all(event["event_id"] not in caplog.text for event in events)
+    finally:
+        _clear_staged_process_completion_events()
+
+
+def test_committed_receipt_settlement_exception_with_failed_restage_is_uncertain(
+    streaming,
+    monkeypatch,
+    tmp_path,
+):
+    bp, _config, _models, routes = _configure_receipt_route_without_provider(
+        monkeypatch,
+        tmp_path,
+        "provider preparation reached after uncertain settlement",
+    )
+    session_id = "uncertain-settlement-owner"
+    events = [
+        _make_event("uncertain-first", time.time(), session_key=session_id),
+        _make_event("uncertain-second", time.time(), session_key=session_id),
+    ]
+    terminal = {"role": "assistant", "content": "already committed"}
+    assert streaming._stamp_process_completion_receipts(
+        terminal,
+        events,
+        session_id=session_id,
+    )
+    session = _make_session(tmp_path, session_id, messages=[terminal])
+    session.save(skip_index=True)
+    reg = _install_fake_registry(monkeypatch, [])
+    reg.finish_notification_delivery = lambda event, committed: (_ for _ in ()).throw(
+        RuntimeError("settlement unavailable")
+    )
+    restage_calls = []
+
+    def fail_first_restage(owner, event):
+        restage_calls.append((owner, event))
+        return event is not events[0]
+
+    monkeypatch.setattr(bp, "stage_process_completion_event", fail_first_restage)
+    monkeypatch.setattr(
+        bp,
+        "claim_staged_process_completion_events",
+        lambda _sid: list(events),
+    )
+
+    response = _call_process_wakeup_start(routes, session)
+
+    assert response["_status"] == 500
+    assert response["code"] == "durable_completion_claim_preservation_uncertain"
+    assert response["retryable"] is True
+    assert restage_calls == [(session_id, event) for event in events]
 
 
 def test_receipt_lookup_failure_preserves_claim_without_provider(
@@ -652,6 +867,7 @@ def test_invalid_mixed_claim_batch_restages_every_stable_claim_without_provider(
 
 
 def test_invalid_mixed_claim_preservation_failure_is_uncertain_and_exhaustive(
+    streaming,
     monkeypatch,
     tmp_path,
     caplog,
@@ -679,7 +895,9 @@ def test_invalid_mixed_claim_preservation_failure_is_uncertain_and_exhaustive(
 
     def fail_one_restage(owner, event):
         restage_calls.append((owner, event))
-        return event is not failed
+        if event is failed:
+            raise RuntimeError(f"{event['event_id']} {event['session_key']}")
+        return True
 
     monkeypatch.setattr(bp, "stage_process_completion_event", fail_one_restage)
     with config.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
@@ -690,7 +908,7 @@ def test_invalid_mixed_claim_preservation_failure_is_uncertain_and_exhaustive(
         }
 
     try:
-        with caplog.at_level("ERROR"):
+        with caplog.at_level("WARNING"):
             response = _call_process_wakeup_start(routes, session)
         assert response["_status"] == 500
         assert response["code"] == "durable_completion_claim_preservation_uncertain"
@@ -699,7 +917,14 @@ def test_invalid_mixed_claim_preservation_failure_is_uncertain_and_exhaustive(
             ("different-preservation-owner", failed),
             (session.session_id, last),
         ]
-        assert failed["event_id"] in caplog.text
+        opaque_token = streaming._process_completion_receipt_digest(
+            failed,
+            session_id=failed["session_key"],
+        )
+        assert opaque_token is not None
+        assert failed["event_id"] not in caplog.text
+        assert failed["session_key"] not in caplog.text
+        assert f"type=completion index=1 token={opaque_token[:16]}" in caplog.text
         with config.BG_TASK_COMPLETE_EVENTS_SEEN_LOCK:
             # Seen ownership is released only when every exact claim is safe.
             assert first["event_id"] in config.BG_TASK_COMPLETE_EVENTS_SEEN[

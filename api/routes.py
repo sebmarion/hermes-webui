@@ -10229,6 +10229,7 @@ from api.streaming import (
     _run_agent_streaming,
     _durable_process_completion_receipt_status,
     _finalize_process_completion_claims,
+    _process_completion_receipt_digest,
     _release_process_completion_seen,
     cancel_stream,
     _materialize_pending_user_turn_before_error,
@@ -23895,17 +23896,20 @@ def _start_chat_stream_for_session(
             s.session_id
         )
 
-    def _process_completion_claim_identity(event: object) -> str:
-        if not isinstance(event, dict):
-            return f"malformed:{type(event).__name__}"
-        event_type = str(event.get("type") or "unknown").strip() or "unknown"
-        stable_id = str(
-            event.get("event_id")
-            or event.get("delegation_id")
-            or "missing"
-        ).strip()
-        owner = str(event.get("session_key") or "missing").strip()
-        return f"{event_type}:{stable_id[:160]}@{owner[:160]}"
+    def _process_completion_claim_identity(event: object, index: int) -> str:
+        event_type = (
+            event.get("type")
+            if isinstance(event, dict)
+            and event.get("type") in ("completion", "async_delegation")
+            else "invalid"
+        )
+        owner = event.get("session_key") if isinstance(event, dict) else None
+        digest = (
+            _process_completion_receipt_digest(event, session_id=owner)
+            if isinstance(owner, str)
+            else None
+        )
+        return f"type={event_type} index={index} token={(digest or 'invalid')[:16]}"
 
     def _claim_preservation_uncertain(failed_identities: list[str]) -> dict:
         logger.error(
@@ -23923,18 +23927,19 @@ def _start_chat_stream_for_session(
         nonlocal process_completion_events
         try:
             from api.background_process import stage_process_completion_event
-        except Exception:
-            logger.exception(
-                "Durable process completion claim staging is unavailable"
+        except Exception as exc:
+            logger.error(
+                "Durable process completion claim staging is unavailable (error=%s)",
+                type(exc).__name__,
             )
             failed_identities = [
-                _process_completion_claim_identity(event)
-                for event in process_completion_events
+                _process_completion_claim_identity(event, index)
+                for index, event in enumerate(process_completion_events)
             ]
             return _claim_preservation_uncertain(failed_identities)
 
         failed_identities: list[str] = []
-        for event in process_completion_events:
+        for index, event in enumerate(process_completion_events):
             owner = (
                 str(event.get("session_key") or "").strip()
                 if isinstance(event, dict)
@@ -23946,15 +23951,16 @@ def _start_chat_stream_for_session(
                     preserved = bool(
                         stage_process_completion_event(owner, event)
                     )
-                except Exception:
+                except Exception as exc:
                     logger.warning(
-                        "Failed to restage durable process completion claim %s",
-                        _process_completion_claim_identity(event),
-                        exc_info=True,
+                        "Failed to restage durable process completion claim %s "
+                        "(error=%s)",
+                        _process_completion_claim_identity(event, index),
+                        type(exc).__name__,
                     )
             if not preserved:
                 failed_identities.append(
-                    _process_completion_claim_identity(event)
+                    _process_completion_claim_identity(event, index)
                 )
 
         if failed_identities:
@@ -23988,11 +23994,12 @@ def _start_chat_stream_for_session(
                     process_registry,
                     process_completion_events,
                     committed=True,
+                    raise_on_error=True,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.warning(
-                    "Failed to settle replayed process completion claims",
-                    exc_info=True,
+                    "Failed to settle replayed process completion claims (error=%s)",
+                    type(exc).__name__,
                 )
                 return _preserve_process_completion_claims()
             process_completion_events.clear()
