@@ -3161,7 +3161,7 @@ def _durable_process_completion_receipt_status(
 
     messages = getattr(persisted, "messages", None)
     if not isinstance(messages, list):
-        return "absent"
+        return "invalid"
     marker_present = False
     found: set[str] = set()
     for message in messages:

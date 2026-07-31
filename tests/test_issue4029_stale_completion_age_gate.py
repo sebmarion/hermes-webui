@@ -449,6 +449,24 @@ def test_valid_unrelated_assistant_receipt_is_absent(streaming, monkeypatch, tmp
     ) == "absent"
 
 
+def test_non_list_persisted_messages_are_invalid(streaming, monkeypatch):
+    from api import models
+
+    session_id = "corrupt-messages-owner"
+    event = _make_event("corrupt-messages", time.time(), session_key=session_id)
+    corrupt = types.SimpleNamespace(messages={"role": "assistant"})
+    monkeypatch.setattr(
+        models.Session,
+        "load",
+        classmethod(lambda _cls, _sid: corrupt),
+    )
+
+    assert streaming._durable_process_completion_receipt_status(
+        session_id,
+        [event],
+    ) == "invalid"
+
+
 @pytest.mark.parametrize(
     "invalid_tail",
     [
