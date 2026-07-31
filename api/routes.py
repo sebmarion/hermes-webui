@@ -10227,6 +10227,9 @@ from api.streaming import (
     _sse,
     _sse_set_write_deadline,
     _run_agent_streaming,
+    _durable_process_completion_receipt_status,
+    _finalize_process_completion_claims,
+    _release_process_completion_seen,
     cancel_stream,
     _materialize_pending_user_turn_before_error,
     generate_session_title_for_session,
@@ -23892,6 +23895,115 @@ def _start_chat_stream_for_session(
             s.session_id
         )
 
+    def _process_completion_claim_identity(event: object) -> str:
+        if not isinstance(event, dict):
+            return f"malformed:{type(event).__name__}"
+        event_type = str(event.get("type") or "unknown").strip() or "unknown"
+        stable_id = str(
+            event.get("event_id")
+            or event.get("delegation_id")
+            or "missing"
+        ).strip()
+        owner = str(event.get("session_key") or "missing").strip()
+        return f"{event_type}:{stable_id[:160]}@{owner[:160]}"
+
+    def _claim_preservation_uncertain(failed_identities: list[str]) -> dict:
+        logger.error(
+            "Durable process completion claim preservation is uncertain: %s",
+            ", ".join(failed_identities),
+        )
+        return {
+            "error": "Durable process-completion claim preservation is uncertain",
+            "code": "durable_completion_claim_preservation_uncertain",
+            "retryable": True,
+            "_status": 500,
+        }
+
+    def _preserve_process_completion_claims() -> dict:
+        nonlocal process_completion_events
+        try:
+            from api.background_process import stage_process_completion_event
+        except Exception:
+            logger.exception(
+                "Durable process completion claim staging is unavailable"
+            )
+            failed_identities = [
+                _process_completion_claim_identity(event)
+                for event in process_completion_events
+            ]
+            return _claim_preservation_uncertain(failed_identities)
+
+        failed_identities: list[str] = []
+        for event in process_completion_events:
+            owner = (
+                str(event.get("session_key") or "").strip()
+                if isinstance(event, dict)
+                else ""
+            )
+            preserved = False
+            if owner:
+                try:
+                    preserved = bool(
+                        stage_process_completion_event(owner, event)
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to restage durable process completion claim %s",
+                        _process_completion_claim_identity(event),
+                        exc_info=True,
+                    )
+            if not preserved:
+                failed_identities.append(
+                    _process_completion_claim_identity(event)
+                )
+
+        if failed_identities:
+            return _claim_preservation_uncertain(failed_identities)
+
+        _release_process_completion_seen(process_completion_events)
+        process_completion_events.clear()
+        return {
+            "error": "Durable process-completion receipt is unavailable",
+            "code": "durable_completion_receipt_unavailable",
+            "retryable": True,
+            "_status": 503,
+        }
+
+    def _settle_replayed_process_completion() -> dict | None:
+        nonlocal process_completion_events
+        if not process_completion_events:
+            return None
+
+        receipt_status = _durable_process_completion_receipt_status(
+            s.session_id,
+            process_completion_events,
+        )
+        if receipt_status == "absent":
+            return None
+        if receipt_status == "committed":
+            try:
+                from tools.process_registry import process_registry
+
+                acknowledged = _finalize_process_completion_claims(
+                    process_registry,
+                    process_completion_events,
+                    committed=True,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to settle replayed process completion claims",
+                    exc_info=True,
+                )
+                return _preserve_process_completion_claims()
+            process_completion_events.clear()
+            return {
+                "delivery_already_committed": True,
+                "delivery_acknowledged": bool(acknowledged),
+                "_status": 200,
+            }
+
+        return _preserve_process_completion_claims()
+
     recovery_assistant_index_before: int | None = None
     if recovery_claim_token or recovery_fingerprint:
         recovery_assistant_index_before = next(
@@ -23972,6 +24084,9 @@ def _start_chat_stream_for_session(
             if _goal_guard_error:
                 return _goal_guard_error
             _claim_process_completion_events_for_worker()
+            _completion_settlement = _settle_replayed_process_completion()
+            if _completion_settlement is not None:
+                return _completion_settlement
             stream_id = uuid.uuid4().hex
             was_hidden_empty_session = _is_hidden_empty_session(s)
             _prepare_chat_start_session_for_stream(
@@ -24010,6 +24125,9 @@ def _start_chat_stream_for_session(
                 if _goal_guard_error:
                     return _goal_guard_error
                 _claim_process_completion_events_for_worker()
+                _completion_settlement = _settle_replayed_process_completion()
+                if _completion_settlement is not None:
+                    return _completion_settlement
                 stream_id = uuid.uuid4().hex
                 diag.stage("save_pending_state") if diag else None
                 was_hidden_empty_session = _is_hidden_empty_session(s)

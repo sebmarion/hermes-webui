@@ -5,6 +5,7 @@ Includes Sprint 10 cancel support via CANCEL_FLAGS.
 import base64
 import contextlib
 import contextvars
+import hashlib
 import json
 import logging
 import mimetypes
@@ -2991,33 +2992,193 @@ def _release_process_completion_seen(events: list[dict]) -> None:
         )
 
 
+_PROCESS_COMPLETION_RECEIPTS_KEY = "_processCompletionReceipts"
+_PROCESS_COMPLETION_RECEIPT_DOMAIN = b"hermes-webui/process-completion-receipt/v1"
+
+
+def _process_completion_receipt_digest(
+    event: object,
+    *,
+    session_id: str,
+) -> str | None:
+    """Return an opaque stable digest for one exact supported completion event."""
+    expected_owner = str(session_id or "").strip()
+    if not expected_owner or not isinstance(event, dict):
+        return None
+
+    event_type = event.get("type")
+    if event_type == "completion":
+        stable_id = event.get("event_id")
+        process_id = event.get("session_id")
+        if not isinstance(process_id, str) or not process_id.strip():
+            return None
+    elif event_type == "async_delegation":
+        stable_id = event.get("delegation_id")
+    else:
+        return None
+
+    event_owner = event.get("session_key")
+    if (
+        not isinstance(event_owner, str)
+        or event_owner != expected_owner
+        or not isinstance(stable_id, str)
+        or not stable_id.strip()
+    ):
+        return None
+
+    digest = hashlib.sha256()
+    digest.update(_PROCESS_COMPLETION_RECEIPT_DOMAIN)
+    try:
+        for value in (event_type, event_owner, stable_id):
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    except (UnicodeEncodeError, OverflowError):
+        return None
+    return digest.hexdigest()
+
+
+def _process_completion_receipt_digests(
+    events: object,
+    *,
+    session_id: str,
+) -> list[str]:
+    """Validate a required batch and return every exact receipt digest.
+
+    This is intentionally all-or-nothing. Filtering malformed, duplicated, or
+    foreign claims and then acknowledging the remaining subset would lose the
+    rejected durable outbox items.
+    """
+    if not isinstance(events, list) or not events:
+        return []
+    digests: list[str] = []
+    seen: set[str] = set()
+    for event in events:
+        digest = _process_completion_receipt_digest(
+            event,
+            session_id=session_id,
+        )
+        if digest is None or digest in seen:
+            return []
+        seen.add(digest)
+        digests.append(digest)
+    return digests
+
+
 def _validated_process_completion_events(
     events: list[dict] | None,
     *,
     session_id: str,
 ) -> list[dict]:
-    """Accept unique stable events bound to this exact WebUI session."""
-    accepted: list[dict] = []
-    seen_ids: set[str] = set()
-    for event in events or []:
-        if not isinstance(event, dict):
+    """Accept a complete unique stable batch bound to this exact session."""
+    if not _process_completion_receipt_digests(events, session_id=session_id):
+        return []
+    return list(events)
+
+
+def _is_process_completion_receipt_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.lower()
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _stamp_process_completion_receipts(
+    message: dict,
+    events: list[dict] | None,
+    *,
+    session_id: str,
+) -> list[str]:
+    """Merge opaque receipt digests into one terminal assistant message."""
+    required = _process_completion_receipt_digests(
+        events,
+        session_id=session_id,
+    )
+    if not required or not isinstance(message, dict):
+        return []
+
+    existing_raw = message.get(_PROCESS_COMPLETION_RECEIPTS_KEY)
+    existing = (
+        [
+            item
+            for item in existing_raw
+            if _is_process_completion_receipt_digest(item)
+        ]
+        if isinstance(existing_raw, list)
+        else []
+    )
+    merged = list(dict.fromkeys([*existing, *required]))
+    message[_PROCESS_COMPLETION_RECEIPTS_KEY] = merged
+    return required
+
+
+def _stamp_latest_process_completion_receipts(
+    messages: list[dict] | None,
+    events: list[dict] | None,
+    *,
+    session_id: str,
+) -> list[str]:
+    terminal_assistant = next(
+        (
+            message
+            for message in reversed(messages or [])
+            if isinstance(message, dict) and message.get("role") == "assistant"
+        ),
+        None,
+    )
+    if terminal_assistant is None:
+        return []
+    return _stamp_process_completion_receipts(
+        terminal_assistant,
+        events,
+        session_id=session_id,
+    )
+
+
+def _durable_process_completion_receipt_status(
+    session_id: str,
+    events: list[dict] | None,
+) -> str:
+    """Read the fresh sidecar and classify one exact required receipt batch."""
+    required = _process_completion_receipt_digests(
+        events,
+        session_id=session_id,
+    )
+    if not required:
+        return "invalid"
+
+    try:
+        from api.models import Session
+
+        persisted = Session.load(str(session_id or ""))
+    except Exception:
+        logger.warning(
+            "Failed to load durable process completion receipts",
+            exc_info=True,
+        )
+        return "unavailable"
+    if persisted is None:
+        return "absent"
+
+    messages = getattr(persisted, "messages", None)
+    if not isinstance(messages, list):
+        return "absent"
+    found: set[str] = set()
+    for message in messages:
+        if not isinstance(message, dict):
             continue
-        event_type = event.get("type")
-        if event_type == "completion":
-            event_id = str(event.get("event_id") or "").strip()
-        elif event_type == "async_delegation":
-            from api.process_event_utils import completion_delivery_id
-            event_id = completion_delivery_id(event)
-        else:
+        raw_receipts = message.get(_PROCESS_COMPLETION_RECEIPTS_KEY)
+        if not isinstance(raw_receipts, list) or not raw_receipts:
             continue
-        event_owner = str(event.get("session_key") or "").strip()
-        if not event_id or event_owner != str(session_id or ""):
+        if not all(
+            _is_process_completion_receipt_digest(item)
+            for item in raw_receipts
+        ):
             continue
-        if event_id in seen_ids:
-            continue
-        seen_ids.add(event_id)
-        accepted.append(event)
-    return accepted
+        found.update(raw_receipts)
+    return "committed" if all(item in found for item in required) else "absent"
 
 
 def _finalize_process_completion_claims(
@@ -11359,6 +11520,11 @@ def _run_agent_streaming(
                             _error_message['provider_details_label'] = 'Interruption details'
                         elif _err_type == 'tool_limit_reached':
                             _error_message['provider_details_label'] = 'Terminal state details'
+                        _stamp_process_completion_receipts(
+                            _error_message,
+                            _process_completion_claims,
+                            session_id=s.session_id,
+                        )
                         s.messages.append(_error_message)
                         try:
                             s.save()
@@ -11807,6 +11973,12 @@ def _run_agent_streaming(
                         logger.debug("Failed to append cancelled turn journal event", exc_info=True)
                     put('cancel', _cancel_event_payload('Cancelled by user'))
                     return
+                if _process_completion_claims and not ephemeral:
+                    _stamp_latest_process_completion_receipts(
+                        s.messages,
+                        _process_completion_claims,
+                        session_id=s.session_id,
+                    )
                 with _stream_writeback_stage(_writeback_timings, "session_save"):
                     s.save()
                 if cancel_event.is_set():
@@ -12510,6 +12682,12 @@ def _run_agent_streaming(
                                     _turn_pending_source,
                                     _active_turn_identity,
                                 )
+                                _advance_truncation_watermark_after_commit(s)  # #3831
+                                _stamp_latest_process_completion_receipts(
+                                    s.messages,
+                                    _process_completion_claims,
+                                    session_id=s.session_id,
+                                )
                                 s.save()
                         logger.info('[webui] self-heal (except path): retry succeeded')
                         return  # skip error emission
@@ -12625,6 +12803,11 @@ def _run_agent_streaming(
                     _error_message['provider_details_label'] = 'Cancellation details'
                 elif _exc_type == 'interrupted':
                     _error_message['provider_details_label'] = 'Interruption details'
+                _stamp_process_completion_receipts(
+                    _error_message,
+                    _process_completion_claims,
+                    session_id=s.session_id,
+                )
                 s.messages.append(_error_message)
                 try:
                     s.save()
