@@ -13,7 +13,7 @@ import stat
 import sys
 import threading
 import time
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 
 from api.auth import _is_loopback, _signing_key
@@ -41,6 +41,15 @@ _PROCESS_ACTIVITY_COUNT_KEYS = (
 )
 _CHECKPOINT_LEDGER_DIRNAME = "_release_continuity"
 _CHECKPOINT_LEDGER_LOCK = threading.RLock()
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedStartupAcceptanceEvidence:
+    """Exact process-local evidence accepted by signed release control."""
+
+    process_receipt: object
+    driver_attestation: object
+    step_receipt_bundle: object
 
 
 def _startup_type_name(value: object) -> str:
@@ -208,10 +217,7 @@ def _validated_startup_evidence(
     transaction_id: str,
 ) -> dict:
     manifest_sha256 = deferred_release_manifest.deferred_release_manifest_sha256()
-    if (
-        type(evidence).__module__ != "server"
-        or type(evidence).__name__ != "ManagedStartupAcceptanceEvidence"
-    ):
+    if type(evidence) is not ManagedStartupAcceptanceEvidence:
         raise ValueError("managed startup acceptance evidence is absent")
     process_receipt = getattr(evidence, "process_receipt", None)
     driver = getattr(evidence, "driver_attestation", None)

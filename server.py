@@ -134,6 +134,7 @@ from deferred_startup_replay import (
     DeferredStartupStep,
     replay_deferred_startup,
 )
+from api.release_control import ManagedStartupAcceptanceEvidence
 
 
 _STARTUP_FENCE_ALLOWED_REQUESTS = {
@@ -669,15 +670,6 @@ class _ManagedDeferredStartupProcessReceipt(Mapping[str, object]):
 
     def __len__(self) -> int:
         return 4
-
-
-@dataclass(frozen=True, slots=True)
-class ManagedStartupAcceptanceEvidence:
-    """Typed process-local evidence from one successful managed startup replay."""
-
-    process_receipt: _ManagedDeferredStartupProcessReceipt
-    driver_attestation: object
-    step_receipt_bundle: object
 
 
 _DEFERRED_STARTUP_PROCESS_RECEIPT: (

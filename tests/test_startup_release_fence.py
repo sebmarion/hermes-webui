@@ -1826,6 +1826,71 @@ def _acceptance_evidence(*, receipt_names=None, receipt_override=None):
     )
 
 
+def test_startup_evidence_type_is_entrypoint_independent(
+    monkeypatch,
+):
+    import server
+    from api import release_control
+
+    token = "darwin-proc:4321:1:0"
+    token_bytes = token.encode("ascii")
+    token_sha256 = hashlib.sha256(
+        b"hermes-webui:managed-deferred-startup:start-token-receipt:v1\x00"
+        + len(token_bytes).to_bytes(4, "big")
+        + token_bytes
+    ).hexdigest()
+    evidence = _acceptance_evidence()
+    evidence = dataclass_replace(
+        evidence,
+        process_receipt=dataclass_replace(
+            evidence.process_receipt,
+            process_start_token_sha256=token_sha256,
+        ),
+    )
+    monkeypatch.setattr(release_control.os, "getpid", lambda: 4321)
+    monkeypatch.setattr(
+        release_control,
+        "process_start_token",
+        lambda _pid: token,
+    )
+
+    assert (
+        server.ManagedStartupAcceptanceEvidence
+        is release_control.ManagedStartupAcceptanceEvidence
+    )
+    result = release_control._validated_startup_evidence(
+        evidence,
+        transaction_id=TRANSACTION_ID,
+    )
+
+    assert result["transaction_id"] == TRANSACTION_ID
+    assert result["process"]["start_token_sha256"] == token_sha256
+
+
+@pytest.mark.parametrize("module_name", ("server", "__main__", "api.release_control"))
+def test_startup_evidence_rejects_lookalike_types(
+    module_name,
+):
+    from api import release_control
+
+    imported = _acceptance_evidence()
+    lookalike_type = type(
+        "ManagedStartupAcceptanceEvidence",
+        (),
+        {"__module__": module_name},
+    )
+    lookalike = lookalike_type()
+    lookalike.process_receipt = imported.process_receipt
+    lookalike.driver_attestation = imported.driver_attestation
+    lookalike.step_receipt_bundle = imported.step_receipt_bundle
+
+    with pytest.raises(ValueError, match="evidence is absent"):
+        release_control._validated_startup_evidence(
+            lookalike,
+            transaction_id=TRANSACTION_ID,
+        )
+
+
 def test_release_accept_returns_sanitized_exact_startup_evidence(
     monkeypatch,
     isolated_startup_admission,
