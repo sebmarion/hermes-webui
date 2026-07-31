@@ -247,6 +247,44 @@ class _AuthSelfHealCancellingAgent(_SuccessfulAgent):
         return super().run_conversation(**kwargs)
 
 
+class _AuthSelfHealToolTailAgent(_MockAgent):
+    run_calls = 0
+
+    def run_conversation(self, **kwargs):
+        type(self).run_calls += 1
+        if type(self).run_calls == 1:
+            raise RuntimeError("HTTP 401: authentication token is invalid")
+        history = list(kwargs.get("conversation_history") or [])
+        return {
+            "messages": history
+            + [
+                {
+                    "role": "user",
+                    "content": kwargs.get("persist_user_message", ""),
+                },
+                {
+                    "role": "assistant",
+                    "content": "I will inspect the process output.",
+                    "tool_calls": [
+                        {
+                            "id": "call_auth_heal_tail",
+                            "type": "function",
+                            "function": {
+                                "name": "process.inspect",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_auth_heal_tail",
+                    "content": "inspection result without final answer",
+                },
+            ]
+        }
+
+
 def _make_exact_completion_event(session_id: str, suffix: str) -> dict:
     return {
         "type": "completion",
@@ -768,6 +806,67 @@ def test_cancel_during_auth_self_heal_keeps_exact_claim_uncommitted(
         if isinstance(message, dict)
     )
     assert any(event_name == "cancel" for event_name, _payload in emitted)
+
+
+def test_auth_self_heal_tool_tail_is_not_a_terminal_delivery(
+    tmp_path,
+    monkeypatch,
+):
+    import api.state_sync as state_sync
+
+    session = _new_exact_process_wakeup_session(
+        tmp_path,
+        session_id="native_auth_self_heal_tool_tail",
+        stream_id="stream-native-auth-self-heal-tool-tail",
+    )
+    event = _make_exact_completion_event(session.session_id, "native-auth-heal-tail")
+    registry = _install_exact_event_registry(monkeypatch)
+    _AuthSelfHealToolTailAgent.run_calls = 0
+    completion_emissions = []
+    monkeypatch.setattr(
+        state_sync,
+        "finish_session_activity",
+        lambda *_args, **kwargs: completion_emissions.append(
+            bool(kwargs.get("emit_completion"))
+        ),
+    )
+
+    with mock.patch.object(
+        streaming,
+        "_attempt_credential_self_heal",
+        return_value={
+            "provider": "test-provider",
+            "api_key": "refreshed-synthetic-key",
+            "base_url": None,
+        },
+    ):
+        _run_exact_process_wakeup(
+            session,
+            tmp_path,
+            event,
+            _AuthSelfHealToolTailAgent,
+        )
+
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert _AuthSelfHealToolTailAgent.run_calls == 2
+    assert registry.finish_calls == [(event, False)]
+    assert registry.completion_queue.get_nowait() is event
+    assert streaming._durable_process_completion_receipt_status(
+        session.session_id,
+        [event],
+    ) == "absent"
+    assert not any(
+        streaming._PROCESS_COMPLETION_RECEIPTS_KEY in message
+        for message in saved.messages
+        if isinstance(message, dict)
+    )
+    assert not any(
+        message.get("content") == "I will inspect the process output."
+        for message in saved.messages
+        if isinstance(message, dict)
+    )
+    assert completion_emissions == [False]
 
 
 def test_ordinary_success_skips_native_terminal_full_session_snapshot(
