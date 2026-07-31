@@ -12957,7 +12957,10 @@ def test_reconcile_cutover_journal_accepts_exact_durable_promotion(
         cutover._reconcile_cutover_journal(plan)
 
 
-@pytest.mark.parametrize("selector_phase", ["staged", "activated", "last-good"])
+@pytest.mark.parametrize(
+    "selector_phase",
+    ["staged", "activated", "last-good", "split-staged"],
+)
 def test_reconcile_cutover_journal_preserves_pre_promotion_states(
     monkeypatch,
     tmp_path,
@@ -13002,7 +13005,36 @@ def test_reconcile_cutover_journal_preserves_pre_promotion_states(
             "pending_transaction_id": None,
             "last_good": "last-good",
         },
+        "split-staged": {
+            "generation": 1,
+            "current": "last-good",
+            "candidate": "candidate",
+            "pending_transaction_id": transaction_id,
+            "last_good": "historical-fallback",
+        },
     }
+    if selector_phase == "split-staged":
+        plan.update(
+            {
+                "last_good_gateway_identity": {
+                    "build_id": "historical-fallback"
+                },
+                "last_good_split_adoption_receipt": str(
+                    tmp_path / "split-adoption.json"
+                ),
+                "last_good_split_adoption_receipt_sha256": "3" * 64,
+            }
+        )
+        monkeypatch.setattr(
+            cutover,
+            "_read_sealed_split_adoption_receipt",
+            lambda *_args, **_kwargs: {
+                "schema": "hermes.last_good_split_adoption.v2",
+                "selector": {
+                    "state": {"last_good": "historical-fallback"}
+                },
+            },
+        )
     selector_attestation = {
         "status": "verified",
         "transaction_id": transaction_id,
@@ -13077,6 +13109,13 @@ def test_reconcile_cutover_journal_preserves_pre_promotion_states(
         }
     else:
         assert reconciled == journal
+    if selector_phase == "split-staged":
+        selector_attestation["last_good"] = "forged-fallback"
+        with pytest.raises(
+            cutover.ReleaseBuildError,
+            match="selector state cannot reconcile cutover journal",
+        ):
+            cutover._reconcile_cutover_journal(plan)
 
 
 def _process_checkpoint_plan(tmp_path: Path) -> tuple[dict, Path]:

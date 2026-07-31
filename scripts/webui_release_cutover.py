@@ -7196,6 +7196,43 @@ def _installed_plist_attestation(plan: dict) -> dict:
     }
 
 
+def _selector_origin_last_good_id(plan: dict) -> str:
+    """Return the exact selector fallback sealed for the pre-activation state."""
+    last_good_id = plan["last_good_identity"]["build_id"]
+    adoption_keys = set(plan).intersection(
+        _LAST_GOOD_SPLIT_ADOPTION_PLAN_KEYS
+    )
+    if not adoption_keys:
+        return last_good_id
+    if adoption_keys != _LAST_GOOD_SPLIT_ADOPTION_PLAN_KEYS:
+        raise ReleaseBuildError(
+            "cutover plan provenance schema is invalid"
+        )
+    receipt = _read_sealed_split_adoption_receipt(
+        plan["last_good_split_adoption_receipt"],
+        expected_sha256=plan[
+            "last_good_split_adoption_receipt_sha256"
+        ],
+        trusted_root=Path(plan["transaction_journal"]).parent,
+        webui_identity=plan["last_good_identity"],
+        gateway_identity=plan["last_good_gateway_identity"],
+    )
+    selector = receipt.get("selector")
+    selector_state = (
+        selector.get("state") if isinstance(selector, dict) else None
+    )
+    origin_last_good_id = (
+        selector_state.get("last_good")
+        if isinstance(selector_state, dict)
+        else None
+    )
+    if not isinstance(origin_last_good_id, str) or not origin_last_good_id:
+        raise ReleaseBuildError(
+            "last-good adoption receipt selector authority is invalid"
+        )
+    return origin_last_good_id
+
+
 def _selector_transition(plan: dict, transition: str) -> dict:
     state = release_selector.read_selector_state(
         plan["selector_state"],
@@ -7315,6 +7352,7 @@ def _reconcile_cutover_journal(
     candidate = plan["expected_candidate_identity"]
     candidate_id = candidate["build_id"]
     last_good_id = plan["last_good_identity"]["build_id"]
+    origin_last_good_id = _selector_origin_last_good_id(plan)
     if (
         not isinstance(candidate_id, str)
         or not candidate_id
@@ -7334,7 +7372,7 @@ def _reconcile_cutover_journal(
             last_good_id,
             candidate_id,
             plan["transaction_id"],
-            last_good_id,
+            origin_last_good_id,
         ): "staged",
         (
             candidate_id,
@@ -7343,7 +7381,12 @@ def _reconcile_cutover_journal(
             last_good_id,
         ): "activated",
         (candidate_id, None, None, last_good_id): "promoted",
-        (last_good_id, None, None, last_good_id): "last-good",
+        (
+            last_good_id,
+            None,
+            None,
+            origin_last_good_id,
+        ): "last-good",
     }
     selector_phase = allowed.get(selector_tuple)
     if selector_phase is None:
@@ -7439,7 +7482,7 @@ def _reconcile_cutover_journal(
                 last_good_id,
                 candidate_id,
                 plan["transaction_id"],
-                last_good_id,
+                origin_last_good_id,
             ),
             (
                 candidate_id,
