@@ -18,19 +18,33 @@ preserving the active task across compaction.
 
 ### One provider-boundary guard
 
-Hermes Agent owns one admission check immediately before every provider call,
-including tool-loop calls, retries, and model fallbacks. It receives the final
-request after prompt, middleware, and tool assembly.
+Hermes Agent owns one admission check inside the final execution callback,
+immediately before transport I/O. This covers tool-loop calls, retries, and
+model fallbacks and sees the provider-ready request after request middleware,
+execution middleware, transport preflight, prompt assembly, and tool assembly.
 
 The guard performs one bounded sequence:
 
-1. Measure the final request against the selected model's real input budget:
-   `context window - output reserve - safety margin`.
-2. Remove duplicate historical rows and replace old tool bodies and old
-   reasoning with existing compact receipts.
-3. If the request still does not fit, run the existing compressor in place.
-4. Rebuild and measure the request again.
-5. Dispatch only when it fits; otherwise fail closed before network I/O.
+1. Measure the body-bearing fields of the final provider kwargs with the
+   existing provider-payload estimator (`messages` or `input`, instructions,
+   and tools).
+2. Add the existing conservative estimator margin used by background-review
+   admission: `max(1,024, ceil(estimated_input * 5%))`.
+3. Admit only when that total is at or below the smaller of:
+   - the compressor's resolved `threshold_tokens`; and
+   - `context_length -` any explicit final-request output-token value.
+4. If it does not fit, replace historical tool bodies and old tool-call
+   arguments with the compressor's existing compact receipts.
+5. If it still does not fit, run the existing compressor in place.
+6. Rebuild and measure the request again.
+7. Dispatch only when it fits; otherwise fail closed before network I/O.
+
+`context_length`, `threshold_tokens`, threshold percentage, and configured
+output reservation come only from the context compressor bound to the active
+model/provider. Fallback must rebind that compressor before rebuilding the
+request. A non-positive budget or an Agent/compressor model-provider identity
+mismatch fails closed; the guard does not invent a second context-window
+resolver or silently use a generic window.
 
 The guard reuses the current estimator, deterministic tool pruning, compressor,
 and in-place persistence. It is not a plugin, service, retrieval layer, or new
@@ -38,9 +52,27 @@ context framework.
 
 ### In-place continuity
 
-Compaction keeps the same logical and physical session ID. The full visible
-transcript remains archived in state storage, while model context becomes the
-latest verified compression summary/checkpoint plus a bounded recent tail.
+Compaction keeps the same logical and physical session ID. The WebUI sidecar's
+visible `messages` remain the user-facing transcript. Agent `state.db` owns
+model context: `archive_and_compact()` atomically marks the previous active
+rows `active=0, compacted=1` and inserts the compacted active rows. Restart
+loads only `active=1`; archived rows remain searchable and recoverable.
+
+The compacted model context is the existing structured compression summary plus
+the compressor's protected tail. "Recent tail" means the existing
+`tail_token_budget`, while `protect_last_n` remains the minimum protected
+message count. A summary is bounded by the existing
+`min(context_length * 5%, 10,000 tokens)` rule.
+
+Cheap tool pruning is a compaction operation, not an ephemeral request-only
+mutation: when it changes model history, the pruned active projection is
+persisted through the same atomic in-place transaction before request rebuild.
+Outside the protected tail, existing behavior summarizes tool bodies over 200
+characters, truncates large tool-call arguments, and keeps only the newest full
+copy of identical tool output. User and assistant text is never deduplicated by
+content. Turn duplication is prevented by removing whole-database adoption and
+re-baselining the existing post-compaction persistence cursor after the atomic
+rewrite.
 
 The legacy rotation/whole-database-adoption path is not used by automatic
 compression. WebUI must never create an empty recovery conversation. If a
@@ -49,13 +81,32 @@ failure on the existing session and preserves the last valid bounded context.
 
 ### Failure behavior
 
-- Provider fallback resolves a fresh context budget and reruns admission.
-- A provider context-limit rejection may compact and retry once.
-- Tool calls completed before the retry are represented by receipts and are not
-  executed again.
+- Provider fallback rebinds the compressor, rebuilds provider kwargs, and reruns
+  admission. It does not reset the turn-scoped compression-attempt counter.
+- The existing maximum of three compaction attempts applies across the whole
+  logical turn and all providers. A provider context-limit rejection may retry
+  once only when compaction measurably shrank the request, and consumes that
+  same turn-scoped budget.
+- Admission retries only the provider call. It never re-enters the tool
+  executor. Completed assistant/tool pairs retain their provider
+  `tool_call_id` when tool bodies become receipts, so prior side effects are
+  not run again.
 - Compression or summary failure preserves the previous valid model context;
   it never adopts a partial snapshot and never creates blank context.
 - Admission telemetry records category sizes and decisions, not prompt content.
+
+## State transitions
+
+| Event | Required result |
+| --- | --- |
+| First or tool-loop dispatch | Build final kwargs, admit, then perform transport I/O. |
+| Request above budget | Prune tools in place, rebuild, and remeasure. |
+| Still above budget | Compress in place, rebuild, and remeasure within the three-attempt turn cap. |
+| Provider fallback | Rebind context identity; rebuild and re-admit without resetting the cap. |
+| Provider context rejection | Compact-and-retry once only after measurable shrinkage. |
+| Compression failure | Keep the prior active rows and last valid WebUI context unchanged. |
+| Restart | Load the one active compacted projection; archived rows never rejoin it. |
+| Irreducible request | Fail on the existing session; create no recovery child. |
 
 ## Non-goals
 
@@ -68,13 +119,14 @@ failure on the existing session and preserves the last valid bounded context.
 ## Acceptance
 
 - A captured oversized request is rejected before transport, compacted, rebuilt,
-  and dispatched under budget.
+  and dispatched only when `estimate + margin <= resolved ceiling`.
 - Duplicate persisted turns and tool results are not reintroduced into model
   context.
-- Historical tool output is bounded before the normal compression threshold.
+- Tool output over 200 characters outside `tail_token_budget` /
+  `protect_last_n` becomes an existing compact receipt before dispatch.
 - One task survives four in-place compactions, restart reconstruction, model
-  fallback, and summary failure without losing its checkpoint.
+  fallback, and summary failure while retaining exact fixture markers for its
+  objective, constraints, completed work, and next action.
 - Every provider path uses the same resolved budget and admission guard.
 - No retry repeats a completed tool side effect.
 - Compression exhaustion never creates an empty continuation.
-
