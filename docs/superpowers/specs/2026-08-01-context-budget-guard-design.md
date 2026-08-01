@@ -25,17 +25,20 @@ execution middleware, transport preflight, prompt assembly, and tool assembly.
 
 The guard performs one bounded sequence:
 
-1. Measure the body-bearing fields of the final provider kwargs with the
+1. Before admission, apply the existing deterministic tool pruning to every
+   eligible tool result outside `tail_token_budget` / `protect_last_n`. If it
+   changes model history, persist that in-place compaction and rebuild the
+   request. This age-out rule runs whether or not the unpruned request was
+   already over budget.
+2. Measure the body-bearing fields of the final provider kwargs with the
    existing provider-payload estimator (`messages` or `input`, instructions,
    and tools).
-2. Add the existing conservative estimator margin used by background-review
+3. Add the existing conservative estimator margin used by background-review
    admission: `max(1,024, ceil(estimated_input * 5%))`.
-3. Admit only when that total is at or below the smaller of:
+4. Admit only when that total is at or below the smaller of:
    - the compressor's resolved `threshold_tokens`; and
    - `context_length -` any explicit final-request output-token value.
-4. If it does not fit, replace historical tool bodies and old tool-call
-   arguments with the compressor's existing compact receipts.
-5. If it still does not fit, run the existing compressor in place.
+5. If it does not fit, run the existing compressor in place.
 6. Rebuild and measure the request again.
 7. Dispatch only when it fits; otherwise fail closed before network I/O.
 
@@ -100,8 +103,8 @@ failure on the existing session and preserves the last valid bounded context.
 | Event | Required result |
 | --- | --- |
 | First or tool-loop dispatch | Build final kwargs, admit, then perform transport I/O. |
-| Request above budget | Prune tools in place, rebuild, and remeasure. |
-| Still above budget | Compress in place, rebuild, and remeasure within the three-attempt turn cap. |
+| Eligible old tool output | Prune in place and rebuild before admission, regardless of pressure. |
+| Request above budget | Compress in place, rebuild, and remeasure within the three-attempt turn cap. |
 | Provider fallback | Rebind context identity; rebuild and re-admit without resetting the cap. |
 | Provider context rejection | Compact-and-retry once only after measurable shrinkage. |
 | Compression failure | Keep the prior active rows and last valid WebUI context unchanged. |
@@ -124,9 +127,10 @@ failure on the existing session and preserves the last valid bounded context.
   context.
 - Tool output over 200 characters outside `tail_token_budget` /
   `protect_last_n` becomes an existing compact receipt before dispatch.
-- One task survives four in-place compactions, restart reconstruction, model
-  fallback, and summary failure while retaining exact fixture markers for its
-  objective, constraints, completed work, and next action.
+- Across multiple logical turns, one task survives four in-place compactions,
+  restart reconstruction, model fallback, and summary failure while retaining
+  exact fixture markers for its objective, constraints, completed work, and
+  next action.
 - Every provider path uses the same resolved budget and admission guard.
 - No retry repeats a completed tool side effect.
 - Compression exhaustion never creates an empty continuation.
