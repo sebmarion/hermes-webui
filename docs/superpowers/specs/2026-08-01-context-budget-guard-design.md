@@ -22,10 +22,13 @@ Hermes Agent owns one admission check inside the final execution callback,
 immediately before transport I/O. This covers tool-loop calls, retries, and
 model fallbacks and sees the provider-ready request after request middleware,
 execution middleware, transport preflight, prompt assembly, and tool assembly.
+Canonical-history pruning runs immediately before the provider copy is built;
+when it changes history, the atomic rewrite completes and the request is rebuilt
+from that projection before middleware runs.
 
 The guard performs one bounded sequence:
 
-1. Before admission, apply the existing deterministic tool pruning to every
+1. Before building the provider copy, apply the existing deterministic tool pruning to every
    eligible tool result outside `tail_token_budget` / `protect_last_n`. If it
    changes model history, persist that in-place compaction and rebuild the
    request. This age-out rule runs whether or not the unpruned request was
@@ -72,10 +75,11 @@ mutation: when it changes model history, the pruned active projection is
 persisted through the same atomic in-place transaction before request rebuild.
 Outside the protected tail, existing behavior summarizes tool bodies over 200
 characters, truncates large tool-call arguments, and keeps only the newest full
-copy of identical tool output. User and assistant text is never deduplicated by
-content. Turn duplication is prevented by removing whole-database adoption and
-re-baselining the existing post-compaction persistence cursor after the atomic
-rewrite.
+copy of identical tool output. Every mutation, including duplicate replacement,
+is restricted to that prune boundary. User and assistant text is never
+deduplicated by content. Turn duplication is prevented by removing
+whole-database adoption and re-baselining the existing post-compaction
+persistence cursor after the atomic rewrite.
 
 The legacy rotation/whole-database-adoption path is not used by automatic
 compression. WebUI must never create an empty recovery conversation. If a
