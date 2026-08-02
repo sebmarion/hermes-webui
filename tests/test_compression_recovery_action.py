@@ -77,8 +77,10 @@ def test_chat_start_blocks_generic_continue_after_compression_exhausted(monkeypa
 
     assert handler.status == 409
     assert payload["type"] == "compression_recovery_required"
-    assert payload["recommended_recovery_action"] == "start_focused_continuation"
+    assert payload["recommended_recovery_action"] == "reduce_current_request"
     assert payload["compression_recovery"]["terminal_state"] == "compression_exhausted"
+    assert "narrower request" in payload["error"]
+    assert "current session" in payload["error"]
 
 
 def test_chat_start_keeps_recovery_when_substantive_prompt_fails_validation(monkeypatch, tmp_path):
@@ -106,7 +108,7 @@ def test_chat_start_keeps_recovery_when_substantive_prompt_fails_validation(monk
     saved = json.loads((session_dir / f"{sid}.json").read_text(encoding="utf-8"))
 
     assert handler.status == 400
-    assert saved["recommended_recovery_action"] == "start_focused_continuation"
+    assert saved["recommended_recovery_action"] == "reduce_current_request"
     assert saved["compression_recovery"]["terminal_state"] == "compression_exhausted"
 
 
@@ -186,11 +188,11 @@ def test_chat_start_restores_recovery_when_substantive_prompt_start_is_rejected(
     saved = json.loads((session_dir / f"{sid}.json").read_text(encoding="utf-8"))
 
     assert handler.status == 409
-    assert saved["recommended_recovery_action"] == "start_focused_continuation"
+    assert saved["recommended_recovery_action"] == "reduce_current_request"
     assert saved["compression_recovery"]["terminal_state"] == "compression_exhausted"
 
 
-def test_recovery_start_creates_focused_linked_session(monkeypatch, tmp_path):
+def test_recovery_start_returns_current_session_conflict_without_mutating_sessions(monkeypatch, tmp_path):
     session_dir = _isolate_sessions(monkeypatch, tmp_path)
     sid = "recoverysrc1"
     session = Session(
@@ -208,151 +210,33 @@ def test_recovery_start_creates_focused_linked_session(monkeypatch, tmp_path):
     session.save()
     models.SESSIONS[sid] = session
     routes.SESSIONS[sid] = session
+    files_before = {
+        path.name: path.read_bytes()
+        for path in session_dir.iterdir()
+        if path.is_file()
+    }
+    sessions_before = tuple(models.SESSIONS)
 
     handler = _JSONHandler()
     routes._handle_session_compression_recovery_start(handler, {"session_id": sid})
     payload = _payload(handler)
 
-    assert handler.status == 200
-    new_session = payload["session"]
-    assert new_session["session_id"] != sid
-    assert new_session["parent_session_id"] == sid
-    assert new_session["workspace"] == str(tmp_path)
-    assert new_session["model"] == "gpt-4o"
-    assert new_session["model_provider"] == "openai"
-    assert new_session["messages"] == []
-    assert new_session["session_source"] == "fork"
-
-    saved = json.loads((session_dir / f"{new_session['session_id']}.json").read_text(encoding="utf-8"))
-    assert saved["parent_session_id"] == sid
-    assert saved["session_source"] == "fork"
-    assert saved["context_messages"] == []
-    assert saved["compression_recovery_source_session_id"] == sid
-    assert saved["compression_recovery_action"] == "start_focused_continuation"
-    assert compression_recovery_payload_for_session(session)["recommended_action"] == "start_focused_continuation"
-
-
-def test_recovery_child_does_not_merge_parent_transcript(monkeypatch, tmp_path):
-    _isolate_sessions(monkeypatch, tmp_path)
-    sid = "recoverysrcisolate"
-    session = Session(
-        session_id=sid,
-        title="Long task",
-        workspace=str(tmp_path),
-        model="gpt-4o",
-        messages=[
-            {"role": "user", "content": "long task"},
-            {"role": "assistant", "content": "compression exhausted"},
-        ],
-    )
-    stamp_compression_exhausted_recovery(session, message="Context length exceeded.")
-    session.save()
-    models.SESSIONS[sid] = session
-    routes.SESSIONS[sid] = session
-
-    handler = _JSONHandler()
-    routes._handle_session_compression_recovery_start(handler, {"session_id": sid})
-    payload = _payload(handler)
-    child_id = payload["session"]["session_id"]
-    child = models.SESSIONS[child_id]
-
-    assert child.messages == []
-    assert routes._merged_webui_lineage_messages_for_display(child) == []
-
-
-def test_recovery_start_reuses_existing_focused_session(monkeypatch, tmp_path):
-    session_dir = _isolate_sessions(monkeypatch, tmp_path)
-    sid = "recoverysrc2"
-    session = Session(
-        session_id=sid,
-        title="Long task",
-        workspace=str(tmp_path),
-        model="gpt-4o",
-        messages=[{"role": "user", "content": "long task"}],
-    )
-    stamp_compression_exhausted_recovery(session, message="Context length exceeded.")
-    session.save()
-    models.SESSIONS[sid] = session
-    routes.SESSIONS[sid] = session
-
-    first_handler = _JSONHandler()
-    routes._handle_session_compression_recovery_start(first_handler, {"session_id": sid})
-    first_payload = _payload(first_handler)
-    first_child_id = first_payload["session"]["session_id"]
-
-    second_handler = _JSONHandler()
-    routes._handle_session_compression_recovery_start(second_handler, {"session_id": sid})
-    second_payload = _payload(second_handler)
-
-    assert second_handler.status == 200
-    assert second_payload["session"]["session_id"] == first_child_id
-    assert second_payload["message"].startswith("Opened the existing")
-
-    models.SESSIONS.clear()
-    routes.SESSIONS.clear()
-    third_handler = _JSONHandler()
-    routes._handle_session_compression_recovery_start(third_handler, {"session_id": sid})
-    third_payload = _payload(third_handler)
-
-    assert third_handler.status == 200
-    assert third_payload["session"]["session_id"] == first_child_id
-
-    recovery_children = []
-    for path in session_dir.glob("*.json"):
-        if path.name.startswith("_"):
-            continue
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and data.get("compression_recovery_source_session_id") == sid:
-            recovery_children.append(data)
-    assert len(recovery_children) == 1
-
-
-def test_recovery_start_ignores_existing_child_from_other_profile(monkeypatch, tmp_path):
-    session_dir = _isolate_sessions(monkeypatch, tmp_path)
-    sid = "recoverysrcprofile"
-    source = Session(
-        session_id=sid,
-        title="Long task",
-        workspace=str(tmp_path),
-        model="gpt-4o",
-        profile="default",
-        messages=[{"role": "user", "content": "long task"}],
-    )
-    stamp_compression_exhausted_recovery(source, message="Context length exceeded.")
-    source.save()
-    foreign_child = Session(
-        session_id="foreignchild1",
-        title="Foreign focused continuation",
-        workspace=str(tmp_path),
-        model="gpt-4o",
-        profile="other-profile",
-        messages=[],
-        parent_session_id=sid,
-        compression_recovery_source_session_id=sid,
-        compression_recovery_action="start_focused_continuation",
-    )
-    foreign_child.save()
-    models.SESSIONS.clear()
-    routes.SESSIONS.clear()
-    models.SESSIONS[sid] = source
-    routes.SESSIONS[sid] = source
-
-    handler = _JSONHandler()
-    routes._handle_session_compression_recovery_start(handler, {"session_id": sid})
-    payload = _payload(handler)
-
-    assert handler.status == 200
-    assert payload["session"]["session_id"] != "foreignchild1"
-    assert payload["session"]["profile"] == "default"
-
-    recovery_children = []
-    for path in session_dir.glob("*.json"):
-        if path.name.startswith("_"):
-            continue
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict) and data.get("compression_recovery_source_session_id") == sid:
-            recovery_children.append(data)
-    assert {child["profile"] for child in recovery_children} == {"default", "other-profile"}
+    assert handler.status == 409
+    assert payload == {
+        "error": "This session exhausted context compression. Send a narrower request in the current session.",
+        "type": "compression_recovery_required",
+        "source_session_id": sid,
+        "current_session_id": sid,
+        "recommended_recovery_action": "reduce_current_request",
+    }
+    assert tuple(models.SESSIONS) == sessions_before
+    assert tuple(routes.SESSIONS) == sessions_before
+    assert {
+        path.name: path.read_bytes()
+        for path in session_dir.iterdir()
+        if path.is_file()
+    } == files_before
+    assert compression_recovery_payload_for_session(session)["recommended_action"] == "reduce_current_request"
 
 
 def test_recovery_metadata_is_persisted_and_exposed_in_compact_session():
@@ -361,40 +245,15 @@ def test_recovery_metadata_is_persisted_and_exposed_in_compact_session():
     compact = session.compact()
 
     assert recovery["terminal_state"] == "compression_exhausted"
-    assert compact["recommended_recovery_action"] == "start_focused_continuation"
-    assert compact["compression_recovery"]["recommended_action"] == "start_focused_continuation"
-
-
-def test_recovery_child_markers_round_trip_through_state_db_sidecar_rebuild(tmp_path):
-    db = WebUIJsonSessionDB(tmp_path)
-    db.write_session(
-        {
-            "session_id": "recoverychild1",
-            "title": "Focused continuation",
-            "model": "gpt-4o",
-            "started_at": 1700000000,
-            "messages": [],
-            "parent_session_id": "recoverysrc3",
-            "compression_recovery_source_session_id": "recoverysrc3",
-            "compression_recovery_action": "start_focused_continuation",
-        }
-    )
-    row = db.list_sessions()[0]
-
-    assert row["compression_recovery_source_session_id"] == "recoverysrc3"
-    assert row["compression_recovery_action"] == "start_focused_continuation"
-
-    sidecar = _state_db_row_to_sidecar({"id": "recoverychild1", **row, "messages": []})
-
-    assert sidecar["compression_recovery_source_session_id"] == "recoverysrc3"
-    assert sidecar["compression_recovery_action"] == "start_focused_continuation"
+    assert compact["recommended_recovery_action"] == "reduce_current_request"
+    assert compact["compression_recovery"]["recommended_action"] == "reduce_current_request"
 
 
 def test_recovery_source_metadata_round_trips_through_state_db_sidecar_rebuild(tmp_path):
     recovery = {
         "type": "compression_recovery_required",
         "terminal_state": "compression_exhausted",
-        "recommended_action": "start_focused_continuation",
+        "recommended_action": "reduce_current_request",
         "source_session_id": "recoverysrc4",
     }
     db = WebUIJsonSessionDB(tmp_path)
@@ -406,7 +265,7 @@ def test_recovery_source_metadata_round_trips_through_state_db_sidecar_rebuild(t
             "started_at": 1700000000,
             "messages": [{"role": "user", "content": "long task"}],
             "compression_recovery": recovery,
-            "recommended_recovery_action": "start_focused_continuation",
+            "recommended_recovery_action": "reduce_current_request",
         }
     )
     row = db.list_sessions()[0]
@@ -414,21 +273,35 @@ def test_recovery_source_metadata_round_trips_through_state_db_sidecar_rebuild(t
     sidecar = _state_db_row_to_sidecar({"id": "recoverysrc4", **row, "messages": []})
 
     assert sidecar["compression_recovery"] == recovery
-    assert sidecar["recommended_recovery_action"] == "start_focused_continuation"
+    assert sidecar["recommended_recovery_action"] == "reduce_current_request"
 
 
-def test_compression_recovery_ui_wires_card_action_and_send_intercept():
+def test_compression_recovery_ui_renders_current_session_guidance_without_fork_action():
     ui = (ROOT / "static/ui.js").read_text(encoding="utf-8")
     messages = (ROOT / "static/messages.js").read_text(encoding="utf-8")
+    start = ui.index("function _compressionRecoveryHtml")
+    end = ui.index("function _activeCompressionRecoveryPayload", start)
+    card_body = ui[start:end]
 
-    assert "function _compressionRecoveryHtml" in ui
-    assert "data-compression-recovery-card=\"1\"" in ui
-    assert "api('/api/session/compression-recovery/start'" in ui
-    assert "Compression recovery did not return a session." in ui
-    assert "const sid=String(recovery.source_session_id||sessionId||'')" in ui
+    assert "reduce_current_request" in card_body
+    assert "Send a narrower request in this session." in card_body
+    assert "<button" not in card_body
+    assert "startCompressionRecovery" not in ui
+    assert "/api/session/compression-recovery/start" not in ui
     assert "function shouldInterceptCompressionRecoveryContinuation" in ui
     assert "shouldInterceptCompressionRecoveryContinuation(text,S.pendingFiles)" in messages
     assert "_compressionRecovery:recovery||undefined" in messages
+
+
+def test_compression_recovery_ui_generic_continue_shows_narrow_current_session_hint():
+    ui = (ROOT / "static/ui.js").read_text(encoding="utf-8")
+    start = ui.index("function shouldInterceptCompressionRecoveryContinuation")
+    end = ui.index("const MESSAGE_RENDER_WINDOW_DEFAULT", start)
+    body = ui[start:end]
+
+    assert "reduce_current_request" in body
+    assert "Send a narrower request in this session." in body
+    assert "start focused continuation" not in body.lower()
 
 
 def test_compression_recovery_ui_renders_session_level_recovery_on_terminal_message():
@@ -456,25 +329,3 @@ def test_compression_recovery_ui_skips_message_fallback_after_session_clear():
     assert session_guard in body
     assert message_scan in body
     assert body.index(session_guard) < body.index(message_scan)
-
-
-def test_compression_recovery_action_handles_stale_card_409():
-    """A 409 (recovery already cleared) must be mapped to a neutral note and the
-    stale card retired — not surfaced as a raw 'Compression recovery failed' error.
-    """
-    ui = (ROOT / "static/ui.js").read_text(encoding="utf-8")
-    start = ui.index("async function startCompressionRecovery(btn){")
-    end = ui.index("\n}", ui.index("finally", start))
-    body = ui[start:end]
-
-    # Branches on the HTTP status the api() wrapper attaches (err.status).
-    assert "e.status===409" in body
-    # Retires the stale persisted card so it is no longer clickable.
-    assert "data-compression-recovery-consumed" in body
-    # Neutral/info toast, not the generic error path.
-    assert "no longer available" in body
-    # The 409 branch returns before falling through to the generic error toast.
-    assert body.index("e.status===409") < body.index("Compression recovery failed:")
-    # The finally-block must NOT re-enable a retired stale-card button.
-    assert "retiredRecoveryCard" in body
-    assert "if(!retiredRecoveryCard) btn.disabled=false" in body
