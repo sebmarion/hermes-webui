@@ -422,72 +422,36 @@ class TestConflictError:
 
 
 class TestScheduleRestart:
-    """#814 — _schedule_restart must exist and be non-blocking."""
+    """WebUI update requests stage changes without self-restarting."""
 
     def test_schedule_restart_exists(self):
         from api.updates import _schedule_restart
         assert callable(_schedule_restart)
 
-    def test_schedule_restart_is_nonblocking(self, monkeypatch):
-        """_schedule_restart() must return immediately (spawns daemon thread)."""
+    def test_schedule_restart_fails_closed_without_self_exec(self, monkeypatch):
+        """Update requests stage code and require an approved external restart."""
         import api.updates as upd
 
+        class ForbiddenThread:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("self-restart thread must not be created")
+
         execv_called = []
+        monkeypatch.setattr(upd.threading, 'Thread', ForbiddenThread)
+        monkeypatch.setattr(os, 'execv', lambda *args: execv_called.append(args))
 
-        def fake_execv(exe, args):
-            execv_called.append((exe, args))
+        assert upd._schedule_restart(delay=0.05) is False
+        assert execv_called == []
 
-        # Monkeypatch os.execv inside the module's thread closure
-        import os as _os
-        original_execv = _os.execv
-
-        monkeypatch.setattr(sys, 'platform', 'linux')
-        monkeypatch.setattr(upd, '_wait_until_restart_safe', lambda *a, **k: {'restart_blocked': False})
-        monkeypatch.setattr(_os, 'execv', fake_execv)
-
-        start = time.monotonic()
-        upd._schedule_restart(delay=0.05)
-        elapsed = time.monotonic() - start
-
-        assert elapsed < 0.5, f"_schedule_restart must return immediately, took {elapsed:.2f}s"
-        # Give the thread time to call execv
-        time.sleep(0.2)
-        assert execv_called, "_schedule_restart must eventually call os.execv"
-
-    def test_schedule_restart_purges_pycache_before_execv(self, monkeypatch):
-        """The restart thread must purge __pycache__ before re-exec (#3774).
-
-        Pins the fix wiring: os.execv() replaces the process image without
-        touching on-disk .pyc files, so stale bytecode could otherwise serve
-        an old class definition after a self-update. Records the call order of
-        _purge_agent_pycache vs os.execv and asserts the purge runs first.
-        """
+    def test_schedule_restart_does_not_touch_pycache(self, monkeypatch):
+        """Staging an update must not mutate runtime caches before approval."""
         import api.updates as upd
 
         events = []
+        monkeypatch.setattr(upd, "_purge_agent_pycache", lambda repo_dir: events.append(repo_dir))
 
-        def spy_purge(repo_dir):
-            events.append(("purge", repo_dir))
-
-        def fake_execv(exe, args):
-            events.append(("execv", exe))
-
-        # Override the autouse no-op stub with a recording spy.
-        monkeypatch.setattr(sys, 'platform', 'linux')
-        monkeypatch.setattr(upd, '_wait_until_restart_safe', lambda *a, **k: {'restart_blocked': False})
-        monkeypatch.setattr(upd, "_purge_agent_pycache", spy_purge)
-        monkeypatch.setattr(os, "execv", fake_execv)
-
-        upd._schedule_restart(delay=0.05)
-        time.sleep(0.3)
-
-        kinds = [kind for kind, _ in events]
-        assert "purge" in kinds, "_schedule_restart must purge __pycache__"
-        assert "execv" in kinds, "_schedule_restart must call os.execv"
-        assert kinds.index("purge") < kinds.index("execv"), (
-            "__pycache__ purge must happen BEFORE os.execv so the re-exec'd "
-            "process recompiles from fresh source"
-        )
+        assert upd._schedule_restart(delay=0.05) is False
+        assert events == []
 
 
 class TestApplyUpdateRestartSafety:
@@ -663,9 +627,8 @@ class TestSuccessfulUpdateReturnsRestartScheduled:
 
         result = upd.apply_update('webui')
         assert result['ok'] is True
-        assert result.get('restart_scheduled') is True, (
-            "successful update must set restart_scheduled: True"
-        )
+        assert result.get('restart_scheduled') is False
+        assert result.get('restart_required') is True
 
     def test_apply_update_pulls_latest_release_tag_when_updates_are_release_based(
         self, tmp_path, monkeypatch
@@ -766,7 +729,8 @@ class TestApplyForceUpdate:
 
         result = upd.apply_force_update('webui')
         assert result['ok'] is True
-        assert result.get('restart_scheduled') is True
+        assert result.get('restart_scheduled') is False
+        assert result.get('restart_required') is True
 
         git_cmds = [r[0] for r in ran]
         assert 'reset' in git_cmds, "force update must call git reset --hard"
@@ -812,7 +776,8 @@ class TestApplyForceUpdate:
         assert result['ok'] is True, (
             f"force update must not abort on git clean failure (#4914): {result}"
         )
-        assert result.get('restart_scheduled') is True
+        assert result.get('restart_scheduled') is False
+        assert result.get('restart_required') is True
         git_cmds = [r[0] for r in ran]
         assert 'clean' in git_cmds, "force update should still attempt git clean"
         assert 'reset' in git_cmds, (
@@ -1407,7 +1372,8 @@ class TestAgentUpdateRequiresGatewayRestart:
         result = upd.apply_update('agent')
         assert result['ok'] is True
         assert result['target'] == 'agent'
-        assert result['restart_scheduled'] is True
+        assert result['restart_scheduled'] is False
+        assert result['restart_required'] is True
         assert result['gateway_restart'] == 'completed'
         assert gateway_restarts == ['default']
 
@@ -1458,7 +1424,8 @@ class TestAgentUpdateRequiresGatewayRestart:
         assert result['ok'] is True
         assert result['stash_conflict'] is True
         assert result['target'] == 'agent'
-        assert result['restart_scheduled'] is True
+        assert result['restart_scheduled'] is False
+        assert result['restart_required'] is True
         assert result['gateway_restart'] == 'in_progress'
         assert gateway_restarts == ['default']
 
@@ -1527,7 +1494,8 @@ class TestAgentUpdateRequiresGatewayRestart:
         result = upd.apply_force_update('agent')
         assert result['ok'] is True
         assert result['target'] == 'agent'
-        assert result['restart_scheduled'] is True
+        assert result['restart_scheduled'] is False
+        assert result['restart_required'] is True
         assert result['gateway_restart'] == 'completed'
 
     def test_apply_force_update_agent_fails_when_gateway_restart_busy(self, tmp_path, monkeypatch):
@@ -1591,7 +1559,8 @@ class TestAgentUpdateRequiresGatewayRestart:
         result = upd.apply_update('webui')
         assert result['ok'] is True
         assert result['target'] == 'webui'
-        assert result['restart_scheduled'] is True
+        assert result['restart_scheduled'] is False
+        assert result['restart_required'] is True
 
 
 # ── api/routes.py ─────────────────────────────────────────────────────────────
@@ -2518,89 +2487,24 @@ class TestClearLockButton:
 # ── Regression: sequential webui+agent update — restart coordination ──────────
 
 class TestSequentialUpdateRestartCoordination:
-    """Regression guard for the two-target race: when both webui and agent
-    have updates, the client POSTs them sequentially (webui → agent). The
-    first update's success schedules a restart timer; without coordination
-    that timer fires while the second update's git-pull is still running,
-    killing it mid-stream and leaving the second repo partial.
+    """Sequential updates stage safely because neither request self-restarts."""
 
-    Fix: `_schedule_restart` must acquire `_apply_lock` before calling
-    `os.execv`, so a pending second update always completes first.
-    """
-
-    def test_schedule_restart_waits_for_apply_lock(self, monkeypatch):
-        """The restart thread must wait for any in-flight update before
-        calling execv. Exercised by holding _apply_lock from another thread
-        and verifying execv is delayed until the lock is released."""
+    def test_schedule_restart_never_waits_for_or_replaces_under_apply_lock(self):
         import api.updates as upd
-        import threading as _th
-        import time as _t
+        assert upd._apply_lock.acquire(blocking=False) is True
+        try:
+            assert upd._schedule_restart(delay=0.05) is False
+        finally:
+            upd._apply_lock.release()
 
-        execv_called = _th.Event()
-        execv_time = []
-
-        def fake_execv(exe, args):
-            execv_time.append(_t.monotonic())
-            execv_called.set()
-
-        monkeypatch.setattr(sys, 'platform', 'linux')
-        monkeypatch.setattr(upd, '_wait_until_restart_safe', lambda *a, **k: {'restart_blocked': False})
-        monkeypatch.setattr(os, 'execv', fake_execv)
-
-        # Hold _apply_lock from another thread (simulating an in-flight
-        # second update) for 0.4 s.
-        release_time = []
-        lock_held = _th.Event()
-
-        def holder():
-            with upd._apply_lock:
-                lock_held.set()
-                _t.sleep(0.4)
-                release_time.append(_t.monotonic())
-
-        holder_thread = _th.Thread(target=holder, daemon=True)
-        holder_thread.start()
-        lock_held.wait(timeout=2)
-
-        # Schedule a restart with a short delay. The lock is held;
-        # the restart thread should block on it.
-        upd._schedule_restart(delay=0.05)
-        _t.sleep(0.15)
-        assert not execv_called.is_set(), (
-            "execv called while _apply_lock was still held by another "
-            "thread — restart must wait for in-flight updates to finish"
-        )
-
-        # Let the holder release.
-        holder_thread.join(timeout=2)
-        assert release_time, "holder didn't release the lock"
-
-        # execv should fire shortly after the lock release.
-        assert execv_called.wait(timeout=2), (
-            "execv never fired after _apply_lock was released"
-        )
-        assert execv_time[0] >= release_time[0], (
-            f"execv fired before lock was released "
-            f"(execv={execv_time[0]}, release={release_time[0]})"
-        )
-
-    def test_schedule_restart_still_fires_when_no_update_in_flight(self, monkeypatch):
-        """Sanity: with nothing holding the lock, restart still fires promptly."""
+    def test_schedule_restart_stays_disabled_when_no_update_in_flight(self, monkeypatch):
         import api.updates as upd
-        import time as _t
 
         execv_called = []
-        def fake_execv(exe, args):
-            execv_called.append(True)
-        monkeypatch.setattr(sys, 'platform', 'linux')
-        monkeypatch.setattr(upd, '_wait_until_restart_safe', lambda *a, **k: {'restart_blocked': False})
-        monkeypatch.setattr(os, 'execv', fake_execv)
+        monkeypatch.setattr(os, 'execv', lambda *args: execv_called.append(args))
 
-        upd._schedule_restart(delay=0.05)
-        _t.sleep(0.25)
-        assert execv_called, (
-            "restart must still fire when _apply_lock is free"
-        )
+        assert upd._schedule_restart(delay=0.05) is False
+        assert execv_called == []
 
 
 

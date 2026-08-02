@@ -235,3 +235,20 @@ def test_apply_updates_wait_for_all_targets_before_reload():
     assert result["apiCalls"] == ["agent", "webui"]
     assert result["waitCalls"] == []
     assert result["errors"] == [{"target": "webui", "message": "webui failed"}]
+
+
+def test_apply_updates_restart_required_never_enters_reload_wait():
+    result = _run_apply_updates_harness(
+        {"agent": {"behind": 1}, "webui": {"behind": 1}},
+        [
+            {"ok": True, "restart_required": True, "restart_scheduled": False},
+            {"ok": True, "restart_required": True, "restart_scheduled": False},
+        ],
+    )
+    assert result["apiCalls"] == ["agent", "webui"]
+    assert result["waitCalls"] == []
+    assert any(
+        "ask in chat to restart with fresh approval" in toast["message"]
+        for toast in result["showToasts"]
+    )
+    assert result["buttonDisabled"] is False

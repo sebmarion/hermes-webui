@@ -1,8 +1,7 @@
-"""Regression tests for #4626 — suppress the Windows console window on WebUI restart.
+"""Regression tests for supervised WebUI restart behavior on Windows.
 
-Two Windows restart paths spawn server.py:
-  1. bootstrap.py (foreground supervisor auto-restart)
-  2. api/updates._schedule_restart (Update-button self-update restart)
+Only bootstrap.py may spawn a Windows replacement. The update API must stage
+changes and require explicit externally supervised restart approval.
 
 Before #4626, both used python.exe (console subsystem) without CREATE_NO_WINDOW, so
 every restart flashed an empty terminal window on Windows. If the user closed that
@@ -11,9 +10,8 @@ window it took the WebUI down with it.
 These are source-level assertions because the behavior is Windows-only (the
 DETACHED_PROCESS / CREATE_NO_WINDOW subprocess constants and pythonw.exe only exist
 on win32), so the spawn path can't be exercised on the Linux CI box. We pin:
-  - both restart paths add CREATE_NO_WINDOW to the Popen creationflags
-  - both prefer pythonw.exe over python.exe when it exists next to the interpreter
-  - the non-Windows paths are untouched (defensive getattr(..., 0) guards, win32 branch)
+  - bootstrap adds CREATE_NO_WINDOW and prefers pythonw.exe
+  - api/updates._schedule_restart never spawns or exits the serving process
 """
 from __future__ import annotations
 
@@ -25,17 +23,15 @@ BOOTSTRAP_PY = (REPO / "bootstrap.py").read_text(encoding="utf-8")
 
 
 class TestWindowsRestartConsoleSuppression:
-    def test_updates_restart_adds_create_no_window(self):
-        assert "CREATE_NO_WINDOW" in UPDATES_PY, (
-            "_schedule_restart must add CREATE_NO_WINDOW to the Windows restart "
-            "Popen creationflags so python.exe does not flash an empty console (#4626)"
-        )
-
-    def test_updates_restart_prefers_pythonw(self):
-        # python.exe -> pythonw.exe substitution (windowless subsystem).
-        assert "w.exe" in UPDATES_PY and "python.exe" in UPDATES_PY, (
-            "_schedule_restart should prefer pythonw.exe over python.exe on Windows (#4626)"
-        )
+    def test_updates_restart_requires_external_coordinator(self):
+        restart_body = UPDATES_PY.split("def _schedule_restart", 1)[1].split(
+            "def _ensure_gateway_restart", 1
+        )[0]
+        assert "return False" in restart_body
+        assert "threading.Thread" not in restart_body
+        assert "subprocess.Popen" not in restart_body
+        assert "os.execv" not in restart_body
+        assert "os._exit" not in restart_body
 
     def test_bootstrap_restart_adds_create_no_window(self):
         assert "CREATE_NO_WINDOW" in BOOTSTRAP_PY, (
@@ -80,7 +76,4 @@ class TestWindowsRestartConsoleSuppression:
         # Linux/macOS behavior change.
         assert 'sys.platform == "win32"' in BOOTSTRAP_PY or "sys.platform == 'win32'" in BOOTSTRAP_PY, (
             "bootstrap.py restart change must stay inside the win32 branch"
-        )
-        assert "sys.platform == 'win32'" in UPDATES_PY or 'sys.platform == "win32"' in UPDATES_PY, (
-            "api/updates.py restart change must stay inside the win32 branch"
         )

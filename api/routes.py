@@ -12372,7 +12372,12 @@ def _shutdown_log_value(value, *, default: str = "unknown", max_len: int = 160) 
 
 
 def _handle_shutdown(handler) -> bool:
-    """Shut down the WebUI server process."""
+    """Reject direct WebUI self-termination.
+
+    A request served by this process cannot also guarantee that a replacement
+    process comes back. WebUI lifecycle operations must go through the external
+    coordinator after a fresh, exact operator approval.
+    """
     headers = getattr(handler, "headers", {})
     ua = headers.get("User-Agent", "no-ua") if hasattr(headers, "get") else "no-ua"
     remote = "unknown"
@@ -12385,17 +12390,19 @@ def _handle_shutdown(handler) -> bool:
         _shutdown_log_value(getattr(handler, "path", None), max_len=240),
         _shutdown_log_value(ua, default="no-ua", max_len=240),
     )
-    j(handler, {"status": "shutting_down"})
-    import signal
-    import threading
-
-    def _do_shutdown():
-        import time
-        time.sleep(0.3)
-        os.kill(os.getpid(), signal.SIGINT)
-
-    threading.Thread(target=_do_shutdown, daemon=True).start()
-    return True
+    logger.warning("[shutdown-request] rejected=explicit_restart_approval_required")
+    return j(
+        handler,
+        {
+            "ok": False,
+            "error": "explicit_restart_approval_required",
+            "message": (
+                "WebUI cannot stop or restart itself. Request a restart in chat; "
+                "the external coordinator will require fresh approval and verify recovery."
+            ),
+        },
+        status=409,
+    )
 
 
 def _handle_health_restart(handler) -> bool:

@@ -9759,6 +9759,7 @@ async function applyUpdates(){
   }
   try{
     const stashConflictMessages=[];
+    let restartRequired=false;
     const baselineServerIdentity = await _readHealthServerIdentity();
     for(const target of targets){
       // Send the channel the CHECK reported for this target (what was actually
@@ -9779,8 +9780,17 @@ async function applyUpdates(){
         stashConflictMessages.push('Update applied ('+target+'): '+(res.message||'Local changes were preserved in git stash.'));
         if(errEl){errEl.textContent=stashConflictMessages.join('\n\n');errEl.style.display='block';}
       }
+      if(res.restart_required) restartRequired=true;
     }
     const stashConflictMessage=stashConflictMessages.join('\n\n');
+    if(restartRequired){
+      const approvalMessage='Update staged — ask in chat to restart with fresh approval.';
+      showToast(stashConflictMessage?stashConflictMessage+'\n\n'+approvalMessage:approvalMessage,10000,'warning');
+      sessionStorage.removeItem('hermes-update-checked');
+      sessionStorage.removeItem('hermes-update-dismissed');
+      resetApplyButton(0);
+      return;
+    }
     showToast(stashConflictMessage||'Update applied — restarting…',stashConflictMessages.length?10000:undefined,stashConflictMessages.length?'warning':undefined);
     sessionStorage.removeItem('hermes-update-checked');
     sessionStorage.removeItem('hermes-update-dismissed');
@@ -9833,8 +9843,12 @@ async function applyClearUpdateLock(btn){
     if(res.ok){
       sessionStorage.removeItem('hermes-update-checked');
       sessionStorage.removeItem('hermes-update-dismissed');
-      showToast('Update applied — restarting…');
-      _waitForServerThenReload({});
+      if(res.restart_required){
+        showToast('Update staged — ask in chat to restart with fresh approval.',10000,'warning');
+      } else {
+        showToast('Update applied — restarting…');
+        _waitForServerThenReload({});
+      }
     } else if(res.lock_held){
       // v2.2: server returns manual-instruction. Show the exact `rm`
       // command + a one-click "I've removed it, retry update" affordance
@@ -9974,6 +9988,13 @@ async function forceUpdate(btn){
     const res=await api('/api/updates/force',{method:'POST',body:JSON.stringify((()=>{const b={target};const _ch=window._updateData?.[target]?.channel;if(_ch==='stable'||_ch==='experimental')b.channel=_ch;return b;})()),timeoutMs:120000});
     if(!res.ok){
       if(errEl){errEl.textContent='Force update failed: '+(res.message||'unknown error');errEl.style.display='block';}
+      btn.disabled=false;btn.textContent='Force update';
+      return;
+    }
+    if(res.restart_required){
+      showToast('Force update staged — ask in chat to restart with fresh approval.',10000,'warning');
+      sessionStorage.removeItem('hermes-update-checked');
+      sessionStorage.removeItem('hermes-update-dismissed');
       btn.disabled=false;btn.textContent='Force update';
       return;
     }

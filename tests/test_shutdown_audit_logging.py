@@ -1,6 +1,5 @@
 import logging
 import types
-import threading
 
 
 def test_server_shutdown_audit_logs_active_stream_context(monkeypatch, caplog):
@@ -31,23 +30,15 @@ def test_server_shutdown_audit_logs_active_stream_context(monkeypatch, caplog):
     assert "session-2" not in logged
 
 
-def test_shutdown_route_logs_request_context_without_starting_real_shutdown(monkeypatch, caplog):
+def test_shutdown_route_logs_request_context_and_rejects_self_shutdown(monkeypatch, caplog):
     from api import routes
 
     responses = []
-    monkeypatch.setattr(routes, "j", lambda handler, payload, **kw: responses.append(payload) or True)
-
-    started_threads = []
-
-    class FakeThread:
-        def __init__(self, target, daemon=False):
-            self.target = target
-            self.daemon = daemon
-
-        def start(self):
-            started_threads.append((self.target, self.daemon))
-
-    monkeypatch.setattr(threading, "Thread", FakeThread)
+    monkeypatch.setattr(
+        routes,
+        "j",
+        lambda handler, payload, **kw: responses.append((payload, kw.get("status"))) or True,
+    )
 
     handler = types.SimpleNamespace(
         client_address=("127.0.0.1", 12345),
@@ -67,5 +58,17 @@ def test_shutdown_route_logs_request_context_without_starting_real_shutdown(monk
     assert "ua=pytest-agent?forged" in logged
     assert "/api/shutdown\nforged" not in logged
     assert "pytest-agent\r\nforged" not in logged
-    assert responses == [{"status": "shutting_down"}]
-    assert started_threads and started_threads[0][1] is True
+    assert "rejected=explicit_restart_approval_required" in logged
+    assert responses == [
+        (
+            {
+                "ok": False,
+                "error": "explicit_restart_approval_required",
+                "message": (
+                    "WebUI cannot stop or restart itself. Request a restart in chat; "
+                    "the external coordinator will require fresh approval and verify recovery."
+                ),
+            },
+            409,
+        )
+    ]
