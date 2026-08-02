@@ -466,18 +466,14 @@ function _compressionRecoveryHtml(recovery, sessionId){
   if(!recovery||typeof recovery!=='object') return '';
   if(String(recovery.terminal_state||'')!=='compression_exhausted') return '';
   const action=String(recovery.recommended_action||'');
-  if(action!=='start_focused_continuation') return '';
-  const sid=String(recovery.source_session_id||sessionId||'');
+  if(action!=='reduce_current_request') return '';
   const title=String(recovery.title||'Context compression exhausted');
-  const summary=String(recovery.summary||'Start a focused continuation, then describe the next narrow task.');
-  const actionLabel=String(recovery.action_label||'Start focused continuation');
-  const icon=(typeof li==='function')?li('git-branch',14):'';
+  const summary=String(recovery.summary||'Send a narrower request in this session.');
   return `<div class="compression-recovery-card" data-compression-recovery-card="1">
     <div class="compression-recovery-copy">
       <div class="compression-recovery-title">${esc(title)}</div>
       <div class="compression-recovery-summary">${esc(summary)}</div>
     </div>
-    <button class="compression-recovery-action" type="button" data-recovery-session-id="${esc(sid)}" onclick="startCompressionRecovery(this);event.stopPropagation()">${icon}<span>${esc(actionLabel)}</span></button>
   </div>`;
 }
 
@@ -511,58 +507,15 @@ function shouldInterceptCompressionRecoveryContinuation(text, files){
   const hasFiles=Array.isArray(files)&&files.length>0;
   if(hasFiles||!isGenericCompressionContinuationIntent(text)) return false;
   const recovery=_activeCompressionRecoveryPayload();
-  return !!(recovery&&String(recovery.recommended_action||'')==='start_focused_continuation');
+  return !!(recovery&&String(recovery.recommended_action||'')==='reduce_current_request');
 }
 
 function showCompressionRecoveryContinuationHint(){
   const card=document.querySelector('[data-compression-recovery-card="1"]');
   if(card&&typeof card.scrollIntoView==='function'){
     try{card.scrollIntoView({block:'center',behavior:'smooth'});}catch(_){card.scrollIntoView();}
-    const btn=card.querySelector('.compression-recovery-action');
-    if(btn&&typeof btn.focus==='function') setTimeout(()=>btn.focus(),120);
   }
-  if(typeof showToast==='function') showToast('This session exhausted context compression. Start a focused continuation, then describe the next narrow task.',4500,'warning');
-}
-
-async function startCompressionRecovery(btn){
-  const sourceSid=String((btn&&btn.dataset&&btn.dataset.recoverySessionId)||(S.session&&S.session.session_id)||'').trim();
-  if(!sourceSid) return;
-  let retiredRecoveryCard=false;
-  if(btn){btn.disabled=true;btn.classList.add('loading');}
-  try{
-    const data=await api('/api/session/compression-recovery/start',{method:'POST',body:JSON.stringify({session_id:sourceSid})});
-    const sid=data&&data.session&&data.session.session_id;
-    if(!sid) throw new Error('Compression recovery did not return a session.');
-    try{localStorage.setItem('hermes-webui-session',sid);}catch(_){}
-    if(typeof loadSession==='function') await loadSession(sid,{preserveActiveInput:false});
-    else if(data.session){S.session=data.session;S.messages=data.session.messages||[];syncTopbar();renderMessages();}
-    if(typeof renderSessionList==='function') await renderSessionList();
-    if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(sid);
-    if(typeof showToast==='function') showToast((data&&data.message)||'Started focused continuation.',3000,'success');
-    const composer=$('msg');
-    if(composer&&typeof composer.focus==='function') composer.focus();
-  }catch(e){
-    // A 409 means this session no longer has an active recovery action (the
-    // session already moved on — e.g. a substantive prompt cleared it). The
-    // persisted card in the transcript is stale, so retire it and show a neutral
-    // note instead of a raw error. The server is authoritative on availability.
-    if(e&&e.status===409){
-      const staleCard=(btn&&btn.closest&&btn.closest('.compression-recovery-card'))
-        ||document.querySelector('[data-compression-recovery-card="1"]');
-      if(staleCard){
-        staleCard.setAttribute('data-compression-recovery-consumed','1');
-        const staleBtn=staleCard.querySelector('.compression-recovery-action');
-        if(staleBtn){staleBtn.disabled=true;staleBtn.classList.remove('loading');}
-        retiredRecoveryCard=true;
-      }
-      if(typeof showToast==='function') showToast('This conversation already moved on — the focused-continuation action is no longer available.',4000,'info');
-      return;
-    }
-    if(typeof showToast==='function') showToast('Compression recovery failed: '+(e&&e.message||e),5000,'error');
-  }finally{
-    // Do NOT re-enable a button we deliberately retired in the 409 branch.
-    if(btn){if(!retiredRecoveryCard) btn.disabled=false;btn.classList.remove('loading');}
-  }
+  if(typeof showToast==='function') showToast('This session exhausted context compression. Send a narrower request in this session.',4500,'warning');
 }
 
 const MESSAGE_RENDER_WINDOW_DEFAULT=50;

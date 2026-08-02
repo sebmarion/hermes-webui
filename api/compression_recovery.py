@@ -8,7 +8,7 @@ from typing import Any
 
 
 COMPRESSION_RECOVERY_TERMINAL_STATE = "compression_exhausted"
-COMPRESSION_RECOVERY_ACTION_START_FOCUSED = "start_focused_continuation"
+COMPRESSION_RECOVERY_ACTION_REDUCE_CURRENT_REQUEST = "reduce_current_request"
 
 
 _GENERIC_CONTINUATION_INTENTS = frozenset(
@@ -67,15 +67,15 @@ def build_compression_recovery_payload(session, *, message: str = "", details: s
     context_length = _positive_int(getattr(session, "context_length", None))
     payload = {
         "terminal_state": COMPRESSION_RECOVERY_TERMINAL_STATE,
-        "recommended_action": COMPRESSION_RECOVERY_ACTION_START_FOCUSED,
+        "recommended_action": COMPRESSION_RECOVERY_ACTION_REDUCE_CURRENT_REQUEST,
         "source_session_id": source_sid,
         "created_at": time.time(),
         "title": "Context compression exhausted",
         "summary": (
-            "This run could not safely shrink the conversation enough to continue in place. "
-            "Start a focused continuation, then describe the next narrow task."
+            "This run could not safely shrink the conversation enough. "
+            "Send a narrower request in this session."
         ),
-        "action_label": "Start focused continuation",
+        "action_label": "Reduce current request",
         "message": str(message or "").strip(),
         "details": str(details or "").strip()[:1200],
         "last_prompt_tokens": last_prompt_tokens,
@@ -101,7 +101,7 @@ def compression_recovery_payload_for_session(session) -> dict | None:
     if payload.get("terminal_state") != COMPRESSION_RECOVERY_TERMINAL_STATE:
         return None
     action = str(payload.get("recommended_action") or getattr(session, "recommended_recovery_action", "") or "")
-    if action != COMPRESSION_RECOVERY_ACTION_START_FOCUSED:
+    if action != COMPRESSION_RECOVERY_ACTION_REDUCE_CURRENT_REQUEST:
         return None
     return payload
 
