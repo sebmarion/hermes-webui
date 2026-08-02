@@ -623,11 +623,12 @@ def _prewarm_skill_tool_modules():
             pass
 
 
-# Lazy import to avoid circular deps -- hermes-agent is on sys.path via api/config.py
-try:
-    from run_agent import AIAgent
-except ImportError:
-    AIAgent = None
+# Lazy import to avoid circular deps -- hermes-agent is on sys.path via api/config.py.
+# Resolve through the runtime guard so a long-lived WebUI cannot reuse an
+# AIAgent class after the Agent checkout changes underneath it.
+from api.agent_runtime import get_ai_agent_class
+
+AIAgent = None
 
 def _get_ai_agent():
     """Return AIAgent class, retrying the import if the initial attempt failed.
@@ -638,12 +639,9 @@ def _get_ai_agent():
     requiring a server restart.
     """
     global AIAgent
-    if AIAgent is None:
-        try:
-            from run_agent import AIAgent as _cls  # noqa: PLC0415
-            AIAgent = _cls
-        except ImportError:
-            pass
+    _cls = get_ai_agent_class()
+    if _cls is not None:
+        AIAgent = _cls
     return AIAgent
 
 
