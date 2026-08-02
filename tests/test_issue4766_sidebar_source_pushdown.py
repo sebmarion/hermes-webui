@@ -444,6 +444,40 @@ def test_frontend_uses_one_unfiltered_source_list():
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_external_sidebar_toggle_hides_cli_rows_by_default_and_restores_them():
+    src = SESSIONS_JS.read_text(encoding="utf-8")
+    index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="btnToggleExternalSessions"' in index
+    assert "function _sidebarRowsForDisplay(" in src
+
+    is_cli_fn = _extract_function(src, "_isCliSession")
+    display_rows_fn = _extract_function(src, "_sidebarRowsForDisplay")
+    script = f"""
+global._showExternalSessions = false;
+function _isMessagingSession(session) {{
+  return session && session.source === 'messaging';
+}}
+{is_cli_fn}
+{display_rows_fn}
+const rows = [
+  {{ session_id: 'webui-1', source: 'webui' }},
+  {{ session_id: 'cli-1', source: 'cli' }},
+  {{ session_id: 'claude-1', source: 'external_agent', is_cli_session: true }},
+  {{ session_id: 'telegram-1', source: 'messaging' }},
+];
+const hidden = _sidebarRowsForDisplay(rows).map(row => row.session_id);
+global._showExternalSessions = true;
+const shown = _sidebarRowsForDisplay(rows).map(row => row.session_id);
+console.log(JSON.stringify({{ hidden, shown }}));
+"""
+    body = _run_node(script)
+
+    assert body["hidden"] == ["webui-1", "telegram-1"]
+    assert body["shown"] == ["webui-1", "cli-1", "claude-1", "telegram-1"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_session_list_query_string_uses_unified_source_and_flags():
     src = SESSIONS_JS.read_text(encoding="utf-8")
     exclude_hidden_fn = _extract_function(src, "_sessionListExcludeHiddenEnabled")
