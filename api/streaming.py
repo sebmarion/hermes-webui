@@ -6550,6 +6550,38 @@ def _agent_result_terminal_failure(result) -> bool:
     return False
 
 
+def _compression_exhausted_context_messages(result_messages, previous_context, msg_text):
+    """Keep only pre-turn context after a structured local budget rejection."""
+    result_messages = list(result_messages or [])
+    for index in range(len(result_messages) - 1, -1, -1):
+        if _looks_like_current_user_turn(result_messages[index], msg_text):
+            return result_messages[:index]
+    # If the Agent did not return a recognizable current-user boundary, the
+    # WebUI snapshot is the only safe model-context source. Never replay an
+    # untrusted failed-turn payload into the next provider request.
+    return list(previous_context or [])
+
+
+def _drop_synthetic_compression_exhaustion_response(result_messages, result):
+    """Keep partial work visible while removing the Agent's local error row."""
+    expected = str(
+        result.get("final_response") or result.get("error") or ""
+    ).strip() if isinstance(result, dict) else ""
+    if not expected:
+        return list(result_messages or [])
+    filtered = []
+    for message in result_messages or []:
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and not message.get("tool_calls")
+            and str(message.get("content") or "").strip() == expected
+        ):
+            continue
+        filtered.append(message)
+    return filtered
+
+
 _TOOL_RESULT_SNIPPET_MAX = 4000
 
 # Tool-arg keys whose values are card content / diff-reconstruction inputs.
@@ -9723,6 +9755,9 @@ def _run_agent_streaming(
                 with _stream_writeback_stage(_writeback_timings, "merge_result"):
                     _tool_limit_reached = _agent_result_tool_limit_reached(result)
                     _guardrail_terminal = _agent_result_guardrail_blocked(result)
+                    _structured_compression_exhausted = bool(
+                        isinstance(result, dict) and result.get("compression_exhausted")
+                    )
                     if _guardrail_terminal is not None:
                         logger.info(
                             "guardrail terminal mapped: %s",
@@ -9734,6 +9769,20 @@ def _run_agent_streaming(
                         enabled=_tool_limit_reached,
                         previous_messages=_previous_context_messages,
                     )
+                    _context_result_messages = _result_messages
+                    _display_result_messages_source = _result_messages
+                    if _structured_compression_exhausted:
+                        _context_result_messages = _compression_exhausted_context_messages(
+                            _result_messages,
+                            _previous_context_messages,
+                            msg_text,
+                        )
+                        _display_result_messages_source = (
+                            _drop_synthetic_compression_exhaustion_response(
+                                _result_messages,
+                                result,
+                            )
+                        )
                     # #5494 — parity with hermes-agent's handle_max_iterations() return
                     # value. When the agent produced no usable summary assistant
                     # message but result['final_response'] carries a graceful fallback
@@ -9770,7 +9819,7 @@ def _run_agent_streaming(
                         return
                     _next_context_messages = _restore_reasoning_metadata(
                         _previous_context_messages,
-                        _result_messages,
+                        _context_result_messages,
                     )
                     # Stamp stable ids on the shared result rows AFTER the context
                     # restore (so carried-forward ids survive) and BEFORE the
@@ -9801,7 +9850,7 @@ def _run_agent_streaming(
                         )
                     _display_result_messages = _restore_display_reasoning_metadata(
                         _previous_messages,
-                        _result_messages,
+                        _display_result_messages_source,
                     )
                     _guardrail_candidate_token = str(stream_id)
                     if _guardrail_terminal is not None:
@@ -10008,11 +10057,17 @@ def _run_agent_streaming(
                 # misleading no_response "silent rate limit, try again" fallback.
                 if not _last_err and _captured_terminal_error[0]:
                     _last_err = _captured_terminal_error[0]
-                _classification = _classify_provider_error(
-                    str(_last_err) if _last_err else '',
-                    _last_err,
-                    silent_failure=not bool(_last_err),
-                )
+                if _structured_compression_exhausted:
+                    # The result flag is the authoritative contract. Local
+                    # admission reasons are diagnostic strings and can change
+                    # without changing the terminal state.
+                    _classification = _classify_provider_error("compression_exhausted")
+                else:
+                    _classification = _classify_provider_error(
+                        str(_last_err) if _last_err else '',
+                        _last_err,
+                        silent_failure=not bool(_last_err),
+                    )
                 _is_quota = _classification['type'] == 'quota_exhausted'
                 _is_auth = _classification['type'] == 'auth_mismatch'
                 _drop_replayed_assistant = (
