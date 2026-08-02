@@ -1324,6 +1324,24 @@ _PROVIDER_DISPLAY = {
     "bedrock": "AWS Bedrock",
 }
 
+# Providers intentionally hidden from the model-picker dropdown. Keep runtime
+# resolver / credential support intact so existing sessions or direct config
+# routes do not break; this only suppresses provider optgroups returned by
+# /api/models. `openai-codex` is deliberately NOT hidden.
+_PICKER_HIDDEN_PROVIDER_IDS = frozenset({
+    "neuralwatt",
+    "mindai",
+    "mind-ai",
+    "nvidia",
+    "openai",
+    "openai-api",
+})
+
+# Optional profile-local provider menu allowlist.  The normal WebUI keeps its
+# broad provider catalog when this is absent; a profile may opt into a strict
+# menu by setting ``webui.provider_menu.allowed_providers`` in config.yaml.
+_PICKER_ALLOWED_PROVIDER_CONFIG_KEY = "allowed_providers"
+
 # Provider alias → canonical slug.  Users configure providers using the
 # dotted/hyphenated form they see on the provider website (``z.ai``,
 # ``x.ai``, ``google``) but the internal catalog (``_PROVIDER_MODELS``)
@@ -1616,6 +1634,192 @@ def _canonicalise_provider_id(name: object) -> str:
     if resolved and (resolved.lower() in _PROVIDER_DISPLAY or resolved.lower() in _PROVIDER_MODELS):
         return resolved.lower()
     return raw
+
+
+def _normalise_picker_provider_token(value: object) -> str:
+    return re.sub(r"[\s_]+", "-", str(value or "").strip().lower())
+
+
+def _is_picker_hidden_provider(provider_id: object) -> bool:
+    """Return True when a provider should not be rendered in the model picker."""
+    raw = _normalise_picker_provider_token(provider_id)
+    if not raw:
+        return False
+    candidates = {raw}
+    if raw.startswith(("custom:", "custom-")):
+        custom_name = (
+            raw.split(":", 1)[1]
+            if ":" in raw
+            else raw.removeprefix("custom-")
+        )
+        if custom_name:
+            candidates.add(custom_name)
+    for candidate in tuple(candidates):
+        canonical = _canonicalise_provider_id(candidate) or candidate
+        candidates.add(canonical)
+    return any(candidate in _PICKER_HIDDEN_PROVIDER_IDS for candidate in candidates)
+
+
+def _picker_provider_candidates(value: object) -> set[str]:
+    """Return normalized provider-id candidates for an id or display label."""
+    raw = _normalise_picker_provider_token(value)
+    if not raw:
+        return set()
+    candidates = {raw}
+    if raw.startswith(("custom:", "custom-")):
+        suffix = raw.split(":", 1)[1] if ":" in raw else raw.removeprefix("custom-")
+        if suffix:
+            candidates.add(suffix)
+    else:
+        candidates.add(f"custom:{raw}")
+    for candidate in tuple(candidates):
+        canonical = _canonicalise_provider_id(candidate) or candidate
+        candidates.add(canonical)
+    return candidates
+
+
+def _webui_provider_menu_allowlist(config_obj: dict | None = None) -> frozenset[str] | None:
+    """Return a configured provider-menu allowlist, or ``None`` when disabled."""
+    source = config_obj if isinstance(config_obj, dict) else cfg
+    webui_cfg = source.get("webui", {}) if isinstance(source, dict) else {}
+    menu_cfg = webui_cfg.get("provider_menu", {}) if isinstance(webui_cfg, dict) else {}
+    raw_allowed = menu_cfg.get(_PICKER_ALLOWED_PROVIDER_CONFIG_KEY) if isinstance(menu_cfg, dict) else None
+    if not isinstance(raw_allowed, (list, tuple, set, frozenset)):
+        return None
+    allowed: set[str] = set()
+    for provider in raw_allowed:
+        allowed.update(_picker_provider_candidates(provider))
+    return frozenset(allowed)
+
+
+def _is_picker_allowed_provider(provider_id: object, provider_label: object = None) -> bool:
+    """Return whether an explicitly configured provider may render in the picker."""
+    allowlist = _webui_provider_menu_allowlist()
+    if allowlist is None:
+        return True
+    candidates = _picker_provider_candidates(provider_id)
+    if provider_label:
+        candidates.update(_picker_provider_candidates(provider_label))
+    return bool(candidates.intersection(allowlist))
+
+
+def _is_codex_pro_model(model: object) -> bool:
+    """Return True for the unwanted Codex ``-pro`` model variants only."""
+    values = model.values() if isinstance(model, dict) else (model,)
+    return any(
+        str(value or "").strip().lower().endswith(("-pro", " pro"))
+        for value in values
+    )
+
+
+def _filter_codex_pro_models(payload: dict | None) -> dict | None:
+    """Remove Codex ``-pro`` rows from visible, overflow, and badge payloads."""
+    if not isinstance(payload, dict):
+        return payload
+    groups = payload.get("groups")
+    if not isinstance(groups, list):
+        return payload
+    for group in groups:
+        if not isinstance(group, dict) or not _is_picker_codex_group(group):
+            continue
+        for bucket in ("models", "extra_models"):
+            models = group.get(bucket)
+            if isinstance(models, list):
+                group[bucket] = [
+                    model for model in models
+                    if not _is_codex_pro_model(model)
+                ]
+    badges = payload.get("configured_model_badges")
+    if isinstance(badges, dict):
+        payload["configured_model_badges"] = {
+            key: value
+            for key, value in badges.items()
+            if not _is_codex_pro_model(key)
+        }
+    return payload
+
+
+def _is_picker_codex_group(group: dict) -> bool:
+    """Return True for a Codex group, including cache payloads with only labels."""
+    return bool(
+        _is_provider_id_codex(group.get("provider_id") or group.get("id"))
+        or _is_provider_id_codex(group.get("provider") or group.get("display_name"))
+    )
+
+
+def _is_provider_id_codex(value: object) -> bool:
+    return "openai-codex" in _picker_provider_candidates(value)
+
+
+def _filter_picker_hidden_provider_groups(payload: dict | None) -> dict | None:
+    """Remove hidden/allowlisted provider optgroups from any /api/models payload.
+
+    Applied at the shared post-processing boundary so live rebuilds, static
+    fallbacks, fresh disk-cache hits, and stale disk fallbacks all expose the
+    same cleaned dropdown catalog.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    groups = payload.get("groups")
+    if not isinstance(groups, list):
+        return payload
+
+    filtered_groups: list = []
+    for group in groups:
+        if not isinstance(group, dict):
+            filtered_groups.append(group)
+            continue
+        provider_id = group.get("provider_id")
+        provider_label = group.get("provider")
+        if (
+            _is_picker_hidden_provider(provider_id)
+            or _is_picker_hidden_provider(provider_label)
+            or not _is_picker_allowed_provider(provider_id, provider_label)
+        ):
+            continue
+        filtered_groups.append(group)
+
+    payload["groups"] = filtered_groups
+    badges = payload.get("configured_model_badges")
+    if isinstance(badges, dict):
+        payload["configured_model_badges"] = {
+            key: value
+            for key, value in badges.items()
+            if not (
+                isinstance(value, dict)
+                and _is_picker_hidden_provider(value.get("provider"))
+            )
+            and _is_picker_allowed_provider(
+                value.get("provider"),
+                value.get("provider"),
+            )
+        }
+    return _filter_codex_pro_models(payload)
+
+
+def _filter_webui_provider_records(records: list[dict] | None) -> list[dict]:
+    """Apply the profile's provider-menu allowlist to Settings card records."""
+    if not isinstance(records, list):
+        return []
+    if _webui_provider_menu_allowlist() is None:
+        return records
+    filtered: list[dict] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if not _is_picker_allowed_provider(record.get("id"), record.get("display_name")):
+            continue
+        record = copy.deepcopy(record)
+        if _is_picker_codex_group(record):
+            models = record.get("models")
+            if isinstance(models, list):
+                record["models"] = [
+                    model for model in models
+                    if not _is_codex_pro_model(model)
+                ]
+                record["models_total"] = len(record["models"])
+        filtered.append(record)
+    return filtered
 
 
 def _normalize_base_url_for_match(value: object) -> str:
@@ -4831,6 +5035,7 @@ def _annotate_fast_tier_model_groups(payload: dict | None) -> dict | None:
     """Add service-tier capability metadata to OpenAI-family model groups."""
     if not isinstance(payload, dict):
         return payload
+    payload = _filter_picker_hidden_provider_groups(payload)
     groups = payload.get("groups")
     if not isinstance(groups, list):
         return payload
@@ -8470,13 +8675,13 @@ def get_available_models(
         except Exception:
             pass
 
-        return {
+        return _annotate_fast_tier_model_groups({
             "active_provider": active_provider,
             "default_model": default_model,
             "configured_model_badges": _build_configured_model_badges(),
             "groups": groups,
             "aliases": model_aliases,
-        }
+        })
 
     # ── FAST PATH ─────────────────────────────────────────────────────────────
     # Mark that a build may be in progress BEFORE acquiring the lock.

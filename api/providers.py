@@ -37,6 +37,7 @@ from api.config import (
     _PROVIDER_MODELS,
     _coerce_provider_cost_budget,
     _custom_provider_slug_from_name,
+    _filter_webui_provider_records,
     _get_label_for_model,
     _models_from_live_provider_ids,
     _pool_entry_payloads,
@@ -2858,6 +2859,7 @@ def get_providers() -> dict[str, Any]:
             return (2, pid)
         return (3, pid)
     providers.sort(key=_provider_sort_key)
+    providers = _filter_webui_provider_records(providers)
 
     result = {
         "providers": providers,
