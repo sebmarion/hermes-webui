@@ -67,8 +67,8 @@ def test_neuralwatt_provider_has_key_false_without_env(monkeypatch, tmp_path):
     assert providers._provider_has_key("neuralwatt") is False
 
 
-def test_neuralwatt_model_group_appears_with_models_in_config(monkeypatch, tmp_path):
-    """Neuralwatt appears as a provider group when config.yaml lists its models."""
+def test_neuralwatt_model_group_is_hidden_even_when_configured(monkeypatch, tmp_path):
+    """Neuralwatt remains routable/configurable but is suppressed from the model picker."""
     _force_env_fallback(monkeypatch)
     monkeypatch.setenv("NEURALWATT_API_KEY", "test-neuralwatt-key")
 
@@ -90,8 +90,58 @@ def test_neuralwatt_model_group_appears_with_models_in_config(monkeypatch, tmp_p
     )
 
     groups = {group["provider_id"]: group for group in result["groups"]}
-    assert "neuralwatt" in groups, f"neuralwatt missing from groups: {list(groups.keys())}"
-    assert groups["neuralwatt"]["provider"] == "Neuralwatt"
-    model_ids = {model["id"] for model in groups["neuralwatt"]["models"]}
-    assert "glm-5.2" in model_ids
-    assert "glm-5.2-short" in model_ids
+    assert "neuralwatt" not in groups, f"neuralwatt should be hidden from groups: {list(groups.keys())}"
+
+
+def test_hidden_picker_providers_removed_but_openai_codex_kept(monkeypatch, tmp_path):
+    """Requested hidden providers do not render as dropdown groups; OpenAI Codex still does."""
+    _force_env_fallback(monkeypatch)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-key")
+    monkeypatch.setenv("NEURALWATT_API_KEY", "test-neuralwatt-key")
+
+    result = _run_available_models_with_cfg(
+        monkeypatch,
+        tmp_path,
+        {
+            "model": {"default": "gpt-5.5", "provider": "openai-codex"},
+            "providers": {
+                "openai": {"api_key": "test", "models": ["gpt-5.5"]},
+                "openai-api": {"api_key": "test", "models": ["gpt-5.5"]},
+                "nvidia": {"api_key": "test", "models": ["nvidia/nemotron-3-super-120b-a12b"]},
+                "neuralwatt": {"api_key": "test", "models": ["glm-5.2"]},
+                "mindai": {"api_key": "test", "models": ["mindai-coder"]},
+            },
+        },
+    )
+
+    provider_ids = {group["provider_id"] for group in result["groups"]}
+    assert "openai-codex" not in config._PICKER_HIDDEN_PROVIDER_IDS
+    assert "openai-codex" in provider_ids
+    assert provider_ids.isdisjoint({"openai", "openai-api", "nvidia", "neuralwatt", "mindai"})
+
+
+def test_hidden_picker_provider_labels_removed_from_cached_payload(monkeypatch, tmp_path):
+    """Post-processing also cleans stale/cache-style groups that only carry provider labels."""
+    payload = {
+        "configured_model_badges": {
+            "gpt-5.5": {"provider": "OpenAI API"},
+            "glm-5.2": {"provider": "custom:neuralwatt"},
+            "gpt-5.6-sol": {"provider": "openai-codex"},
+        },
+        "groups": [
+            {"provider": "OpenAI API", "models": [{"id": "gpt-5.5"}]},
+            {"provider": "Openai", "models": [{"id": "gpt-5.5"}]},
+            {"provider": "NVIDIA NIM", "models": [{"id": "nemotron"}]},
+            {"provider": "mindai", "models": [{"id": "mindai-coder"}]},
+            {"provider_id": "custom:neuralwatt", "provider": "Neuralwatt", "models": [{"id": "glm-5.2"}]},
+            {"provider_id": "openai-codex", "provider": "OpenAI Codex", "models": [{"id": "gpt-5.6-sol"}]},
+        ],
+    }
+
+    cleaned = config._annotate_fast_tier_model_groups(payload)
+    groups = cleaned["groups"]
+    assert [group.get("provider_id") for group in groups] == ["openai-codex"]
+    assert cleaned["configured_model_badges"] == {
+        "gpt-5.6-sol": {"provider": "openai-codex"}
+    }

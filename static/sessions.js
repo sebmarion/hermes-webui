@@ -4340,6 +4340,8 @@ let _sessionAttentionSoundPrimed = false;
 const _sessionAttentionSoundState = new Map();
 let _renamingSid = null;  // session_id currently being renamed (blocks list re-renders)
 let _showArchived = false;  // toggle to show archived sessions
+const SHOW_EXTERNAL_SESSIONS_STORAGE_KEY = 'hermes-show-external-sessions';
+let _showExternalSessions = false;  // CLI/Claude rows are opt-in in the sidebar
 let _sessionSelectMode = false;  // batch select mode
 const _selectedSessions = new Set();  // selected session IDs
 let _allProjects = [];  // cached project list
@@ -4365,12 +4367,52 @@ function _restoreShowAllProfiles(){
   }catch(_e){ _showAllProfiles = false; }
 }
 
+function _restoreShowExternalSessions(){
+  try{
+    const raw=localStorage.getItem(SHOW_EXTERNAL_SESSIONS_STORAGE_KEY);
+    _showExternalSessions = raw === '1' || raw === 'true';
+  }catch(_e){ _showExternalSessions = false; }
+}
+
+function _updateExternalSessionsToggle(rows){
+  const button = typeof $ === 'function' ? $('btnToggleExternalSessions') : null;
+  if(!button) return;
+  const hasExternalRows = Array.isArray(rows) && rows.some(row => _isCliSession(row));
+  button.hidden = !hasExternalRows;
+  button.classList.toggle('active', _showExternalSessions);
+  button.setAttribute('aria-pressed', _showExternalSessions ? 'true' : 'false');
+  const label = typeof t === 'function' ? t('settings_label_external_sessions') : 'Show non-WebUI sessions';
+  button.title = label;
+  button.setAttribute('aria-label', label);
+}
+
+function _setShowExternalSessions(enabled){
+  _showExternalSessions = !!enabled;
+  try{
+    localStorage.setItem(SHOW_EXTERNAL_SESSIONS_STORAGE_KEY, _showExternalSessions ? '1' : '0');
+  }catch(_e){}
+  _lastSessionListRenderSig = null;
+  _updateExternalSessionsToggle(_allSessions);
+  if(typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
+}
+
+function _toggleExternalSessions(){
+  _setShowExternalSessions(!_showExternalSessions);
+}
+
+function _sidebarRowsForDisplay(rows){
+  const normalized = Array.isArray(rows) ? rows : [];
+  if(_showExternalSessions) return normalized;
+  return normalized.filter(row => !_isCliSession(row));
+}
+
 function _setShowAllProfiles(enabled){
   _showAllProfiles=!!enabled;
   try{ localStorage.setItem(SHOW_ALL_PROFILES_STORAGE_KEY,_showAllProfiles?'1':'0'); }catch(_e){}
 }
 
 _restoreShowAllProfiles();
+_restoreShowExternalSessions();
 let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
@@ -5737,8 +5779,8 @@ function _sessionListRenderSignature(){
   try{
     const search=($('sessionSearch')&&$('sessionSearch').value)||'';
     return JSON.stringify([
-      _allSessions,
-      _sidebarReferenceSessions,
+      _sidebarRowsForDisplay(_allSessions),
+      _sidebarRowsForDisplay(_sidebarReferenceSessions),
       _legacyWebuiArchive,
       _allProjects,
       _activeSessionIdForSidebar(),
@@ -5778,6 +5820,7 @@ function _applySessionListPayload(sessData, projData){
     : [];
   _reconcileActiveSessionIdleStateFromList(serverSessions);
   _allSessions = _mergeOptimisticFirstTurnSessions(serverSessions);
+  if(typeof _updateExternalSessionsToggle === 'function') _updateExternalSessionsToggle(_allSessions);
   _reconcileDurableCompletionReceipts(_allSessions);
   // Tag the cache with the scope it was loaded under (active profile +
   // all-profiles flag). If a later /api/sessions fails right after a profile
@@ -7895,7 +7938,7 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
 // project as the render they feed before using them.
 function _scopedSidebarReferenceRows(){
   if(typeof _sidebarReferenceSessions==='undefined'||!Array.isArray(_sidebarReferenceSessions)||!_sidebarReferenceSessions.length) return [];
-  return _sidebarReferenceSessions.filter(s=>{
+  return _sidebarRowsForDisplay(_sidebarReferenceSessions).filter(s=>{
     if(!s) return false;
     // Project scope: mirror _partitionSidebarSessionRows exactly.
     if(_activeProject===NO_PROJECT_FILTER){ if(s.project_id) return false; }
@@ -7984,7 +8027,7 @@ function renderSessionListFromCache(){
   const searchQueryRaw=($('sessionSearch').value||'').trim();
   const q=searchQueryRaw.toLowerCase();
   const activeSidForSidebar=_activeSessionIdForSidebar();
-  const sidebarRows=_sessionRowsWithActiveEphemeralSession(_allSessions);
+  const sidebarRows=_sidebarRowsForDisplay(_sessionRowsWithActiveEphemeralSession(_allSessions));
   // Merge direct session-id/link matches, title matches, then content matches (deduped).
   // Direct matches must not disable content search: if a user pasted the same
   // session id into another conversation, that content hit should still appear.
