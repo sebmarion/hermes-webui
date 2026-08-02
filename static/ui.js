@@ -4983,6 +4983,7 @@ function _normalizeToolsetsCatalog(payload) {
   const seen = new Set();
   const names = [];
   servers.forEach(function(server) {
+    if (!server || server.enabled === false || server.status === 'disabled' || server.status === 'invalid_config') return;
     const name = String((server && server.name) || '').trim();
     if (!name || seen.has(name)) return;
     seen.add(name);
