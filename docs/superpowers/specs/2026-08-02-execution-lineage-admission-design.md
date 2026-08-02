@@ -77,6 +77,9 @@ The invariant that failed was:
 - No deletion or rewriting of archived sessions or compression snapshots.
 - No cleanup, adoption, or refactor of the existing unrelated dirty recovery
   work in the checkout.
+- No lineage-wide re-indexing of the durable async-delegation store. Its starts
+  receive the concurrency gate, while its existing exact-session/runtime and
+  startup-replay semantics remain unchanged.
 
 ## Terms
 
@@ -98,12 +101,14 @@ The invariant that failed was:
    there is no unowned gap.
 3. `update_active_run()` may rotate `session_id` after compression but may not
    replace or remove `execution_lineage_key`.
-4. A rejected start performs no pending-sidecar write, turn-journal append,
-   stream registration, provider call, or thread launch.
+4. A turn-bearing reservation binds before that turn's pending-sidecar write,
+   turn-journal append, stream registration, provider call, or thread launch.
+   A lineage-busy rejection therefore performs none of those mutations.
 5. A rejected deferred wakeup stays queued, and a rejected tool-limit child
    stays durably claimed.
-6. A deferred entry retains the physical `target_session_id` on which its
-   prompt must eventually run even though queue ownership is lineage-wide.
+6. A deferred entry retains the physical `target_session_id` and validated
+   `target_profile` on which its prompt must eventually run even though queue
+   ownership is lineage-wide.
 7. The final active or bound owner in a lineage is the only teardown allowed
    to claim its next deferred item.
 8. Profile identity is part of the key; equal session IDs in different profile
@@ -139,8 +144,9 @@ Resolution is intentionally narrow:
 2. If tool-limit control metadata exists, validate that
    `Session.root_session_id` and
    `Session.tool_limit_continuation.root_session_id` are both non-empty and
-   equal. That explicit root becomes the candidate. A partial or conflicting
-   pair fails closed.
+   equal. The durable receipt selected by child ID must agree on child ID,
+   root ID, execution ID, and normalized profile. That explicit root becomes
+   the candidate. A missing receipt, partial identity, or conflict fails closed.
 3. Resolve the candidate upward through the existing bounded,
    compression-only `resolve_shared_session(..., mode="history")` helper.
 4. On `found`, use its `root_id`.
@@ -176,15 +182,22 @@ public health field.
 
 ### Bind the existing reservation
 
-`_start_chat_stream_for_session()` remains the shared native/Gateway chokepoint.
-It already runs inside `_admit_stream_start`, so an admission reservation exists
-before it can mutate a sidecar or start a worker.
+`_start_chat_stream_for_session()` remains the shared native/Gateway defensive
+chokepoint. It already runs inside `_admit_stream_start`, so an admission
+reservation exists before it can mutate a sidecar or start a worker.
 
-Immediately after read-only runtime/session validation and before the first
-pending-state mutation, it resolves the execution lineage and binds the current
-reservation under `ACTIVE_RUNS_LOCK`. Resolution, profile lookup, and state-db
-reads happen before taking that lock; the locked section only validates the
-already-computed key and compares in-memory owners.
+Every local turn-bearing entrypoint binds at its earliest point after physical
+session/profile identity exists and before the first turn-state mutation.
+`start_session_turn()` therefore binds after loading the session but before
+process-pause or delegation-turn mutation. The browser/local-adapter path binds
+after read-only backend selection and before pending state. The shared chat
+chokepoint repeats the bind idempotently as a defensive assertion.
+
+Resolution, receipt lookup, profile lookup, and state-db reads happen before
+taking `ACTIVE_RUNS_LOCK`; the locked section only validates the already-
+computed key and compares in-memory owners. External-runner selection bypasses
+this local bind because external execution ownership is explicitly out of
+scope.
 
 Binding is idempotent for the same reservation and key because nested admitted
 helpers reuse the same reservation. Binding a reservation to a different key
@@ -215,9 +228,19 @@ For native/Gateway chat workers, a missing key is a rejected upgrade rather
 than an unkeyed active run. Existing auxiliary run kinds that do not execute a
 conversation remain unchanged.
 
-Only turn-bearing reservations are bound. Background finalizers, title workers,
-and other auxiliary reservations intentionally overlap their owning turn and
-must remain unkeyed so they do not conflict with it.
+Only turn-bearing reservations are bound. The required classification is:
+
+| Reservation/worker | Lineage behavior |
+| --- | --- |
+| Browser/local-adapter chat, process/goal/tool continuation, native worker, Gateway-backed worker | Bind to the addressed conversation lineage. |
+| `/btw` and ordinary background agent worker | Bind to the newly created hidden child as an independent lineage before its first save/launch. |
+| Manual compression worker | Bind to the addressed conversation lineage before compression mutation. |
+| Background finalizer, title worker, recovery sweep, release helper, other sessionless auxiliary work | Remain unkeyed; these intentionally overlap a keyed turn. |
+
+Implementation planning must inventory every direct `register_active_run()`
+caller against this table. No direct conversation worker may silently remain
+unkeyed, and no overlapping auxiliary helper may accidentally acquire its
+owner's key.
 
 If worker registration fails, existing reservation/active-run cleanup releases
 the key on every error path. Cancellation, normal completion, and exceptions
@@ -236,9 +259,9 @@ presentation/activity routing only. Attempts to change
 key changes from physical `session_id` to `execution_lineage_key`; no second
 queue is introduced.
 
-Each entry gains `target_session_id`. Existing fields such as `process_id`,
-`wakeup_prompt`, `async_delegation_id`, and `completion_event` keep their current
-meaning.
+Each entry gains `target_session_id` and normalized `target_profile`. Existing
+fields such as `process_id`, `wakeup_prompt`, `async_delegation_id`, and
+`completion_event` keep their current meaning.
 
 Recording, peeking, claiming, and re-deferring all use the shared lineage
 resolver. When recording against a lineage that is already bound or active,
@@ -255,20 +278,21 @@ Draining keeps the current one-prompt-per-turn rule:
 1. If any reservation or active run owns the lineage, leave the bucket intact.
 2. Atomically claim the bucket under `DEFERRED_PROCESS_WAKEUPS_LOCK`.
 3. Re-defer entries two through N before starting entry one.
-4. Start entry one on its retained `target_session_id`, not on the session whose
-   teardown happened to trigger the drain.
+4. Start entry one on its retained `target_session_id` with an
+   `expected_profile` check, not on the session whose teardown happened to
+   trigger the drain. A missing/mismatched target profile fails closed and
+   requeues the entry rather than routing it through the active profile.
 5. A 409 or maintenance fence re-records the same entry under the same lineage
    key, preserving current at-least-once retry and exactly-one-claim behavior.
 
 The durable async-delegation SQLite state machine is not replaced or migrated.
 Its wakeup start also passes through execution-lineage admission, so it cannot
-create a concurrent alias run. The post-run hook may invoke its existing
-exact-session dispatcher for the current physical session and execution root;
-no schema expansion is needed. Indexing that durable store by every historical
+create a concurrent alias run. Indexing that durable store by every historical
 tool segment is a separate durability enhancement. This design's lineage-wide
 claim/drain guarantee applies to `DEFERRED_PROCESS_WAKEUPS`, the queue involved
 in the reproduced incident; durable delegation is covered here only by the
-authoritative no-concurrent-start gate.
+authoritative no-concurrent-start gate and retains its existing exact-session
+runtime retry plus startup replay.
 
 ## Parent teardown order
 
@@ -281,11 +305,13 @@ The order is:
 2. For a tool-limit terminal, create or update the durable child receipt but do
    not launch the child while the parent owns the lineage.
 3. Remove the parent stream and call `unregister_active_run()`.
-4. Preserve the existing goal-continuation recovery hook.
-5. Retry claimed tool-limit receipts for this execution root through the
-   existing `recover_pending_continuations()` mechanism.
-6. Drain the existing process-local deferred bucket for the lineage and retain
-   the durable delegation store's current exact-session retry behavior.
+4. Retry claimed tool-limit receipts filtered to this execution root through
+   the existing `recover_pending_continuations()` mechanism.
+5. Preserve the existing goal-continuation recovery hook. Tool-limit recovery
+   has priority because it continues the turn that just exhausted its tool
+   budget; the admission gate keeps a still-pending goal continuation durable.
+6. Drain the existing process-local deferred bucket for the lineage. The
+   durable delegation store retains its current exact-session retry behavior.
 
 If the tool child starts, its bound reservation makes step 6 a no-op. When that
 child later unregisters, the same helper runs again; no tool receipt remains
@@ -328,6 +354,10 @@ from validated profile/session metadata before every recovered start.
 - **Lock ordering:** never perform profile resolution, state-db reads, sidecar
   I/O, receipt I/O, thread creation, or network work while holding
   `ACTIVE_RUNS_LOCK`.
+- **No lock nesting:** compute lineage before either registry lock; compare and
+  bind under `ACTIVE_RUNS_LOCK`; release it before touching
+  `DEFERRED_PROCESS_WAKEUPS_LOCK`, a receipt lock, or the delegation-store lock.
+  Queue operations never call the resolver while holding the queue lock.
 
 ## State ownership
 
@@ -346,7 +376,8 @@ from validated profile/session metadata before every recovered start.
 Implementation and review must cover:
 
 - entry source: browser, process wakeup, goal continuation, tool-limit
-  continuation, and durable async delegation;
+  continuation, `/btw`, ordinary background agent, manual compression, and
+  durable async-delegation admission (not lineage-wide durable-store draining);
 - backend: native and Gateway-backed local workers;
 - ownership phase: unbound reservation, bound reservation, active run,
   unregistering run, and idle lineage;
@@ -384,12 +415,16 @@ Neighboring coverage:
 - equal physical IDs in two profile databases remain independent;
 - conflicting tool root fields and ambiguous/degraded compression resolution
   fail before mutation;
+- missing or conflicting durable tool receipts fail before admission;
 - failed child start leaves its receipt claimed;
 - a wakeup 409 requeues the same physical target;
+- deferred dispatch validates the retained target profile and cannot fall back
+  to another profile;
 - multiple deferred items preserve order and start one per teardown;
 - native and Gateway teardown both call the shared ordering helper;
 - auxiliary/finalizer reservations may overlap a keyed turn without collision;
-- lifecycle health does not expose the key or its source path/root values;
+- all health, admission, checkpoint, and logging projections either whitelist
+  safe fields or remove the key and its source path/root values;
 - success, exception, cancellation, and registration failure release ownership;
 - existing release-fence and wakeup race suites remain green.
 
@@ -432,7 +467,8 @@ frontend, and tests. They are not evidence for, or part of, this fix.
 
 The change is complete when one execution lineage can never have more than one
 bound reservation or active run; the reproduced tool-child/ancestor-wakeup race
-has exactly one winner; losing work remains durable and later runs once; native
-and Gateway lifecycles share the same order; compression, forks, and profiles
-behave as specified; and no new scheduler, lock family, queue, schema, or UI
-state was introduced.
+has exactly one winner; the losing generic wakeup remains in its existing
+process-local queue and later runs once while durable tool receipts retain
+their existing restart semantics; native and Gateway lifecycles share the same
+order; compression, forks, and profiles behave as specified; and no new
+scheduler, lock family, queue, schema, or UI state was introduced.
