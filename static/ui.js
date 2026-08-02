@@ -5094,7 +5094,7 @@ function _populateToolsetsDropdown() {
   const applyBtn = $('toolsetsApplyBtn');
   const clearBtn = $('toolsetsClearBtn');
   if (!desc || !state || !input) return;
-  desc.textContent = t('session_toolsets_desc');
+  desc.textContent = t('session_toolsets_additions_desc');
   if (applyBtn) applyBtn.textContent = t('session_toolsets_apply');
   if (clearBtn) clearBtn.textContent = t('session_toolsets_clear');
   input.placeholder = t('session_toolsets_placeholder');
@@ -5217,12 +5217,12 @@ document.addEventListener('click', function(e) {
     if (!input) return;
     const raw = input.value.trim();
     if (!raw) {
-      showToast(t('session_toolsets_desc'), 2000);
+      showToast(t('session_toolsets_additions_desc'), 2000);
       return;
     }
     const toolsets = raw.split(',').map(s => s.trim()).filter(Boolean);
     if (toolsets.length === 0) {
-      showToast(t('session_toolsets_desc'), 2000);
+      showToast(t('session_toolsets_additions_desc'), 2000);
       return;
     }
     _applySessionToolsets(toolsets);

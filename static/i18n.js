@@ -412,6 +412,7 @@ const LOCALES = {
     // Session toolsets (#493)
     session_toolsets:'Session Toolsets',
     session_toolsets_desc:'Use active profile defaults or choose a custom toolset list for this session',
+    session_toolsets_additions_desc:'Profile defaults stay enabled. Add configured MCP servers or other optional toolsets for this session.',
     session_toolsets_global:'Active profile defaults',
     session_toolsets_profile_defaults:'Active profile defaults',
     session_toolsets_custom:'Custom override',

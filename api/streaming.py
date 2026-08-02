@@ -9008,11 +9008,14 @@ def _run_agent_streaming(
 
             # Per-profile toolsets — use _resolve_cli_toolsets() so MCP
             # server toolsets are included, matching native CLI behaviour.
-            from api.config import _resolve_cli_toolsets
+            from api.config import _merge_session_toolsets, _resolve_cli_toolsets
             _toolsets = _resolve_cli_toolsets(_cfg)
 
-            # Per-session toolset override (#493): if the session has
-            # enabled_toolsets set, use that instead of the global config.
+            # Per-session toolset additions (#493): preserve the profile's
+            # base capability/security policy and add session-selected tools.
+            # The picker exposes configured MCP servers, so replacing the base
+            # list here would silently strip file/terminal for selections such
+            # as ["gitnexus"].
             try:
                 from api.models import Session, SESSION_DIR
                 _session_path = SESSION_DIR / f"{session_id}.json"
@@ -9026,7 +9029,7 @@ def _run_agent_streaming(
                     # (Opus pre-release advisor finding for v0.50.257.)
                     _override = getattr(_session_meta, 'enabled_toolsets', None) if _session_meta else None
                     if _override:
-                        _toolsets = _override
+                        _toolsets = _merge_session_toolsets(_toolsets, _override)
             except Exception as _ts_err:
                 print(f"[webui] WARNING: failed to read per-session toolsets for {session_id}: {_ts_err}", flush=True)
 

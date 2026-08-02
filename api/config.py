@@ -1148,6 +1148,21 @@ def _normalize_cli_toolsets(toolsets):
     return normalized
 
 
+def _merge_session_toolsets(profile_toolsets, session_toolsets):
+    """Add session capabilities without replacing the profile's tool surface.
+
+    The WebUI picker lists configured MCP servers. Treating that selection as
+    an absolute allowlist silently removed ``file`` and ``terminal`` when a
+    user selected one server such as ``gitnexus``. Profile defaults remain the
+    authority for the base capability/security policy; session choices are
+    ordered additions on top of that base.
+    """
+    return _normalize_cli_toolsets([
+        *(profile_toolsets or []),
+        *(session_toolsets or []),
+    ])
+
+
 def _resolve_cli_toolsets(cfg=None, *, strict: bool = False):
     """Resolve CLI toolsets using the agent's _get_platform_tools() so that
     MCP server toolsets are automatically included, matching CLI behaviour."""

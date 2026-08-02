@@ -16288,10 +16288,10 @@ def handle_post(handler, parsed) -> bool:
         return j(handler, {"ok": True, "personality": s.personality, "prompt": prompt})
 
     if parsed.path == "/api/session/toolsets":
-        """Set or clear per-session toolset override (#493).
+        """Set or clear per-session toolset additions (#493).
 
         POST body: { session_id, toolsets: [...] | null }
-        - toolsets: list of toolset names to restrict the session to, or null to clear.
+        - toolsets: names added to active profile defaults, or null to clear.
         """
         try:
             require(body, "session_id")
