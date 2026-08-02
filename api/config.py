@@ -1148,8 +1148,40 @@ def _normalize_cli_toolsets(toolsets):
     return normalized
 
 
-def _merge_session_toolsets(profile_toolsets, session_toolsets):
-    """Add session capabilities without replacing the profile's tool surface.
+def _configured_session_toolsets(cfg=None):
+    """Return enabled, valid MCP server names that sessions may add.
+
+    Session selections are optional MCP capabilities, not a second way to
+    request arbitrary core toolsets. Keeping this allowlist derived from the
+    trusted profile configuration prevents a client from adding a capability
+    that the profile intentionally omitted (for example, ``terminal``).
+    """
+    if cfg is None:
+        cfg = get_config()
+    servers = cfg.get("mcp_servers", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(servers, dict):
+        return set()
+    allowed = set()
+    for raw_name, server_cfg in servers.items():
+        name = str(raw_name or "").strip()
+        if not name or not isinstance(server_cfg, dict):
+            continue
+        enabled = server_cfg.get("enabled", True)
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() not in {"0", "false", "no", "off"}
+        if not enabled or not (server_cfg.get("url") or server_cfg.get("command")):
+            continue
+        allowed.add(name)
+    return allowed
+
+
+def _merge_session_toolsets(
+    profile_toolsets,
+    session_toolsets,
+    *,
+    allowed_session_toolsets=None,
+):
+    """Add permitted session capabilities without replacing profile tools.
 
     The WebUI picker lists configured MCP servers. Treating that selection as
     an absolute allowlist silently removed ``file`` and ``terminal`` when a
@@ -1157,9 +1189,13 @@ def _merge_session_toolsets(profile_toolsets, session_toolsets):
     authority for the base capability/security policy; session choices are
     ordered additions on top of that base.
     """
+    additions = session_toolsets or []
+    if allowed_session_toolsets is not None:
+        allowed = {str(name).strip() for name in allowed_session_toolsets if name}
+        additions = [name for name in additions if name in allowed]
     return _normalize_cli_toolsets([
         *(profile_toolsets or []),
-        *(session_toolsets or []),
+        *additions,
     ])
 
 

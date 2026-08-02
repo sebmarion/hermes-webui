@@ -3292,6 +3292,7 @@ from api.config import (
     CANCEL_FLAGS,
     STREAM_LAST_EVENT_ID,
     SERVER_START_TIME,
+    _configured_session_toolsets,
     _resolve_cli_toolsets,
     get_available_models,
     get_available_models_for_session_visit,
@@ -15483,7 +15484,7 @@ def _require_passkey_registration_auth(handler) -> tuple[bool, str, int]:
     return True, "", 200
 
 def _validate_session_toolsets_shape(toolsets):
-    """Validate per-session toolset override shape without catalog lookup."""
+    """Validate the shape of per-session toolset additions."""
     if toolsets is None:
         return None
     if not isinstance(toolsets, list) or not toolsets:
@@ -15492,9 +15493,26 @@ def _validate_session_toolsets_shape(toolsets):
         raise ValueError("each toolset must be a non-empty string")
     return toolsets
 
+
+def _session_toolset_allowlist(session):
+    """Resolve the trusted MCP additions for a session's profile."""
+    from api.profiles import get_hermes_home_for_profile
+
+    profile = str(getattr(session, "profile", None) or "").strip()
+    if profile:
+        try:
+            profile_home = get_hermes_home_for_profile(profile)
+        except Exception:
+            profile_home = get_active_hermes_home()
+    else:
+        profile_home = get_active_hermes_home()
+    return _configured_session_toolsets(get_config_for_profile_home(profile_home))
+
+
 def handle_post(handler, parsed) -> bool:
     """Handle all POST routes. Returns True if handled, False for 404."""
     diag = RequestDiagnostics.maybe_start("POST", parsed.path, logger=logger, print_fn=getattr(handler, '_safe_webui_print', None))
+
     if parsed.path == "/api/csp-report":
         if diag:
             diag.stage("csp_report")
@@ -16312,6 +16330,15 @@ def handle_post(handler, parsed) -> bool:
             s = get_session(sid)
         except KeyError:
             return bad(handler, "Session not found", 404)
+        if toolsets is not None:
+            allowed = _session_toolset_allowlist(s)
+            invalid = [name for name in toolsets if name not in allowed]
+            if invalid:
+                return bad(
+                    handler,
+                    "Unknown or disabled session toolset(s): " + ", ".join(invalid),
+                    400,
+                )
         with _get_session_agent_lock(sid):
             s.enabled_toolsets = toolsets
             s.save()

@@ -88,6 +88,7 @@ def test_toolsets_affordance_i18n_keys_exist_in_locale_blocks():
         "session_toolsets_configured_servers",
         "session_toolsets_loading_servers",
         "session_toolsets_no_configured_servers",
+        "session_toolsets_additions_desc",
     ]
     for key in keys:
         assert I18N_JS.count(f"{key}:") >= 8, f"missing locale entries for {key}"

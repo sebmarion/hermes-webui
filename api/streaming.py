@@ -9008,8 +9008,13 @@ def _run_agent_streaming(
 
             # Per-profile toolsets — use _resolve_cli_toolsets() so MCP
             # server toolsets are included, matching native CLI behaviour.
-            from api.config import _merge_session_toolsets, _resolve_cli_toolsets
+            from api.config import (
+                _configured_session_toolsets,
+                _merge_session_toolsets,
+                _resolve_cli_toolsets,
+            )
             _toolsets = _resolve_cli_toolsets(_cfg)
+            _allowed_session_toolsets = _configured_session_toolsets(_cfg)
 
             # Per-session toolset additions (#493): preserve the profile's
             # base capability/security policy and add session-selected tools.
@@ -9029,7 +9034,11 @@ def _run_agent_streaming(
                     # (Opus pre-release advisor finding for v0.50.257.)
                     _override = getattr(_session_meta, 'enabled_toolsets', None) if _session_meta else None
                     if _override:
-                        _toolsets = _merge_session_toolsets(_toolsets, _override)
+                        _toolsets = _merge_session_toolsets(
+                            _toolsets,
+                            _override,
+                            allowed_session_toolsets=_allowed_session_toolsets,
+                        )
             except Exception as _ts_err:
                 print(f"[webui] WARNING: failed to read per-session toolsets for {session_id}: {_ts_err}", flush=True)
 

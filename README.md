@@ -202,7 +202,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 - Retry the last assistant response with one click
 - Cancel a running task directly from the composer footer (Stop button next to Send)
 - Tool call cards inline -- each shows the tool name, args, and result snippet; expand/collapse all toggle for multi-tool turns
-- Per-session optional toolsets add configured MCP servers on top of the active profile defaults; selecting one cannot silently remove the profile's file or terminal capabilities
+- Per-session optional toolsets add enabled, configured MCP servers on top of the active profile defaults; selecting one cannot silently remove the profile's file or terminal capabilities
 - Subagent delegation cards -- child agent activity shown with distinct icon and indented border
 - Mermaid diagram rendering inline (flowcharts, sequence diagrams, gantt charts)
 - Thinking/reasoning display -- collapsible gold-themed cards for Claude extended thinking and o3 reasoning blocks
