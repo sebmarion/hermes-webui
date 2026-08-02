@@ -112,7 +112,7 @@ def test_chat_start_keeps_recovery_when_substantive_prompt_fails_validation(monk
     assert saved["compression_recovery"]["terminal_state"] == "compression_exhausted"
 
 
-def test_chat_start_clears_recovery_when_substantive_prompt_starts(monkeypatch, tmp_path):
+def test_chat_start_legacy_path_clears_recovery_without_extra_predispatch_save(monkeypatch, tmp_path):
     session_dir = _isolate_sessions(monkeypatch, tmp_path)
     sid = "recoverychat3"
     session = Session(
@@ -126,6 +126,9 @@ def test_chat_start_clears_recovery_when_substantive_prompt_starts(monkeypatch, 
     session.save()
     models.SESSIONS[sid] = session
     routes.SESSIONS[sid] = session
+    monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "legacy-direct")
+    monkeypatch.setattr("api.runtime_adapter.runtime_adapter_enabled", lambda: False)
+    monkeypatch.setattr("api.runtime_adapter.runtime_adapter_runner_enabled", lambda: False)
     monkeypatch.setattr(routes, "_resolve_chat_workspace_with_recovery", lambda *_args, **_kwargs: str(tmp_path))
     monkeypatch.setattr(routes, "_read_profile_model_config", lambda *_args, **_kwargs: (None, None, {}))
     monkeypatch.setattr(
@@ -134,9 +137,19 @@ def test_chat_start_clears_recovery_when_substantive_prompt_starts(monkeypatch, 
         lambda requested_model, requested_provider, **_kwargs: (requested_model or "gpt-4o", requested_provider or "openai", False),
     )
     monkeypatch.setattr(routes, "webui_gateway_chat_enabled", lambda _config: False)
+    original_save = Session.save
+    save_calls = []
+
+    def _tracked_save(saved_session, *args, **kwargs):
+        if saved_session is session:
+            save_calls.append(compression_recovery_payload_for_session(session))
+        return original_save(saved_session, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "save", _tracked_save)
 
     def _fake_start_run(run_session, **_kwargs):
         assert compression_recovery_payload_for_session(run_session) is None
+        assert save_calls == []
         run_session.save()
         return {"session_id": sid, "stream_id": "stream1", "_status": 200}
 
@@ -149,6 +162,7 @@ def test_chat_start_clears_recovery_when_substantive_prompt_starts(monkeypatch, 
 
     assert handler.status == 200
     assert payload["stream_id"] == "stream1"
+    assert save_calls == [None]
     assert saved["compression_recovery"] == {}
     assert saved["recommended_recovery_action"] is None
 

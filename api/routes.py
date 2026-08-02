@@ -25058,10 +25058,13 @@ def _handle_chat_start(handler, body, diag=None):
             if recovery:
                 recovery_cleared_for_start = copy.deepcopy(recovery)
                 clear_compression_recovery(s)
-                # Runner-owned starts do not persist the WebUI sidecar. Publish
-                # the clear before dispatch; every rejected/error path below
-                # restores this exact recovery payload durably.
-                s.save()
+                from api.runtime_adapter import runtime_adapter_runner_enabled
+
+                if runtime_adapter_runner_enabled():
+                    # Runner-owned starts do not persist the WebUI sidecar.
+                    # Legacy starts publish the clear with pending-turn
+                    # ownership inside their existing start transaction.
+                    s.save()
             response = _start_run(
                 s,
                 **start_run_kwargs,
