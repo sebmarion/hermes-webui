@@ -153,6 +153,65 @@ def test_chat_start_clears_recovery_when_substantive_prompt_starts(monkeypatch, 
     assert saved["recommended_recovery_action"] is None
 
 
+def test_chat_start_persists_recovery_clear_before_runner_local_accepts(monkeypatch, tmp_path):
+    _isolate_sessions(monkeypatch, tmp_path)
+    sid = "recoveryrunner1"
+    session = Session(
+        session_id=sid,
+        title="Recovery",
+        workspace=str(tmp_path),
+        model="gpt-4o",
+        messages=[{"role": "user", "content": "long task"}],
+    )
+    stamp_compression_exhausted_recovery(session, message="Context length exceeded.")
+    session.save()
+    models.SESSIONS[sid] = session
+    routes.SESSIONS[sid] = session
+    monkeypatch.setattr(routes, "_resolve_chat_workspace_with_recovery", lambda *_args, **_kwargs: str(tmp_path))
+    monkeypatch.setattr(routes, "_read_profile_model_config", lambda *_args, **_kwargs: (None, None, {}))
+    monkeypatch.setattr(
+        routes,
+        "_resolve_compatible_session_model_state",
+        lambda requested_model, requested_provider, **_kwargs: (requested_model or "gpt-4o", requested_provider or "openai", False),
+    )
+    monkeypatch.setattr(routes, "webui_gateway_chat_enabled", lambda _config: False)
+    monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "runner-local")
+    monkeypatch.setattr("api.runtime_adapter.runtime_adapter_enabled", lambda: False)
+    monkeypatch.setattr("api.runtime_adapter.runtime_adapter_runner_enabled", lambda: True)
+
+    persisted_recovery_at_dispatch = []
+
+    class _RunnerClient:
+        def start_run(self, request):
+            persisted = Session.load(sid)
+            persisted_recovery_at_dispatch.append(persisted.compression_recovery)
+            return {
+                "run_id": "runner-run-1",
+                "stream_id": "runner-stream-1",
+                "session_id": request.session_id,
+                "status": "started",
+            }
+
+    monkeypatch.setattr(routes, "_runtime_runner_client_factory", lambda: _RunnerClient())
+    monkeypatch.setattr(
+        routes,
+        "_start_chat_stream_for_session",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("runner-local start entered the WebUI local stream path")
+        ),
+    )
+
+    handler = _JSONHandler()
+    routes._handle_chat_start(handler, {"session_id": sid, "message": "continue by checking the repo"})
+    reloaded = Session.load(sid)
+
+    assert handler.status == 200
+    assert _payload(handler)["stream_id"] == "runner-stream-1"
+    assert persisted_recovery_at_dispatch == [{}]
+    assert reloaded.compression_recovery == {}
+    assert reloaded.recommended_recovery_action is None
+
+
 def test_chat_start_restores_recovery_when_substantive_prompt_start_is_rejected(monkeypatch, tmp_path):
     session_dir = _isolate_sessions(monkeypatch, tmp_path)
     sid = "recoverychat4"
@@ -165,6 +224,7 @@ def test_chat_start_restores_recovery_when_substantive_prompt_start_is_rejected(
     )
     stamp_compression_exhausted_recovery(session, message="Context length exceeded.")
     session.save()
+    expected_recovery = json.loads(json.dumps(session.compression_recovery))
     models.SESSIONS[sid] = session
     routes.SESSIONS[sid] = session
     monkeypatch.setattr(routes, "_resolve_chat_workspace_with_recovery", lambda *_args, **_kwargs: str(tmp_path))
@@ -188,6 +248,7 @@ def test_chat_start_restores_recovery_when_substantive_prompt_start_is_rejected(
     saved = json.loads((session_dir / f"{sid}.json").read_text(encoding="utf-8"))
 
     assert handler.status == 409
+    assert saved["compression_recovery"] == expected_recovery
     assert saved["recommended_recovery_action"] == "reduce_current_request"
     assert saved["compression_recovery"]["terminal_state"] == "compression_exhausted"
 

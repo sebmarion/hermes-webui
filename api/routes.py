@@ -25054,10 +25054,14 @@ def _handle_chat_start(handler, body, diag=None):
                 return restore_err
             return None
 
-        if recovery:
-            recovery_cleared_for_start = copy.deepcopy(recovery)
-            clear_compression_recovery(s)
         try:
+            if recovery:
+                recovery_cleared_for_start = copy.deepcopy(recovery)
+                clear_compression_recovery(s)
+                # Runner-owned starts do not persist the WebUI sidecar. Publish
+                # the clear before dispatch; every rejected/error path below
+                # restores this exact recovery payload durably.
+                s.save()
             response = _start_run(
                 s,
                 **start_run_kwargs,
