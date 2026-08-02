@@ -3054,6 +3054,42 @@ def test_process_completion_recovery_runs_once_inside_signed_accept(
     assert calls == ["checkpoint", "recover"]
 
 
+def test_missing_process_registry_is_fail_soft_only_for_unmanaged_startup(monkeypatch):
+    import server
+
+    real_import = __import__
+
+    def import_without_process_registry(name, *args, **kwargs):
+        if name == "tools.process_registry":
+            raise ImportError("Hermes Agent not installed")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", import_without_process_registry)
+    monkeypatch.setattr(
+        server.api_config,
+        "startup_run_admission_is_closed",
+        lambda: False,
+    )
+
+    assert server._recover_process_completion_notifications() == {
+        "status": "unavailable",
+        "recovered": 0,
+        "recovered_processes": 0,
+        "recovered_notifications": 0,
+    }
+
+    monkeypatch.setattr(
+        server.api_config,
+        "startup_run_admission_is_closed",
+        lambda: True,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="paired Agent lacks durable process checkpoint recovery",
+    ):
+        server._recover_process_completion_notifications()
+
+
 def test_async_delegation_recovery_runs_once_inside_signed_accept(
     monkeypatch,
     isolated_startup_admission,
