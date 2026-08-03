@@ -4,6 +4,7 @@ State-extraction prelude to the routes.py split tracked in #1907.
 Extracts approval state, not handlers, by design.
 """
 import queue
+import sys
 import threading
 import uuid
 
@@ -11,22 +12,25 @@ from api.session_events import publish_session_list_changed
 
 # Approval system (optional -- graceful fallback if agent not available)
 try:
-    from tools.approval import (
-        submit_pending as _submit_pending_raw,
-        approve_session,
-        approve_permanent,
-        save_permanent_allowlist,
-        is_approved,
-        _pending,
-        _lock,
-        _permanent_approved,
-        _gateway_queues,
-        resolve_gateway_approval,
-        enable_session_yolo,
-        disable_session_yolo,
-        is_session_yolo_enabled,
-    )
+    import tools.approval as _approval_module
 except ImportError:
+    _approval_module = None
+
+if _approval_module is not None:
+    _submit_pending_raw = getattr(_approval_module, "submit_pending", lambda *a, **k: None)
+    approve_session = getattr(_approval_module, "approve_session", lambda *a, **k: None)
+    approve_permanent = getattr(_approval_module, "approve_permanent", lambda *a, **k: None)
+    save_permanent_allowlist = getattr(_approval_module, "save_permanent_allowlist", lambda *a, **k: None)
+    is_approved = getattr(_approval_module, "is_approved", lambda *a, **k: True)
+    _pending = getattr(_approval_module, "_pending", {})
+    _lock = getattr(_approval_module, "_lock", threading.Lock())
+    _permanent_approved = getattr(_approval_module, "_permanent_approved", set())
+    _gateway_queues = getattr(_approval_module, "_gateway_queues", {})
+    resolve_gateway_approval = getattr(_approval_module, "resolve_gateway_approval", lambda *a, **k: 0)
+    enable_session_yolo = getattr(_approval_module, "enable_session_yolo", lambda *a, **k: None)
+    disable_session_yolo = getattr(_approval_module, "disable_session_yolo", lambda *a, **k: None)
+    is_session_yolo_enabled = getattr(_approval_module, "is_session_yolo_enabled", lambda *a, **k: False)
+else:
     _submit_pending_raw = lambda *a, **k: None
     approve_session = lambda *a, **k: None
     approve_permanent = lambda *a, **k: None
@@ -40,6 +44,56 @@ except ImportError:
     _lock = threading.Lock()
     _permanent_approved = set()
     _gateway_queues = {}
+
+
+def _refresh_optional_approval_backend() -> None:
+    """Attach a late-installed tools.approval module without losing shared state."""
+    global _approval_module, _submit_pending_raw, approve_session, approve_permanent
+    global save_permanent_allowlist, is_approved, _pending, _lock, _permanent_approved
+    global _gateway_queues, resolve_gateway_approval, enable_session_yolo
+    global disable_session_yolo, is_session_yolo_enabled
+    if _approval_module is not None:
+        return
+    try:
+        import tools.approval as module
+    except ImportError:
+        return
+    old_pending, old_gateway_queues = _pending, _gateway_queues
+    _approval_module = module
+    _submit_pending_raw = getattr(module, "submit_pending", _submit_pending_raw)
+    approve_session = getattr(module, "approve_session", approve_session)
+    approve_permanent = getattr(module, "approve_permanent", approve_permanent)
+    save_permanent_allowlist = getattr(module, "save_permanent_allowlist", save_permanent_allowlist)
+    is_approved = getattr(module, "is_approved", is_approved)
+    _pending = getattr(module, "_pending", _pending)
+    _lock = getattr(module, "_lock", _lock)
+    _permanent_approved = getattr(module, "_permanent_approved", _permanent_approved)
+    _gateway_queues = getattr(module, "_gateway_queues", _gateway_queues)
+    resolve_gateway_approval = getattr(module, "resolve_gateway_approval", resolve_gateway_approval)
+    enable_session_yolo = getattr(module, "enable_session_yolo", enable_session_yolo)
+    disable_session_yolo = getattr(module, "disable_session_yolo", disable_session_yolo)
+    is_session_yolo_enabled = getattr(module, "is_session_yolo_enabled", is_session_yolo_enabled)
+    for key, value in old_pending.items():
+        _pending.setdefault(key, value)
+    for key, value in old_gateway_queues.items():
+        _gateway_queues.setdefault(key, value)
+    routes_module = sys.modules.get("api.routes")
+    if routes_module is not None:
+        routes_module._pending = _pending
+        routes_module._lock = _lock
+        routes_module._gateway_queues = _gateway_queues
+        for name in (
+            "_submit_pending_raw",
+            "approve_session",
+            "approve_permanent",
+            "save_permanent_allowlist",
+            "is_approved",
+            "resolve_gateway_approval",
+            "enable_session_yolo",
+            "disable_session_yolo",
+            "is_session_yolo_enabled",
+        ):
+            setattr(routes_module, name, globals()[name])
 
 
 # ── Approval SSE subscribers (long-connection push) ──────────────────────────
@@ -420,6 +474,7 @@ def _gateway_mirrored_pending_run_id(session_key: str, approval_id: str) -> str 
 
 def submit_gateway_pending_mirror(session_key: str, approval: dict) -> tuple[dict | None, int]:
     """Mirror the live gateway head into WebUI polling state under a typed tag."""
+    _refresh_optional_approval_backend()
     with _lock:
         run_id = str(approval.get("run_id") or "").strip()
         approval_id = str(approval.get("approval_id") or "").strip()

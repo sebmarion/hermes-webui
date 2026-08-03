@@ -122,6 +122,10 @@ class ListenerAbsent(DrainIdentityMismatch):
     """No process currently owns the probed listener."""
 
 
+class LaunchdAbsenceTransient(DrainIdentityMismatch):
+    """launchd has not finished publishing a post-bootout service state."""
+
+
 class ListenerProbeAmbiguous(ReleaseBuildError):
     """The listener owner could not be determined unambiguously."""
 
@@ -6032,7 +6036,13 @@ def _bootstrap_launchd_job_with_retry(
             }
         if completed.returncode != 5:
             raise ReleaseBuildError("launchd cutover command failed")
-        _require_launchd_job_absent(plan, gateway=gateway)
+        # launchd tears a booted-out job down asynchronously.  A bootstrap
+        # can therefore return its transient I/O error while ``print`` still
+        # reports the old service (or while the absence response is still
+        # settling).  Probe the exact, expected absent receipt for a bounded
+        # window before retrying.  We remain fail-closed: a service that does
+        # not become unambiguously absent still aborts the cutover.
+        _wait_for_launchd_job_absent(plan, gateway=gateway)
         if attempt == 20:
             raise ReleaseBuildError(
                 "launchd cutover command failed after teardown retry"
@@ -6068,6 +6078,10 @@ def _require_launchd_job_absent(
         or completed.stdout != ""
         or completed.stderr != expected_stderr
     ):
+        if completed.returncode == 5:
+            raise LaunchdAbsenceTransient(
+                "launchd service database is still settling"
+            )
         raise DrainIdentityMismatch(
             "launchd job absence probe is ambiguous"
         )
@@ -6076,6 +6090,38 @@ def _require_launchd_job_absent(
         "target": target,
         "returncode": completed.returncode,
     }
+
+
+def _wait_for_launchd_job_absent(
+    plan: dict,
+    *,
+    gateway: bool,
+    timeout_seconds: float = 5.0,
+    interval_seconds: float = 0.1,
+) -> dict:
+    """Wait for launchd to publish an exact absent receipt after bootout.
+
+    ``launchctl bootstrap`` may report its transient code 5 before the
+    service database has finished removing the old instance.  Treating the
+    first non-absent probe as permanent ambiguity turns that normal teardown
+    race into an unnecessary failed rollback.  This helper only retries the
+    read; it never accepts a loaded or malformed response as absent.
+    """
+    if timeout_seconds <= 0 or interval_seconds <= 0:
+        raise ValueError("launchd absence timing values are invalid")
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+    while True:
+        try:
+            return _require_launchd_job_absent(plan, gateway=gateway)
+        except LaunchdAbsenceTransient as exc:
+            last_error = exc
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(min(interval_seconds, max(0.0, deadline - time.monotonic())))
+    raise DrainIdentityMismatch(
+        f"launchd job absence probe did not settle: {last_error}"
+    )
 
 
 def _ps_value(pid: int, field: str) -> str:
@@ -8860,6 +8906,8 @@ def _run_release_commit_plan_core(
         )
         gateway_drained = current["phases"].get("gateway_drained")
         if not isinstance(gateway_drained, dict):
+            gateway_drained = _prepare_legacy_gateway_drain(plan)
+        if not isinstance(gateway_drained, dict):
             raise ReleaseBuildError(
                 "legacy gateway drain must be durably proved before checkpoint"
             )
@@ -9063,6 +9111,94 @@ def _run_release_commit_plan(
     return result
 
 
+def _prepare_legacy_gateway_drain(plan: dict) -> dict:
+    """Persist the legacy gateway drain proof before paired WebUI checkpointing."""
+    journal = read_transaction_journal(
+        plan["transaction_journal"],
+        transaction_id=plan["transaction_id"],
+    )
+    phases = journal["phases"]
+
+    def record(phase: str, receipt: dict) -> None:
+        nonlocal journal, phases
+        if phase in phases:
+            return
+        journal = record_transaction_phase(
+            plan["transaction_journal"],
+            transaction_id=plan["transaction_id"],
+            phase=phase,
+            receipt=receipt,
+        )
+        phases = journal["phases"]
+
+    drained = phases.get("gateway_drained")
+    if isinstance(drained, dict):
+        return drained
+
+    last_good_binding = phases.get("gateway_last_good_attested", {}).get(
+        "binding"
+    )
+    if not isinstance(last_good_binding, dict):
+        raise ReleaseBuildError("candidate gateway has no last-good receipt")
+    if "gateway_drain_intent" not in phases:
+        last_good_gateway = _attest_managed_gateway_binding(
+            plan,
+            plan["last_good_gateway_identity"],
+        )
+        durable_runtime = last_good_binding.get("runtime")
+        if (
+            not isinstance(durable_runtime, dict)
+            or not _runtime_receipt_matches(
+                last_good_gateway["runtime"], durable_runtime
+            )
+            or last_good_gateway.get("listener_pid")
+            != last_good_binding.get("listener_pid")
+            or last_good_gateway.get("pid_start_token")
+            != last_good_binding.get("pid_start_token")
+        ):
+            raise DrainIdentityMismatch(
+                "last-good gateway changed before durable drain intent"
+            )
+        prepared = {
+            "gateway": {
+                "pid": int(last_good_gateway["listener_pid"]),
+                "pid_start_token": str(last_good_gateway["pid_start_token"]),
+            }
+        }
+        record(
+            "gateway_drain_intent",
+            {
+                "prepared": prepared,
+                "intent": _legacy_gateway_drain_intent_receipt(
+                    plan,
+                    prepared,
+                ),
+                "last_good_binding_sha256": (
+                    _canonical_journal_value_sha256(last_good_binding)
+                ),
+            },
+        )
+    drain_phase = phases["gateway_drain_intent"]
+    prepared = drain_phase.get("prepared")
+    drain_intent = drain_phase.get("intent")
+    if not isinstance(prepared, dict) or not isinstance(drain_intent, dict):
+        raise ReleaseBuildError("durable gateway drain intent is invalid")
+    if "gateway_drained" not in phases:
+        _write_legacy_gateway_drain_marker(plan, drain_intent)
+        record(
+            "gateway_drained",
+            _wait_for_legacy_gateway_drain(
+                plan,
+                prepared,
+                drain_intent,
+            ),
+        )
+    drained = phases.get("gateway_drained")
+    if not isinstance(drained, dict):
+        raise ReleaseBuildError("legacy gateway drain receipt is invalid")
+    return drained
+
+
 def _complete_candidate_gateway_transition(plan: dict, result: dict) -> dict:
     """Finish or adopt the durable candidate-gateway half of a release."""
     journal = read_transaction_journal(
@@ -9146,65 +9282,15 @@ def _complete_candidate_gateway_transition(plan: dict, result: dict) -> dict:
             record(cutover_phase, adopted)
 
     if "gateway_gracefully_stopped" not in phases:
-        last_good_binding = (
-            phases.get("gateway_last_good_attested", {}).get("binding")
+        _prepare_legacy_gateway_drain(plan)
+        journal = read_transaction_journal(
+            plan["transaction_journal"],
+            transaction_id=plan["transaction_id"],
         )
-        if not isinstance(last_good_binding, dict):
-            raise ReleaseBuildError("candidate gateway has no last-good receipt")
-        if "gateway_drain_intent" not in phases:
-            last_good_gateway = _attest_managed_gateway_binding(
-                plan,
-                plan["last_good_gateway_identity"],
-            )
-            durable_runtime = last_good_binding.get("runtime")
-            if (
-                not isinstance(durable_runtime, dict)
-                or not _runtime_receipt_matches(
-                    last_good_gateway["runtime"], durable_runtime
-                )
-                or last_good_gateway.get("listener_pid")
-                != last_good_binding.get("listener_pid")
-                or last_good_gateway.get("pid_start_token")
-                != last_good_binding.get("pid_start_token")
-            ):
-                raise DrainIdentityMismatch(
-                    "last-good gateway changed before durable drain intent"
-                )
-            prepared = {
-                "gateway": {
-                    "pid": int(last_good_gateway["listener_pid"]),
-                    "pid_start_token": str(last_good_gateway["pid_start_token"]),
-                }
-            }
-            record(
-                "gateway_drain_intent",
-                {
-                    "prepared": prepared,
-                    "intent": _legacy_gateway_drain_intent_receipt(
-                        plan,
-                        prepared,
-                    ),
-                    "last_good_binding_sha256": (
-                        _canonical_journal_value_sha256(last_good_binding)
-                    ),
-                },
-            )
-        drain_phase = phases["gateway_drain_intent"]
-        prepared = drain_phase.get("prepared")
-        drain_intent = drain_phase.get("intent")
-        if not isinstance(prepared, dict) or not isinstance(drain_intent, dict):
-            raise ReleaseBuildError("durable gateway drain intent is invalid")
-        if "gateway_drained" not in phases:
-            _write_legacy_gateway_drain_marker(plan, drain_intent)
-            record(
-                "gateway_drained",
-                _wait_for_legacy_gateway_drain(
-                    plan,
-                    prepared,
-                    drain_intent,
-                ),
-            )
+        phases = journal["phases"]
         if "gateway_stop_intent" not in phases:
+            drain_phase = phases["gateway_drain_intent"]
+            prepared = drain_phase.get("prepared")
             record(
                 "gateway_stop_intent",
                 {

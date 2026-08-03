@@ -6,7 +6,7 @@ must treat every status other than ``present`` as ineligible for a fast path.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 import os
@@ -78,7 +78,9 @@ class SidecarMetadataProof:
     stat_signature: SidecarStatSignature | None = None
     sidecar_generation: int | None = None
     truncation_watermark: int | float | None = None
-    route_metadata: Mapping[str, Any] = MappingProxyType({})
+    route_metadata: Mapping[str, Any] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
 
 @dataclass(frozen=True)

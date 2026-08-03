@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+from api.process_event_utils import completion_delivery_id
 
 from api.config import (
     get_config,
@@ -597,6 +598,48 @@ def _is_fallback_lifecycle_message(kind: str, message: str) -> bool:
             or 'fallback activated' in m
             or 'trying fallback' in m
         )
+    )
+
+
+def _is_agent_compression_start_status(kind: str, message: str) -> bool:
+    """Return True only for real Hermes context-compression start notices.
+
+    WebUI bridges matching lifecycle statuses into an SSE ``compressing`` event
+    and paints the live "Compressing context" worklog divider. The previous
+    matcher used broad substrings such as ``'compressing' in message`` and
+    ``'preflight compression' in message``, which can false-positive on skip /
+    cooldown / unrelated notices and make brand-new low-token turns look like
+    auto-compression.
+
+    Positive markers below match the agent emitters in hermes-agent
+    (``turn_context`` preflight, ``conversation_loop`` pre-API / 413 / too-large,
+    ``conversation_compression`` compaction status). Explicitly reject skip /
+    defer notices so "Skipping preflight compression…" never surfaces as a
+    running compress divider.
+    """
+    k = str(kind or '').strip().lower()
+    m = str(message or '').strip().lower()
+    if k != 'lifecycle' or not m:
+        return False
+    # Skip / cooldown / defer logs must never look like a live compression start.
+    if (
+        'skipping' in m
+        or 'defer' in m
+        or 'cooldown' in m
+        or 'will not start' in m
+    ):
+        return False
+    # Post-compress retry chatter is not a start event.
+    if 'compressed' in m and 'compressing' not in m and 'compression attempt' not in m:
+        return False
+    return (
+        'preflight compression:' in m
+        or 'pre-api compression:' in m
+        or 'compacting context' in m
+        or 'context too large' in m
+        or '— compressing (' in m
+        or '- compressing (' in m
+        or 'compression attempt' in m
     )
 
 
@@ -2466,6 +2509,12 @@ def _format_process_notification(evt: dict) -> str:
     """Format a completed background process notification for agent input."""
     if not isinstance(evt, dict):
         return ''
+    if evt.get('type') == 'async_delegation':
+        try:
+            from tools.process_registry import format_process_notification
+            return str(format_process_notification(evt) or '')
+        except Exception:
+            return ''
     if evt.get('type') != 'completion':
         return ''
     _sid = evt.get('session_id', '')
@@ -2557,7 +2606,8 @@ def _validated_process_completion_events(
         if event_type == "completion":
             event_id = str(event.get("event_id") or "").strip()
         elif event_type == "async_delegation":
-            event_id = str(event.get("delegation_id") or "").strip()
+            from api.process_event_utils import completion_delivery_id
+            event_id = completion_delivery_id(event)
         else:
             continue
         event_owner = str(event.get("session_key") or "").strip()
@@ -2590,10 +2640,41 @@ def _finalize_process_completion_claims(
     return all_finished
 
 
+def _accept_pending_async_delegations(
+    pending: list[tuple[dict, object, str, object]],
+    *,
+    session_id: str,
+) -> list[str]:
+    """Complete claimed async events after the turn accepts their writeback."""
+    from api.process_event_utils import (
+        complete_async_delegation_delivery,
+        release_async_delegation_delivery,
+        requeue_async_delegation_event,
+    )
+
+    rejected: list[str] = []
+    for event, claim, notification, completion_queue in pending:
+        try:
+            complete_async_delegation_delivery(event, claim)
+        except Exception:
+            release_async_delegation_delivery(event, claim)
+            if not requeue_async_delegation_event(event, completion_queue):
+                from api.process_event_utils import (
+                    ASYNC_DELIVERY_ROUTING_RETRY_SECONDS,
+                    _arm_async_delegation_restore_sweep,
+                )
+                _arm_async_delegation_restore_sweep(
+                    completion_queue, ASYNC_DELIVERY_ROUTING_RETRY_SECONDS
+                )
+            rejected.append(notification)
+    return rejected
+
+
 def _drain_webui_process_notifications(
     session_id: str,
     *,
     claimed_events: list[dict] | None = None,
+    pending_async_acceptances: list[tuple[dict, object, str, object]] | None = None,
 ) -> list[str]:
     """Return completion notifications that belong to this WebUI session.
 
@@ -2629,15 +2710,79 @@ def _drain_webui_process_notifications(
             break
 
         evt_sid = str(evt.get('session_id') or '') if isinstance(evt, dict) else ''
-        event_id = str(evt.get('event_id') or '') if isinstance(evt, dict) else ''
+        if isinstance(evt, dict) and evt.get("type") == "completion":
+            # ``_process_one`` claims terminal process completions by their
+            # durable event_id.  Keep that same identity in the next-turn
+            # drain; ``completion_delivery_id`` intentionally returns the
+            # process/session id for other consumers and would otherwise let
+            # a duplicate queue entry bypass BG_TASK_COMPLETE_EVENTS_SEEN.
+            event_id = str(
+                evt.get("event_id") or completion_delivery_id(evt) or ""
+            ).strip()
+        else:
+            event_id = completion_delivery_id(evt) if isinstance(evt, dict) else ''
         event_session_key = (
             str(evt.get('session_key') or '') if isinstance(evt, dict) else ''
         )
+        if isinstance(evt, dict) and evt.get("type") == "async_delegation":
+            evt_sid = evt_sid or event_session_key or event_id
         if not evt_sid or not event_id or not event_session_key:
             skipped_events.append(evt)
             continue
-        if event_session_key != session_id:
+        event_target_session = event_session_key
+        if isinstance(evt, dict) and evt.get("type") == "async_delegation":
+            origin_session = str(evt.get("origin_ui_session_id") or "").strip()
+            if origin_session:
+                event_target_session = origin_session
+            else:
+                try:
+                    from api import config as _process_cfg
+                    event_target_session = str(
+                        _process_cfg.PROCESS_SESSION_INDEX.get(event_session_key, event_session_key)
+                    )
+                except Exception:
+                    pass
+        if event_target_session != session_id:
             skipped_events.append(evt)
+            continue
+        if isinstance(evt, dict) and evt.get("type") == "completion":
+            try:
+                if process_registry.is_completion_consumed(evt_sid):
+                    continue
+            except Exception:
+                pass
+
+        if isinstance(evt, dict) and evt.get("type") == "async_delegation":
+            if evt.get("origin_ui_session_id") and str(evt.get("origin_ui_session_id")) != str(session_id):
+                skipped_events.append(evt)
+                continue
+            from api.process_event_utils import (
+                claim_async_delegation_delivery,
+                complete_async_delegation_delivery,
+                release_async_delegation_delivery,
+                requeue_async_delegation_event,
+                schedule_async_delegation_claim_retry,
+            )
+            claim = claim_async_delegation_delivery(evt, "webui-next-turn")
+            if claim is None:
+                schedule_async_delegation_claim_retry(evt, completion_queue)
+                continue
+            notification = _format_process_notification(evt)
+            if not notification:
+                release_async_delegation_delivery(evt, claim)
+                skipped_events.append(evt)
+                continue
+            if pending_async_acceptances is not None:
+                pending_async_acceptances.append((evt, claim, notification, completion_queue))
+                notifications.append(notification)
+                continue
+            try:
+                complete_async_delegation_delivery(evt, claim)
+            except Exception:
+                release_async_delegation_delivery(evt, claim)
+                skipped_events.append(evt)
+                continue
+            notifications.append(notification)
             continue
 
         # The primary WebUI drain may already own this stable event in the
@@ -2702,6 +2847,14 @@ def _drain_webui_process_notifications(
             completion_queue.put(evt)
         except Exception:
             logger.debug("Failed to requeue process completion event", exc_info=True)
+            if isinstance(evt, dict) and evt.get("type") == "async_delegation":
+                from api.process_event_utils import (
+                    ASYNC_DELIVERY_ROUTING_RETRY_SECONDS,
+                    _arm_async_delegation_restore_sweep,
+                )
+                _arm_async_delegation_restore_sweep(
+                    completion_queue, ASYNC_DELIVERY_ROUTING_RETRY_SECONDS
+                )
             break
     if uncommitted_events:
         _finalize_process_completion_claims(
@@ -4768,6 +4921,76 @@ def _should_strip_reasoning_content(
 
     # Unknown mode -- preserve default behavior.
     return False
+
+
+def _compact_image_parts_for_persistence(messages) -> int:
+    """Replace persisted image parts with text placeholders after a completed turn.
+
+    The active model receives native image parts while a tool call is running. Once
+    the turn has completed, retaining base64 data URLs in both the visible
+    transcript and ``context_messages`` makes every JSON sidecar save/load and
+    session API response scale with the image bytes. Hermes Agent's durable
+    session store applies the same text-only policy for completed multimodal
+    tool results. Keep text parts and the surrounding tool-call chain intact so
+    future turns retain the conversational record and can re-open the original
+    image from the preceding tool-call arguments when needed.
+
+    This intentionally mutates the owned session message rows in place. It is
+    called only after ``run_conversation()`` has returned, so it never removes
+    image parts that the current model invocation still needs.
+    """
+    changed = 0
+    for message in messages or ():
+        # Mirror Hermes Agent's durable-session policy: native *tool* results
+        # are transient input for the current model call. User attachments are
+        # a separate product contract and must remain intact here.
+        if not isinstance(message, dict) or message.get('role') != 'tool':
+            continue
+        content = message.get('content')
+        if not isinstance(content, list):
+            continue
+
+        compacted_content = []
+        image_parts = 0
+        for part in content:
+            if not isinstance(part, dict):
+                # A provider can legally return scalar content alongside typed
+                # parts. Preserve it unchanged rather than flattening/reordering
+                # the structured result during durable-session compaction.
+                compacted_content.append(part)
+                continue
+            part_type = part.get('type')
+            # Guard the set-membership with an isinstance check: a JSON-valid
+            # part can carry an unhashable ``type`` (e.g. a list), and
+            # ``unhashable in {...}`` raises TypeError — which would turn an
+            # otherwise-complete streaming send into the error path before the
+            # session is saved. Only the three string image types are compacted;
+            # every other part (including non-string ``type`` values) is preserved.
+            if isinstance(part_type, str) and part_type in {'image', 'image_url', 'input_image'}:
+                compacted_content.append({'type': 'text', 'text': '[screenshot]'})
+                image_parts += 1
+            else:
+                compacted_content.append(part)
+
+        if image_parts:
+            message['content'] = compacted_content
+            changed += image_parts
+    return changed
+
+
+def _compact_session_image_parts_for_persistence(session) -> int:
+    """Compact completed native-vision tool results in both durable histories."""
+    changed = (
+        _compact_image_parts_for_persistence(getattr(session, 'context_messages', None))
+        + _compact_image_parts_for_persistence(getattr(session, 'messages', None))
+    )
+    if changed:
+        logger.info(
+            "Compacted %d completed image message part(s) for session %s",
+            changed,
+            getattr(session, 'session_id', None),
+        )
+    return changed
 
 
 def _sanitize_messages_for_api(
@@ -8048,16 +8271,7 @@ def _run_agent_streaming(
             and 'http' in _lower
         ):
             _captured_terminal_error[0] = _message
-        _is_compression_start = (
-            _kind == 'lifecycle'
-            and (
-                'preflight compression' in _lower
-                or 'compressing' in _lower
-                or 'compacting context' in _lower
-                or 'context too large' in _lower
-            )
-        )
-        if _is_compression_start:
+        if _is_agent_compression_start_status(_kind, _message):
             put('compressing', {
                 'session_id': session_id,
                 'message': 'Compressing context',
@@ -8342,7 +8556,8 @@ def _run_agent_streaming(
             def _approval_notify_cb(approval_data):
                 if _submit_pending_for_polling is not None:
                     try:
-                        _submit_pending_for_polling(session_id, approval_data)
+                        head, total = _submit_pending_for_polling(session_id, approval_data)
+                        approval_data = {**(head or approval_data), "pending_count": total}
                     except Exception:
                         logger.warning("Failed to mirror approval into WebUI polling state", exc_info=True)
                 put('approval', approval_data)
@@ -9835,6 +10050,7 @@ def _run_agent_streaming(
                             s.messages.append(
                                 _guardrail_recovery_message(_guardrail_terminal.reason)
                             )
+                    _compact_session_image_parts_for_persistence(s)
                     _advance_truncation_watermark_after_commit(s)  # #3831
                 # Strip XML tool-call blocks from assistant message content.
                 # DeepSeek and some other providers emit <function_calls>...</function_calls>
@@ -10207,6 +10423,7 @@ def _run_agent_streaming(
                                     msg_text,
                                     source=getattr(s, 'pending_user_source', None) or 'webui',
                                 )
+                                _compact_session_image_parts_for_persistence(s)
                                 _advance_truncation_watermark_after_commit(s)  # #3831
                                 # Skip the error block — jump directly to the
                                 # normal post-result persistence path by
@@ -11464,6 +11681,7 @@ def _run_agent_streaming(
                                     msg_text,
                                     source=getattr(s, 'pending_user_source', None) or 'webui',
                                 )
+                                _compact_session_image_parts_for_persistence(s)
                                 _advance_truncation_watermark_after_commit(s)  # #3831
                                 s.save()
                         logger.info('[webui] self-heal (except path): retry succeeded')

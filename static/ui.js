@@ -2651,8 +2651,50 @@ function _getOptionProviderId(opt){
 }
 function _providerFromModelValue(modelId){
   const value=String(modelId||'').trim();
+  if(value.startsWith('@custom:')){
+    const rest=value.slice('@custom:'.length);
+    const colon=rest.indexOf(':');
+    return colon>=0?`custom:${rest.slice(0,colon)}`:'custom';
+  }
   if(value.startsWith('@')&&value.includes(':')) return value.slice(1,value.lastIndexOf(':'));
   return '';
+}
+function _modelPickerOptionIdentity(modelId){
+  let value=String(modelId||'');
+  if(value.startsWith('@')&&value.includes(':')){
+    value=value.startsWith('@custom:')
+      ? value.substring(value.lastIndexOf(':')+1)
+      : value.substring(value.indexOf(':')+1);
+  }
+  value=value.split('/').pop();
+  return value.replace(/-/g,'.').toLowerCase();
+}
+function _deduplicateModelPickerOptions(sel,selectedValue){
+  if(!sel||!sel.querySelectorAll) return 0;
+  let removed=0;
+  for(const group of sel.querySelectorAll('optgroup')){
+    const options=Array.from(group.children||[]).filter(opt=>opt&&opt.tagName==='OPTION');
+    const byIdentity=new Map();
+    for(const opt of options){
+      const identity=_modelPickerOptionIdentity(opt.value);
+      if(!identity) continue;
+      if(!byIdentity.has(identity)) byIdentity.set(identity,[]);
+      byIdentity.get(identity).push(opt);
+    }
+    for(const candidates of byIdentity.values()){
+      if(candidates.length<2) continue;
+      const selected=candidates.find(opt=>opt.value===selectedValue);
+      const routable=candidates.find(opt=>String(opt.value||'').startsWith('@'));
+      const survivor=(selected&&String(selected.value||'').startsWith('@'))||!routable
+        ? (selected||routable||candidates[0]) : routable;
+      for(const opt of candidates){
+        if(opt===survivor) continue;
+        group.removeChild(opt);
+        removed++;
+      }
+    }
+  }
+  return removed;
 }
 function _providerSkipsModelMismatchWarning(providerId){
   const p=String(providerId||'').toLowerCase();
@@ -2670,7 +2712,13 @@ function _modelStateForSelect(sel, modelId){
   const value=String(modelId||'').trim();
   if(!value) return {model:'',model_provider:null};
   const explicitProvider=_providerFromModelValue(value);
-  if(explicitProvider) return {model:value,model_provider:explicitProvider};
+  if(explicitProvider){
+    const prefix=`@${explicitProvider}:`;
+    const model= value.toLowerCase().startsWith(prefix.toLowerCase())
+      ? value.slice(prefix.length)
+      : value.slice(value.lastIndexOf(':')+1);
+    return {model,model_provider:explicitProvider};
+  }
   // Resolve the provider from the option whose VALUE matches the requested
   // model — never blindly from sel.selectedOptions[0] (#5567). During a profile
   // /tab switch or a model-list rebuild the dropdown transiently still has the
@@ -2953,6 +3001,7 @@ function _findModelInDropdown(modelId, sel, preferredProviderId){
   if(preferred){
     const providerMatch=options.find(o=>norm(o.value)===target && _getOptionProviderId(o).toLowerCase()===preferred);
     if(providerMatch) return providerMatch.value;
+    return null;
   }
   // 2. Normalized match
   const exact=opts.find(o=>norm(o)===target);
@@ -3034,7 +3083,7 @@ function _applyModelToDropdown(modelId, sel, preferredProviderId, opts){
       if(sel.id==='modelSelect'&&typeof syncModelChip==='function') syncModelChip();
       if(sel.id==='settingsModel'&&typeof syncSettingsModelChip==='function') syncSettingsModelChip();
       if(pickerChanged){
-        if(sel.id==='modelSelect') _invalidateComposerModelDropdown();
+        if(sel.id==='modelSelect'&&typeof _invalidateComposerModelDropdown==='function') _invalidateComposerModelDropdown();
         else _refreshOpenModelDropdown();
       }
     }
@@ -3044,6 +3093,7 @@ function _applyModelToDropdown(modelId, sel, preferredProviderId, opts){
 }
 function _ensureModelOptionInDropdown(modelId, sel, preferredProviderId){
   if(!modelId||!sel) return null;
+  if(typeof _deduplicateModelPickerOptions==='function') _deduplicateModelPickerOptions(sel,sel.value);
   const applied=_applyModelToDropdown(modelId,sel,preferredProviderId);
   if(applied) return applied;
   const value=modelId;
@@ -3058,7 +3108,7 @@ function _ensureModelOptionInDropdown(modelId, sel, preferredProviderId){
   sel.appendChild(opt);
   sel.value=modelId;
   if(sel.id==='modelSelect'){
-    _invalidateComposerModelDropdown();
+    if(typeof _invalidateComposerModelDropdown==='function') _invalidateComposerModelDropdown();
     if(typeof syncModelChip==='function') syncModelChip();
   }
   if(sel.id==='settingsModel'){
@@ -3475,6 +3525,23 @@ function _normalizeConfiguredModelKey(modelId){
   return s.replace(/-/g,'.');
 }
 
+function _isEquivalentConfiguredModelEntry(modelId,badge,entries){
+  const provider=String(badge&&badge.provider||'').toLowerCase();
+  let rawModel=String(modelId||'');
+  const routedPrefix=`@${provider}:`;
+  if(provider&&rawModel.toLowerCase().startsWith(routedPrefix)){
+    rawModel=rawModel.slice(routedPrefix.length);
+  }else if(provider&&rawModel.toLowerCase().startsWith(`${provider}:`)){
+    rawModel=rawModel.slice(provider.length+1);
+  }
+  const target=_normalizeConfiguredModelKey(rawModel);
+  return (Array.isArray(entries)?entries:[]).some(entry=>{
+    if(!entry||_normalizeConfiguredModelKey(entry.value)!==target) return false;
+    const entryProvider=String(entry.providerId||(entry.badge&&entry.badge.provider)||'').toLowerCase();
+    return !provider||!entryProvider||provider===entryProvider;
+  });
+}
+
 function _getConfiguredModelBadge(modelId,badgeMap,providerId){
   const map=badgeMap||window._configuredModelBadges||{};
   if(!modelId||!map) return null;
@@ -3836,9 +3903,8 @@ function renderModelDropdown(){
       _groupMeta.get(groupKey).modelCount++;
     }
   }
-  const _existingConfiguredKeys=new Set(_modelData.map(existing=>_normalizeConfiguredModelKey(existing.value)));
   for(const [modelId,badge] of Object.entries(_badgeMap)){
-    if(_existingConfiguredKeys.has(_normalizeConfiguredModelKey(modelId))) continue;
+    if(_isEquivalentConfiguredModelEntry(modelId,badge,_modelData)) continue;
     _modelData.push({
       value:modelId,
       name:esc(getModelLabel(modelId)),
@@ -3846,7 +3912,6 @@ function renderModelDropdown(){
       group:'',
       badge,
     });
-    _existingConfiguredKeys.add(_normalizeConfiguredModelKey(modelId));
   }
   // Create search input FIRST before filterModels definition
   const _scopeNote=document.createElement('div');
@@ -6731,6 +6796,31 @@ function _stripVisibleAssistantEchoFromThinking(thinkingText, ...visibleTexts){
   return clean;
 }
 
+const _DATA_IMAGE_RE=/^data:image\/(?:png|jpe?g|gif|webp|avif)(?:;base64)?,[a-z0-9+/=%._~:@!$&'()*+,;-]*$/i;
+const _DATA_IMAGE_SVG_RE=/^data:image\/svg\+xml;base64,[a-z0-9+/=]+$/i;
+const _DATA_IMAGE_MAX_LEN=2*1024*1024;
+function _isSafeDataImageUri(ref){
+  const value=String(ref||'');
+  return value.length<=_DATA_IMAGE_MAX_LEN&&(_DATA_IMAGE_RE.test(value)||_DATA_IMAGE_SVG_RE.test(value));
+}
+function _dataImageHtml(ref,altText){
+  if(!_isSafeDataImageUri(ref)) return null;
+  return `<img class="msg-media-img" src="${esc(ref)}" alt="${esc(altText||'image')}" loading="lazy">`;
+}
+function _inlineMediaHtmlForRef(ref,sessionId,altText){
+  if(/^data:/i.test(ref||'')){
+    const img=_dataImageHtml(ref,altText||'image');
+    return img||`<code>${esc(String(ref||'').slice(0,64))}…</code>`;
+  }
+  const path=String(ref||'').replace(/^file:\/\//i,'');
+  return `<img class="msg-media-img" src="api/media?path=${encodeURIComponent(path)}" alt="${esc(altText||path.split('/').pop()||'image')}" loading="lazy">`;
+}
+function _mdImageHtml(alt,url){
+  if(/^data:/i.test(url)) return _dataImageHtml(url,alt)||esc(`![${alt}](${String(url).slice(0,64)}…)`);
+  if(/^file:\/\//i.test(url)) return _inlineMediaHtmlForRef(url,undefined,alt);
+  return `<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`;
+}
+
 function renderMd(raw){
   let s=(raw||'').replace(/\r\n/g,'\n').replace(/\r/g,'\n');
   // ── Entity decode: must run FIRST so &gt; lines become > for the blockquote
@@ -6966,7 +7056,7 @@ function renderMd(raw){
     // backticks stays protected as a \x00C token and is never rendered as <img>.
     // Must run before _code_stash restore and before _link_stash so the image
     // is not consumed by the [label](url) link regex.
-    t=t.replace(/!\[([^\]]*)\]\((https?:\/\/[^\)]+)\)/g,(_,alt,url)=>`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
+    t=t.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+)\)/g,(_,alt,url)=>_mdImageHtml(alt,url));
     // Stash rendered <img> tags so autolink never matches URLs inside src=
     const _img_stash=[];
     t=t.replace(/(<img\b[^>]*>)/g,m=>{_img_stash.push(m);return `\x00G${_img_stash.length-1}\x00`;});
@@ -7108,7 +7198,7 @@ function renderMd(raw){
   // #487: Outer image pass — handles ![alt](url) in plain paragraphs (outside tables/lists).
   // Runs AFTER the table pass (images in table cells are handled by inlineMd() above).
   // Runs BEFORE the outer [label](url) link pass so the image is not consumed as a plain link.
-  s=s.replace(/!\[([^\]]*)\]\((https?:\/\/[^\)]+)\)/g,(_,alt,url)=>`<img src="${url.replace(/"/g,'%22')}" alt="${esc(alt)}" class="msg-media-img" loading="lazy">`);
+  s=s.replace(/!\[([^\]]*)\]\(((?:https?:\/\/|file:\/\/|data:image\/)[^\)]+)\)/g,(_,alt,url)=>_mdImageHtml(alt,url));
   // Outer link pass for labeled links in plain paragraphs (outside table cells).
   // Runs AFTER the table pass so table cells are processed by inlineMd() only.
   // Stash existing <a> tags first to avoid re-linking already-linked URLs.
@@ -7198,7 +7288,8 @@ function renderMd(raw){
     const raw=_safeAttrValue(v);
     const compact=raw.replace(/[\u0000-\u001f\u007f\s]+/g,'').toLowerCase();
     if(!compact) return false;
-    if(/^(javascript|data|vbscript):/i.test(compact)) return false;
+    if(/^data:/i.test(compact)) return !!(img&&typeof _isSafeDataImageUri==='function'&&_isSafeDataImageUri(raw));
+    if(/^(javascript|vbscript):/i.test(compact)) return false;
     if(/^https?:\/\//i.test(raw)) return true;
     if(/^(mailto:|tel:|message:)/i.test(raw)) return true;
     if(img && /^api\//i.test(raw)) return true;
@@ -7316,6 +7407,10 @@ function renderMd(raw){
   // ── Restore MEDIA stash → inline images or download links ─────────────────
   s=s.replace(/\x00D(\d+)\x00/g,(_,i)=>{
     let ref=media_stash[+i];
+    if(/^data:/i.test(ref||'')){
+      const inline=_dataImageHtml(ref,'image');
+      return inline||`<code>${esc(String(ref).slice(0,64))}…</code>`;
+    }
     // Keep this logic self-contained: some tests extract renderMd() alone and
     // execute it in node, without the top-level helper functions from ui.js.
     const mediaKindForName=(name='')=>{
@@ -9624,11 +9719,16 @@ function _showUpdateBanner(data){
   const parts=[];
   const webuiPart=_formatUpdateTargetStatus('WebUI',data.webui);
   const agentPart=_formatUpdateTargetStatus('Agent',data.agent);
+  const liveMain=!!(data&&data.live_main);
   if(webuiPart) parts.push(webuiPart);
   if(agentPart) parts.push(agentPart);
   window._updateData=data;
   const btnApply=$('btnApplyUpdate');
   if(btnApply){
+    if(liveMain){
+      btnApply.disabled=true;
+      btnApply.style.display='none';
+    }else{
     const webuiManual=!!(data&&data.webui&&data.webui.manual_update&&data.webui.behind>0);
     const webuiUpdatable=!!(data&&data.webui&&data.webui.behind>0&&!webuiManual);
     const agentUpdatable=!!(data&&data.agent&&data.agent.behind>0);
@@ -9641,6 +9741,13 @@ function _showUpdateBanner(data){
       const clearLockBtn=$('btnClearUpdateLock');
       if(clearLockBtn){clearLockBtn.disabled=true;clearLockBtn.style.display='none';clearLockBtn.dataset.target='';}
     }
+    }
+  }
+  if(liveMain){
+    const forceBtn=$('btnForceUpdate');
+    if(forceBtn){forceBtn.disabled=true;forceBtn.style.display='none';forceBtn.dataset.target='';}
+    const clearLockBtn=$('btnClearUpdateLock');
+    if(clearLockBtn){clearLockBtn.disabled=true;clearLockBtn.style.display='none';clearLockBtn.dataset.target='';}
   }
   if(!parts.length){
     _renderUpdateWhatsNewLinks(data);
@@ -9651,7 +9758,7 @@ function _showUpdateBanner(data){
   const msg=$('updateMsg');
   if(msg){
     const manualInstruction=_formatManualUpdateInstruction(data&&data.webui);
-    msg.textContent='\u2B06 '+parts.join(', ')+' available'+(manualInstruction?' · '+manualInstruction:'');
+    msg.textContent='\u2B06 '+parts.join(', ')+' available'+(liveMain?' · Ask an agent to merge upstream into main':(manualInstruction?' · '+manualInstruction:''));
   }
   const banner=$('updateBanner');
   if(banner) banner.classList.add('visible');
@@ -9697,6 +9804,13 @@ async function applyUpdates(){
   if(btn){btn.disabled=true;btn.textContent=updateText('update_updating','Updating\u2026');}
   const errEl=$('updateError');
   if(errEl){errEl.style.display='none';errEl.textContent='';}
+  if(window._updateData?.live_main){
+    const msg=updateText('update_agent_merge_required','Updates for the local live-main checkout are agent-owned. Ask an agent to merge upstream and restart after tests pass.');
+    if(errEl){errEl.textContent=msg;errEl.style.display='block';}
+    else showToast(msg,10000,'warning');
+    resetApplyButton(0);
+    return;
+  }
   // Hide any leftover force-update button from a prior conflict so a fresh
   // retry starts clean (otherwise stale state points at the wrong target).
   const forceBtnReset=$('btnForceUpdate');
@@ -12113,7 +12227,8 @@ function _anchorSceneNodeForRow(row, opts){
     // renderMd path below, which stays the source of truth for the final DOM.
     const proseKey=row.local_id||row.row_id||'';
     if(!settled && proseKey && typeof window.__anchorProseIncrementalNode==='function'){
-      const inc=window.__anchorProseIncrementalNode(proseKey,text);
+      const finalize=row.status==='completed'||row.status==='done'||row.sealed===true;
+      const inc=window.__anchorProseIncrementalNode(proseKey,text,{finalize});
       // Route the incremental node through the shared row-decoration block below
       // (data-anchor-scene-row / -row-id / -row-role / -source-event-type) instead
       // of returning early — otherwise live incremental prose rows lose the

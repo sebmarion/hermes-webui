@@ -95,6 +95,12 @@ PARSE_LAZY_TAIL_PAYLOAD_SRC = _extract_function(
 LAZY_TAIL_LOAD_DECISION_SRC = _extract_function(
     SESSIONS_SRC, "_lazyTailLoadDecision"
 )
+INFLIGHT_HAS_VISIBLE_STATE_SRC = _extract_function(
+    SESSIONS_SRC, "_inflightHasVisibleState"
+)
+SELECT_LIVE_RECOVERY_INFLIGHT_SRC = _extract_function(
+    SESSIONS_SRC, "_selectLiveRecoveryInflight"
+)
 
 
 def _normalise_ws(s: str) -> str:
@@ -225,6 +231,7 @@ function createEnvironment() {
   // the fetch URL drops msg_limit/expand_renderable and mismatches the
   // enqueued buildMessageUrl(), stalling the ordered api() harness.
   globalThis._MSG_LIMIT_MAX = 500;
+  globalThis._INITIAL_MSG_LIMIT = 30;
   // #6177: _msgLimitMax is a module-scope `let` (live server-advertised ceiling,
   // defaulting to _MSG_LIMIT_MAX). It's read by _ensureMessagesLoaded's
   // boundedReloadLimit and _loadOlderMessages's useBeforePaging; the harness
@@ -243,9 +250,11 @@ function createEnvironment() {
   globalThis.stopClarifyPolling = () => {};
   globalThis.hideClarifyCard = () => {};
   globalThis._saveComposerDraftNow = () => Promise.resolve();
+  globalThis._composerDraftSessionForSave = (sid) => sid;
   globalThis._sessionProfileMismatchFromError = () => null;
   globalThis._switchProfileForSessionLoad = async () => {};
   globalThis._clearSameSessionForceReloadHint = () => { clearHintCalls += 1; };
+  globalThis._resetMessagePaging = () => {};
   globalThis._clearStuckSessionOnBoot = () => {};
   globalThis._setSessionViewedCount = () => {};
   // #4946: loadSession() now routes its viewed-count/unread clear through
@@ -729,6 +738,10 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior():
         "__PARSE_LAZY_TAIL_PAYLOAD_SRC__", PARSE_LAZY_TAIL_PAYLOAD_SRC
     ).replace(
         "__LAZY_TAIL_LOAD_DECISION_SRC__", LAZY_TAIL_LOAD_DECISION_SRC
+    ).replace(
+        "__INFLIGHT_HAS_VISIBLE_STATE_SRC__", INFLIGHT_HAS_VISIBLE_STATE_SRC
+    ).replace(
+        "__SELECT_LIVE_RECOVERY_INFLIGHT_SRC__", SELECT_LIVE_RECOVERY_INFLIGHT_SRC
     )
     body = _run_node(script)
 

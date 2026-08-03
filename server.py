@@ -1036,7 +1036,10 @@ def _recover_goal_continuations_for_startup() -> dict:
 
 
 def _recover_process_completion_notifications() -> dict:
-    from tools.process_registry import process_registry
+    try:
+        from tools.process_registry import process_registry
+    except ImportError:
+        process_registry = None
 
     recover_processes = getattr(process_registry, "recover_from_checkpoint", None)
     recover = getattr(process_registry, "recover_completion_notifications", None)

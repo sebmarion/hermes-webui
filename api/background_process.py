@@ -45,6 +45,7 @@ import inspect
 import logging
 import os
 import queue
+import stat
 import threading
 import time
 import uuid
@@ -57,11 +58,23 @@ from api.managed_background_workers import (
     ManagedBackgroundWorkerStart,
     ManagedBackgroundWorkerVerification,
 )
+from api.process_event_utils import (
+    ASYNC_DELIVERY_ROUTING_RETRY_SECONDS,
+    claim_async_delegation_delivery,
+    complete_async_delegation_delivery,
+    completion_delivery_id,
+    release_async_delegation_delivery,
+    requeue_async_delegation_event,
+    schedule_async_delegation_claim_retry,
+)
 
 logger = logging.getLogger(__name__)
 
 _DRAIN_THREAD: Optional[threading.Thread] = None
 _DRAIN_STOP = threading.Event()
+_PROCESS_RECOVERY_DONE = False
+_PROCESS_CHECKPOINT_RECOVERED = False
+_PROCESS_RECOVERY_LOCK = threading.Lock()
 
 _REAPER_THREAD: Optional[threading.Thread] = None
 _REAPER_STOP = threading.Event()
@@ -1008,6 +1021,30 @@ def _process_one(evt: dict) -> None:
     # Async delegation has a separate durable ownership/claim state machine.
     # Return after it runs so none of the generic process-registry in-memory
     # dedupe paths can ACK or discard this event first.
+    if (
+        evt.get("type") == "async_delegation"
+        and (evt.get("is_batch") or evt.get("results") is not None)
+    ):
+        try:
+            from tools.process_registry import process_registry as _async_registry
+        except Exception:
+            _async_registry = None
+        session_key = str(evt.get("session_key") or "").strip()
+        session_id = str(evt.get("origin_ui_session_id") or "").strip()
+        if not session_id and session_key:
+            with _cfg.PROCESS_SESSION_INDEX_LOCK:
+                session_id = str(_cfg.PROCESS_SESSION_INDEX.get(session_key) or "").strip()
+        if not session_id:
+            _retry_unmapped_async_delegation_event(_async_registry, evt)
+            return
+        _process_async_delegation_event_claimed(
+            evt,
+            session_id=session_id,
+            delegation_id=str(evt.get("delegation_id") or "").strip(),
+            process_registry=_async_registry,
+        )
+        return
+
     if evt.get("type") == "async_delegation":
         _process_async_delegation_event(evt)
         return
@@ -1217,6 +1254,7 @@ def recover_profile_async_delegations() -> int:
         if tracker in seen:
             continue
         seen.add(tracker)
+        _normalize_async_delegation_tracker_mode(tracker)
         try:
             result = recover_async_delegations(tracker_path=tracker) or {}
         except TypeError:
@@ -1224,8 +1262,127 @@ def recover_profile_async_delegations() -> int:
             # root-profile recovery remains available; strict BestPlan stays
             # disabled because that core also lacks capability V1.
             result = recover_async_delegations() or {}
+        _normalize_async_delegation_tracker_mode(tracker)
         queued += int(result.get("queued") or 0)
     return queued
+
+
+def _normalize_async_delegation_tracker_mode(path: str | Path) -> None:
+    """Enforce the private regular-file contract around Agent recovery.
+
+    The Agent writer uses a replace-on-write operation.  Its replacement file
+    inherits the process umask rather than the tracker's owner-only mode, so a
+    valid recovery can leave the durable authority world-readable.  Open the
+    exact path without following the final symlink, validate ownership and
+    regular-file identity on the held descriptor, and normalize the mode
+    before and after recovery.
+    """
+    tracker = Path(path)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not isinstance(nofollow, int) or nofollow == 0:
+        raise RuntimeError("async delegation tracker cannot be secured without O_NOFOLLOW")
+    try:
+        descriptor = os.open(
+            tracker,
+            os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+        )
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError("async delegation tracker is not readable") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or opened.st_nlink != 1
+        ):
+            raise RuntimeError("async delegation tracker is not a private bounded regular file")
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        verified = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(verified.st_mode)
+            or verified.st_uid != os.getuid()
+            or verified.st_nlink != 1
+            or stat.S_IMODE(verified.st_mode) != 0o600
+        ):
+            raise RuntimeError("async delegation tracker mode normalization was not durable")
+    finally:
+        os.close(descriptor)
+
+
+def _requeue_async_delegation_event(process_registry, evt: dict, *, claim=None, delay: float = 0.5) -> bool:
+    completion_queue = getattr(process_registry, "completion_queue", None)
+    return requeue_async_delegation_event(
+        evt, completion_queue, delay=delay, stop_event=_DRAIN_STOP,
+        durable=(bool(getattr(claim, "durable", False)) if claim is not None else None),
+    )
+
+
+def _retry_unmapped_async_delegation_event(process_registry, evt: dict) -> None:
+    completion_queue = getattr(process_registry, "completion_queue", None)
+    if schedule_async_delegation_claim_retry(evt, completion_queue, delay=ASYNC_DELIVERY_ROUTING_RETRY_SECONDS):
+        return
+    if not evt.get("_webui_routing_retry_attempted"):
+        retry_evt = dict(evt)
+        retry_evt["_webui_routing_retry_attempted"] = True
+        _requeue_async_delegation_event(process_registry, retry_evt, delay=ASYNC_DELIVERY_ROUTING_RETRY_SECONDS)
+
+
+def _record_async_delegation_accepted(evt: dict, *, session_id: str, claim) -> None:
+    complete_async_delegation_delivery(evt, claim)
+    try:
+        _emit_bg_task_complete_events_coalesced(session_id, _build_payload(evt, session_id))
+    except Exception:
+        logger.debug("async delegation live-view emit failed", exc_info=True)
+
+
+def _start_async_delegation_wakeup_turn(session_id: str, wakeup_prompt: str, *, delegation_id: str, evt: dict, claim, process_registry) -> None:
+    def _runner() -> None:
+        try:
+            from api.routes import start_session_turn
+            resp = start_session_turn(
+                session_id,
+                wakeup_prompt,
+                source="process_wakeup",
+                delegation_id=delegation_id,
+            )
+            raw_status = (resp or {}).get("_status")
+            status = (200 if (resp or {}).get("stream_id") else 500) if raw_status is None else int(raw_status)
+            if 200 <= status < 300:
+                _record_async_delegation_accepted(evt, session_id=session_id, claim=claim)
+            else:
+                release_async_delegation_delivery(evt, claim)
+                _requeue_async_delegation_event(process_registry, evt, claim=claim)
+        except Exception:
+            release_async_delegation_delivery(evt, claim)
+            _requeue_async_delegation_event(process_registry, evt, claim=claim)
+            logger.warning("async delegation wakeup turn failed", exc_info=True)
+    threading.Thread(target=_runner, name=f"hermes-webui-delegation-wakeup-{str(session_id)[:8]}", daemon=True).start()
+
+
+def _process_async_delegation_event_claimed(evt: dict, *, session_id: str, delegation_id: str, process_registry) -> None:
+    try:
+        claim = claim_async_delegation_delivery(evt, "webui-background")
+    except Exception:
+        _requeue_async_delegation_event(process_registry, evt)
+        return
+    if claim is None:
+        schedule_async_delegation_claim_retry(evt, getattr(process_registry, "completion_queue", None))
+        return
+    try:
+        wakeup_prompt = str(format_wakeup_prompt(evt) or "").strip()
+        if not wakeup_prompt:
+            raise RuntimeError("async delegation completion could not be formatted")
+        if _session_has_active_turn(session_id):
+            release_async_delegation_delivery(evt, claim)
+            _requeue_async_delegation_event(process_registry, evt, claim=claim)
+            return
+        _start_async_delegation_wakeup_turn(session_id, wakeup_prompt, delegation_id=delegation_id, evt=evt, claim=claim, process_registry=process_registry)
+    except Exception:
+        release_async_delegation_delivery(evt, claim)
+        _requeue_async_delegation_event(process_registry, evt, claim=claim)
 
 
 def _process_async_delegation_event(evt: dict) -> None:
@@ -2141,6 +2298,12 @@ def _drain_loop(readiness: threading.Event | None = None) -> None:
         from tools.process_registry import process_registry
     except Exception as exc:
         logger.warning("bg_task_complete drain unavailable: %s", exc)
+        # Agent-free WebUI mode still needs the startup worker contract to be
+        # healthy. Keep an inert worker alive until shutdown; no completion
+        # events can arrive without the optional Agent registry.
+        if readiness is not None:
+            readiness.set()
+        _DRAIN_STOP.wait()
         return
     if readiness is not None:
         readiness.set()
@@ -2175,6 +2338,37 @@ def _drain_loop(readiness: threading.Event | None = None) -> None:
             _process_one(evt)
         except Exception:
             logger.warning("bg_task_complete event handling failed", exc_info=True)
+
+
+def recover_processes_for_webui(process_registry=None, get_session_fn=None) -> int:
+    """Recover checkpointed Agent processes and rebuild WebUI session routing."""
+    global _PROCESS_CHECKPOINT_RECOVERED, _PROCESS_RECOVERY_DONE
+    if process_registry is None:
+        try:
+            from tools.process_registry import process_registry
+        except ImportError:
+            logger.debug("process recovery unavailable: Hermes Agent is not installed")
+            return 0
+    if get_session_fn is None:
+        from api.models import get_session as get_session_fn
+    with _PROCESS_RECOVERY_LOCK:
+        if _PROCESS_RECOVERY_DONE:
+            return 0
+        recovered = 0
+        if not _PROCESS_CHECKPOINT_RECOVERED:
+            recovered = process_registry.recover_from_checkpoint()
+            _PROCESS_CHECKPOINT_RECOVERED = True
+        for row in process_registry.list_sessions():
+            process_id = str(row.get("session_id") or "")
+            if not process_id:
+                continue
+            proc_session = process_registry.get(process_id)
+            session_key = str(getattr(proc_session, "session_key", "") or "")
+            if not session_key or get_session_fn(session_key, metadata_only=True) is None:
+                continue
+            register_process_session(session_key, session_key)
+        _PROCESS_RECOVERY_DONE = True
+        return recovered
 
 
 def register_process_session(session_key: str, session_id: str) -> None:
@@ -2272,6 +2466,10 @@ def start_drain_thread() -> bool:
     with _THREAD_LIFECYCLE_LOCK:
         if _DRAIN_THREAD is not None and _DRAIN_THREAD.is_alive():
             return False
+        try:
+            recover_processes_for_webui()
+        except Exception:
+            logger.warning("background process recovery failed", exc_info=True)
         _WAKEUP_INTAKE_STOP.clear()
         _DRAIN_STOP.clear()
         _DRAIN_THREAD = threading.Thread(

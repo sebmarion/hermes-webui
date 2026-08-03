@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
+import types
+from pathlib import Path
 
 import pytest
 
@@ -78,6 +81,41 @@ def test_drain_start_has_no_hidden_recovery_or_replay(workers, monkeypatch):
     finally:
         release.set()
         bp.stop_drain_thread(timeout=1.0)
+
+
+def test_async_tracker_recovery_restores_private_mode_after_atomic_replace(
+    workers, monkeypatch, tmp_path
+):
+    """Recovery must preserve the owner-only tracker contract across writers."""
+    bp = workers
+    import api.profiles as profiles
+
+    tracker = tmp_path / "async_delegations.json"
+    tracker.write_text("{}", encoding="utf-8")
+    tracker.chmod(0o644)
+    observed_before = []
+
+    def recover_async_delegations(*, tracker_path):
+        target = Path(tracker_path)
+        observed_before.append(target.stat().st_mode & 0o777)
+        replacement = target.with_suffix(".replacement")
+        replacement.write_text("{}", encoding="utf-8")
+        replacement.chmod(0o644)
+        os.replace(replacement, target)
+        return {"queued": 1}
+
+    fake_module = types.ModuleType("tools.async_delegation")
+    fake_module.recover_async_delegations = recover_async_delegations
+    monkeypatch.setitem(sys.modules, "tools.async_delegation", fake_module)
+    monkeypatch.setattr(
+        profiles,
+        "list_profiles_api",
+        lambda: [{"path": str(tmp_path)}],
+    )
+
+    assert bp.recover_profile_async_delegations() == 1
+    assert observed_before == [0o600]
+    assert tracker.stat().st_mode & 0o777 == 0o600
 
 
 def test_unmanaged_legacy_start_does_not_require_process_epoch(

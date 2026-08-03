@@ -98,6 +98,38 @@ def _last_good_split_evidence() -> MappingProxyType:
     )
 
 
+def test_launchd_absence_wait_retries_transient_teardown_probe(monkeypatch):
+    """A launchd teardown race must be retried, not misclassified as unsafe."""
+    plan = {
+        "launchd_domain": "gui/501",
+        "launchd_label": "com.example.webui",
+    }
+    attempts = []
+    clock = [0.0]
+
+    def probe(_plan, *, gateway):
+        attempts.append(gateway)
+        if len(attempts) < 3:
+            raise cutover.LaunchdAbsenceTransient(
+                "service database is settling"
+            )
+        return {"status": "absent", "target": "gui/501/com.example.webui"}
+
+    def monotonic():
+        value = clock[0]
+        clock[0] += 0.1
+        return value
+
+    monkeypatch.setattr(cutover, "_require_launchd_job_absent", probe)
+    monkeypatch.setattr(cutover.time, "monotonic", monotonic)
+    monkeypatch.setattr(cutover.time, "sleep", lambda _seconds: None)
+
+    receipt = cutover._wait_for_launchd_job_absent(plan, gateway=False)
+
+    assert receipt["status"] == "absent"
+    assert attempts == [False, False, False]
+
+
 def _plain_last_good_split_evidence() -> dict:
     return {
         "webui": {"identity": {"build_id": "last-good"}},
@@ -13891,6 +13923,117 @@ def test_legacy_gateway_drain_accepts_exact_old_status_and_empty_checkpoint(
     assert receipt["status"] == "verified"
     assert receipt["work"] == {"active_agents": 0}
     assert receipt["health_mode"] == "legacy-status-file"
+
+
+def test_prepare_legacy_gateway_drain_persists_receipt_before_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    """The paired WebUI checkpoint must consume a durable gateway-drain phase."""
+    transaction_id = "precheckpoint-drain-transaction-0001"
+    journal_path = tmp_path / "transaction.json"
+    candidate = {
+        "build_id": "candidate",
+        "startup_fenced": True,
+        "startup_transaction_id": transaction_id,
+    }
+    cutover.initialize_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+        expected_candidate_identity=candidate,
+        rollback_receipt={
+            "build_id": "last-good",
+            "plist_sha256": "a" * 64,
+            "state_snapshot_id": "snapshot",
+            "state_snapshot_sha256": "b" * 64,
+        },
+    )
+    binding = {
+        "status": "verified",
+        "listener_pid": 41,
+        "pid_start_token": "gateway-start",
+        "runtime": {"command": "legacy"},
+    }
+    phases = (
+        ("staged", {}),
+        ("plist_installed", {"plist_sha256": "c" * 64}),
+        (
+            "last_good_split_attested",
+            {"last_good_origin_attestation": _plain_last_good_split_evidence()},
+        ),
+        (
+            "gateway_last_good_attested",
+            {
+                "binding": binding,
+                "last_good_origin_attestation": _plain_last_good_split_evidence(),
+            },
+        ),
+        ("watchdog_cron_disable_intent", {"prepared": {"status": "prepared"}}),
+        ("watchdog_cron_disabled", {"status": "disabled"}),
+        ("watchdog_state_reconciled", {"status": "reconciled"}),
+    )
+    for phase, receipt in phases:
+        cutover.record_transaction_phase(
+            journal_path,
+            transaction_id=transaction_id,
+            phase=phase,
+            receipt=receipt,
+        )
+
+    state_root = tmp_path / "legacy-home"
+    state_root.mkdir()
+    plan = {
+        "transaction_id": transaction_id,
+        "transaction_journal": str(journal_path),
+        "gateway_listener_port": 8642,
+        "synthetic_process_notifications_path": str(
+            state_root / "process_notifications.json"
+        ),
+        "last_good_gateway_identity": {"build_id": "last-good-gateway"},
+    }
+    intent = {
+        "status": "prepared",
+        "marker": {
+            "path": str(state_root / ".drain_request.json"),
+            "payload": {"release_transaction_id": transaction_id},
+            "sha256": "d" * 64,
+        },
+    }
+    monkeypatch.setattr(
+        cutover,
+        "_attest_managed_gateway_binding",
+        lambda _plan, _identity: binding,
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_legacy_gateway_drain_intent_receipt",
+        lambda _plan, prepared: {**intent, "prepared": prepared},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_write_legacy_gateway_drain_marker",
+        lambda _plan, _intent: {"path": intent["marker"]["path"], "sha256": "d" * 64},
+    )
+    monkeypatch.setattr(
+        cutover,
+        "_wait_for_legacy_gateway_drain",
+        lambda _plan, prepared, _intent: {
+            "status": "verified",
+            "gateway": prepared["gateway"],
+        },
+    )
+
+    receipt = cutover._prepare_legacy_gateway_drain(plan)
+
+    assert receipt["status"] == "verified"
+    journal = cutover.read_transaction_journal(
+        journal_path,
+        transaction_id=transaction_id,
+    )
+    assert journal["phases"]["gateway_drain_intent"]["prepared"] == {
+        "gateway": {"pid": 41, "pid_start_token": "gateway-start"}
+    }
+    assert journal["phases"]["gateway_drained"]["status"] == "verified"
 
 
 def test_legacy_gateway_health_without_api_key_uses_public_receipt(

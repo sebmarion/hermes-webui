@@ -131,6 +131,28 @@ def test_update_apply_network_error_has_recovery_message_not_raw_failed_to_fetch
     assert 'Update failed: "+e.message' not in src
 
 
+def test_live_main_update_apply_is_read_only_and_hands_off_to_agent():
+    result = _run_apply_updates_harness(
+        {"live_main": True, "agent": {"behind": 1}, "webui": {"behind": 1}},
+        [],
+    )
+    assert result["apiCalls"] == []
+    assert result["waitCalls"] == []
+    assert "agent" in result["errorText"].lower()
+
+
+def test_live_main_banner_clears_all_mutating_controls():
+    src = _ui_js()
+    banner_start = src.index("function _showUpdateBanner(data)")
+    banner_end = src.index("function _i18nUpdateText", banner_start)
+    body = src[banner_start:banner_end]
+    assert "data&&data.live_main" in body
+    assert "btnApplyUpdate" in body
+    assert "btnForceUpdate" in body
+    assert "btnClearUpdateLock" in body
+    assert "agent" in body.lower()
+
+
 def test_update_apply_structured_server_errors_still_use_json_message_path():
     """Server-reachable JSON errors must keep the existing targeted message path."""
     src = _ui_js()

@@ -118,6 +118,7 @@ class ConversationShadowEvidenceStore:
         self._key_path = self._path.with_suffix(_KEY_SUFFIX)
         self._clock = clock
         self._sample_rate = sample_rate
+        self._generation_history: dict[str, set[int]] = {}
         with _LOCKS_GUARD:
             self._lock = _LOCKS.setdefault(self._path.resolve(), threading.RLock())
 
@@ -227,7 +228,13 @@ class ConversationShadowEvidenceStore:
                     cohort["difference_count"] = int(cohort["difference_count"]) + 1
                     if cohort.get("disabled_at") is None:
                         cohort["disabled_at"] = now
-                elif _generation_seen(cohort["generation_bloom"], proof.request_generation, secret):
+                elif (
+                    proof.request_generation in self._generation_history.setdefault(key, set())
+                    or (
+                        not self._generation_history[key]
+                        and _generation_seen(cohort["generation_bloom"], proof.request_generation, secret)
+                    )
+                ):
                     return self._readiness_from_cohort(cohort, "duplicate_generation")
                 elif cohort.get("disabled_at") is None:
                     cohort["sample_count"] = int(cohort["sample_count"]) + 1
@@ -240,6 +247,7 @@ class ConversationShadowEvidenceStore:
                 cohort["generation_bloom"] = _mark_generation(
                     cohort["generation_bloom"], proof.request_generation, secret
                 )
+                self._generation_history.setdefault(key, set()).add(proof.request_generation)
                 if persisted is None:
                     _evict_old_cohorts(cohorts, MAX_COHORTS - 1)
                 cohorts[key] = cohort
