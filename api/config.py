@@ -9618,6 +9618,10 @@ class RunAdmissionBusy(RunAdmissionError):
     """Admitted or running work still prevents a safe process exit."""
 
 
+class RunAdmissionLineageBusy(RunAdmissionClosed):
+    """Another reservation or active worker owns the execution lineage."""
+
+
 class RunAdmissionStartupIndeterminate(RunAdmissionConflict):
     """Deferred startup cannot be proved safe to retry or accept."""
 
@@ -10225,6 +10229,48 @@ def reserve_run_admission(*, kind: str, **metadata) -> str:
             raise RunAdmissionBusy("run admission reservation capacity is exhausted")
         _RUN_ADMISSION_RESERVATIONS[reservation_id] = entry
     return reservation_id
+
+
+def bind_run_admission(
+    reservation_id: str | None,
+    execution_lineage_key: str,
+) -> str:
+    """Bind one existing reservation to an immutable execution owner.
+
+    Resolution of the key happens before this function.  The critical section
+    only compares already-computed opaque values against in-process owners.
+    """
+    reservation_id = str(reservation_id or "").strip()
+    key = str(execution_lineage_key or "").strip()
+    if not reservation_id:
+        raise RunAdmissionClosed("run admission reservation is missing")
+    if not key or len(key) > 256:
+        raise ValueError("execution lineage key is invalid")
+    with ACTIVE_RUNS_LOCK:
+        entry = _RUN_ADMISSION_RESERVATIONS.get(reservation_id)
+        if entry is None:
+            raise RunAdmissionClosed("run admission reservation is missing")
+        current = str(entry.get("execution_lineage_key") or "").strip()
+        if current:
+            if current != key:
+                raise ValueError("run admission reservation lineage is immutable")
+            return key
+        for other_id, other in _RUN_ADMISSION_RESERVATIONS.items():
+            if other_id == reservation_id or not isinstance(other, dict):
+                continue
+            if str(other.get("execution_lineage_key") or "").strip() == key:
+                raise RunAdmissionLineageBusy(
+                    "execution lineage already has an admitted reservation"
+                )
+        for other in ACTIVE_RUNS.values():
+            if isinstance(other, dict) and str(
+                other.get("execution_lineage_key") or ""
+            ).strip() == key:
+                raise RunAdmissionLineageBusy(
+                    "execution lineage already has an active run"
+                )
+        entry["execution_lineage_key"] = key
+        return key
 
 
 def fork_run_admission(
@@ -11051,8 +11097,8 @@ def register_active_run(
             raise RunAdmissionClosed("checkpoint stopping rejects worker upgrade")
         reservation = None
         if admission_reservation_id:
-            reservation = _RUN_ADMISSION_RESERVATIONS.pop(
-                str(admission_reservation_id), None
+            reservation = _RUN_ADMISSION_RESERVATIONS.get(
+                str(admission_reservation_id)
             )
             if reservation is None:
                 raise RunAdmissionClosed("run admission reservation is missing")
@@ -11064,8 +11110,27 @@ def register_active_run(
                 for key, value in reservation.items()
                 if key not in {"reservation_id", "phase", "reserved_at", "kind"}
             }
+            bound_key = str(inherited.get("execution_lineage_key") or "").strip()
+            supplied_key = str(entry.get("execution_lineage_key") or "").strip()
+            if bound_key and supplied_key and bound_key != supplied_key:
+                raise ValueError("active run lineage does not match reservation")
             inherited.update(entry)
             entry = inherited
+        lineage_key = str(entry.get("execution_lineage_key") or "").strip()
+        if entry.get("lineage_required") and not lineage_key:
+            raise RunAdmissionClosed(
+                "turn-bearing worker has no execution lineage reservation"
+            )
+        if lineage_key:
+            for other_stream, other in ACTIVE_RUNS.items():
+                if other_stream == stream_id or not isinstance(other, dict):
+                    continue
+                if str(other.get("execution_lineage_key") or "").strip() == lineage_key:
+                    raise RunAdmissionLineageBusy(
+                        "execution lineage already has an active run"
+                    )
+        if reservation:
+            _RUN_ADMISSION_RESERVATIONS.pop(str(admission_reservation_id), None)
         ACTIVE_RUNS[stream_id] = entry
         _remember_session_activity_profile_locked(entry)
     try:
@@ -11092,6 +11157,13 @@ def update_active_run(stream_id: str, **metadata) -> None:
     with ACTIVE_RUNS_LOCK:
         entry = ACTIVE_RUNS.get(stream_id)
         if entry is not None:
+            if "execution_lineage_key" in metadata:
+                current_key = str(entry.get("execution_lineage_key") or "").strip()
+                supplied_key = str(metadata.get("execution_lineage_key") or "").strip()
+                if not current_key or supplied_key != current_key:
+                    raise ValueError("execution lineage key is immutable")
+                metadata = dict(metadata)
+                metadata.pop("execution_lineage_key", None)
             previous = dict(entry)
             entry.update(metadata)
             _remember_session_activity_profile_locked(entry)
