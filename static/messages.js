@@ -1368,7 +1368,8 @@ async function send(){
     return;
   }
   if(typeof shouldInterceptCompressionRecoveryContinuation==='function'&&shouldInterceptCompressionRecoveryContinuation(text,S.pendingFiles)){
-    if(typeof showCompressionRecoveryContinuationHint==='function') showCompressionRecoveryContinuationHint();
+    if(typeof redirectCompressionRecoverySend==='function') await redirectCompressionRecoverySend();
+    else if(typeof showCompressionRecoveryContinuationHint==='function') showCompressionRecoveryContinuationHint();
     _sendInProgress=false;_sendInProgressSid=null;
     return;
   }

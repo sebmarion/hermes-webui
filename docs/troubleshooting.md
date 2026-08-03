@@ -147,15 +147,22 @@ linked continuation instead.
    - the final assistant error message carrying `_compressionRecovery`
 
 **Fix.** Use the `Start focused continuation` action in the exhausted message.
-The new linked session preserves the workspace, model, profile, project, and
-toolset lane, but intentionally starts with an empty model-facing transcript so
-the oversized exhausted tail is not replayed. After the new session opens,
-describe the next narrow task explicitly instead of sending a bare continuation.
+The exhausted session is terminal and read-only: any attempted send opens the
+focused continuation instead of retrying the oversized parent context. The new
+linked session preserves the workspace, model, profile, project, toolset, and
+worktree lane, but never copies the source transcript or tool rows. It carries
+at most the newest secret-redacted compaction summary (bounded to 8,000
+characters) as hidden reference context and restores the latest substantive
+user request as an editable composer draft. Generic `continue` / `handoff`
+turns are skipped when selecting that draft. Nothing is submitted automatically;
+review or edit the draft, then press Send. Use **Open source history** in the
+focused continuation to return to the read-only transcript.
 
 **When to file a bug.** File a bug if the exhausted message has no recovery
-action, the action creates a session with the old oversized context/messages
-replayed into the model-facing transcript, or a bare "continue" starts another
-turn in the exhausted session instead of being blocked with recovery guidance.
+action, the action copies the old transcript/tool rows, the focused child loses
+its draft on reload, any recovery action submits work automatically, or either
+`/api/chat/start` or the synchronous `/api/chat` path accepts another turn in
+the exhausted parent instead of returning recovery guidance.
 
 ---
 
