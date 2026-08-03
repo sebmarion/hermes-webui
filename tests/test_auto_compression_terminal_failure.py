@@ -84,23 +84,27 @@ def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_err
             self.session_cache_write_tokens = 0
             self.reasoning_config = None
             self.ephemeral_system_prompt = None
-            self._last_error = None
+            self._last_error = "Context budget rejected locally: compaction_made_no_progress."
 
         def run_conversation(self, **kwargs):
             if self.stream_delta_callback:
                 self.stream_delta_callback("I am still working through the files.")
             self.session_id = new_sid
-            self._last_error = "Context length exceeded: cannot compress further."
             return {
                 "failed": True,
                 "partial": True,
                 "compression_exhausted": True,
-                "error": "Context length exceeded: cannot compress further.",
+                "error": "Context budget rejected locally: compaction_made_no_progress.",
+                "final_response": "Context budget rejected locally: compaction_made_no_progress.",
                 "messages": [
                     {"role": "user", "content": kwargs.get("persist_user_message", "")},
                     {"role": "assistant", "content": "I am still working through the files."},
                     {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}]},
                     {"role": "tool", "tool_call_id": "call_1", "content": "large output"},
+                    {
+                        "role": "assistant",
+                        "content": "Context budget rejected locally: compaction_made_no_progress.",
+                    },
                 ],
             }
 
@@ -152,6 +156,16 @@ def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_err
     assert new_payload["messages"][-1]["_error"] is True
     assert new_payload["messages"][-1]["_compressionRecovery"]["recommended_action"] == "reduce_current_request"
     assert "Context compression exhausted" in new_payload["messages"][-1]["content"]
+    assert not any(
+        "Context budget rejected locally: compaction_made_no_progress." in str(message.get("content") or "")
+        for message in new_payload["messages"]
+        if not message.get("_error")
+    )
+    assert not any(
+        "Context budget rejected locally: compaction_made_no_progress." in str(message.get("content") or "")
+        or message.get("content") == "Do the long task."
+        for message in new_payload.get("context_messages", [])
+    )
     assert old_sid not in streaming.SESSIONS
     assert streaming.SESSIONS[new_sid].session_id == new_sid
 
