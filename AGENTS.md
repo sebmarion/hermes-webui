@@ -14,6 +14,10 @@ Before making changes, read:
 3. `docs/CONTRACTS.md`
 4. `CHANGELOG.md`
 
+If `AGENTS.local.md` exists in this checkout, read it after this file. It may
+add machine-local restrictions, but it cannot broaden the authority granted by
+the user or these project instructions.
+
 For architecture, testing, or setup work, also read the matching reference:
 
 - `ARCHITECTURE.md` for design constraints and current module layout

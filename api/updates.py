@@ -75,10 +75,32 @@ _GIT_LOCK_SIGNATURES = (
     'another git process seems to be running',
     'unable to create .git/index.lock',
 )
+_LIVE_MAIN_TRUE_VALUES = frozenset({'1', 'true', 'yes', 'on'})
 # Lock files we previously enumerated for auto-removal in v2. v2.2 no longer
 # removes anything on the server, so the enumerable list is no longer needed;
 # ``_inventory_locks`` reports whatever ``.git/**/*.lock`` files currently exist
 # via plain ``rglob``.
+
+
+def _is_live_main_mode() -> bool:
+    """Return whether this process is the local live-main runtime."""
+    return os.environ.get('HERMES_WEBUI_LIVE_MAIN', '').strip().lower() in _LIVE_MAIN_TRUE_VALUES
+
+
+def _agent_merge_required_response(target: str) -> dict:
+    """Return the non-mutating handoff used by the local live-main runtime."""
+    if target not in ('webui', 'agent'):
+        return {'ok': False, 'message': f'Unknown target: {target}'}
+    return {
+        'ok': False,
+        'agent_merge_required': True,
+        'target': target,
+        'message': (
+            'This local live-main checkout is agent-owned. Ask an agent to fetch '
+            'upstream, merge it into main while preserving local changes, run the '
+            'tests, and restart the WebUI. No files were changed.'
+        ),
+    }
 
 
 
@@ -308,6 +330,9 @@ def apply_clear_lock(target: str) -> dict:
         (now that the lock is gone) will take the success branch and
         re-run the normal apply.
     """
+    if _is_live_main_mode():
+        return _agent_merge_required_response(target)
+
     blocker_snapshot = _restart_blocker_snapshot()
     if blocker_snapshot.get('restart_blocked'):
         return _restart_blocked_response(target, blocker_snapshot)
@@ -1337,6 +1362,7 @@ def check_for_updates(force=False, *, include_agent=True, channel=None):
     """Return cached update status for webui and agent repos."""
     global _check_in_progress
     include_agent = bool(include_agent)
+    live_main = _is_live_main_mode()
     if channel is None:
         channel = _read_update_channel()
     channel = _normalize_channel(channel)
@@ -1354,9 +1380,13 @@ def check_for_updates(force=False, *, include_agent=True, channel=None):
             and cache_matches
             and time.time() - _update_cache['checked_at'] < CACHE_TTL
         ):
-            return dict(_update_cache)
+            cached = dict(_update_cache)
+            cached['live_main'] = live_main
+            return cached
         if _check_in_progress and cache_matches:
-            return dict(_update_cache)  # another thread is already checking this channel
+            cached = dict(_update_cache)
+            cached['live_main'] = live_main
+            return cached  # another thread is already checking this channel
         _check_in_progress = True
 
     try:
@@ -1375,7 +1405,9 @@ def check_for_updates(force=False, *, include_agent=True, channel=None):
             _update_cache['checked_at'] = time.time()
             _update_cache['include_agent'] = include_agent
             _update_cache['channel'] = channel
-            return dict(_update_cache)
+            result = dict(_update_cache)
+            result['live_main'] = live_main
+            return result
     finally:
         _check_in_progress = False
 
@@ -1819,6 +1851,9 @@ def apply_force_update(target: str, channel=None) -> dict:
     if channel is None:
         channel = _read_update_channel()
     channel = _normalize_channel(channel)
+    if _is_live_main_mode():
+        return _agent_merge_required_response(target)
+
     blocker_snapshot = _restart_blocker_snapshot()
     if blocker_snapshot.get('restart_blocked'):
         return _restart_blocked_response(target, blocker_snapshot)
@@ -1951,6 +1986,9 @@ def apply_force_update(target: str, channel=None) -> dict:
 
 def apply_update(target, channel=None):
     """Stash, pull --ff-only, pop for the given target repo."""
+    if _is_live_main_mode():
+        return _agent_merge_required_response(target)
+
     if channel is None:
         channel = _read_update_channel()
     channel = _normalize_channel(channel)

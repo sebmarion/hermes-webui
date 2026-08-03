@@ -214,6 +214,22 @@ respawn loop, set ``HERMES_WEBUI_FOREGROUND=1`` in the service environment.
 
 ## Diagnostic recipe
 
+## Local live-main sync
+
+For a single-user checkout running directly from `main`, upstream sync is an
+agent-owned operation. Run:
+
+```bash
+python3 scripts/sync_live_main.py --repo /Users/seb/hermes-webui
+```
+
+The helper fetches and merges `origin/main`, preserves staged/unstaged and
+untracked work in a named stash, and reapplies that stash with `git stash apply
+--index`. It never runs `pull`, `reset`, `restore`, `checkout .`, `clean`,
+`rebase`, or `stash pop`, and it never drops the preservation stash. If merge or
+stash application conflicts, repair the current worktree, run the tests, and
+keep the stash until the live process is healthy.
+
 If the Web UI keeps getting respawned and you suspect the double-fork loop:
 
 ```bash
