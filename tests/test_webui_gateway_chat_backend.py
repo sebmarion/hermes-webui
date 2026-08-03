@@ -4,7 +4,9 @@ from email.message import Message
 import json
 from pathlib import Path
 import re
+import sys
 import time
+import types
 import urllib.error
 
 import api.gateway_chat as gateway_chat
@@ -24,6 +26,35 @@ from api.gateway_chat import (
     webui_chat_backend_mode,
     webui_gateway_chat_enabled,
 )
+
+
+def _install_gateway_process_registry(monkeypatch):
+    class _Registry:
+        def __init__(self):
+            self.finish_calls = []
+
+        def finish_notification_delivery(self, event, committed):
+            self.finish_calls.append((event, committed))
+            return True
+
+    registry = _Registry()
+    fake_module = types.ModuleType("tools.process_registry")
+    fake_module.process_registry = registry
+    monkeypatch.setitem(sys.modules, "tools.process_registry", fake_module)
+    return registry
+
+
+def _gateway_completion_event(session_id, suffix="gateway"):
+    return {
+        "type": "completion",
+        "event_id": f"gateway:{suffix}:completion",
+        "session_id": f"process-{suffix}",
+        "session_key": session_id,
+        "command": f"command-{suffix}",
+        "exit_code": 0,
+        "output": f"output-{suffix}",
+        "created_at": 1.0,
+    }
 
 
 def test_gateway_chat_backend_is_default_off_for_truthy_values():
@@ -224,6 +255,35 @@ def test_gateway_http_401_with_key_suggests_key_mismatch():
     assert event["hint"] == "Check that HERMES_WEBUI_GATEWAY_API_KEY matches the Hermes Gateway API_SERVER_KEY."
 
 
+def test_gateway_http_transport_payload_keeps_429_and_positive_model_evidence_classified():
+    rate_limit = urllib.error.HTTPError(
+        "http://gateway.local/v1/chat/completions",
+        429,
+        "Too Many Requests",
+        hdrs=Message(),
+        fp=None,
+    )
+    assert gateway_chat._gateway_http_transport_payload(
+        rate_limit,
+        '{"detail":"route not found"}',
+        api_key_configured=True,
+    )["type"] == "rate_limit"
+
+    model_error = urllib.error.HTTPError(
+        "http://gateway.local/v1/chat/completions",
+        404,
+        "Not Found",
+        hdrs=Message(),
+        fp=None,
+    )
+    assert gateway_chat._gateway_http_transport_payload(
+        model_error,
+        '{"error":{"message":"The requested model does not exist",'
+        '"param":"model","code":"model_not_found"}}',
+        api_key_configured=True,
+    )["type"] == "model_not_found"
+
+
 def test_frontend_renders_gateway_auth_error_with_specific_label():
     src = Path("static/messages.js").read_text(encoding="utf-8")
     start = src.find("source.addEventListener('apperror'")
@@ -394,6 +454,228 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
         "tid": "call-1",
     }) in event_pairs
     assert all(len(item) == 3 and item[2] for item in events)
+
+
+def test_gateway_chat_worker_commits_process_completion_receipt_on_success(tmp_path, monkeypatch):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", lambda req, timeout=0: FakeResponse())
+    registry = _install_gateway_process_registry(monkeypatch)
+    s = new_session()
+    stream_id = "stream-gateway-process-success"
+    s.active_stream_id = stream_id
+    s.pending_user_message = "wake up"
+    s.pending_user_source = "process_wakeup"
+    s.process_wakeup_pause = {"reason": "credential_pool_empty"}
+    s.save()
+    STREAMS[stream_id] = create_stream_channel()
+    event = _gateway_completion_event(s.session_id, "success")
+
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "wake up",
+        "test-model",
+        str(tmp_path),
+        stream_id,
+        [],
+        process_completion_events=[event],
+    )
+
+    saved = models.get_session(s.session_id)
+    assert registry.finish_calls == [(event, True)]
+    assert saved.messages[-1][streaming._PROCESS_COMPLETION_RECEIPTS_KEY]
+    assert event["event_id"] not in json.dumps(saved.messages[-1], sort_keys=True)
+    assert saved.process_wakeup_pause == {}
+
+
+def test_gateway_chat_worker_commits_process_completion_receipt_on_terminal_error(tmp_path, monkeypatch):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield b"event: response.failed\n"
+            yield b'data: {"message":"All 0 credential(s) exhausted for test-provider"}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", lambda req, timeout=0: FakeResponse())
+    registry = _install_gateway_process_registry(monkeypatch)
+    s = new_session()
+    stream_id = "stream-gateway-process-terminal"
+    s.active_stream_id = stream_id
+    s.pending_user_message = "wake up"
+    s.pending_user_source = "process_wakeup"
+    s.process_wakeup_pause = {"reason": "credential_pool_empty"}
+    s.save()
+    events = []
+    channel = create_stream_channel()
+    subscriber = channel.subscribe()
+    STREAMS[stream_id] = channel
+    event = _gateway_completion_event(s.session_id, "terminal")
+
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "wake up",
+        "test-model",
+        str(tmp_path),
+        stream_id,
+        [],
+        process_completion_events=[event],
+    )
+    while not subscriber.empty():
+        events.append(subscriber.get_nowait())
+
+    saved = models.get_session(s.session_id)
+    assert registry.finish_calls == [(event, True)]
+    assert saved.messages[-1].get("_error") is True
+    assert saved.messages[-1][streaming._PROCESS_COMPLETION_RECEIPTS_KEY]
+    assert event["event_id"] not in json.dumps(saved.messages[-1], sort_keys=True)
+    assert saved.process_wakeup_pause["paused"] is True
+    assert any(item[0] == "apperror" for item in events)
+
+
+def test_gateway_chat_worker_preserves_pending_state_when_receipt_save_fails(tmp_path, monkeypatch):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"done"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", lambda req, timeout=0: FakeResponse())
+    registry = _install_gateway_process_registry(monkeypatch)
+    s = new_session()
+    stream_id = "stream-gateway-process-save-failure"
+    s.active_stream_id = stream_id
+    s.pending_user_message = "wake up"
+    s.pending_user_source = "process_wakeup"
+    s.process_wakeup_pause = {"reason": "credential_pool_empty"}
+    s.save()
+    original_save = models.Session.save
+
+    def _fail_receipt_save(session, *args, **kwargs):
+        if any(
+            isinstance(message, dict)
+            and streaming._PROCESS_COMPLETION_RECEIPTS_KEY in message
+            for message in (getattr(session, "messages", None) or [])
+        ):
+            raise OSError("synthetic receipt publication failure")
+        return original_save(session, *args, **kwargs)
+
+    monkeypatch.setattr(models.Session, "save", _fail_receipt_save)
+    STREAMS[stream_id] = create_stream_channel()
+    event = _gateway_completion_event(s.session_id, "save-failure")
+
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "wake up",
+        "test-model",
+        str(tmp_path),
+        stream_id,
+        [],
+        process_completion_events=[event],
+    )
+
+    saved = models.Session.load(s.session_id)
+    assert registry.finish_calls == [(event, False)]
+    assert saved.active_stream_id == stream_id
+    assert saved.pending_user_message == "wake up"
+    assert saved.process_wakeup_pause == {"reason": "credential_pool_empty"}
+    assert not any(
+        isinstance(message, dict)
+        and streaming._PROCESS_COMPLETION_RECEIPTS_KEY in message
+        for message in (saved.messages or [])
+    )
+
+
+def test_gateway_chat_worker_keeps_http_transport_classification_with_process_receipt(tmp_path, monkeypatch):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
+    registry = _install_gateway_process_registry(monkeypatch)
+    http_error = urllib.error.HTTPError(
+        "http://gateway.local/v1/chat/completions",
+        401,
+        "Unauthorized",
+        Message(),
+        None,
+    )
+    http_error.read = lambda _size=-1: b"gateway auth body"
+    monkeypatch.setattr(
+        gateway_chat.urllib.request,
+        "urlopen",
+        lambda req, timeout=0: (_ for _ in ()).throw(http_error),
+    )
+    s = new_session()
+    stream_id = "stream-gateway-process-http-401"
+    s.active_stream_id = stream_id
+    s.pending_user_message = "wake up"
+    s.pending_user_source = "process_wakeup"
+    s.save()
+    events = []
+    channel = create_stream_channel()
+    subscriber = channel.subscribe()
+    STREAMS[stream_id] = channel
+    event = _gateway_completion_event(s.session_id, "http-401")
+
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "wake up",
+        "test-model",
+        str(tmp_path),
+        stream_id,
+        [],
+        process_completion_events=[event],
+    )
+    while not subscriber.empty():
+        events.append(subscriber.get_nowait())
+
+    saved = models.get_session(s.session_id)
+    assert registry.finish_calls == [(event, True)]
+    assert saved.messages[-1]["_error"] is True
+    assert saved.messages[-1][streaming._PROCESS_COMPLETION_RECEIPTS_KEY]
+    apperror = next(item[1] for item in events if item[0] == "apperror")
+    assert apperror["type"] == "gateway_auth_error"
 
 
 def test_gateway_chat_worker_classifies_terminal_provider_error_without_text(tmp_path, monkeypatch):

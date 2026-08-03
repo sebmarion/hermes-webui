@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -33,7 +34,12 @@ from api.config import (
     update_active_run,
 )
 from api.helpers import _redact_text, redact_session_data
-from api.models import clear_process_wakeup_pause, get_session, merge_session_messages_append_only
+from api.models import (
+    clear_process_wakeup_pause,
+    get_session,
+    merge_session_messages_append_only,
+    record_process_wakeup_provider_unavailable_pause,
+)
 from api.run_journal import RunJournalWriter, bound_run_journal_snapshot_args
 
 logger = logging.getLogger(__name__)
@@ -336,6 +342,118 @@ def _gateway_http_error_event(exc: urllib.error.HTTPError, err_body: str, *, api
         "message": f"Gateway returned HTTP {exc.code}.",
         "hint": safe or "Check the configured Gateway API server.",
     }
+
+
+def _gateway_http_transport_payload(
+    exc: urllib.error.HTTPError,
+    err_body: str,
+    *,
+    api_key_configured: bool,
+) -> dict:
+    """Keep Gateway transport errors distinct, except for an explicit 429."""
+    gateway_payload = _gateway_http_error_event(
+        exc,
+        err_body,
+        api_key_configured=api_key_configured,
+    )
+    if int(getattr(exc, "code", 0) or 0) != 429:
+        if _gateway_http_has_model_error_evidence(err_body):
+            from api.streaming import _classify_provider_error, _provider_error_payload
+
+            classification = _classify_provider_error(err_body)
+            if classification.get("type") == "model_not_found":
+                payload = _provider_error_payload(
+                    err_body,
+                    classification["type"],
+                    classification.get("hint", ""),
+                )
+                payload["label"] = classification.get("label") or "Model not found"
+                return payload
+        return gateway_payload
+    from api.streaming import _classify_provider_error, _provider_error_payload
+
+    classification = _classify_provider_error(
+        f"HTTP 429: {err_body or getattr(exc, 'reason', '')}"
+    )
+    if classification.get("type") != "rate_limit":
+        return gateway_payload
+    payload = _provider_error_payload(
+        f"HTTP 429: {err_body or getattr(exc, 'reason', '')}",
+        classification["type"],
+        classification.get("hint", ""),
+    )
+    payload["label"] = classification.get("label") or "Rate limit reached"
+    return payload
+
+
+def _gateway_http_has_model_error_evidence(err_body: str) -> bool:
+    """Recognize bounded, positive model-field evidence in a Gateway body."""
+    text = str(err_body or "")[:2048]
+    if not text:
+        return False
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        decoded = None
+    records = []
+    if isinstance(decoded, dict):
+        records.append(decoded)
+        for key in ("error", "detail"):
+            nested = decoded.get(key)
+            if isinstance(nested, dict):
+                records.append(nested)
+    evidence_texts = []
+    for record in records:
+        code = re.sub(
+            r"[^a-z0-9]+",
+            "_",
+            str(record.get("code") or record.get("type") or "").casefold(),
+        ).strip("_")
+        parameter = re.sub(
+            r"[^a-z0-9]+",
+            "_",
+            str(record.get("param") or record.get("field") or "").casefold(),
+        ).strip("_")
+        if code in {"model_not_found", "unknown_model", "invalid_model"}:
+            return True
+        if parameter in {"model", "model_id", "model_name"}:
+            return True
+        for key in ("message", "detail", "error"):
+            value = record.get(key)
+            if isinstance(value, str):
+                evidence_texts.append(value)
+    if isinstance(decoded, str):
+        evidence_texts.append(decoded)
+    elif decoded is None:
+        evidence_texts.append(text)
+    exact_model_failures = {
+        "model not found",
+        "model does not exist",
+        "the model does not exist",
+        "requested model does not exist",
+        "the requested model does not exist",
+        "unknown model",
+        "invalid model",
+        "no such model",
+    }
+    return any(
+        re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", value.casefold())).strip()
+        in exact_model_failures
+        for value in evidence_texts
+    )
+
+
+def _gateway_http_terminal_payload(exc: urllib.error.HTTPError) -> dict:
+    """Compatibility entry point for callers that classify a Gateway HTTP error."""
+    try:
+        err_body = exc.read(2048).decode("utf-8", errors="replace")
+    except Exception:
+        err_body = ""
+    return _gateway_http_transport_payload(
+        exc,
+        err_body,
+        api_key_configured=bool(_gateway_api_key()),
+    )
 
 
 def _gateway_sse_delta(payload: dict) -> str:
@@ -708,33 +826,79 @@ def stop_gateway_run(run_id: str) -> bool:
         return False
 
 
-def _settle_gateway_terminal_error(session_id, stream_id, workspace, model, model_provider, terminal_error):
+def _settle_gateway_terminal_error(
+    session_id,
+    stream_id,
+    workspace,
+    model,
+    model_provider,
+    terminal_error,
+    *,
+    process_completion_claims=None,
+    error_payload_override=None,
+    cancel_event=None,
+):
     from api.streaming import (
         _classify_provider_error,
         _materialize_pending_user_turn_before_error,
         _provider_error_payload,
         _session_payload_with_full_messages,
+        _snapshot_native_terminal_state,
         _snapshot_and_append_partial_on_error,
+        _stamp_process_completion_receipts,
         _terminal_turn_duration,
+        _durable_process_completion_receipt_status,
+        _restore_native_terminal_state,
     )
 
     with _get_session_agent_lock(session_id):
         session = get_session(session_id)
         if not _stream_writeback_is_current(session, stream_id):
             return None
-        error_classification = _classify_provider_error(terminal_error)
-        error_payload = _provider_error_payload(
-            terminal_error,
-            error_classification["type"],
-            error_classification.get("hint", ""),
+        if cancel_event is not None and cancel_event.is_set():
+            return None
+        terminal_state_before = (
+            _snapshot_native_terminal_state(session)
+            if process_completion_claims
+            else None
         )
+        if isinstance(error_payload_override, dict):
+            error_payload = dict(error_payload_override)
+            error_classification = {
+                "label": str(error_payload.get("label") or "Gateway request failed"),
+                "type": str(error_payload.get("type") or "gateway_http_error"),
+                "hint": str(error_payload.get("hint") or ""),
+            }
+        else:
+            error_classification = _classify_provider_error(terminal_error)
+            error_payload = _provider_error_payload(
+                terminal_error,
+                error_classification["type"],
+                error_classification.get("hint", ""),
+            )
+        if getattr(session, "pending_user_source", None) == "process_wakeup":
+            recorded_pause = record_process_wakeup_provider_unavailable_pause(
+                session,
+                classification=error_classification.get("type", ""),
+                model=model,
+                provider=model_provider,
+            )
+            if recorded_pause is not None:
+                pause_hint = (
+                    "Automatic retries for this conversation are paused until you "
+                    "send a message, switch the model/provider, or fix the credentials."
+                )
+                error_payload["hint"] = (
+                    f"{error_payload.get('hint', '').rstrip()} {pause_hint}"
+                ).strip()
         turn_duration = _terminal_turn_duration(session)
         _materialize_pending_user_turn_before_error(session)
         session.active_stream_id = None
         session.pending_user_message = None
-        session.pending_attachments = []
+        session.pending_attachments = None
         session.pending_started_at = None
         session.pending_user_source = None
+        session.pending_server_instance_id = None
         try:
             _snapshot_and_append_partial_on_error(session, stream_id)
         except Exception:
@@ -759,16 +923,60 @@ def _settle_gateway_terminal_error(session_id, stream_id, workspace, model, mode
         session.model = model
         session.model_provider = model_provider
         terminal_session_persisted = False
+        process_completion_delivery_committed = False
+        process_completion_receipt_status = None
+        if process_completion_claims:
+            stamped = _stamp_process_completion_receipts(
+                error_message,
+                process_completion_claims,
+                session_id=session.session_id,
+            )
+            if not stamped:
+                _restore_native_terminal_state(session, terminal_state_before)
+                error_payload["process_completion_delivery_uncertain"] = True
+                error_payload["process_completion_delivery_committed"] = False
+                error_payload["terminal_session_persisted"] = False
+                error_payload["session"] = redact_session_data(
+                    _session_payload_with_full_messages(session, tool_calls=[])
+                )
+                error_payload["session_id"] = session.session_id
+                return error_payload
+        if cancel_event is not None and cancel_event.is_set():
+            _restore_native_terminal_state(session, terminal_state_before)
+            return None
         try:
             session.save()
             terminal_session_persisted = True
+            process_completion_delivery_committed = bool(process_completion_claims)
+            if process_completion_claims:
+                process_completion_receipt_status = "committed"
         except Exception:
+            if process_completion_claims:
+                receipt_status = _durable_process_completion_receipt_status(
+                    session.session_id,
+                    process_completion_claims,
+                )
+                process_completion_receipt_status = receipt_status
+                process_completion_delivery_committed = receipt_status == "committed"
+                if receipt_status == "absent":
+                    _restore_native_terminal_state(session, terminal_state_before)
+                else:
+                    terminal_session_persisted = process_completion_delivery_committed
             logger.debug("Failed to persist gateway terminal error settlement", exc_info=True)
-        error_payload["session"] = redact_session_data(
-            _session_payload_with_full_messages(session, tool_calls=[])
-        )
+        if process_completion_receipt_status in {"invalid", "unavailable", "absent"}:
+            error_payload.pop("session", None)
+        else:
+            error_payload["session"] = redact_session_data(
+                _session_payload_with_full_messages(session, tool_calls=[])
+            )
         error_payload["session_id"] = session.session_id
         error_payload["terminal_session_persisted"] = terminal_session_persisted
+        if process_completion_claims:
+            error_payload["process_completion_delivery_committed"] = (
+                process_completion_delivery_committed
+            )
+            if not process_completion_delivery_committed and terminal_session_persisted:
+                error_payload["process_completion_delivery_uncertain"] = True
         if terminal_session_persisted:
             error_payload["terminal_session_persisted_session_id"] = session.session_id
         return error_payload
@@ -824,7 +1032,7 @@ def _run_gateway_chat_streaming(
     final user/assistant turn back into the WebUI session.
     """
     from api.streaming import (
-        _finalize_process_completion_claims,
+        _settle_native_process_completion_claims,
         _validated_process_completion_events,
     )
 
@@ -839,7 +1047,7 @@ def _run_gateway_chat_streaming(
         try:
             from tools.process_registry import process_registry
 
-            _finalize_process_completion_claims(
+            _settle_native_process_completion_claims(
                 process_registry,
                 process_completion_claims,
                 committed=committed,
@@ -918,6 +1126,8 @@ def _run_gateway_chat_streaming(
         STREAM_LIVE_TOOL_CALLS[stream_id] = []
 
     success_writeback_committed = False
+    delivery_writeback_committed = False
+    terminal_cleanup_save_suppressed = False
     continuation_pending = False
     runs_api_pending_marked = True
 
@@ -971,12 +1181,35 @@ def _run_gateway_chat_streaming(
             or reasoning_selection.get("reasoning_mode") == "ultra"
         )
         if ultra_requested and reasoning_selection.get("ultra_identity"):
-            put_gateway_event("apperror", {
+            ultra_payload = {
                 "label": "Ultra is unavailable through Gateway chat",
                 "type": "gateway_ultra_unsupported",
                 "message": "Real Ultra requires native WebUI chat and cannot run through the Gateway backend.",
                 "hint": "Use native WebUI chat for Ultra, or select Max to keep using Gateway chat.",
-            })
+            }
+            error_payload = _settle_gateway_terminal_error(
+                session_id,
+                stream_id,
+                workspace,
+                model,
+                model_provider,
+                ultra_payload["message"],
+                process_completion_claims=process_completion_claims,
+                error_payload_override=ultra_payload,
+                cancel_event=cancel_event,
+            )
+            if error_payload is not None:
+                delivery_writeback_committed = bool(
+                    error_payload.get("process_completion_delivery_committed")
+                )
+                if process_completion_claims and not delivery_writeback_committed:
+                    terminal_cleanup_save_suppressed = True
+                put_gateway_event("apperror", error_payload)
+            else:
+                if process_completion_claims:
+                    terminal_cleanup_save_suppressed = True
+                if cancel_event.is_set():
+                    put_gateway_event("cancel", {"message": "Cancelled by user"})
             return
         reasoning_effort = _gateway_reasoning_effort_for_request(
             cfg,
@@ -1056,6 +1289,37 @@ def _run_gateway_chat_streaming(
                     session=s,
                 )
             except Exception as exc:
+                runs_error_override = None
+                if isinstance(exc, urllib.error.HTTPError):
+                    try:
+                        runs_error_body = exc.read(2048).decode("utf-8", errors="replace")
+                    except Exception:
+                        runs_error_body = ""
+                    runs_error_override = _gateway_http_transport_payload(
+                        exc,
+                        runs_error_body,
+                        api_key_configured=bool(_gateway_api_key()),
+                    )
+                else:
+                    from api.streaming import _classify_provider_error, _provider_error_payload
+
+                    runs_classification = _classify_provider_error(str(exc), exc)
+                    if runs_classification.get("type") != "error":
+                        runs_error_override = _provider_error_payload(
+                            str(exc),
+                            runs_classification["type"],
+                            runs_classification.get("hint", ""),
+                        )
+                        runs_error_override["label"] = (
+                            runs_classification.get("label") or "Gateway runs API error"
+                        )
+                    else:
+                        runs_error_override = {
+                            "label": "Gateway runs API error",
+                            "type": "gateway_runs_error",
+                            "message": str(exc)[:400],
+                            "hint": "Check that the Hermes Gateway runs API (/v1/runs) is available.",
+                        }
                 error_payload = _settle_gateway_terminal_error(
                     session_id,
                     stream_id,
@@ -1063,9 +1327,21 @@ def _run_gateway_chat_streaming(
                     model,
                     model_provider,
                     str(exc),
+                    process_completion_claims=process_completion_claims,
+                    error_payload_override=runs_error_override,
+                    cancel_event=cancel_event,
                 )
                 if error_payload is None:
+                    if process_completion_claims:
+                        terminal_cleanup_save_suppressed = True
+                    if cancel_event.is_set():
+                        put_gateway_event("cancel", {"message": "Cancelled by user"})
                     return
+                delivery_writeback_committed = bool(
+                    error_payload.get("process_completion_delivery_committed")
+                )
+                if process_completion_claims and not delivery_writeback_committed:
+                    terminal_cleanup_save_suppressed = True
                 put_gateway_event("apperror", error_payload)
                 return
             if final_text is None:
@@ -1151,6 +1427,33 @@ def _run_gateway_chat_streaming(
                     except json.JSONDecodeError:
                         continue
                     _payload_event = str(payload.get("event") or payload.get("type") or sse_event).strip()
+                    _payload_event_key = _payload_event.casefold()
+                    _terminal_event_keys = {
+                        "error",
+                        "gateway.error",
+                        "response.error",
+                        "response.failed",
+                        "run.failed",
+                    }
+                    if (
+                        _payload_event_key in _terminal_event_keys
+                        or sse_event.casefold() in _terminal_event_keys
+                    ):
+                        terminal_error = str(
+                            payload.get("error")
+                            or payload.get("message")
+                            or payload.get("detail")
+                            or payload.get("type")
+                            or _payload_event
+                        )
+                        sse_event = "message"
+                        continue
+                    if _payload_event_key in {"run.cancelled", "response.cancelled"} or sse_event.casefold() in {
+                        "run.cancelled",
+                        "response.cancelled",
+                    }:
+                        put_gateway_event("cancel", {"message": "Cancelled by gateway"})
+                        return
                     if _payload_event in {"hermes.approval.request", "approval.request"}:
                         approval_data = _gateway_runs_approval_event(payload)
                         if approval_data:
@@ -1236,12 +1539,54 @@ def _run_gateway_chat_streaming(
                 model,
                 model_provider,
                 terminal_error,
+                process_completion_claims=process_completion_claims,
+                cancel_event=cancel_event,
             )
             if error_payload is None:
+                if process_completion_claims:
+                    terminal_cleanup_save_suppressed = True
+                if cancel_event.is_set():
+                    put_gateway_event("cancel", {"message": "Cancelled by user"})
                 return
+            delivery_writeback_committed = bool(
+                error_payload.get("process_completion_delivery_committed")
+            )
+            if process_completion_claims and not delivery_writeback_committed:
+                terminal_cleanup_save_suppressed = True
             put_gateway_event("apperror", error_payload)
             return
         if not assistant_text:
+            if process_completion_claims:
+                empty_payload = {
+                    "label": "Gateway returned no response",
+                    "type": "gateway_empty_response",
+                    "message": "Gateway returned no assistant message for this turn.",
+                    "hint": "Check that Hermes Gateway API server is running and reachable.",
+                }
+                error_payload = _settle_gateway_terminal_error(
+                    session_id,
+                    stream_id,
+                    workspace,
+                    model,
+                    model_provider,
+                    "Gateway returned no assistant message for this turn.",
+                    process_completion_claims=process_completion_claims,
+                    error_payload_override=empty_payload,
+                    cancel_event=cancel_event,
+                )
+                if error_payload is None:
+                    if process_completion_claims:
+                        terminal_cleanup_save_suppressed = True
+                    if cancel_event.is_set():
+                        put_gateway_event("cancel", {"message": "Cancelled by user"})
+                    return
+                delivery_writeback_committed = bool(
+                    error_payload.get("process_completion_delivery_committed")
+                )
+                if not delivery_writeback_committed:
+                    terminal_cleanup_save_suppressed = True
+                put_gateway_event("apperror", error_payload)
+                return
             put_gateway_event("apperror", {
                 "label": "Gateway returned no response",
                 "type": "gateway_empty_response",
@@ -1259,6 +1604,11 @@ def _run_gateway_chat_streaming(
             if cancel_event.is_set():
                 put_gateway_event("cancel", {"message": "Cancelled by user"})
                 return
+            process_terminal_state_before = None
+            if process_completion_claims:
+                from api.streaming import _snapshot_native_terminal_state
+
+                process_terminal_state_before = _snapshot_native_terminal_state(s)
             now = time.time()
             # Preserve subsecond ordering for gateway-backed turns. Using an
             # integer seconds timestamp gives the user and assistant rows the
@@ -1288,6 +1638,27 @@ def _run_gateway_chat_streaming(
             saved_reasoning = STREAM_REASONING_TEXT.get(stream_id, "")
             if saved_reasoning:
                 assistant_msg["reasoning"] = saved_reasoning
+            if process_completion_claims:
+                from api.streaming import (
+                    _restore_native_terminal_state,
+                    _stamp_process_completion_receipts,
+                )
+
+                if not _stamp_process_completion_receipts(
+                    assistant_msg,
+                    process_completion_claims,
+                    session_id=s.session_id,
+                ):
+                    _restore_native_terminal_state(s, process_terminal_state_before)
+                    terminal_cleanup_save_suppressed = True
+                    put_gateway_event("apperror", {
+                        "label": "Process completion delivery unavailable",
+                        "type": "durable_completion_receipt_unavailable",
+                        "message": "The completed process could not be delivered safely.",
+                        "hint": "The completion will be retried after the session is available.",
+                        "retryable": True,
+                    })
+                    return
             previous_messages = list(getattr(s, "messages", None) or [])
             previous_context = list(getattr(s, "context_messages", None) or getattr(s, "messages", None) or [])
             if _internal_control:
@@ -1392,8 +1763,32 @@ def _run_gateway_chat_streaming(
             if cancel_event.is_set():
                 _restore_cancelled_success_writeback()
                 return
-            s.save()
+            if process_completion_claims:
+                from api.streaming import _save_native_terminal_delivery
+
+                receipt_status = _save_native_terminal_delivery(
+                    s,
+                    process_completion_claims,
+                    before=process_terminal_state_before,
+                )
+                delivery_writeback_committed = receipt_status == "committed"
+                if receipt_status != "committed":
+                    terminal_cleanup_save_suppressed = True
+                    put_gateway_event("apperror", {
+                        "label": "Process completion delivery unavailable",
+                        "type": "durable_completion_receipt_unavailable",
+                        "message": "The completed process could not be delivered safely.",
+                        "hint": "The completion will be retried after the session is available.",
+                        "retryable": True,
+                    })
+                    return
+            else:
+                s.save()
             if cancel_event.is_set():
+                if delivery_writeback_committed:
+                    success_writeback_committed = True
+                    put_gateway_event("cancel", {"message": "Cancelled by user"})
+                    return
                 _restore_cancelled_success_writeback()
                 return
             success_writeback_committed = True
@@ -1478,29 +1873,95 @@ def _run_gateway_chat_streaming(
             err_body = exc.read(2048).decode("utf-8", errors="replace")
         except Exception:
             err_body = ""
-        put_gateway_event(
-            "apperror",
-            _gateway_http_error_event(exc, err_body, api_key_configured=bool(_gateway_api_key())),
+        http_error_payload = _gateway_http_transport_payload(
+            exc,
+            err_body,
+            api_key_configured=bool(_gateway_api_key()),
         )
+        if process_completion_claims:
+            error_payload = _settle_gateway_terminal_error(
+                session_id,
+                stream_id,
+                workspace,
+                model,
+                model_provider,
+                f"{exc}: {err_body}".strip(),
+                process_completion_claims=process_completion_claims,
+                error_payload_override=http_error_payload,
+                cancel_event=cancel_event,
+            )
+            if error_payload is not None:
+                delivery_writeback_committed = bool(
+                    error_payload.get("process_completion_delivery_committed")
+                )
+                if process_completion_claims and not delivery_writeback_committed:
+                    terminal_cleanup_save_suppressed = True
+                put_gateway_event("apperror", error_payload)
+            else:
+                if cancel_event.is_set():
+                    put_gateway_event("cancel", {"message": "Cancelled by user"})
+                terminal_cleanup_save_suppressed = True
+                put_gateway_event(
+                    "apperror",
+                    http_error_payload,
+                )
+        else:
+            put_gateway_event(
+                "apperror",
+                http_error_payload,
+            )
     except Exception as exc:
         safe = _redact_text(str(exc))[:500]
-        put_gateway_event("apperror", {
+        generic_error_payload = {
             "label": "Gateway request failed",
             "type": "gateway_error",
             "message": safe or "Gateway request failed.",
             "hint": "Check HERMES_WEBUI_GATEWAY_BASE_URL and Gateway API server health.",
-        })
+        }
+        if process_completion_claims:
+            error_payload = _settle_gateway_terminal_error(
+                session_id,
+                stream_id,
+                workspace,
+                model,
+                model_provider,
+                safe or "Gateway request failed.",
+                process_completion_claims=process_completion_claims,
+                error_payload_override=generic_error_payload,
+                cancel_event=cancel_event,
+            )
+            if error_payload is not None:
+                delivery_writeback_committed = bool(
+                    error_payload.get("process_completion_delivery_committed")
+                )
+                if process_completion_claims and not delivery_writeback_committed:
+                    terminal_cleanup_save_suppressed = True
+                put_gateway_event("apperror", error_payload)
+            else:
+                terminal_cleanup_save_suppressed = True
+                if cancel_event.is_set():
+                    put_gateway_event("cancel", {"message": "Cancelled by user"})
+                put_gateway_event("apperror", {
+                    "label": "Gateway request failed",
+                    "type": "gateway_error",
+                    "message": safe or "Gateway request failed.",
+                    "hint": "Check HERMES_WEBUI_GATEWAY_BASE_URL and Gateway API server health.",
+                })
+        else:
+            put_gateway_event("apperror", generic_error_payload)
     finally:
         _settle_process_completion_claims(
-            committed=success_writeback_committed,
+            committed=success_writeback_committed or delivery_writeback_committed,
         )
+        terminal_session_cleanup_allowed = not terminal_cleanup_save_suppressed
         if s is not None:
-            try:
-                with _get_session_agent_lock(session_id):
-                    _clear_gateway_pending_state(get_session(session_id), stream_id)
-            except Exception:
-                logger.debug("Failed to clear gateway stream state", exc_info=True)
-            _cleanup_gateway_pending_mirror(session_id, stream_id)
+            if terminal_session_cleanup_allowed:
+                try:
+                    with _get_session_agent_lock(session_id):
+                        _clear_gateway_pending_state(get_session(session_id), stream_id)
+                except Exception:
+                    logger.debug("Failed to clear gateway stream state", exc_info=True)
+                _cleanup_gateway_pending_mirror(session_id, stream_id)
         with STREAMS_LOCK:
             CANCEL_FLAGS.pop(stream_id, None)
             STREAM_GOAL_RELATED.pop(stream_id, None)
@@ -1513,16 +1974,17 @@ def _run_gateway_chat_streaming(
         if runs_api_pending_marked and gateway_run_id_pending(stream_id):
             _finish_gateway_run_starting(stream_id)
         _clear_gateway_run_starting(stream_id)
-        try:
-            from api.goal_continuation import settle_goal_continuation
+        if terminal_session_cleanup_allowed:
+            try:
+                from api.goal_continuation import settle_goal_continuation
 
-            settle_goal_continuation(session_id, stream_id)
-        except Exception:
-            logger.exception(
-                "gateway goal continuation settle hook failed for session %s stream %s",
-                session_id,
-                stream_id,
-            )
+                settle_goal_continuation(session_id, stream_id)
+            except Exception:
+                logger.exception(
+                    "gateway goal continuation settle hook failed for session %s stream %s",
+                    session_id,
+                    stream_id,
+                )
         try:
             from api.state_sync import (
                 COMPLETION_SOURCE_WEBUI_GATEWAY,
@@ -1571,17 +2033,18 @@ def _run_gateway_chat_streaming(
                     stream_id,
                     exc_info=True,
                 )
-        try:
-            from api.background_process import recover_successors_after_unregister
+        if terminal_session_cleanup_allowed:
+            try:
+                from api.background_process import recover_successors_after_unregister
 
-            recover_successors_after_unregister(
-                session_id,
-                session=s,
-                profile=getattr(s, "profile", None) or profile,
-            )
-        except Exception:
-            logger.exception(
-                "gateway post-unregister successor recovery failed for session %s stream %s",
-                session_id,
-                stream_id,
-            )
+                recover_successors_after_unregister(
+                    session_id,
+                    session=s,
+                    profile=getattr(s, "profile", None) or profile,
+                )
+            except Exception:
+                logger.exception(
+                    "gateway post-unregister successor recovery failed for session %s stream %s",
+                    session_id,
+                    stream_id,
+                )

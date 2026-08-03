@@ -546,7 +546,7 @@ def test_successful_process_wakeup_ack_replay_does_not_call_provider_twice(
     registry.fail_committed_remaining = 1
     _CountingSuccessfulAgent.run_calls = 0
 
-    emitted = _run_exact_process_wakeup(
+    _run_exact_process_wakeup(
         session,
         tmp_path,
         event,
@@ -2321,6 +2321,11 @@ def test_process_wakeup_pause_successful_clear_serializes_against_concurrent_sup
     )
     monkeypatch.setattr(routes, "_process_wakeup_provider_has_recovery_credential", _provider_has_recovery)
     monkeypatch.setattr(routes, "_start_run", _fake_start_run)
+    # This test exercises pause-clear serialization.  The live admission guard
+    # intentionally rejects a second same-lineage start while the first run is
+    # still admitted; isolate that newer contract so the race remains focused
+    # on the pause lock and both starts can reach the code under test.
+    monkeypatch.setattr(routes, "_bind_execution_lineage", lambda *_args, **_kwargs: None)
 
     def _run(name):
         responses[name] = routes.start_session_turn(
