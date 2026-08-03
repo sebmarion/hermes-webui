@@ -40,9 +40,9 @@
 - Create: `tests/test_sync_live_main.py`
 - Modify: `docs/supervisor.md` with the operator-facing invocation and recovery states
 
-- [ ] **Step 1: Write temporary-repository tests** covering staged, unstaged, and untracked local edits; local commits ahead of upstream; fetch followed by a normal merge; and a merge/stash-apply conflict that leaves the named stash recoverable.
+- [ ] **Step 1: Write temporary-repository tests** covering staged, unstaged, and untracked local edits; divergence with both local-only and remote-only commits; fetch followed by a normal merge; and a merge/stash-apply conflict that leaves the named stash recoverable. Assert the command log contains no `reset`, `restore`, `checkout .`, `clean`, `rebase`, or `pull` invocation.
 - [ ] **Step 2: Run `./scripts/test.sh tests/test_sync_live_main.py -q`** and confirm the tests fail because the helper does not exist.
-- [ ] **Step 3: Implement `sync_live_main(repo, upstream_ref='origin/main')` and its CLI** with explicit repo/branch/in-progress-operation validation, `fetch`, a named `stash push --include-untracked` only when needed, `merge --no-rebase`, `stash apply --index` (never `pop`), and human-readable conflict handoff. It must never invoke `reset`, `restore`, `checkout .`, `clean`, or rebase.
+- [ ] **Step 3: Implement `sync_live_main(repo, upstream_ref='origin/main')` and its CLI** with explicit repo/branch/in-progress-operation validation, `fetch`, a named `stash push --include-untracked` only when needed, plain `merge` (optionally `--no-edit`), `stash apply --index` (never `pop`), and human-readable conflict handoff. It must never invoke `pull`, `reset`, `restore`, `checkout .`, `clean`, or rebase.
 - [ ] **Step 4: Keep the stash until the caller explicitly confirms verification**; the helper must print its stash object/name on every non-success path and never silently drop it.
 - [ ] **Step 5: Run the helper tests** and verify the full preservation/conflict matrix passes.
 
