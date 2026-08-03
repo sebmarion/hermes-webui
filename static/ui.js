@@ -15768,6 +15768,7 @@ function renderMessages(options){
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
     const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
+    const nextfixBtn = (!isUser&&!m._live) ? `<button class="msg-action-btn msg-nextfix-btn" title="${t('nextfix_action')}" aria-label="${t('nextfix_action')}" onclick="openNextfixReport(${rawIdx})">${li('alert-triangle',13)}</button>` : '';
     const copyBtn  = `<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>`;
     const readOnlySession=typeof _isReadOnlySession==='function'
       ? _isReadOnlySession(S.session)
@@ -15793,7 +15794,7 @@ function renderMessages(options){
     const questionJumpBtn = (_qJumpTarget!==undefined&&_qJumpTarget!==null)
       ? _questionJumpButtonHtml(_qJumpTarget, assistantRawIdxByQuestionRawIdx.get(_qJumpTarget)??rawIdx)
       : '';
-    const footHtml = `<div class="msg-foot">${timeHtml}<span class="msg-actions">${editBtn}${ttsBtn}${forkBtn}${copyBtn}${retryBtn}</span>${questionJumpBtn}</div>`;
+    const footHtml = `<div class="msg-foot">${timeHtml}<span class="msg-actions">${editBtn}${ttsBtn}${forkBtn}${copyBtn}${retryBtn}${nextfixBtn}</span>${questionJumpBtn}</div>`;
 
     if(_isContextCompactionMessage(m)){
       continue;

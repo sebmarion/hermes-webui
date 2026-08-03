@@ -1767,6 +1767,27 @@
   </div>
 </div>
 <div class="toast" id="toast"></div>
+<dialog class="nextfix-dialog" id="nextfixDialog" aria-labelledby="nextfixTitle">
+  <form id="nextfixForm" method="dialog">
+    <div class="nextfix-dialog-header">
+      <div>
+        <p class="nextfix-kicker">Safe Change</p>
+        <h2 id="nextfixTitle" data-i18n="nextfix_capture_title">Fix in next release</h2>
+        <p class="nextfix-dialog-copy" data-i18n="nextfix_capture_copy">Capture this response as a local issue. Nothing is generated, synced, staged, or applied automatically.</p>
+      </div>
+      <button class="nextfix-close" id="nextfixCancel" type="button" aria-label="Close" data-i18n-aria-label="nextfix_cancel">×</button>
+    </div>
+    <label for="nextfixObserved" data-i18n="nextfix_observed_label">What happened?</label>
+    <textarea id="nextfixObserved" maxlength="4096" rows="8" required></textarea>
+    <label for="nextfixExpected" data-i18n="nextfix_expected_label">What should have happened?</label>
+    <textarea id="nextfixExpected" maxlength="4096" rows="4" required placeholder="Describe the correct behavior…" data-i18n-placeholder="nextfix_expected_placeholder"></textarea>
+    <p class="nextfix-status" id="nextfixStatus" role="status" hidden></p>
+    <div class="nextfix-dialog-actions">
+      <button class="nextfix-secondary" id="nextfixCancelFooter" type="button" data-i18n="nextfix_cancel">Cancel</button>
+      <button class="nextfix-primary" type="submit" data-i18n="nextfix_capture">Capture issue</button>
+    </div>
+  </form>
+</dialog>
 <script src="static/i18n.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/icons.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/assistant_turn_anchors.js?v=__WEBUI_VERSION__" defer></script>
@@ -1776,6 +1797,7 @@
 <script src="static/sessions.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/commands.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/messages.js?v=__WEBUI_VERSION__" defer></script>
+<script src="static/nextfix.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/extension_settings.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/panels.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/onboarding.js?v=__WEBUI_VERSION__" defer></script>

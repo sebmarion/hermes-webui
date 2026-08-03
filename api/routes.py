@@ -15827,6 +15827,19 @@ def handle_post(handler, parsed) -> bool:
             diag.finish()
         return True
 
+    if parsed.path == "/api/nextfix":
+        from api.nextfix import NextfixUnavailable, NextfixValidationError, capture_nextfix
+
+        try:
+            return j(handler, capture_nextfix(body))
+        except NextfixValidationError as exc:
+            return bad(handler, str(exc), status=400)
+        except NextfixUnavailable as exc:
+            return bad(handler, str(exc), status=503)
+        except Exception:
+            logger.exception("nextfix capture failed")
+            return bad(handler, "Failed to capture report", status=500)
+
     if parsed.path == "/api/escape/authorize":
         return _handle_escape_authorize(handler, parsed, body)
 
