@@ -11717,6 +11717,7 @@ def _run_agent_streaming(
                     s,
                     stream_id,
                     tool_limit_reached=bool(_tool_limit_reached),
+                    defer_start=True,
                 )
             except Exception:
                 logger.exception(
@@ -11774,21 +11775,36 @@ def _run_agent_streaming(
         # by source-order regression tests. It must run outside STREAMS_LOCK and
         # only after the final durable write above, so release admission never
         # inverts locks or observes a false idle boundary.
-        unregister_active_run(stream_id, defer_activity_finish=True)
+        _unregistered_active_entry = unregister_active_run(
+            stream_id,
+            defer_activity_finish=True,
+        )
+        # Compression can rotate the physical session ID while this worker
+        # remains the same run. ``finish_session_activity`` clears the known
+        # aliases before unregister, but the authoritative ACTIVE_RUNS entry
+        # is the final identity-safe cleanup source for any rotated/profile-
+        # migrated row left by a crash-window heartbeat.
+        if _unregistered_active_entry:
+            try:
+                from api.state_sync import clear_session_activity
 
-        # Successor recovery runs after the parent row is gone. During a release
-        # fence its own admission is rejected while the durable receipt remains
-        # claimed for the replacement process.
-        try:
-            from api.goal_continuation import recover_pending_goal_continuations
+                clear_session_activity(
+                    str(
+                        _unregistered_active_entry.get("session_id")
+                        or session_id
+                    ),
+                    stream_id,
+                    profile=_unregistered_active_entry.get("profile") or profile,
+                )
+            except Exception:
+                logger.debug(
+                    "authoritative active activity cleanup failed for %s",
+                    stream_id,
+                    exc_info=True,
+                )
 
-            recover_pending_goal_continuations(session_id=session_id)
-        except Exception:
-            logger.exception(
-                "goal continuation recovery hook failed for session %s stream %s",
-                session_id,
-                stream_id,
-            )
+        # Successor recovery runs after the parent row is gone. Tool-limit
+        # recovery must precede goal and generic deferred work.
 
         # ── Defer-path fix: turn-teardown idle-hook ────────────────────────
         # The session has just transitioned active→idle: unregister_active_run
@@ -11810,12 +11826,16 @@ def _run_agent_streaming(
         # turn's own teardown finds nothing claimed (no wakeup loop). The
         # drain spawns its own daemon thread, so teardown never blocks.
         try:
-            from api.background_process import drain_deferred_wakeups_for_session
+            from api.background_process import recover_successors_after_unregister
 
-            drain_deferred_wakeups_for_session(session_id)
+            recover_successors_after_unregister(
+                session_id,
+                session=s,
+                profile=getattr(s, "profile", None) or profile,
+            )
         except Exception:
             logger.debug(
-                "turn-teardown deferred-wakeup drain failed for session %s",
+                "post-unregister successor recovery failed for session %s",
                 session_id,
                 exc_info=True,
             )

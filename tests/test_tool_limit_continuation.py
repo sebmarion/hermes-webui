@@ -68,6 +68,29 @@ def test_duplicate_terminal_callback_creates_and_starts_one_child(store):
     }
 
 
+def test_teardown_can_claim_child_without_starting_before_parent_release(store):
+    p = parent()
+    p.save()
+    starts = []
+
+    receipt = tlc.handle_terminal(
+        p,
+        "parent-run-deferred",
+        tool_limit_reached=True,
+        start=lambda sid, prompt: starts.append((sid, prompt))
+        or {"stream_id": "child-run"},
+        defer_start=True,
+    )
+
+    assert receipt["state"] == "claimed"
+    assert starts == []
+    assert tlc.recover_pending_continuations(
+        start=lambda sid, prompt: starts.append((sid, prompt))
+        or {"stream_id": "child-run"},
+    ) == 1
+    assert len(starts) == 1
+
+
 def test_restart_recovery_starts_claimed_receipt_once(store):
     p = parent()
     p.save()

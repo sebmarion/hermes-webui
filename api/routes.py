@@ -11937,6 +11937,8 @@ def _run_lifecycle_health() -> dict:
             item.pop("session_id", None)
             item.pop("stream_id", None)
             item.pop("workspace", None)
+            item.pop("execution_lineage_key", None)
+            item.pop("lineage_required", None)
             started_at = item.get("started_at")
             try:
                 age = max(0.0, now - float(started_at))
@@ -23006,6 +23008,14 @@ def _bind_execution_lineage(session, admission_reservation_id):
     bind_run_admission(
         admission_reservation_id,
         resolved.execution_lineage_key,
+        session_id=(
+            getattr(resolved, "requested_session_id", None)
+            or getattr(session, "session_id", None)
+        ),
+        profile=(
+            getattr(resolved, "profile", None)
+            or getattr(session, "profile", None)
+        ),
     )
     return resolved
 
@@ -24335,6 +24345,7 @@ def start_session_turn(
     message: str,
     *,
     source: str = "process_wakeup",
+    expected_profile: str | None = None,
     _admission_reservation_id=None,
     _admission_transfer_state=None,
     delegation_id: str = "",
@@ -24381,6 +24392,15 @@ def start_session_turn(
         s = get_session(session_id)
     except KeyError:
         return {"error": "Session not found", "_status": 404}
+
+    if expected_profile and not _profiles_match(
+        getattr(s, "profile", None), expected_profile
+    ):
+        from api.execution_lineage import ExecutionLineageUnavailable
+
+        return _execution_lineage_error_payload(
+            ExecutionLineageUnavailable("wakeup target profile conflicts")
+        )
 
     try:
         _bind_execution_lineage(s, _admission_reservation_id)

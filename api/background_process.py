@@ -1387,6 +1387,91 @@ def _process_async_delegation_event(evt: dict) -> None:
         dispatch_pending_delegation_wakeups_for_session(session_id)
 
 
+def _execution_lineage_for_session(
+    session_id: str,
+    *,
+    expected_profile: str | None = None,
+) -> tuple[str, str]:
+    """Resolve a wakeup target without falling back across real profiles."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        raise ValueError("session id is required")
+    try:
+        from api.models import get_session
+
+        session = get_session(sid, metadata_only=True)
+    except KeyError:
+        session = None
+    except Exception as exc:
+        from api.execution_lineage import ExecutionLineageUnavailable
+
+        raise ExecutionLineageUnavailable(
+            "wakeup target metadata is unavailable"
+        ) from exc
+    if session is None:
+        # Synthetic unit-test/legacy events may arrive before WebUI has a
+        # sidecar. Keep their physical bucket until the first real session
+        # record exists; this does not create a permissive cross-profile path.
+        return sid, str(expected_profile or "").strip()
+    actual_profile = str(getattr(session, "profile", None) or "default").strip()
+    if expected_profile and actual_profile != str(expected_profile).strip():
+        from api.execution_lineage import ExecutionLineageUnavailable
+
+        raise ExecutionLineageUnavailable("wakeup target profile conflicts")
+    from api.execution_lineage import resolve_execution_lineage
+
+    resolved = resolve_execution_lineage(
+        sid,
+        session=session,
+        profile=actual_profile,
+    )
+    return resolved.execution_lineage_key, resolved.profile
+
+
+def _live_lineage_key_for_session(session_id: str) -> str:
+    """Return an already-owned key for a physical target, if one exists."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return ""
+    try:
+        from api import config as _cfg
+
+        with _cfg.ACTIVE_RUNS_LOCK:
+            for owner in list((_cfg._RUN_ADMISSION_RESERVATIONS or {}).values()) + list(
+                (_cfg.ACTIVE_RUNS or {}).values()
+            ):
+                if not isinstance(owner, dict) or str(owner.get("session_id") or "") != sid:
+                    continue
+                key = str(owner.get("execution_lineage_key") or "").strip()
+                if key:
+                    return key
+    except Exception:
+        logger.debug("live execution-lineage lookup failed for %s", sid, exc_info=True)
+    return ""
+
+
+def _queue_identity_for_session(
+    session_id: str,
+    *,
+    expected_profile: str | None = None,
+) -> tuple[str, str, bool]:
+    """Return (bucket key, profile, resolved) for queue operations."""
+    try:
+        key, profile = _execution_lineage_for_session(
+            session_id,
+            expected_profile=expected_profile,
+        )
+        key = _live_lineage_key_for_session(session_id) or key
+        return key, profile, True
+    except Exception:
+        logger.warning(
+            "execution lineage unavailable for deferred target %s",
+            session_id,
+            exc_info=True,
+        )
+        return str(session_id or ""), str(expected_profile or "").strip(), False
+
+
 def record_deferred_wakeup(
     session_id: str,
     process_id: str,
@@ -1394,6 +1479,8 @@ def record_deferred_wakeup(
     *,
     async_delegation_id: str = "",
     completion_event: dict | None = None,
+    execution_lineage_key: str | None = None,
+    target_profile: str | None = None,
 ) -> None:
     """Persist a deferred process-completion wakeup for later redelivery.
 
@@ -1413,8 +1500,16 @@ def record_deferred_wakeup(
     from api import config as _cfg
 
     try:
+        bucket_key, resolved_profile, _resolved = (
+            (str(execution_lineage_key).strip(), str(target_profile or "").strip(), True)
+            if execution_lineage_key
+            else _queue_identity_for_session(
+                session_id,
+                expected_profile=target_profile,
+            )
+        )
         with _cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
-            entries = _cfg.DEFERRED_PROCESS_WAKEUPS.setdefault(session_id, [])
+            entries = _cfg.DEFERRED_PROCESS_WAKEUPS.setdefault(bucket_key, [])
             if process_id:
                 existing = next(
                     (e for e in entries if e.get("process_id") == process_id),
@@ -1426,7 +1521,27 @@ def record_deferred_wakeup(
                     if completion_event and not existing.get("completion_event"):
                         existing["completion_event"] = completion_event
                     return
-            entry = {"process_id": process_id, "wakeup_prompt": wakeup_prompt}
+            entry = {
+                "process_id": process_id,
+                "wakeup_prompt": wakeup_prompt,
+            }
+            # A real persisted session always resolves to an opaque digest.
+            # Keep the legacy two-field shape for synthetic/pre-sidecar events
+            # that still use their physical ID as the fallback bucket; this
+            # avoids exposing an unvalidated identity and preserves old queue
+            # readers while the session record is being reconstructed.
+            if (
+                execution_lineage_key
+                or bucket_key != str(session_id)
+                or resolved_profile
+            ):
+                entry.update(
+                    {
+                        "target_session_id": str(session_id),
+                        "target_profile": resolved_profile,
+                        "execution_lineage_key": bucket_key,
+                    }
+                )
             if async_delegation_id:
                 entry["async_delegation_id"] = async_delegation_id
             if completion_event:
@@ -1438,7 +1553,11 @@ def record_deferred_wakeup(
         )
 
 
-def claim_deferred_wakeups(session_id: str) -> list[dict]:
+def claim_deferred_wakeups(
+    session_id: str,
+    *,
+    execution_lineage_key: str | None = None,
+) -> list[dict]:
     """Atomically remove and return all deferred wakeups for *session_id*.
 
     The single-delivery guarantee for the defer path: the dict ``pop`` under
@@ -1454,8 +1573,16 @@ def claim_deferred_wakeups(session_id: str) -> list[dict]:
     from api import config as _cfg
 
     try:
+        bucket_key = str(execution_lineage_key or "").strip()
+        if not bucket_key:
+            bucket_key, _profile, _resolved = _queue_identity_for_session(session_id)
         with _cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
-            return _cfg.DEFERRED_PROCESS_WAKEUPS.pop(session_id, []) or []
+            entries = _cfg.DEFERRED_PROCESS_WAKEUPS.pop(bucket_key, []) or []
+            if not entries and bucket_key != str(session_id):
+                # Preserve a pre-lineage fallback bucket created before a
+                # session sidecar became available.
+                entries = _cfg.DEFERRED_PROCESS_WAKEUPS.pop(session_id, []) or []
+            return entries
     except Exception:
         logger.debug(
             "claim_deferred_wakeups failed for session %s", session_id, exc_info=True
@@ -1463,7 +1590,11 @@ def claim_deferred_wakeups(session_id: str) -> list[dict]:
         return []
 
 
-def drain_deferred_wakeups_for_session(session_id: str) -> int:
+def drain_deferred_wakeups_for_session(
+    session_id: str,
+    *,
+    execution_lineage_key: str | None = None,
+) -> int:
     """Turn-teardown idle-hook: redeliver deferred wakeups once idle.
 
     Called from ``api/streaming`` right AFTER ``unregister_active_run`` so
@@ -1488,6 +1619,11 @@ def drain_deferred_wakeups_for_session(session_id: str) -> int:
     from api import config as _cfg
 
     try:
+        bucket_key, target_profile, resolved = _queue_identity_for_session(session_id)
+        if execution_lineage_key:
+            bucket_key = str(execution_lineage_key).strip()
+        if not resolved:
+            return 0
         # Async-delegation wakeups use the durable SQLite state machine. Only
         # one prompt starts per turn boundary; generic process wakeups below
         # retain their established in-memory behavior.
@@ -1495,15 +1631,24 @@ def drain_deferred_wakeups_for_session(session_id: str) -> int:
         if durable_started:
             return durable_started
         # Multi-stream guard: only fire when the session is TRULY idle.
-        if _session_has_active_turn(session_id):
+        if _session_has_active_turn(session_id, execution_lineage_key=bucket_key):
             return 0
         # Peek without claiming: avoid taking the entries then discovering
         # there is nothing to do under contention.
         with _cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
-            if not _cfg.DEFERRED_PROCESS_WAKEUPS.get(session_id):
+            if not (
+                _cfg.DEFERRED_PROCESS_WAKEUPS.get(bucket_key)
+                or (
+                    bucket_key != str(session_id)
+                    and _cfg.DEFERRED_PROCESS_WAKEUPS.get(session_id)
+                )
+            ):
                 return 0
         # Atomic claim — exactly one caller gets the entries.
-        entries = claim_deferred_wakeups(session_id)
+        entries = claim_deferred_wakeups(
+            session_id,
+            execution_lineage_key=bucket_key,
+        )
         if not entries:
             return 0
         # The session-level PENDING marker is server-internal telemetry; the
@@ -1541,15 +1686,31 @@ def drain_deferred_wakeups_for_session(session_id: str) -> int:
                         (entry or {}).get("async_delegation_id") or ""
                     ),
                     completion_event=(entry or {}).get("completion_event"),
+                    execution_lineage_key=str(
+                        (entry or {}).get("execution_lineage_key") or bucket_key
+                    ),
+                    target_profile=str(
+                        (entry or {}).get("target_profile") or target_profile
+                    ),
                 )
+            target_session_id = str(
+                (first or {}).get("target_session_id") or session_id
+            )
+            target_profile = str(
+                (first or {}).get("target_profile") or target_profile
+            ).strip()
             _start_server_side_wakeup_turn(
-                session_id,
+                target_session_id,
                 str((first or {}).get("wakeup_prompt") or "").strip(),
                 process_id=str((first or {}).get("process_id") or ""),
                 async_delegation_id=str(
                     (first or {}).get("async_delegation_id") or ""
                 ),
                 completion_event=(first or {}).get("completion_event"),
+                execution_lineage_key=str(
+                    (first or {}).get("execution_lineage_key") or bucket_key
+                ),
+                expected_profile=target_profile,
             )
             started = 1
         if started:
@@ -1567,6 +1728,91 @@ def drain_deferred_wakeups_for_session(session_id: str) -> int:
             exc_info=True,
         )
         return 0
+
+
+def recover_successors_after_unregister(
+    session_id: str,
+    *,
+    session=None,
+    profile: str | None = None,
+) -> dict[str, int]:
+    """Run post-turn successor recovery in one backend-independent order.
+
+    The parent active-run row must already be removed before this helper is
+    called. Tool-limit receipts have priority, then goal continuations, then
+    the generic lineage-owned process wakeup bucket. Each subsystem keeps its
+    existing durable/retry semantics; this function only fixes their ordering.
+    """
+    target_session_id = str(
+        getattr(session, "session_id", None) or session_id or ""
+    ).strip()
+    if not target_session_id:
+        return {"tool_limit": 0, "goal": 0, "deferred": 0}
+    target_profile = str(
+        profile or getattr(session, "profile", None) or ""
+    ).strip()
+    root_session_id = target_session_id
+    lineage_resolved = False
+    try:
+        from api.execution_lineage import resolve_execution_lineage
+
+        resolved = resolve_execution_lineage(
+            target_session_id,
+            session=session,
+            profile=target_profile or None,
+        )
+        root_session_id = resolved.execution_root_session_id
+        target_profile = resolved.profile
+        lineage_resolved = True
+    except Exception:
+        # Recovery must not invent a cross-profile/root fallback. The durable
+        # tool receipt filter remains exact-root when the validated resolver is
+        # temporarily unavailable, and the generic drain itself fails closed.
+        logger.warning(
+            "execution lineage unavailable during successor recovery for %s",
+            target_session_id,
+            exc_info=True,
+        )
+
+    tool_started = 0
+    if lineage_resolved:
+        try:
+            from api.tool_limit_continuation import recover_pending_continuations
+
+            tool_started = int(
+                recover_pending_continuations(
+                    root_session_id=root_session_id,
+                    profile=target_profile or None,
+                )
+                or 0
+            )
+        except Exception:
+            logger.exception(
+                "tool-limit successor recovery failed for %s",
+                target_session_id,
+            )
+
+    goal_started = 0
+    try:
+        from api.goal_continuation import recover_pending_goal_continuations
+
+        goal_started = int(
+            recover_pending_goal_continuations(session_id=target_session_id) or 0
+        )
+    except Exception:
+        logger.exception(
+            "goal successor recovery failed for %s",
+            target_session_id,
+        )
+
+    deferred_started = int(
+        drain_deferred_wakeups_for_session(target_session_id) or 0
+    )
+    return {
+        "tool_limit": tool_started,
+        "goal": goal_started,
+        "deferred": deferred_started,
+    }
 
 
 def _run_claimed_delegation_wakeup(row: dict) -> None:
@@ -1651,30 +1897,54 @@ def replay_pending_delegation_wakeups() -> int:
     return started
 
 
-def _session_has_active_turn(session_id: str) -> bool:
-    """True if a foreground/streaming agent turn is currently active for *session_id*.
+def _session_has_active_turn(
+    session_id: str,
+    *,
+    execution_lineage_key: str | None = None,
+) -> bool:
+    """True if a foreground turn owns this physical session or its lineage.
 
-    The drain thread has no Session object, so we key on ACTIVE_RUNS — the
-    worker-lifecycle registry that this module already uses (see
-    ``_emit_to_session_streams``) to map a stream back to its owning session.
-    ACTIVE_RUNS is registered at agent-worker start and removed in the worker's
-    outer ``finally``, so it survives cancel/reconnect races better than
-    STREAMS. There is a brief window where ``_start_chat_stream_for_session``
-    has populated STREAMS but the worker thread has not yet called
-    ``register_active_run``; in that window this returns False and the
-    subsequent ``start_session_turn`` is rejected with a 409 by
-    ``_start_chat_stream_for_session``'s own active-stream guard — i.e. the
-    same lock /api/chat/start uses is the authoritative race backstop.
+    The resolver runs before ``ACTIVE_RUNS_LOCK``.  Bound reservations are
+    included because the worker thread has a small, real admission window
+    between sidecar/stream setup and ``register_active_run``.  If lineage
+    resolution is unavailable, return ``True`` (fail closed) so a wakeup cannot
+    cross an unknown profile/root boundary.
     """
     from api import config as _cfg
 
     try:
+        bucket_key = str(execution_lineage_key or "").strip()
+        if not bucket_key:
+            bucket_key, _profile, resolved = _queue_identity_for_session(session_id)
+            if not resolved:
+                return True
+        physical_id = str(session_id or "")
         with _cfg.ACTIVE_RUNS_LOCK:
-            for _stream_id, meta in (_cfg.ACTIVE_RUNS or {}).items():
-                if isinstance(meta, dict) and meta.get("session_id") == session_id:
+            for reservation in (_cfg._RUN_ADMISSION_RESERVATIONS or {}).values():
+                if (
+                    isinstance(reservation, dict)
+                    and str(reservation.get("execution_lineage_key") or "").strip()
+                    == bucket_key
+                ):
+                    return True
+            for meta in (_cfg.ACTIVE_RUNS or {}).values():
+                if not isinstance(meta, dict):
+                    continue
+                if (
+                    str(meta.get("execution_lineage_key") or "").strip()
+                    == bucket_key
+                ):
+                    return True
+                # Auxiliary/legacy rows may intentionally be unkeyed. They
+                # still block their exact physical target, but never claim a
+                # different lineage merely because IDs happen to be related.
+                if not str(meta.get("execution_lineage_key") or "").strip() and str(
+                    meta.get("session_id") or ""
+                ) == physical_id:
                     return True
     except Exception:
         logger.debug("ACTIVE_RUNS active-turn check failed", exc_info=True)
+        return True
     return False
 
 
@@ -1685,6 +1955,8 @@ def _start_server_side_wakeup_turn(
     process_id: str = "",
     async_delegation_id: str = "",
     completion_event: dict | None = None,
+    execution_lineage_key: str | None = None,
+    expected_profile: str | None = None,
 ) -> None:
     """Start an agent turn server-side for a process_complete wakeup (Option Z).
 
@@ -1729,6 +2001,8 @@ def _start_server_side_wakeup_turn(
                 wakeup_prompt,
                 async_delegation_id=async_delegation_id,
                 completion_event=completion_event,
+                execution_lineage_key=execution_lineage_key,
+                target_profile=expected_profile,
             )
 
         try:
@@ -1738,9 +2012,10 @@ def _start_server_side_wakeup_turn(
                 completion_event
                 and stage_process_completion_event(session_id, completion_event)
             )
-            resp = start_session_turn(
-                session_id, wakeup_prompt, source="process_wakeup"
-            )
+            start_kwargs = {"source": "process_wakeup"}
+            if expected_profile:
+                start_kwargs["expected_profile"] = expected_profile
+            resp = start_session_turn(session_id, wakeup_prompt, **start_kwargs)
             status = int((resp or {}).get("_status", 200) or 200)
             if status == 409 and (resp or {}).get("error") == "process_wakeup_paused":
                 _defer_unclaimed_completion()
@@ -1767,6 +2042,8 @@ def _start_server_side_wakeup_turn(
                         wakeup_prompt,
                         async_delegation_id=async_delegation_id,
                         completion_event=completion_event,
+                        execution_lineage_key=execution_lineage_key,
+                        target_profile=expected_profile,
                     )
                 if completion_staged and completion_event:
                     _unstage_process_completion_event(session_id, completion_event)
@@ -1776,6 +2053,23 @@ def _start_server_side_wakeup_turn(
                     session_id,
                 )
             elif status >= 400:
+                if (
+                    status == 503
+                    and (resp or {}).get("code") == "execution_lineage_unavailable"
+                    and wakeup_prompt
+                ):
+                    # A claimed lineage-owned entry must survive a target
+                    # profile/identity retry failure; otherwise the atomic
+                    # queue pop would silently lose the prompt.
+                    record_deferred_wakeup(
+                        session_id,
+                        process_id,
+                        wakeup_prompt,
+                        async_delegation_id=async_delegation_id,
+                        completion_event=completion_event,
+                        execution_lineage_key=execution_lineage_key,
+                        target_profile=expected_profile,
+                    )
                 _defer_unclaimed_completion()
                 logger.warning(
                     "server-side wakeup failed for session %s: status=%s err=%r",
@@ -1797,6 +2091,8 @@ def _start_server_side_wakeup_turn(
                             wakeup_prompt,
                             async_delegation_id=async_delegation_id,
                             completion_event=completion_event,
+                            execution_lineage_key=execution_lineage_key,
+                            target_profile=expected_profile,
                         )
                         logger.error(
                             "accepted process wakeup did not bind its durable completion event"

@@ -17,7 +17,7 @@ def test_streaming_keeps_parent_active_through_settlement_then_recovers_successo
     settle_idx = src.find("settle_goal_continuation(session_id, stream_id)", pop_idx)
     finish_idx = src.find("finish_session_activity(", settle_idx)
     unregister_idx = src.find("unregister_active_run(stream_id", finish_idx)
-    recover_idx = src.find("recover_pending_goal_continuations(", unregister_idx)
+    recover_idx = src.find("recover_successors_after_unregister(", unregister_idx)
     assert -1 not in (pop_idx, settle_idx, finish_idx, unregister_idx, recover_idx)
     assert pop_idx < settle_idx < finish_idx < unregister_idx < recover_idx
 

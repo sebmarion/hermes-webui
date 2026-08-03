@@ -9538,8 +9538,10 @@ BG_TASK_COMPLETE_EVENTS_SEEN_LOCK = threading.Lock()
 
 # Legacy process-completion defer queue. This is intentionally process-local;
 # async delegation completions use api.delegation_wakeup_store's durable SQLite
-# pending/claimed/delivered state instead.
-DEFERRED_PROCESS_WAKEUPS: dict = {}  # session_id -> list[{"process_id", "wakeup_prompt"}]
+# pending/claimed/delivered state instead. Real WebUI rows are bucketed by the
+# opaque execution-lineage key; legacy synthetic rows may temporarily use the
+# physical session ID until their sidecar identity is available.
+DEFERRED_PROCESS_WAKEUPS: dict = {}  # execution_lineage_key -> list[wakeup entries]
 DEFERRED_PROCESS_WAKEUPS_LOCK = threading.Lock()
 
 # ── Persistent per-session SSE channel (Option X) ──────────────────────────
@@ -10234,6 +10236,9 @@ def reserve_run_admission(*, kind: str, **metadata) -> str:
 def bind_run_admission(
     reservation_id: str | None,
     execution_lineage_key: str,
+    *,
+    session_id: str | None = None,
+    profile: str | None = None,
 ) -> str:
     """Bind one existing reservation to an immutable execution owner.
 
@@ -10254,6 +10259,10 @@ def bind_run_admission(
         if current:
             if current != key:
                 raise ValueError("run admission reservation lineage is immutable")
+            if session_id:
+                entry.setdefault("session_id", str(session_id))
+            if profile:
+                entry.setdefault("profile", str(profile))
             return key
         for other_id, other in _RUN_ADMISSION_RESERVATIONS.items():
             if other_id == reservation_id or not isinstance(other, dict):
@@ -10270,6 +10279,10 @@ def bind_run_admission(
                     "execution lineage already has an active run"
                 )
         entry["execution_lineage_key"] = key
+        if session_id:
+            entry["session_id"] = str(session_id)
+        if profile:
+            entry["profile"] = str(profile)
         return key
 
 

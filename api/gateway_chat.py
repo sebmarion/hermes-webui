@@ -1287,14 +1287,39 @@ def _run_gateway_chat_streaming(
             )
         except Exception:
             logger.debug("gateway completion event finalization failed for %s", session_id, exc_info=True)
-        unregister_active_run(stream_id, defer_activity_finish=True)
-        try:
-            from api.goal_continuation import recover_pending_goal_continuations
+        _unregistered_active_entry = unregister_active_run(
+            stream_id,
+            defer_activity_finish=True,
+        )
+        if _unregistered_active_entry:
+            try:
+                from api.state_sync import clear_session_activity
 
-            recover_pending_goal_continuations(session_id=session_id)
+                clear_session_activity(
+                    str(
+                        _unregistered_active_entry.get("session_id")
+                        or session_id
+                    ),
+                    stream_id,
+                    profile=_unregistered_active_entry.get("profile") or profile,
+                )
+            except Exception:
+                logger.debug(
+                    "gateway authoritative active activity cleanup failed for %s",
+                    stream_id,
+                    exc_info=True,
+                )
+        try:
+            from api.background_process import recover_successors_after_unregister
+
+            recover_successors_after_unregister(
+                session_id,
+                session=s,
+                profile=getattr(s, "profile", None) or profile,
+            )
         except Exception:
             logger.exception(
-                "gateway goal continuation recovery hook failed for session %s stream %s",
+                "gateway post-unregister successor recovery failed for session %s stream %s",
                 session_id,
                 stream_id,
             )

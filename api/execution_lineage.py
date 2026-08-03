@@ -82,13 +82,11 @@ def _load_receipt_for_child(child_id: str) -> dict | None:
     ]
     if not matches:
         return None
-    return max(
-        matches,
-        key=lambda row: (
-            float(row.get("updated_at") or row.get("claimed_at") or 0),
-            int(row.get("continuation_index") or 0),
-        ),
-    )
+    if len(matches) != 1:
+        raise ExecutionLineageUnavailable(
+            "tool-limit child receipt identity is ambiguous"
+        )
+    return matches[0]
 
 
 def _session_root(session, *, session_id: str, profile: str) -> str:

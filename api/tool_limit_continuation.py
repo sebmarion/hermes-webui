@@ -631,7 +631,13 @@ def _start_receipt(
     if starter is None:
         from api.routes import start_session_turn
 
-        starter = lambda sid, text: start_session_turn(sid, text, source=SOURCE)
+        target_profile = str(receipt.get("profile") or "").strip()
+
+        def starter(sid, text):
+            kwargs = {"source": SOURCE}
+            if target_profile:
+                kwargs["expected_profile"] = target_profile
+            return start_session_turn(sid, text, **kwargs)
     prompt = str(
         receipt.get("continuation_prompt")
         or "Continue the unfinished task from the parent segment. Use the inherited context, "
@@ -672,8 +678,14 @@ def handle_terminal(
     start: Callable[[str, str], dict] | None = None,
     emit: Callable[[str, dict], None] | None = None,
     now: float | None = None,
+    defer_start: bool = False,
 ) -> dict | None:
-    """Settle one segment and, on exhaustion, claim/start exactly one child."""
+    """Settle one segment and, on exhaustion, claim one child.
+
+    ``defer_start`` is used by in-process WebUI teardown: the durable child is
+    claimed while the parent still owns admission, then a post-unregister
+    recovery pass launches it. Existing callers keep claim-and-start behavior.
+    """
     now = float(now if now is not None else time.time())
     meta = getattr(session, "tool_limit_continuation", None)
     if not isinstance(meta, dict):
@@ -756,7 +768,7 @@ def handle_terminal(
     if receipt.get("state") == "blocked":
         _persist_blocked_terminal(session, receipt.get("blocked_reason"))
     _emit(receipt, emit)
-    if receipt.get("state") in ("claimed", "starting"):
+    if not defer_start and receipt.get("state") in ("claimed", "starting"):
         latest, _started = _start_receipt(key, start=start)
         if latest is not None:
             return latest
@@ -766,13 +778,40 @@ def handle_terminal(
 def recover_pending_continuations(
     *, start: Callable[[str, str], dict] | None = None,
     emit: Callable[[str, dict], None] | None = None,
+    root_session_id: str | None = None,
+    profile: str | None = None,
 ) -> int:
-    """Restart each durable claimed-but-not-started child once."""
+    """Restart each durable claimed-but-not-started child once.
+
+    Optional root/profile filters are used by post-teardown recovery so one
+    parent cannot launch a receipt from another execution lineage or profile.
+    """
+    root_filter = str(root_session_id or "").strip()
+    profile_filter = str(profile or "").strip()
+    profile_matches = None
+    if profile_filter:
+        try:
+            from api.profiles import _profiles_match
+
+            profile_matches = _profiles_match
+        except Exception:
+            profile_matches = None
     with _store_lock():
         pending = [
             key
             for key, receipt in _load_store()["receipts"].items()
             if receipt.get("child_session_id")
+            and (
+                not root_filter
+                or str(receipt.get("root_session_id") or "").strip() == root_filter
+            )
+            and (
+                not profile_filter
+                or (
+                    callable(profile_matches)
+                    and profile_matches(receipt.get("profile"), profile_filter)
+                )
+            )
             and (
                 receipt.get("state") == "claimed"
                 or (
