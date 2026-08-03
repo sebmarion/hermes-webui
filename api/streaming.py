@@ -7519,6 +7519,7 @@ def _run_agent_streaming(
     bestplan_config=None,
     profile=None,
     admission_reservation_id=None,
+    lineage_required=False,
     process_completion_events=None,
     worker_accept_callback=None,
 ):
@@ -7567,6 +7568,7 @@ def _run_agent_streaming(
             provider=model_provider,
             ephemeral=bool(ephemeral),
             profile=profile,
+            lineage_required=bool(lineage_required),
         )
     except RunAdmissionClosed:
         if _provided_process_completion_events:

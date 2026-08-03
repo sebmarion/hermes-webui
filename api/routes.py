@@ -3339,7 +3339,9 @@ from api.config import (
     get_config_for_profile_home,
     _cfg_lock,
     PENDING_BG_TASK_COMPLETIONS,
+    bind_run_admission,
     RunAdmissionClosed,
+    RunAdmissionLineageBusy,
     fork_run_admission,
     register_active_run,
     release_run_admission,
@@ -22990,6 +22992,43 @@ def _maintenance_fence_payload() -> dict:
     }
 
 
+def _bind_execution_lineage(session, admission_reservation_id):
+    """Resolve and atomically bind the current turn's execution owner."""
+    if not admission_reservation_id:
+        raise RunAdmissionClosed("run admission reservation is missing")
+    from api.execution_lineage import resolve_execution_lineage
+
+    resolved = resolve_execution_lineage(
+        str(getattr(session, "session_id", "") or ""),
+        session=session,
+        profile=getattr(session, "profile", None),
+    )
+    bind_run_admission(
+        admission_reservation_id,
+        resolved.execution_lineage_key,
+    )
+    return resolved
+
+
+def _execution_lineage_error_payload(exc: Exception) -> dict:
+    from api.execution_lineage import ExecutionLineageUnavailable
+
+    if isinstance(exc, RunAdmissionLineageBusy):
+        return {
+            "error": "session already has an active stream",
+            "code": "execution_lineage_busy",
+            "_status": 409,
+        }
+    if isinstance(exc, ExecutionLineageUnavailable):
+        return {
+            "error": "execution lineage is unavailable",
+            "code": "execution_lineage_unavailable",
+            "retryable": True,
+            "_status": 503,
+        }
+    raise exc
+
+
 def _admit_stream_start(kind: str):
     """Reserve before a handler can persist, register streams, or spawn work."""
     def decorate(function):
@@ -23093,6 +23132,18 @@ def _handle_btw(
         model_provider=model_provider,
         profile=getattr(s, 'profile', None),
     )
+    try:
+        _bind_execution_lineage(ephemeral, _admission_reservation_id)
+    except RunAdmissionLineageBusy as exc:
+        payload = _execution_lineage_error_payload(exc)
+        return j(handler, payload, status=409)
+    except Exception as exc:
+        from api.execution_lineage import ExecutionLineageUnavailable
+
+        if isinstance(exc, ExecutionLineageUnavailable):
+            payload = _execution_lineage_error_payload(exc)
+            return j(handler, payload, status=503)
+        raise
     # Copy conversation history for context (agent reads from messages)
     ephemeral.messages = list(s.messages or [])
     ephemeral.title = f"btw: {question[:60]}"
@@ -23114,6 +23165,7 @@ def _handle_btw(
             "model_provider": model_provider,
             "profile": getattr(s, "profile", None),
             "admission_reservation_id": _admission_reservation_id,
+            "lineage_required": True,
         },
         daemon=True,
     )
@@ -23158,6 +23210,16 @@ def _handle_background(
         model_provider=model_provider,
         profile=getattr(s, 'profile', None),
     )
+    try:
+        _bind_execution_lineage(bg, _admission_reservation_id)
+    except RunAdmissionLineageBusy as exc:
+        return j(handler, _execution_lineage_error_payload(exc), status=409)
+    except Exception as exc:
+        from api.execution_lineage import ExecutionLineageUnavailable
+
+        if isinstance(exc, ExecutionLineageUnavailable):
+            return j(handler, _execution_lineage_error_payload(exc), status=503)
+        raise
     bg.title = f"bg: {prompt[:60]}"
     bg.save()
     stream_id = uuid.uuid4().hex
@@ -23204,6 +23266,7 @@ def _handle_background(
                     model_provider=model_provider,
                     profile=getattr(s, "profile", None),
                     admission_reservation_id=_admission_reservation_id,
+                    lineage_required=True,
                 )
                 # Reload the bg session from disk and extract the final assistant reply.
                 try:
@@ -23547,6 +23610,16 @@ def _start_chat_stream_for_session(
     if stale_response is not None:
         stale_response["_status"] = 409
         return stale_response
+    try:
+        _bind_execution_lineage(s, _admission_reservation_id)
+    except RunAdmissionLineageBusy as exc:
+        return _execution_lineage_error_payload(exc)
+    except Exception as exc:
+        from api.execution_lineage import ExecutionLineageUnavailable
+
+        if isinstance(exc, ExecutionLineageUnavailable):
+            return _execution_lineage_error_payload(exc)
+        raise
     attachments = attachments or []
     process_completion_events: list[dict] = []
 
@@ -23784,6 +23857,7 @@ def _start_chat_stream_for_session(
             "goal_related": goal_related,
             "profile": getattr(s, "profile", None),
             "admission_reservation_id": _admission_reservation_id,
+            "lineage_required": True,
         }
         if process_completion_events:
             worker_kwargs["process_completion_events"] = process_completion_events
@@ -24307,6 +24381,17 @@ def start_session_turn(
         s = get_session(session_id)
     except KeyError:
         return {"error": "Session not found", "_status": 404}
+
+    try:
+        _bind_execution_lineage(s, _admission_reservation_id)
+    except RunAdmissionLineageBusy as exc:
+        return _execution_lineage_error_payload(exc)
+    except Exception as exc:
+        from api.execution_lineage import ExecutionLineageUnavailable
+
+        if isinstance(exc, ExecutionLineageUnavailable):
+            return _execution_lineage_error_payload(exc)
+        raise
 
     try:
         workspace = _resolve_chat_workspace_with_recovery(s, None)
@@ -27331,6 +27416,17 @@ def _handle_session_compress(handler, body):
         s = get_session(sid)
     except KeyError:
         return bad(handler, "Session not found", 404)
+
+    try:
+        _bind_execution_lineage(s, _admission_reservation_id)
+    except RunAdmissionLineageBusy as exc:
+        return j(handler, _execution_lineage_error_payload(exc), status=409)
+    except Exception as exc:
+        from api.execution_lineage import ExecutionLineageUnavailable
+
+        if isinstance(exc, ExecutionLineageUnavailable):
+            return j(handler, _execution_lineage_error_payload(exc), status=503)
+        raise
 
     if getattr(s, "active_stream_id", None):
         return bad(handler, "Session is still streaming; wait for the current turn to finish.", 409)

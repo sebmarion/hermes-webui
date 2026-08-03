@@ -589,6 +589,7 @@ def _run_gateway_chat_streaming(
     goal_related=False,
     profile=None,
     admission_reservation_id=None,
+    lineage_required=False,
     process_completion_events=None,
     worker_accept_callback=None,
 ):
@@ -648,6 +649,7 @@ def _run_gateway_chat_streaming(
             provider=model_provider,
             backend="gateway",
             profile=profile,
+            lineage_required=bool(lineage_required),
         )
     except RunAdmissionClosed:
         _settle_process_completion_claims(committed=False)

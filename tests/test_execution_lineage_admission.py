@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -105,3 +106,38 @@ def test_invalid_profile_fails_closed(monkeypatch):
 
     with pytest.raises(execution_lineage.ExecutionLineageUnavailable):
         execution_lineage.resolve_execution_lineage("root", profile="../foreign")
+
+
+def test_route_binds_after_session_identity_exists_before_turn_mutation(
+    clean_admission_state, monkeypatch
+):
+    from api import execution_lineage, routes
+
+    cfg = clean_admission_state
+    reservation = cfg.reserve_run_admission(kind="chat")
+    session = SimpleNamespace(session_id="physical-root", profile="default")
+    resolution = SimpleNamespace(execution_lineage_key="v1:key:route")
+    monkeypatch.setattr(
+        execution_lineage,
+        "resolve_execution_lineage",
+        lambda *_args, **_kwargs: resolution,
+    )
+
+    routes._bind_execution_lineage(session, reservation)
+
+    assert cfg._RUN_ADMISSION_RESERVATIONS[reservation]["execution_lineage_key"] == (
+        "v1:key:route"
+    )
+
+
+def test_lineage_required_worker_cannot_register_without_a_bound_key(
+    clean_admission_state,
+):
+    cfg = clean_admission_state
+
+    with pytest.raises(cfg.RunAdmissionClosed):
+        cfg.register_active_run(
+            "unkeyed-turn",
+            session_id="physical-root",
+            lineage_required=True,
+        )
