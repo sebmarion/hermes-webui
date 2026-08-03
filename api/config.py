@@ -33,6 +33,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -1108,6 +1109,11 @@ MIME_MAP = {
     ".m4v": "video/mp4",
     ".webm": "video/webm",
     ".ogv": "video/ogg",
+    # TypeScript source files are always served as text/plain; treating them
+    # as an executable or generic binary MIME would make safe artifact preview
+    # inconsistent with the other code extensions.
+    ".ts": "text/plain",
+    ".tsx": "text/plain",
 }
 
 # ── Toolsets (from config.yaml or hardcoded default) ─────────────────────────
@@ -1516,6 +1522,26 @@ def _custom_provider_entries(config_obj: dict | None = None) -> list[dict]:
     if not isinstance(entries, list):
         return []
     return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def _configured_model_ids(raw_models: object) -> list[str]:
+    """Extract ordered model IDs from the supported config allowlist shapes."""
+    if isinstance(raw_models, dict):
+        candidates = raw_models.keys()
+    elif isinstance(raw_models, list):
+        candidates = raw_models
+    else:
+        return []
+    model_ids: list[str] = []
+    for item in candidates:
+        if isinstance(item, dict):
+            candidate = item.get("id") or item.get("model") or item.get("name")
+        else:
+            candidate = item
+        model_id = str(candidate or "").strip()
+        if model_id and model_id not in model_ids:
+            model_ids.append(model_id)
+    return model_ids
 
 
 def _named_custom_provider_slugs(config_obj: dict | None = None) -> set[str]:
@@ -2989,7 +3015,7 @@ def _get_provider_cfg(provider_id) -> dict:
     return provider_cfg if isinstance(provider_cfg, dict) else {}
 
 
-def resolve_model_provider(model_id: str) -> tuple:
+def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) -> tuple:
     """Resolve model name, provider, and base_url for AIAgent.
 
     Model IDs from the dropdown can be in several formats:
@@ -3084,15 +3110,7 @@ def resolve_model_provider(model_id: str) -> tuple:
                 if _canon_config_provider == "copilot":
                     continue  # copilot.models is a settings map, not an allowlist
                 _own_models = _pdef.get('models')
-                if isinstance(_own_models, list):
-                    for _m in _own_models:
-                        _mid = str(_m.get('id') or '') if isinstance(_m, dict) else str(_m or '')
-                        if _mid.strip():
-                            _provider_models_set.add(_mid.strip())
-                elif isinstance(_own_models, dict):
-                    _provider_models_set.update(
-                        str(k).strip() for k in _own_models if isinstance(k, str) and str(k).strip()
-                    )
+                _provider_models_set.update(_configured_model_ids(_own_models))
     _skip_custom_providers = (
         _is_explicit_non_custom_provider
         and (
@@ -3114,12 +3132,7 @@ def resolve_model_provider(model_id: str) -> tuple:
             if entry_model:
                 entry_model_ids.add(entry_model)
             entry_models = entry.get('models')
-            if isinstance(entry_models, dict):
-                entry_model_ids.update(
-                    key.strip()
-                    for key in entry_models.keys()
-                    if isinstance(key, str) and key.strip()
-                )
+            entry_model_ids.update(_configured_model_ids(entry_models))
             if entry_name and model_id in entry_model_ids:
                 provider_hint = _custom_provider_slug_from_name(entry_name)
                 return model_id, provider_hint, entry_base_url or None
@@ -3320,20 +3333,19 @@ def resolve_model_provider(model_id: str) -> tuple:
                     # leftover the relay rejects; strip it (#433). Keep the
                     # ``prefix in _PROVIDER_MODELS`` belt so an adversarial catalog
                     # advertising a bare id can't strip an unknown-vendor prefix.
-                    if bare in _advertised and prefix in _PROVIDER_MODELS:
+                    if bare in _advertised and _canonicalise_provider_id(prefix) in _PROVIDER_MODELS:
                         return bare, config_provider, config_base_url
                     # Advertised but neither exact shape matched → intrinsic /
                     # unknown prefix the proxy routes on; preserve it whole.
                     return model_id, config_provider, config_base_url
                 # (3) Provenance genuinely unavailable (cold/unbuilt or
                 #     fingerprint-mismatched catalog AND not config-declared).
-                #     Fall back to the LEGACY family heuristic so this narrow edge
-                #     is never WORSE than the pre-fix behaviour: a first-party
-                #     redundant prefix still strips (#433 relay works cold), while
-                #     an intrinsic/unknown prefix (bedrock/opus-4-6 #3872,
-                #     zai-org/GLM-5.1 #548) is preserved. The #5979 active-user
-                #     path can't reach here — a selected id is either config-
-                #     declared or in the catalog the dropdown was built from.
+                #     A deliberate pick must stay verbatim: the proxy may route
+                #     on the vendor namespace, and stripping it is irreversible
+                #     without a config declaration (#5979). Unmarked stale
+                #     session ids retain the legacy first-party strip (#433).
+                if explicitly_picked:
+                    return model_id, config_provider, config_base_url
                 if prefix in _PROVIDER_MODELS and _is_first_party_model(prefix, bare):
                     return bare, config_provider, config_base_url
                 return model_id, config_provider, config_base_url
@@ -3356,7 +3368,11 @@ def resolve_model_provider(model_id: str) -> tuple:
         # branch (#3872).
         _cp_lower_cross = (config_provider or "").strip().lower()
         _is_custom_cross = _cp_lower_cross == "custom" or _cp_lower_cross.startswith("custom:")
-        if prefix in _PROVIDER_MODELS and prefix != config_provider and not _is_custom_cross:
+        if (
+            _canonicalise_provider_id(prefix) in _PROVIDER_MODELS
+            and _canonicalise_provider_id(prefix) != _canonicalise_provider_id(config_provider)
+            and not _is_custom_cross
+        ):
             return model_id, "openrouter", None
 
     return model_id, config_provider, config_base_url
@@ -3992,8 +4008,20 @@ def _candidate_supports_reasoning(candidate: str) -> bool:
             if major >= 4 or (major == 3 and minor >= 7):
                 return True
         return False
+    # Positive-only prefixed Qwen 3+ detection (e.g. "al-qwen3-8-max-preview"
+    # → tokens ["al","qwen3","8",...]). Scan for any token starting with
+    # "qwen" followed by version >= 3 and immediately allow. Do NOT return
+    # False here — Qwen 2.x embedded in hybrid IDs like
+    # "deepseek-r1-distill-qwen2.5-bakeneko-32b" must fall through to the
+    # DeepSeek detector below.
+    for token in tokens:
+        m = re.match(r"qwen(\d+)", token)
+        if m and int(m.group(1)) >= 3:
+            return True
+    # Terminal guard for standalone/bare Qwen IDs (original behavior):
+    # "qwen" as a standalone token or normalized starting with "qwen" means
+    # this IS a Qwen model — apply the 3+ gate and block 2.x.
     if "qwen" in token_set or normalized.startswith("qwen"):
-        # Restrict to Qwen 3+ (exclude Qwen 2/2.5)
         match = re.search(r"qwen.*?(\d+)(?:\D+(\d+))?", normalized)
         if match:
             major = int(match.group(1))
@@ -4475,6 +4503,31 @@ def resolve_model_reasoning_efforts(
     return filtered
 
 
+def _configured_reasoning_effort_lists(provider_entry, model_id: str) -> list:
+    """Return model-level then provider-level configured effort lists."""
+    if not isinstance(provider_entry, dict):
+        return []
+    configured_lists = []
+    models = provider_entry.get("models")
+    if isinstance(models, dict):
+        model_key = str(model_id or "").strip().lower()
+        model_entry = models.get(model_id)
+        if not isinstance(model_entry, dict) and model_key:
+            model_entry = next(
+                (
+                    metadata
+                    for configured_id, metadata in models.items()
+                    if str(configured_id).strip().lower() == model_key
+                    and isinstance(metadata, dict)
+                ),
+                None,
+            )
+        if isinstance(model_entry, dict):
+            configured_lists.append(model_entry.get("reasoning_efforts"))
+    configured_lists.append(provider_entry.get("reasoning_efforts"))
+    return configured_lists
+
+
 def _resolve_model_reasoning_efforts_impl(
     model_id: str | None = None,
     provider_id: str | None = None,
@@ -4508,29 +4561,30 @@ def _resolve_model_reasoning_efforts_impl(
     if _nested_route_reasoning_denied(hinted_model):
         return []
 
-    # 0. Provider config: providers.<name>.reasoning_efforts or named
-    # custom_providers[].reasoning_efforts. When the user has explicitly listed
-    # valid efforts for a provider, return that list directly — no heuristics,
-    # no models.dev lookup.
-    # Only short-circuits when the filtered list is non-empty; an all-invalid
-    # list (e.g. typos) falls through to heuristics instead of hiding reasoning.
-    _re_list = None
+    # 0. Model-level config wins over provider-level config. Explicit valid
+    # model metadata is authoritative; invalid/empty entries fall through to
+    # the provider list and then to the normal metadata/heuristic sources.
+    _re_lists = []
     try:
         if provider and provider.startswith("custom:"):
             for _entry in _custom_provider_entries():
                 if _custom_provider_slug_from_name(_entry.get("name")) == provider:
-                    _re_list = _entry.get("reasoning_efforts")
+                    _re_lists = _configured_reasoning_effort_lists(_entry, hinted_model)
                     break
         elif provider:
             _prov_entry = (cfg.get("providers") or {}).get(provider, {})
             if isinstance(_prov_entry, dict):
-                _re_list = _prov_entry.get("reasoning_efforts")
-        if isinstance(_re_list, list) and _re_list:
-            _filtered = [str(x).strip().lower() for x in _re_list
-                         if str(x).strip().lower() in {*VALID_REASONING_EFFORTS, "none"}]
-            _filtered = list(dict.fromkeys(_filtered))
-            if _filtered:
-                return _filtered
+                _re_lists = _configured_reasoning_effort_lists(_prov_entry, hinted_model)
+        for _re_list in _re_lists:
+            if isinstance(_re_list, list) and _re_list:
+                _filtered = [
+                    str(x).strip().lower()
+                    for x in _re_list
+                    if str(x).strip().lower() in {*VALID_REASONING_EFFORTS, "none"}
+                ]
+                _filtered = list(dict.fromkeys(_filtered))
+                if _filtered:
+                    return _filtered
     except Exception:
         pass
 
@@ -8476,9 +8530,18 @@ def get_available_models(
                         if isinstance(cfg_models, dict):
                             raw_models = [{"id": k, "label": k} for k in cfg_models.keys()]
                         elif isinstance(cfg_models, list):
-                            raw_models = [{"id": k["id"] if isinstance(k, dict) else k,
-                                            "label": k.get("label", k["id"]) if isinstance(k, dict) else k}
-                                           for k in cfg_models]
+                            raw_models = []
+                            for item in cfg_models:
+                                if isinstance(item, dict):
+                                    model_id = item.get("id") or item.get("model") or item.get("name")
+                                    if not model_id:
+                                        continue
+                                    raw_models.append({
+                                        "id": model_id,
+                                        "label": item.get("label", model_id),
+                                    })
+                                elif item:
+                                    raw_models.append({"id": item, "label": item})
 
                     if not raw_models:
                         if pid == "moa":
@@ -9061,7 +9124,80 @@ def _models_cache_file_age_seconds(cache_path: Path, now: float) -> float | None
     except OSError:
         return None
 
+def warm_models_catalog_provenance_if_cold() -> None:
+    """Best-effort, NON-BLOCKING, disk-only publish of catalog provenance.
 
+    The send path (``api/streaming.py``) resolves the wire model via
+    ``resolve_model_provider`` without ever building the models catalog, and the
+    #1855 chat/start fast path deliberately skips the catalog when a session
+    already carries a persisted model+provider — so "cold at send" is the
+    designed behaviour after any process restart, memory-TTL expiry, or cache
+    invalidation, not a rare race. In that state the custom-proxy provenance
+    signal (``_endpoint_advertised_model_ids``) is ``None`` and resolution falls
+    to the cold-preserve default; this helper restores the endpoint-advertised
+    signal from the durable disk cache so the #433 bare-only-strip stays exact.
+
+    Deliberately does NOT call ``get_available_models(prefer_cache=True)``: even
+    in prefer-cache mode that acquires ``_available_models_cache_lock`` and can
+    block up to ~60s waiting on an in-flight rebuild (unbounded in synchronous
+    rebuild mode) — unacceptable on the send hot path. Instead this:
+      * tries the cache lock NON-BLOCKING and returns immediately if it's busy
+        (a concurrent rebuild will publish provenance itself);
+      * reads ONLY the on-disk cache (no network, no live probe, no rebuild);
+      * publishes the snapshot + source fingerprint via the same globals the
+        real publish sites use, then ``_sync_models_cache_provenance()``.
+    Publishing the fingerprint from the CURRENT runtime is correct: the disk
+    cache is validated by schema/version/source-fingerprint on load
+    (``_is_loadable_disk_cache``), so a load success means it belongs to this
+    profile. Callers must not hold ``_cfg_lock`` (this reads config for the
+    fingerprint); the send worker satisfies that.
+
+    Profile isolation: the fast no-op is taken ONLY when the resident provenance
+    fingerprint matches the CURRENT profile's runtime fingerprint. The catalog
+    globals are process-wide, so a concurrently-active profile B could have left
+    its own (or a stale) provenance resident; an unconditional non-``None``
+    early return would let B's catalog block profile A from loading A's own valid
+    disk cache (A would then resolve against B's advertised ids). Comparing the
+    published fingerprint to the current one before short-circuiting closes that
+    hole — a mismatch falls through to load THIS profile's disk snapshot.
+    """
+    global _available_models_cache, _available_models_cache_ts
+    global _available_models_cache_source_fingerprint
+
+    def _provenance_is_current() -> bool:
+        prov = _models_cache_provenance
+        if prov is None:
+            return False
+        try:
+            return prov[1] == _models_cache_source_fingerprint()
+        except Exception:
+            return False
+
+    if _provenance_is_current():
+        return  # already warm for THIS profile — one global read, no work
+    got = _available_models_cache_lock.acquire(blocking=False)
+    if not got:
+        return  # a concurrent build/publish holds the lock; it will publish
+    try:
+        if _provenance_is_current():
+            return  # published for this profile while we waited for the lock
+        try:
+            disk_groups = _load_models_cache_from_disk()
+        except Exception:
+            disk_groups = None
+        if disk_groups is None:
+            return  # no durable cache for this profile → stay cold, preserve verbatim
+        _available_models_cache = disk_groups
+        _available_models_cache_ts = time.monotonic()
+        try:
+            _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+        except Exception:
+            _available_models_cache_source_fingerprint = None
+        _sync_models_cache_provenance()
+    except Exception:
+        logger.debug("models catalog provenance warm failed", exc_info=True)
+    finally:
+        _available_models_cache_lock.release()
 def get_available_models_for_session_visit() -> dict:
     """Return /api/models with a short session-visit freshness horizon.
 
@@ -11324,7 +11460,11 @@ def _clear_thread_env():
 
 
 # ── Per-session agent locks ───────────────────────────────────────────────────
-SESSION_AGENT_LOCKS: dict = {}
+# Weak values keep one lock for every overlapping holder/waiter without leaking
+# one permanent registry entry per deleted session.  A caller's local reference
+# keeps the lock alive for the whole critical section; once no operation can
+# still use it, the registry entry disappears automatically.
+SESSION_AGENT_LOCKS = weakref.WeakValueDictionary()
 SESSION_AGENT_LOCKS_LOCK = threading.Lock()
 
 
@@ -11348,11 +11488,42 @@ def _get_session_agent_lock(session_id: str) -> threading.Lock:
       - Lock contract: hold for the in-memory mutation, s.save(), and its local
         state.db metadata publication; never across network I/O (LLM calls,
         HTTP requests).
+      - A Lock is created lazily on first access. The weak registry retains it
+        while any holder or waiter has a strong reference, then reclaims the
+        entry automatically when no overlapping operation can still use it.
+      - During context compression the agent may rotate session_id. The
+        streaming thread atomically aliases both old and new IDs to the *same*
+        Lock object under SESSION_AGENT_LOCKS_LOCK (see streaming.py's
+        compression block). Keeping the old alias prevents a late old-ID caller
+        from creating a second Lock while an earlier holder or waiter still
+        exists. Both weak aliases disappear automatically after all strong
+        references to the Lock are released.
+      - Lock contract: hold for the in-memory mutation + s.save() only; never
+        across network I/O (LLM calls, HTTP requests).
     """
     with SESSION_AGENT_LOCKS_LOCK:
-        if session_id not in SESSION_AGENT_LOCKS:
-            SESSION_AGENT_LOCKS[session_id] = threading.Lock()
-        return SESSION_AGENT_LOCKS[session_id]
+        lock = SESSION_AGENT_LOCKS.get(session_id)
+        if lock is None:
+            lock = threading.Lock()
+            SESSION_AGENT_LOCKS[session_id] = lock
+        return lock
+
+
+def _alias_session_agent_lock(
+    old_session_id: str,
+    new_session_id: str,
+    lock: threading.Lock,
+) -> None:
+    """Alias a compression continuation to the same live mutation lock.
+
+    Keep the old ID alias while any holder or waiter still references ``lock``.
+    Because the registry values are weak, both aliases disappear automatically
+    once no overlapping operation can use the pre-compression lock. Removing the
+    old alias eagerly would let a late old-ID request create a second lock.
+    """
+    with SESSION_AGENT_LOCKS_LOCK:
+        SESSION_AGENT_LOCKS[old_session_id] = lock
+        SESSION_AGENT_LOCKS[new_session_id] = lock
 
 
 # ── Settings persistence ─────────────────────────────────────────────────────

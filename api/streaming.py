@@ -18,6 +18,7 @@ import threading
 import time
 import traceback
 import copy
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -33,7 +34,8 @@ from api.config import (
     PENDING_GOAL_CONTINUATION_GUARDS,
     STREAM_LAST_EVENT_ID,
     LOCK, SESSIONS, SESSIONS_MAX, SESSION_DIR,
-    _get_session_agent_lock, _set_thread_env, _clear_thread_env,
+    _get_session_agent_lock, _alias_session_agent_lock,
+    _set_thread_env, _clear_thread_env,
     register_active_run, update_active_run, unregister_active_run,
     release_run_admission, RunAdmissionClosed,
     start_admitted_auxiliary_thread,
@@ -42,6 +44,7 @@ from api.config import (
     resolve_model_provider,
     resolve_custom_provider_connection,
     model_with_provider_context,
+    warm_models_catalog_provenance_if_cold,
     load_settings,
     parse_reasoning_effort,
     coerce_reasoning_effort_for_model,
@@ -68,6 +71,16 @@ from api.models import (
     reconciled_state_db_messages_for_session,
 )
 from api.session_ops import mark_session_title_generated, session_has_manual_title
+from api.process_event_utils import (
+    build_active_turn_token,
+    claim_async_delegation_delivery,
+    complete_async_delegation_delivery,
+    completion_delivery_id,
+    release_async_delegation_delivery,
+    requeue_async_delegation_event,
+    schedule_async_delegation_claim_retry,
+    stamp_message_source,
+)
 
 
 def _session_payload_with_full_messages(session, *, tool_calls=None):
@@ -612,8 +625,11 @@ def _is_agent_compression_start_status(kind: str, message: str) -> bool:
     auto-compression.
 
     Positive markers below match the agent emitters in hermes-agent
-    (``turn_context`` preflight, ``conversation_loop`` pre-API / 413 / too-large,
-    ``conversation_compression`` compaction status). Explicitly reject skip /
+    (``conversation_loop`` pre-API / 413 / too-large,
+    ``conversation_compression`` compaction status). Preflight compression
+    (``turn_context``) is intentionally excluded — the later authoritative
+    ``Compacting context`` marker is the signal that compression actually
+    proceeded. Explicitly reject skip /
     defer notices so "Skipping preflight compression…" never surfaces as a
     running compress divider.
     """
@@ -633,8 +649,7 @@ def _is_agent_compression_start_status(kind: str, message: str) -> bool:
     if 'compressed' in m and 'compressing' not in m and 'compression attempt' not in m:
         return False
     return (
-        'preflight compression:' in m
-        or 'pre-api compression:' in m
+        'pre-api compression:' in m
         or 'compacting context' in m
         or 'context too large' in m
         or '— compressing (' in m
@@ -1496,6 +1511,391 @@ def _drop_synthetic_control_messages(messages):
         for msg in list(messages or [])
         if not _is_synthetic_control_message(msg)
     ]
+
+
+def _clean_synthetic_control_messages_with_provenance(messages):
+    """Remove synthetic rows while retaining marked verification-nudge provenance."""
+    raw_messages = list(messages or [])
+    has_verification_nudge = any(
+        isinstance(message, dict)
+        and message.get('role') == 'user'
+        and _is_synthetic_control_message(message)
+        for message in raw_messages
+    )
+    return _drop_synthetic_control_messages(raw_messages), has_verification_nudge
+
+
+def _active_turn_authority(session, stream_id, msg_text):
+    """Capture the stream-owned pending turn before settlement mutates it."""
+    pending_text = getattr(session, 'pending_user_message', None)
+    return {
+        'token': build_active_turn_token(stream_id, getattr(session, 'pending_started_at', None)),
+        'text': pending_text if pending_text is not None else msg_text,
+        'timestamp': getattr(session, 'pending_started_at', None),
+        'source': getattr(session, 'pending_user_source', None) or 'webui',
+        'attachments': copy.deepcopy(getattr(session, 'pending_attachments', None) or []),
+        'current_turn_user_idx': None,
+        'turn_id': '',
+    }
+
+
+def _coerce_current_turn_user_idx(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        idx = int(value)
+    except (TypeError, ValueError):
+        return None
+    return idx if idx >= 0 else None
+
+
+def _resolve_active_turn_authority(identity, *, result=None, agent=None):
+    if not isinstance(identity, dict):
+        return identity
+    resolved = dict(identity)
+    if isinstance(result, dict):
+        _result_idx = _coerce_current_turn_user_idx(result.get('current_turn_user_idx'))
+        if _result_idx is not None:
+            resolved['current_turn_user_idx'] = _result_idx
+        _result_turn_id = str(result.get('turn_id') or '').strip()
+        if _result_turn_id:
+            resolved['turn_id'] = _result_turn_id
+    if agent is not None:
+        if resolved.get('current_turn_user_idx') is None:
+            _agent_idx = _coerce_current_turn_user_idx(
+                getattr(agent, '_persist_user_message_idx', None)
+            )
+            if _agent_idx is not None:
+                resolved['current_turn_user_idx'] = _agent_idx
+        if not resolved.get('turn_id'):
+            _agent_turn_id = str(getattr(agent, '_current_turn_id', '') or '').strip()
+            if _agent_turn_id:
+                resolved['turn_id'] = _agent_turn_id
+    return resolved
+
+
+def _active_turn_boundary_is_valid(identity):
+    if not isinstance(identity, dict):
+        return False
+    if not str(identity.get('turn_id') or '').strip():
+        return False
+    return isinstance(identity.get('current_turn_user_idx'), int)
+
+
+def _active_turn_token_matches(message, identity):
+    token = identity.get('token') if isinstance(identity, dict) else None
+    if not token:
+        return False
+    return (
+        isinstance(message, dict)
+        and message.get('role') == 'user'
+        and message.get('_active_turn_token') == token
+    )
+
+
+def _active_turn_has_checkpoint(messages, identity):
+    return any(_active_turn_token_matches(message, identity) for message in messages or [])
+
+
+def _mark_active_turn_checkpoint(message, identity):
+    if (
+        isinstance(message, dict)
+        and message.get('role') == 'user'
+        and isinstance(identity, dict)
+        and identity.get('token')
+    ):
+        message['_active_turn_token'] = identity['token']
+    return message
+
+
+def _mark_active_turn_checkpoint_in_history(messages, identity, msg_text, *, allow_index_fallback=True):
+    messages = list(messages or [])
+    if not isinstance(identity, dict):
+        return messages, False
+    if _active_turn_has_checkpoint(messages, identity):
+        return messages, True
+    if not allow_index_fallback:
+        return messages, False
+    if not _active_turn_boundary_is_valid(identity):
+        return messages, False
+    idx = identity['current_turn_user_idx']
+    if idx < 0 or idx >= len(messages):
+        return messages, False
+    message = messages[idx]
+    expected_text = identity.get('text') if identity.get('text') is not None else msg_text
+    if (
+        not isinstance(message, dict)
+        or message.get('role') != 'user'
+        or _normalize_user_text(message.get('content')) != _normalize_user_text(expected_text)
+    ):
+        return messages, False
+    _mark_active_turn_checkpoint(message, identity)
+    return messages, True
+
+
+def _owner_projection_current_turn_row(messages, identity):
+    messages = list(messages or [])
+    if not isinstance(identity, dict):
+        return None
+    for message in messages:
+        if _active_turn_token_matches(message, identity):
+            return copy.deepcopy(message)
+    return None
+
+
+def _find_active_turn_checkpoint_index(result_messages, previous_context, identity, msg_text):
+    result_messages = list(result_messages or [])
+    if not isinstance(identity, dict):
+        return None
+    if _active_turn_has_checkpoint(result_messages, identity):
+        for idx, message in enumerate(result_messages):
+            if _active_turn_token_matches(message, identity):
+                return idx
+    if not _active_turn_boundary_is_valid(identity):
+        return None
+    expected_text = identity.get('text') if identity.get('text') is not None else msg_text
+    candidates = []
+    current_turn_user_idx = identity['current_turn_user_idx']
+    previous_context = list(previous_context or [])
+    if _messages_have_prefix(result_messages, previous_context):
+        # An index inside the durable prefix points at historical history, not
+        # the pending turn. Only use the Agent's boundary index when it lands
+        # in the returned delta; otherwise the caller must append a fresh
+        # checkpoint after the prefix.
+        if current_turn_user_idx >= len(previous_context):
+            candidates.append(current_turn_user_idx)
+    else:
+        offset = current_turn_user_idx - len(previous_context)
+        if offset >= 0:
+            candidates.append(offset)
+        candidates.append(current_turn_user_idx)
+    seen = set()
+    for idx in candidates:
+        if idx in seen or idx is None:
+            continue
+        seen.add(idx)
+        if idx < 0 or idx >= len(result_messages):
+            continue
+        message = result_messages[idx]
+        if (
+            isinstance(message, dict)
+            and message.get('role') == 'user'
+            and _normalize_user_text(message.get('content')) == _normalize_user_text(expected_text)
+        ):
+            return idx
+    return None
+
+
+def _materialize_active_turn_user(identity, msg_text, source):
+    message = {
+        'role': 'user',
+        'content': identity.get('text') if isinstance(identity, dict) else msg_text,
+    }
+    if isinstance(identity, dict):
+        if identity.get('timestamp') is not None:
+            message['timestamp'] = identity['timestamp']
+        if identity.get('attachments'):
+            message['attachments'] = copy.deepcopy(identity['attachments'])
+        stamp_message_source(
+            message,
+            identity.get('source') or source or 'webui',
+            active_turn_token=identity.get('token'),
+        )
+    else:
+        stamp_message_source(message, source)
+    return message
+
+
+def _settle_current_turn_boundary(previous_context, result_messages, identity, msg_text, source):
+    """Insert the pending turn before assistant/tool output when it is absent."""
+    result_messages = list(result_messages or [])
+    if not result_messages or not isinstance(identity, dict):
+        return result_messages
+    _checkpoint_idx = _find_active_turn_checkpoint_index(
+        result_messages,
+        previous_context,
+        identity,
+        msg_text,
+    )
+    if _checkpoint_idx is not None:
+        _mark_active_turn_checkpoint(result_messages[_checkpoint_idx], identity)
+        return result_messages
+    previous_context = list(previous_context or [])
+    if _messages_have_prefix(result_messages, previous_context):
+        insert_at = len(previous_context)
+    elif _active_turn_boundary_is_valid(identity):
+        insert_at = identity['current_turn_user_idx'] - len(previous_context)
+        if insert_at < 0 or insert_at > len(result_messages):
+            insert_at = identity['current_turn_user_idx']
+        if insert_at < 0 or insert_at > len(result_messages):
+            insert_at = None
+    else:
+        insert_at = None
+    if insert_at is None and all(
+        _is_context_compression_marker(message)
+        or (isinstance(message, dict) and message.get('role') in ('assistant', 'tool'))
+        for message in result_messages
+    ):
+        insert_at = 0
+        while insert_at < len(result_messages) and _is_context_compression_marker(result_messages[insert_at]):
+            insert_at += 1
+    if insert_at is None:
+        return result_messages
+    return (
+        result_messages[:insert_at]
+        + [_materialize_active_turn_user(identity, msg_text, source)]
+        + result_messages[insert_at:]
+    )
+
+
+def _align_current_turn_display(previous_display, previous_context, identity):
+    """Make a context-only exact checkpoint visible before shared settlement."""
+    # Alignment may stamp the active-turn token onto a boundary row. Work on
+    # isolated rows so a diagnostic/settlement pass cannot mutate the
+    # pre-turn snapshot that the silent-failure classifier and error recovery
+    # use to decide whether the pending prompt still needs materialization.
+    display = copy.deepcopy(list(previous_display or []))
+    context = copy.deepcopy(list(previous_context or []))
+    if not isinstance(identity, dict):
+        return display, context
+    display, _ = _mark_active_turn_checkpoint_in_history(
+        display,
+        identity,
+        identity.get('text'),
+        allow_index_fallback=False,
+    )
+    if _active_turn_has_checkpoint(display, identity):
+        return display, context
+    checkpoint = _owner_projection_current_turn_row(
+        context,
+        identity,
+    )
+    if checkpoint is None and identity.get('token'):
+        checkpoint = _materialize_active_turn_user(
+            identity,
+            identity.get('text'),
+            identity.get('source') or 'webui',
+        )
+        context.append(copy.deepcopy(checkpoint))
+    if checkpoint is not None and not _active_turn_has_checkpoint(display, identity):
+        display.append(copy.deepcopy(checkpoint))
+    return display, context
+
+
+def _prepare_marker_clean_writeback(
+    previous_context_messages,
+    result_messages,
+    active_turn_identity=None,
+):
+    """Return marker-cleaned rows, next context rows, and nudge provenance."""
+    cleaned, has_verification_nudge = _clean_synthetic_control_messages_with_provenance(
+        result_messages
+    )
+    provenance = {
+        'verification_nudge_seen': has_verification_nudge,
+        'active_turn_identity': copy.deepcopy(active_turn_identity),
+    }
+    if not result_messages:
+        return (
+            cleaned,
+            list(previous_context_messages or []),
+            provenance,
+        )
+    if cleaned:
+        return (
+            cleaned,
+            _restore_reasoning_metadata(previous_context_messages, cleaned),
+            provenance,
+        )
+    return [], list(previous_context_messages or []), provenance
+
+
+def _settle_result_messages(
+    session,
+    previous_messages,
+    previous_context_messages,
+    result_messages,
+    msg_text,
+    source,
+    active_turn_identity,
+):
+    (
+        result_messages,
+        next_context_messages,
+        verification_nudge_provenance,
+    ) = _prepare_marker_clean_writeback(
+        previous_context_messages,
+        result_messages,
+        active_turn_identity,
+    )
+    if result_messages:
+        _assign_stable_message_ids(
+            result_messages,
+            previous_messages,
+            previous_context_messages,
+        )
+        next_context_messages = _dedupe_replayed_context_messages(
+            previous_context_messages,
+            next_context_messages,
+            msg_text,
+        )
+        next_context_messages = _settle_current_turn_boundary(
+            previous_context_messages,
+            next_context_messages,
+            active_turn_identity,
+            msg_text,
+            source,
+        )
+    session.context_messages = (
+        _deduplicate_context_messages(next_context_messages)
+        if result_messages
+        else list(next_context_messages or [])
+    )
+    if result_messages:
+        session.context_messages = _settle_current_turn_boundary(
+            previous_context_messages,
+            session.context_messages,
+            active_turn_identity,
+            msg_text,
+            source,
+        )
+    previous_display_for_writeback, session.context_messages = _align_current_turn_display(
+        previous_messages,
+        session.context_messages,
+        active_turn_identity,
+    )
+    session.messages = _merge_display_messages_after_agent_result(
+        previous_display_for_writeback,
+        previous_context_messages,
+        _restore_display_reasoning_metadata(previous_messages, result_messages),
+        msg_text,
+        source=source,
+        verification_nudge_provenance=verification_nudge_provenance,
+    )
+    _compact_session_image_parts_for_persistence(session)
+    _advance_truncation_watermark_after_commit(session)  # #3831
+    return result_messages
+
+
+def _current_turn_already_has_visible_assistant_answer(messages, *, active_turn_identity=None):
+    """Return True only when the token-owned current turn already has visible assistant prose."""
+    if not isinstance(active_turn_identity, dict) or not active_turn_identity.get('token'):
+        return False
+    current_turn_seen = False
+    for msg in messages or []:
+        if not isinstance(msg, dict) or _is_synthetic_control_message(msg):
+            continue
+        if _active_turn_token_matches(msg, active_turn_identity):
+            current_turn_seen = True
+            continue
+        if not current_turn_seen:
+            continue
+        role = msg.get('role')
+        if role == 'assistant' and _assistant_message_has_final_visible_text(msg) and not msg.get('_error'):
+            return True
+        if role == 'user':
+            return False
+    return False
 
 
 def _agent_result_tool_limit_reached(result) -> bool:
@@ -3425,6 +3825,19 @@ def _looks_invalid_generated_title(text: str) -> bool:
     )
 
 
+def _message_content_part_text(part) -> str:
+    """Extract visible text from a structured content part."""
+    if not isinstance(part, dict):
+        return ''
+    return str(
+        part.get('text')
+        or part.get('content')
+        or part.get('input_text')
+        or part.get('output_text')
+        or ''
+    )
+
+
 def _message_text(value) -> str:
     """Extract plain text from mixed message content payloads."""
     if isinstance(value, list):
@@ -3434,9 +3847,46 @@ def _message_text(value) -> str:
                 continue
             ptype = str(p.get('type') or '').lower()
             if ptype in ('', 'text', 'input_text', 'output_text'):
-                parts.append(str(p.get('text') or p.get('content') or ''))
+                parts.append(_message_content_part_text(p))
         return _strip_thinking_markup('\n'.join(parts).strip())
     return _strip_thinking_markup(str(value or '').strip())
+
+
+def _assistant_content_part_is_tool_use(part) -> bool:
+    """Return True when a content[] part represents a tool invocation boundary."""
+    if not isinstance(part, dict):
+        return False
+    part_type = str(part.get('type') or '').lower()
+    if part_type in {'tool_use', 'tool_call'}:
+        return True
+    if part_type:
+        return False
+    if _message_content_part_text(part).strip():
+        return False
+    return any(key in part for key in ('tool_use_id', 'tool_call_id', 'call_id')) and any(
+        key in part for key in ('name', 'tool_name', 'input', 'args')
+    )
+
+
+def _assistant_message_has_final_visible_text(message) -> bool:
+    """Return True when an assistant row carries a settled visible answer."""
+    if not isinstance(message, dict) or message.get('role') != 'assistant':
+        return False
+    content = message.get('content', '')
+    if isinstance(content, list):
+        last_tool_idx = -1
+        for idx, part in enumerate(content):
+            if _assistant_content_part_is_tool_use(part):
+                last_tool_idx = idx
+        if last_tool_idx >= 0:
+            tail_parts = content[last_tool_idx + 1:]
+            return bool(_message_text(tail_parts).strip())
+        if message.get('tool_calls'):
+            return False
+        return bool(_message_text(content).strip())
+    if message.get('tool_calls'):
+        return False
+    return bool(_message_text(content).strip())
 
 
 _WORKSPACE_PREFIX_RE = re.compile(r'^\s*\[Workspace::v1:\s*(?:\\.|[^\]\\])+\]\s*')
@@ -5247,6 +5697,7 @@ def _deduplicate_context_messages(messages):
         return messages
     seen = set()
     deduped = []
+    user_exact_index = {}
     for msg in messages:
         if _is_context_compression_marker(msg):
             marker_key = (
@@ -5265,6 +5716,26 @@ def _deduplicate_context_messages(messages):
             deduped.append(msg)
             continue
         key = _message_identity(msg)
+        if isinstance(msg, dict) and msg.get('role') == 'user' and key is not None:
+            user_exact_key = (
+                key,
+                msg.get('timestamp'),
+                msg.get('_ts'),
+                msg.get('_source') or 'webui',
+                json.dumps(msg.get('attachments') or [], sort_keys=True, ensure_ascii=False),
+            )
+            prior_exact_idx = user_exact_index.get(user_exact_key)
+            if msg.get('_active_turn_token'):
+                if prior_exact_idx is not None:
+                    deduped[prior_exact_idx] = msg
+                    continue
+                if key in seen:
+                    deduped.append(msg)
+                    user_exact_index[user_exact_key] = len(deduped) - 1
+                    continue
+            elif prior_exact_idx is not None:
+                continue
+            user_exact_index[user_exact_key] = len(deduped)
         if key is not None and key in seen:
             continue
         if key is not None:
@@ -5768,6 +6239,19 @@ def _dedupe_replayed_context_messages(previous_context, result_messages, msg_tex
                 if candidates:
                     candidates = _strip_replayed_context_items(previous_context, candidates)
                 return previous_context + candidates
+        assistant_or_tool_only_result = bool(result_messages) and all(
+            _is_context_compression_marker(m)
+            or (
+                isinstance(m, dict)
+                and m.get('role') in ('assistant', 'tool')
+            )
+            for m in result_messages
+        )
+        if assistant_or_tool_only_result:
+            candidates = _strip_replayed_prefix(previous_context, result_messages)
+            if candidates:
+                candidates = _strip_replayed_context_items(previous_context, candidates)
+            return previous_context + candidates
         return result_messages
     candidates = result_messages[len(previous_context):]
     # Strip stale merges only from the new-turn candidate slice so that
@@ -6274,7 +6758,14 @@ def _advance_truncation_watermark_after_commit(session) -> None:
     session.truncation_watermark = time.time()
 
 
-def _merge_display_messages_after_agent_result(previous_display, previous_context, result_messages, msg_text, source: str = "webui"):
+def _merge_display_messages_after_agent_result(
+    previous_display,
+    previous_context,
+    result_messages,
+    msg_text,
+    source: str = "webui",
+    verification_nudge_provenance=None,
+):
     """Keep UI transcript durable while allowing model context to compact.
 
     If Hermes Agent returns a normal append-only history, append that delta to
@@ -6327,6 +6818,52 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
     previous_display = _deduped
     previous_context = list(previous_context or [])
     result_messages = list(result_messages or [])
+    if isinstance(verification_nudge_provenance, dict):
+        _writeback_provenance = verification_nudge_provenance
+    else:
+        _writeback_provenance = {
+            'verification_nudge_seen': bool(verification_nudge_provenance),
+            'active_turn_identity': None,
+        }
+    _verification_nudge_seen = _writeback_provenance.get('verification_nudge_seen', False) or any(
+        isinstance(message, dict)
+        and message.get('role') == 'user'
+        and _is_synthetic_control_message(message)
+        for message in result_messages
+    )
+    _active_turn_identity = _writeback_provenance.get('active_turn_identity')
+    # A verification corrective answer belongs to the already-visible attempt
+    # when the Agent reports the current boundary as an existing historical
+    # row. In that shape, adding a second user row would split one turn into a
+    # phantom follow-up. Empty results still align normally so the pending
+    # prompt is materialized before the error marker.
+    _clean_result_for_alignment = _drop_synthetic_control_messages(result_messages)
+    _skip_boundary_alignment = False
+    if _verification_nudge_seen and isinstance(_active_turn_identity, dict):
+        _boundary_idx = _active_turn_identity.get('current_turn_user_idx')
+        if (
+            isinstance(_boundary_idx, int)
+            and _boundary_idx >= 0
+            and _boundary_idx < len(previous_display)
+            and isinstance(previous_display[_boundary_idx], dict)
+            and previous_display[_boundary_idx].get('role') == 'user'
+            and _normalize_user_text(previous_display[_boundary_idx].get('content'))
+            == _normalize_user_text(_active_turn_identity.get('text'))
+            and not _active_turn_token_matches(previous_display[_boundary_idx], _active_turn_identity)
+            and any(
+                isinstance(message, dict)
+                and message.get('role') == 'assistant'
+                and _assistant_message_has_final_visible_text(message)
+                for message in _clean_result_for_alignment
+            )
+        ):
+            _skip_boundary_alignment = True
+    if not _skip_boundary_alignment:
+        previous_display, _ = _align_current_turn_display(
+            previous_display,
+            previous_context,
+            _active_turn_identity,
+        )
     # Same marker filter for the model-history inputs: the synthetic verify-loop
     # answer/nudge live in the agent's returned messages and prior context, and
     # would otherwise slip into the merged transcript as a real delta. (#5334)
@@ -6484,7 +7021,19 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
             candidates = _strip_replayed_prefix(previous_context, candidates)
     else:
         current_user_idx = _find_current_user_turn(result_messages, msg_text)
-        turn_candidates = result_messages[current_user_idx:] if current_user_idx is not None else []
+        assistant_or_tool_only_result = bool(result_messages) and all(
+            _is_context_compression_marker(m)
+            or (
+                isinstance(m, dict)
+                and m.get('role') in ('assistant', 'tool')
+            )
+            for m in result_messages
+        )
+        turn_candidates = (
+            result_messages[current_user_idx:]
+            if current_user_idx is not None
+            else result_messages if assistant_or_tool_only_result else []
+        )
         # Normalize stale merges only in the current-turn slice.
         if msg_text and previous_user_tail:
             turn_candidates = _strip_stale_user_merge_from_messages(
@@ -6502,11 +7051,34 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         _message_identity(m) == current_user_key or _looks_like_current_user_turn(m, msg_text)
         for m in candidates
     )
-    current_user_already_checkpointed = bool(
-        merged
+    def _boundary_checkpoint(rows) -> bool:
+        if not isinstance(_active_turn_identity, dict):
+            return False
+        idx = _active_turn_identity.get('current_turn_user_idx')
+        if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
+            return False
+        if idx >= len(rows):
+            return False
+        row = rows[idx]
+        if not isinstance(row, dict) or row.get('role') != 'user':
+            return False
+        expected = _active_turn_identity.get('text')
+        if expected is None:
+            expected = msg_text
+        return _normalize_user_text(row.get('content')) == _normalize_user_text(expected)
+    current_user_already_checkpointed = (
+        _active_turn_has_checkpoint(merged, _active_turn_identity)
+        if _active_turn_identity
+        else False
+    ) or _boundary_checkpoint(merged)
+    verification_user_already_checkpointed = bool(
+        _verification_nudge_seen
+        and _active_turn_identity
         and (
-            _message_identity(merged[-1]) == current_user_key
-            or _looks_like_current_user_turn(merged[-1], msg_text)
+            _active_turn_has_checkpoint(previous_display, _active_turn_identity)
+            or _active_turn_has_checkpoint(previous_context, _active_turn_identity)
+            or _boundary_checkpoint(previous_display)
+            or _boundary_checkpoint(previous_context)
         )
     )
     if (
@@ -6515,6 +7087,7 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         current_user_key is not None
         and not current_user_in_candidates
         and not current_user_already_checkpointed
+        and not verification_user_already_checkpointed
         and any(
             isinstance(m, dict) and m.get('role') in ('assistant', 'tool')
             for m in candidates
@@ -6526,9 +7099,9 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         # directly would make the assistant bubble appear attached to the prior
         # exchange and then clear the pending prompt. Materialize the current
         # turn at the transcript boundary before the assistant/tool response.
-        current_user_msg = {'role': 'user', 'content': msg_text}
-        if source and source != 'webui':
-            current_user_msg['_source'] = source
+        current_user_msg = _materialize_active_turn_user(
+            _active_turn_identity, msg_text, source
+        )
         insert_at = 0
         while insert_at < len(candidates) and _is_context_compression_marker(candidates[insert_at]):
             insert_at += 1
@@ -6542,6 +7115,17 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
             continue
         key = _message_identity(msg)
         is_current_user_turn = _looks_like_current_user_turn(msg, msg_text)
+        if (
+            current_user_already_checkpointed
+            and isinstance(msg, dict)
+            and msg.get('role') == 'user'
+            and ((key is not None and key == current_user_key) or is_current_user_turn)
+        ):
+            # A result that cannot be matched as an append-only prefix may
+            # replay the durable current-user checkpoint in its full history.
+            # Keep the existing checkpoint and only merge the assistant/tool
+            # delta; otherwise a same-prompt turn is duplicated.
+            continue
         if (
             internal_control_source
             and isinstance(msg, dict)
@@ -6676,12 +7260,25 @@ def _turn_transcript_lacks_final_assistant_answer(
     msg_text,
     source: str = "webui",
     drop_replayed_assistant: bool = False,
+    active_turn_identity=None,
 ) -> bool:
     """Return True when an already-merged transcript still lacks a final assistant answer."""
     merged_messages = list(merged_messages or [])
     previous_display = list(previous_display or [])
-    current_user_idx = _find_current_user_turn(merged_messages, msg_text)
-    if current_user_idx is None or current_user_idx < len(previous_display):
+    current_user_token_idx = next(
+        (
+            idx for idx, message in enumerate(merged_messages)
+            if _active_turn_token_matches(message, active_turn_identity)
+        ),
+        None,
+    )
+    current_user_idx = current_user_token_idx
+    if current_user_idx is None:
+        current_user_idx = _find_current_user_turn(merged_messages, msg_text)
+    if current_user_idx is None or (
+        current_user_token_idx is None
+        and current_user_idx < len(previous_display)
+    ):
         # The active turn lives after the durable transcript boundary. If the
         # merged display only exposes an older user row, materialize the pending
         # prompt so a replayed assistant row cannot satisfy the wrong turn.
@@ -6728,6 +7325,7 @@ def _merged_transcript_lacks_final_assistant_answer(
     msg_text,
     source: str = "webui",
     drop_replayed_assistant: bool = False,
+    active_turn_identity=None,
 ) -> bool:
     """Return True when the current turn still lacks a final assistant answer."""
     if source in ('tool_limit_continuation', 'goal_continuation'):
@@ -6741,12 +7339,22 @@ def _merged_transcript_lacks_final_assistant_answer(
             msg_text,
         )
     previous_display = list(previous_display or [])
+    _verification_nudge_seen = any(
+        isinstance(message, dict)
+        and message.get('role') == 'user'
+        and _is_synthetic_control_message(message)
+        for message in result_messages or []
+    )
     merged_messages = _merge_display_messages_after_agent_result(
         previous_display,
         previous_context,
         _restore_reasoning_metadata(previous_display, result_messages),
         msg_text,
         source=source,
+        verification_nudge_provenance={
+            'verification_nudge_seen': _verification_nudge_seen,
+            'active_turn_identity': active_turn_identity,
+        },
     )
     return _turn_transcript_lacks_final_assistant_answer(
         merged_messages,
@@ -6754,6 +7362,7 @@ def _merged_transcript_lacks_final_assistant_answer(
         msg_text,
         source=source,
         drop_replayed_assistant=drop_replayed_assistant,
+        active_turn_identity=active_turn_identity,
     )
 
 
@@ -7121,7 +7730,7 @@ def _sse_set_write_deadline(handler, seconds=None):
         logger.debug("Failed to arm SSE write deadline", exc_info=True)
 
 
-def _materialize_pending_user_turn_before_error(session) -> bool:
+def _materialize_pending_user_turn_before_error(session, *, active_turn_identity=None) -> bool:
     """Persist the pending user prompt before clearing runtime stream state.
 
     Error paths often clear ``pending_user_message`` before appending an assistant
@@ -7134,27 +7743,40 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
     if not pending_text:
         return False
     normalized_pending = " ".join(pending_text.split())
-    if normalized_pending:
-        for existing in reversed(list(getattr(session, 'messages', None) or [])[-8:]):
-            if not isinstance(existing, dict) or existing.get('role') != 'user':
-                continue
-            existing_text = " ".join(str(existing.get('content') or '').split())
-            if existing_text == normalized_pending:
-                return False
     recovered_ts = int(time.time())
     pending_started_at = getattr(session, 'pending_started_at', None)
     if isinstance(pending_started_at, (int, float)) and pending_started_at > 0:
         recovered_ts = int(pending_started_at)
+    pending_source = getattr(session, 'pending_user_source', None) or 'webui'
+    pending_attachments = list(getattr(session, 'pending_attachments', None) or [])
+
+    def is_exact_checkpoint(messages):
+        if not isinstance(messages, list) or not messages:
+            return False
+        existing = messages[-1]
+        if not isinstance(existing, dict) or existing.get('role') != 'user':
+            return False
+        existing_source = existing.get('_source') or 'webui'
+        try:
+            existing_ts = int(existing.get('timestamp'))
+        except (TypeError, ValueError):
+            return False
+        return (
+            _normalize_user_text(existing.get('content')) == _normalize_user_text(pending_text)
+            and existing_ts == recovered_ts
+            and existing_source == pending_source
+            and list(existing.get('attachments') or []) == pending_attachments
+        )
+
+    if is_exact_checkpoint(getattr(session, 'messages', None)):
+        return False
     recovered = {
         'role': 'user',
         'content': pending_text,
         'timestamp': recovered_ts,
         '_recovered': True,
     }
-    pending_source = getattr(session, 'pending_user_source', None)
-    if pending_source and pending_source != 'webui':
-        recovered['_source'] = pending_source
-    pending_attachments = getattr(session, 'pending_attachments', None)
+    stamp_message_source(recovered, pending_source)
     if pending_attachments:
         recovered['attachments'] = list(pending_attachments)
     session.messages.append(recovered)
@@ -7167,14 +7789,8 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
     # Placing the mirror here (rather than in _persist_cancelled_turn) covers
     # all three callers: cancel, provider-error, and exception paths.
     ctx = getattr(session, 'context_messages', None)
-    if isinstance(ctx, list) and ctx:
-        rec_text = " ".join(str(recovered.get('content') or '').split())
-        if not any(
-            isinstance(e, dict) and e.get('role') == 'user'
-            and " ".join(str(e.get('content') or '').split()) == rec_text
-            for e in ctx[-8:]
-        ):
-            ctx.append({k: v for k, v in recovered.items() if k != 'timestamp'})
+    if isinstance(ctx, list) and ctx and not is_exact_checkpoint(ctx):
+        ctx.append(dict(recovered))
     # The new user turn is now committed to messages (#3831): advance a positive
     # truncation watermark left over from a prior retry/undo/edit so that
     # merge_session_messages_append_only() still filters out replaced pre-edit
@@ -7184,6 +7800,22 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
     if getattr(session, 'truncation_watermark', None):
         session.truncation_watermark = float(recovered_ts)
     return True
+
+
+def _terminal_turn_duration(session, *, now: float | None = None) -> float | None:
+    """Freeze a valid turn timer before terminal cleanup clears its origin."""
+    started_at = getattr(session, 'pending_started_at', None)
+    try:
+        started = float(started_at)
+        ended = float(time.time() if now is None else now)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(started) or not math.isfinite(ended) or started <= 0:
+        return None
+    elapsed = ended - started
+    if elapsed < 0:
+        return None
+    return round(elapsed, 3)
 
 
 def _build_partial_message(content_text, reasoning_text, tool_calls) -> dict | None:
@@ -7271,6 +7903,15 @@ def _snapshot_and_append_partial_on_error(session, stream_id) -> dict | None:
             _live_tools = getattr(_live_config, 'STREAM_LIVE_TOOL_CALLS', live_tool_calls)
             if _live_tools is not live_tool_calls:
                 _snap_tool_calls = list(_live_tools.get(stream_id, []) or [])
+
+    # Seal projected live tool rows so the durable scene cannot disagree with
+    # the settled terminal state. Any tool call that was still running at
+    # error time is marked complete with terminal-error metadata.
+    if _snap_tool_calls:
+        for _tc in _snap_tool_calls:
+            if isinstance(_tc, dict) and not _tc.get('done'):
+                _tc['done'] = True
+                _tc['_sealed_by_terminal_error'] = True
 
     _partial_msg = _build_partial_message(_snap_partial_text, _snap_reasoning, _snap_tool_calls)
     if _partial_msg is None:
@@ -8343,7 +8984,13 @@ def _run_agent_streaming(
         # in the outer finally next to _clear_thread_env().
         s = get_session(session_id)
         _turn_pending_source = getattr(s, 'pending_user_source', None) or 'webui'
-        update_active_run(stream_id, phase="running", session_id=session_id, profile=getattr(s, "profile", None) or profile)
+        _active_turn_identity = _active_turn_authority(s, stream_id, msg_text)
+        update_active_run(
+            stream_id,
+            phase="running",
+            session_id=session_id,
+            profile=getattr(s, "profile", None) or profile,
+        )
         s.workspace = str(Path(workspace).expanduser().resolve())
         _last_persisted_model = None
         _last_persisted_provider = None
@@ -9193,8 +9840,21 @@ def _run_agent_streaming(
             # Initialize SessionDB so session_search works in WebUI sessions
             _state_db_path = (Path(_profile_home) / "state.db") if _profile_home else None
             _session_db = _build_session_db_for_stream(_state_db_path)
+            from api.models import model_explicit_pick_signature as _make_model_pick_signature
+            _picked_model_signature = getattr(s, "model_explicit_pick_signature", None)
+            _signature_model = getattr(s, "model", None) or model
+            _signature_provider = getattr(s, "model_provider", None) or provider_context
+            _current_model_signature = _make_model_pick_signature(
+                _signature_model,
+                _signature_provider,
+            )
+            _explicitly_picked = bool(_picked_model_signature) and (
+                _picked_model_signature == _current_model_signature
+            )
+            warm_models_catalog_provenance_if_cold()
             resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
-                model_with_provider_context(model, provider_context)
+                model_with_provider_context(model, provider_context),
+                explicitly_picked=_explicitly_picked,
             )
             configured_base_url = resolved_base_url
 
@@ -9738,12 +10398,18 @@ def _run_agent_streaming(
                     state_messages=_external_state_messages,
                 ) or []
             )
-            _previous_context_messages = _new_turn_context_from_messages(
+            _previous_owner_context_messages = list(
                 reconciled_state_db_messages_for_session(
                     s,
                     prefer_context=True,
                     state_messages=_external_state_messages,
-                ),
+                ) or []
+            )
+            _previous_owner_context_messages = _deduplicate_context_messages(
+                _previous_owner_context_messages
+            )
+            _previous_context_messages = _new_turn_context_from_messages(
+                _previous_owner_context_messages,
                 msg_text,
             )
             _turn_internal_control = {
@@ -9815,7 +10481,79 @@ def _run_agent_streaming(
             )
             _ckpt_thread.start()
 
+            _pending_async_acceptances = []
+            _process_notifications = _drain_webui_process_notifications(
+                session_id,
+                claimed_events=_process_completion_claims,
+                pending_async_acceptances=_pending_async_acceptances,
+            )
+            _bestplan_invocation_message = _expand_bestplan_skill_invocation(
+                msg_text,
+                session_id=session_id,
+            )
+            _agent_msg_text = _bestplan_invocation_message
+            if _process_notifications:
+                _agent_msg_text = "\n\n".join(
+                    [*_process_notifications, _bestplan_invocation_message]
+                ).strip()
+            user_message = _build_native_multimodal_message(
+                workspace_ctx,
+                _agent_msg_text,
+                attachments,
+                workspace,
+                cfg=_cfg,
+            )
             _persistent_state_before = _persistent_state_snapshot(_profile_home)
+            _run_conversation_kwargs = dict(
+                user_message=user_message,
+                system_message=workspace_system_msg,
+                conversation_history=_sanitize_messages_for_api(
+                    _previous_context_messages,
+                    cfg=_cfg,
+                    effective_model=resolved_model,
+                    effective_provider=resolved_provider,
+                    effective_base_url=resolved_base_url,
+                ),
+                task_id=session_id,
+                persist_user_message=msg_text,
+                persist_user_timestamp=getattr(s, 'pending_started_at', None),
+            )
+            # Only pass moa_config when a /moa override is actually active, so a
+            # normal send never trips a TypeError on an older hermes-agent whose
+            # run_conversation() predates the moa_config kwarg.
+            if moa_config is not None:
+                _run_conversation_kwargs["moa_config"] = moa_config
+            if bestplan_config is not None:
+                _run_conversation_kwargs["bestplan_config"] = bestplan_config
+
+            # Finalize durable delegation claims at the current-turn acceptance
+            # boundary: immediately before invoking the agent with the message
+            # that contains their notifications. A failed ACK is removed from
+            # this turn and requeued so retry cannot create a duplicate prompt.
+            _rejected_async_notifications = _accept_pending_async_delegations(
+                _pending_async_acceptances,
+                session_id=session_id,
+            )
+            if _rejected_async_notifications:
+                for _notification in _rejected_async_notifications:
+                    try:
+                        _process_notifications.remove(_notification)
+                    except ValueError:
+                        pass
+                _agent_msg_text = msg_text
+                if _process_notifications:
+                    _agent_msg_text = "\n\n".join(
+                        [*_process_notifications, msg_text]
+                    ).strip()
+                user_message = _build_native_multimodal_message(
+                    workspace_ctx,
+                    _agent_msg_text,
+                    attachments,
+                    workspace,
+                    cfg=_cfg,
+                )
+                _run_conversation_kwargs["user_message"] = user_message
+
             result = _try_resolve_bestplan_go_ingress(
                 agent,
                 original_message=msg_text,
@@ -9827,45 +10565,6 @@ def _run_agent_streaming(
                 config=_cfg,
             )
             if result is None:
-                _process_notifications = _drain_webui_process_notifications(
-                    session_id,
-                    claimed_events=_process_completion_claims,
-                )
-                _bestplan_invocation_message = _expand_bestplan_skill_invocation(
-                    msg_text,
-                    session_id=session_id,
-                )
-                _agent_msg_text = _bestplan_invocation_message
-                if _process_notifications:
-                    _agent_msg_text = "\n\n".join(
-                        [*_process_notifications, _bestplan_invocation_message]
-                    ).strip()
-                user_message = _build_native_multimodal_message(
-                    workspace_ctx,
-                    _agent_msg_text,
-                    attachments,
-                    workspace,
-                    cfg=_cfg,
-                )
-                _run_conversation_kwargs = dict(
-                    user_message=user_message,
-                    system_message=workspace_system_msg,
-                    conversation_history=_sanitize_messages_for_api(
-                        _previous_context_messages,
-                        cfg=_cfg,
-                        effective_model=_effective_runtime_model,
-                        effective_provider=resolved_provider,
-                        effective_base_url=resolved_base_url,
-                    ),
-                    task_id=session_id,
-                    persist_user_message=msg_text,
-                )
-                # Only pass optional orchestrator configs when active so older
-                # Agent runtimes retain compatibility with normal sends.
-                if moa_config is not None:
-                    _run_conversation_kwargs["moa_config"] = moa_config
-                if bestplan_config is not None:
-                    _run_conversation_kwargs["bestplan_config"] = bestplan_config
                 result = agent.run_conversation(**_run_conversation_kwargs)
                 if str(result.get("final_response") or "").strip():
                     result = _capture_bestplan_result(
@@ -9879,6 +10578,11 @@ def _run_agent_streaming(
                         profile_home=_profile_home,
                         host_agent=agent,
                     )
+            _active_turn_identity = _resolve_active_turn_authority(
+                _active_turn_identity,
+                result=result,
+                agent=agent,
+            )
             # #4729: the run is done — flush any reasoning tail still in the coalescing
             # buffer (the agent never calls reasoning_callback(None), and a turn can end on
             # reasoning with no trailing token/tool boundary to trigger a flush) so the last
@@ -9978,7 +10682,9 @@ def _run_agent_streaming(
                             "guardrail terminal mapped: %s",
                             _guardrail_mapping_diagnostic(_guardrail_terminal),
                         )
-                    _result_messages = result.get('messages') or _previous_context_messages
+                    _result_messages = result.get('messages')
+                    if _result_messages is None:
+                        _result_messages = _previous_context_messages
                     _result_messages = _drop_synthetic_max_iteration_summary_requests(
                         _result_messages,
                         enabled=_tool_limit_reached,
@@ -10014,8 +10720,34 @@ def _run_agent_streaming(
                         _result_messages = _maybe_inject_max_iteration_summary_fallback(
                             _result_messages, result
                         )
+                        # The fallback is the authoritative result payload for
+                        # both context and display settlement. Keep this alias
+                        # in sync so the later marker cleanup does not replace
+                        # the synthesized assistant with the pre-injection
+                        # transcript.
+                        _context_result_messages = _result_messages
+                        _display_result_messages_source = _result_messages
                         if isinstance(result, dict):
                             result = {**result, 'messages': _result_messages}
+                    _verification_nudge_seen = any(
+                        isinstance(_message, dict)
+                        and _message.get('role') == 'user'
+                        and _is_synthetic_control_message(_message)
+                        for _message in _result_messages or []
+                    )
+                    _context_result_messages = _drop_synthetic_control_messages(
+                        _context_result_messages
+                    )
+                    _display_result_messages_source = _drop_synthetic_control_messages(
+                        _display_result_messages_source
+                    )
+                    _context_writeback_messages = (
+                        _context_result_messages
+                        if _context_result_messages
+                        else list(_previous_context_messages or [])
+                    )
+                    if isinstance(result, dict):
+                        result = {**result, 'messages': _context_result_messages}
                     if cancel_event.is_set():
                         _finalize_cancelled_turn(s, ephemeral=False)
                         try:
@@ -10032,73 +10764,110 @@ def _run_agent_streaming(
                             logger.debug("Failed to append cancelled turn journal event", exc_info=True)
                         put('cancel', _cancel_event_payload('Cancelled by user'))
                         return
-                    _next_context_messages = _restore_reasoning_metadata(
-                        _previous_context_messages,
-                        _context_result_messages,
+                    # Tool-limit writeback has one authoritative settlement
+                    # owner. Besides preventing divergent display/context
+                    # merges, this preserves a pending current-user boundary
+                    # when the Agent returns a delta-only or synthetic-only
+                    # payload. Guardrail and compression paths still need
+                    # their specialized handling below.
+                    _shared_tool_limit_settlement = bool(
+                        _tool_limit_reached
+                        and _guardrail_terminal is None
+                        and not _structured_compression_exhausted
                     )
-                    # Stamp stable ids on the shared result rows AFTER the context
-                    # restore (so carried-forward ids survive) and BEFORE the
-                    # dedupe/merge build both arrays — including before
-                    # _dedupe_replayed_context_messages deep-copies any
-                    # stale-user repaired boundary row — so display and
-                    # model-context copies of each row share an id for the
-                    # fork/truncate aligner.
-                    _assign_stable_message_ids(
-                        _result_messages, _previous_messages, _previous_context_messages
-                    )
-                    _next_context_messages = _dedupe_replayed_context_messages(
-                        _previous_context_messages,
-                        _next_context_messages,
-                        msg_text,
-                    )
-                    s.context_messages = _deduplicate_context_messages(_next_context_messages)
-                    _internal_control = _turn_internal_control
-                    if _internal_control:
-                        _control_attr, _control_key = _internal_control
-                        _control = getattr(s, _control_attr, None)
-                        s.context_messages = _canonicalize_internal_control_context(
-                            s.context_messages,
+                    if _shared_tool_limit_settlement:
+                        _result_messages = _settle_result_messages(
+                            s,
+                            _previous_messages,
+                            _previous_owner_context_messages,
+                            _result_messages,
                             msg_text,
-                            _control_key,
-                            _control,
-                            previous_messages=_previous_context_messages,
+                            _turn_pending_source,
+                            _active_turn_identity,
                         )
-                    _display_result_messages = _restore_display_reasoning_metadata(
-                        _previous_messages,
-                        _display_result_messages_source,
-                    )
-                    _guardrail_candidate_token = str(stream_id)
-                    if _guardrail_terminal is not None:
-                        # The temporary candidate marker is display-only.  Some
-                        # restored rows still share dictionaries with the agent
-                        # result/context arrays, so isolate them before tagging
-                        # to keep the persisted model context clean.
-                        _display_result_messages = copy.deepcopy(
-                            _display_result_messages
-                        )
-                        _tag_current_turn_guardrail_candidate(
-                            _display_result_messages,
+                        _context_result_messages = list(_result_messages or [])
+                        _display_result_messages_source = list(_result_messages or [])
+                        if isinstance(result, dict):
+                            result = {**result, 'messages': _context_result_messages}
+                    else:
+                        _next_context_messages = _restore_reasoning_metadata(
                             _previous_context_messages,
+                            _context_writeback_messages,
+                        )
+                        # Stamp stable ids on the shared result rows AFTER the context
+                        # restore (so carried-forward ids survive) and BEFORE the
+                        # dedupe/merge build both arrays — including before
+                        # _dedupe_replayed_context_messages deep-copies any
+                        # stale-user repaired boundary row — so display and
+                        # model-context copies of each row share an id for the
+                        # fork/truncate aligner.
+                        _assign_stable_message_ids(
+                            _result_messages, _previous_messages, _previous_context_messages
+                        )
+                        _next_context_messages = _dedupe_replayed_context_messages(
+                            _previous_context_messages,
+                            _next_context_messages,
                             msg_text,
-                            _guardrail_candidate_token,
                         )
-                    s.messages = _merge_display_messages_after_agent_result(
-                        _previous_messages,
-                        _previous_context_messages,
-                        _display_result_messages,
-                        msg_text,
-                        source=getattr(s, 'pending_user_source', None) or 'webui',
-                    )
-                    if _guardrail_terminal is not None:
-                        _marked_guardrail_answer = _mark_latest_assistant_guardrail_status(
-                            s.messages,
-                            _guardrail_terminal.reason,
-                            candidate_token=_guardrail_candidate_token,
+                        _next_context_messages = _settle_current_turn_boundary(
+                            _previous_context_messages,
+                            _next_context_messages,
+                            _active_turn_identity,
+                            msg_text,
+                            _turn_pending_source,
                         )
-                        if not _marked_guardrail_answer:
-                            s.messages.append(
-                                _guardrail_recovery_message(_guardrail_terminal.reason)
+                        s.context_messages = _deduplicate_context_messages(_next_context_messages)
+                        _internal_control = _turn_internal_control
+                        if _internal_control:
+                            _control_attr, _control_key = _internal_control
+                            _control = getattr(s, _control_attr, None)
+                            s.context_messages = _canonicalize_internal_control_context(
+                                s.context_messages,
+                                msg_text,
+                                _control_key,
+                                _control,
+                                previous_messages=_previous_context_messages,
                             )
+                        _display_result_messages = _restore_display_reasoning_metadata(
+                            _previous_messages,
+                            _display_result_messages_source,
+                        )
+                        _guardrail_candidate_token = str(stream_id)
+                        if _guardrail_terminal is not None:
+                            # The temporary candidate marker is display-only.  Some
+                            # restored rows still share dictionaries with the agent
+                            # result/context arrays, so isolate them before tagging
+                            # to keep the persisted model context clean.
+                            _display_result_messages = copy.deepcopy(
+                                _display_result_messages
+                            )
+                            _tag_current_turn_guardrail_candidate(
+                                _display_result_messages,
+                                _previous_context_messages,
+                                msg_text,
+                                _guardrail_candidate_token,
+                            )
+                        s.messages = _merge_display_messages_after_agent_result(
+                            _previous_messages,
+                            _previous_context_messages,
+                            _display_result_messages,
+                            msg_text,
+                            source=_turn_pending_source,
+                            verification_nudge_provenance={
+                                'verification_nudge_seen': _verification_nudge_seen,
+                                'active_turn_identity': _active_turn_identity,
+                            },
+                        )
+                        if _guardrail_terminal is not None:
+                            _marked_guardrail_answer = _mark_latest_assistant_guardrail_status(
+                                s.messages,
+                                _guardrail_terminal.reason,
+                                candidate_token=_guardrail_candidate_token,
+                            )
+                            if not _marked_guardrail_answer:
+                                s.messages.append(
+                                    _guardrail_recovery_message(_guardrail_terminal.reason)
+                                )
                     _compact_session_image_parts_for_persistence(s)
                     _advance_truncation_watermark_after_commit(s)  # #3831
                 # Strip XML tool-call blocks from assistant message content.
@@ -10123,15 +10892,12 @@ def _run_agent_streaming(
                 # registration, and subsequent error persistence all target the
                 # continuation session instead of the stale parent.
                 #
-                # Lock migration: when session_id rotates, we alias the new ID to
-                # the *same* Lock object under SESSION_AGENT_LOCKS so that
-                # subsequent callers using _get_session_agent_lock(new_sid) get the
-                # same Lock the streaming thread is already holding. We then pop
-                # the old-id entry to prevent a leak. This is safe because we
-                # already hold _agent_lock (the Lock object itself), so the
-                # reference stays alive even after the dict entry is removed.
-                # Concurrent readers that already looked up the old ID will still
-                # see the same Lock object until they release it.
+                # Lock migration: when session_id rotates, alias both old and new
+                # IDs to the *same* _agent_lock. Keeping the old alias ensures a
+                # late old-ID request cannot create a second mutation lock while
+                # the streaming holder or an earlier waiter is still active. The
+                # weak registry reclaims both aliases after the final strong
+                # reference to the Lock is released.
                 _compression_origin_session_id = session_id
                 _compression_continuation_session_id = None
                 _agent_sid = getattr(agent, 'session_id', None)
@@ -10216,12 +10982,11 @@ def _run_agent_streaming(
                         SESSIONS[new_sid] = s
                         SESSIONS.move_to_end(new_sid)
                         _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
-                    # Migrate the per-session lock: alias new_sid to the held
-                    # _agent_lock reference directly (not via old_sid lookup),
-                    # then remove the old_sid entry to prevent a leak.
-                    with SESSION_AGENT_LOCKS_LOCK:
-                        SESSION_AGENT_LOCKS[new_sid] = _agent_lock
-                        SESSION_AGENT_LOCKS.pop(old_sid, None)
+                    # Migrate the per-session lock by aliasing new_sid to the
+                    # held _agent_lock reference directly. Keep old_sid aliased
+                    # too until the weak registry can reclaim both safely after
+                    # all old-ID holders and waiters release the lock.
+                    _alias_session_agent_lock(old_sid, new_sid, _agent_lock)
                     # Migrate cached agent to the new session ID so the turn
                     # count survives context compression.
                     from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK
@@ -10258,7 +11023,7 @@ def _run_agent_streaming(
                 # workspace-aware helper from this branch while still
                 # preserving the pre-turn length for downstream self-heal
                 # checks introduced on master.
-                _all_result_messages = result.get('messages') or []
+                _all_result_messages = _drop_synthetic_control_messages(result.get('messages') or [])
                 _prev_len = len(_previous_context_messages)
                 _assistant_added = _assistant_reply_added_after_current_turn(
                     _all_result_messages,
@@ -10293,15 +11058,30 @@ def _run_agent_streaming(
                 )
                 _saved_transcript_lacks_final_answer = _merged_transcript_lacks_final_assistant_answer(
                     _previous_messages,
-                    _previous_context_messages,
+                    _previous_owner_context_messages,
                     _all_result_messages,
                     msg_text,
                     source=getattr(s, 'pending_user_source', None) or 'webui',
                     drop_replayed_assistant=_drop_replayed_assistant,
+                    active_turn_identity=_active_turn_identity,
                 )
+                if not _all_result_messages and not _verification_nudge_seen:
+                    # An empty Agent result cannot complete the pending turn.
+                    # Do not let a historical assistant that happens to follow
+                    # the same user text (or a pre-existing checkpoint token)
+                    # satisfy the current-turn classifier.
+                    _saved_transcript_lacks_final_answer = True
+                if not _assistant_added and not _saved_transcript_lacks_final_answer:
+                    _assistant_added = True
                 _is_agent_result_terminal = _agent_result_terminal_failure(result)
                 _terminal_failure = (
-                    _is_agent_result_terminal
+                    (
+                        _is_agent_result_terminal
+                        and not (
+                            _tool_limit_reached
+                            and not _saved_transcript_lacks_final_answer
+                        )
+                    )
                     or (
                         _saved_transcript_lacks_final_answer
                         and _classification['type'] not in {'cancelled', 'interrupted'}
@@ -10330,14 +11110,10 @@ def _run_agent_streaming(
                     # user-facing recovery disclosure rather than an apperror.
                     _assistant_added = True
                     _terminal_failure = False
-                elif _tool_limit_reached:
-                    # A durable successor, rather than a terminal error card,
-                    # owns this state. The teardown hook claims it only after
-                    # the parent worker has fully settled.
-                    _assistant_added = True
-                    _terminal_failure = False
                 elif _terminal_failure:
                     _assistant_added = False
+                elif _tool_limit_reached and not _session_lacks_final_assistant_answer(s.messages):
+                    _mark_latest_assistant_tool_limit_status(s.messages)
                 # _token_sent tracks whether on_token() was called (any streamed text)
                 if _terminal_failure or (not _assistant_added and not _token_sent):
                     if cancel_event.is_set():
@@ -10415,10 +11191,16 @@ def _run_agent_streaming(
                                     ),
                                     task_id=session_id,
                                     persist_user_message=msg_text,
+                                    persist_user_timestamp=getattr(s, 'pending_started_at', None),
                                 )
                                 if moa_config is not None:
                                     _heal_kwargs["moa_config"] = moa_config
                                 _heal_result = agent.run_conversation(**_heal_kwargs)
+                                _active_turn_identity = _resolve_active_turn_authority(
+                                    _active_turn_identity,
+                                    result=_heal_result,
+                                    agent=agent,
+                                )
                                 _heal_all_msgs = _heal_result.get('messages') or []
                                 _heal_ok = _has_new_assistant_reply(_heal_all_msgs, _prev_len) or _token_sent
                             except Exception as _retry_exc:
@@ -10449,34 +11231,22 @@ def _run_agent_streaming(
                                 # evaluates False on next conceptual pass.
                                 # Since we're in a flat block, directly run the
                                 # post-result merge logic here.
-                                _result_messages = result.get('messages') or _previous_context_messages
+                                _result_messages = result.get('messages')
+                                if _result_messages is None:
+                                    _result_messages = _previous_context_messages
                                 _result_messages = _drop_synthetic_max_iteration_summary_requests(
                                     _result_messages,
                                     enabled=_agent_result_tool_limit_reached(result),
                                     previous_messages=_previous_context_messages,
                                 )
-                                _next_context_messages = _restore_reasoning_metadata(
-                                    _previous_context_messages,
-                                    _result_messages,
-                                )
-                                # Mint ids on the shared result rows BEFORE dedupe
-                                # deep-copies any stale-user boundary row, so both
-                                # arrays share the id (#5564).
-                                _assign_stable_message_ids(
-                                    _result_messages, _previous_messages, _previous_context_messages
-                                )
-                                _next_context_messages = _dedupe_replayed_context_messages(
-                                    _previous_context_messages,
-                                    _next_context_messages,
-                                    msg_text,
-                                )
-                                s.context_messages = _deduplicate_context_messages(_next_context_messages)
-                                s.messages = _merge_display_messages_after_agent_result(
+                                _result_messages = _settle_result_messages(
+                                    s,
                                     _previous_messages,
-                                    _previous_context_messages,
-                                    _restore_reasoning_metadata(_previous_messages, _result_messages),
+                                    _previous_owner_context_messages,
+                                    _result_messages,
                                     msg_text,
-                                    source=getattr(s, 'pending_user_source', None) or 'webui',
+                                    _turn_pending_source,
+                                    _active_turn_identity,
                                 )
                                 _compact_session_image_parts_for_persistence(s)
                                 _advance_truncation_watermark_after_commit(s)  # #3831
@@ -10548,7 +11318,10 @@ def _run_agent_streaming(
                                     + 'send a message, switch the model/provider, or fix the credentials.'
                                 )
                                 _error_payload['hint'] = _err_hint
-                        _materialize_pending_user_turn_before_error(s)
+                        _materialize_pending_user_turn_before_error(
+                            s,
+                            active_turn_identity=_active_turn_identity,
+                        )
                         s.active_stream_id = None
                         s.pending_user_message = None
                         s.pending_attachments = []
@@ -10837,6 +11610,12 @@ def _run_agent_streaming(
                             if _gateway_routing:
                                 _dm['_gatewayRouting'] = _gateway_routing
                             break
+                if _verification_nudge_seen and not _context_result_messages:
+                    # A marker-only verification delta carries no model-visible
+                    # context of its own. Keep the two persisted projections
+                    # byte-for-byte aligned after duration/reasoning metadata
+                    # has been attached to the visible assistant row.
+                    s.context_messages = copy.deepcopy(s.messages)
                 # Persist context window data on the session so the context-ring
                 # indicator survives a page reload (#1318). Must run BEFORE
                 # s.save() for the same reason as the reasoning trace above.
@@ -11693,10 +12472,16 @@ def _run_agent_streaming(
                             ),
                             task_id=session_id,
                             persist_user_message=msg_text,
+                            persist_user_timestamp=getattr(s, 'pending_started_at', None),
                         )
                         if moa_config is not None:
                             _heal_kwargs2["moa_config"] = moa_config
                         _heal_result = _heal_agent.run_conversation(**_heal_kwargs2)
+                        _active_turn_identity = _resolve_active_turn_authority(
+                            _active_turn_identity,
+                            result=_heal_result,
+                            agent=_heal_agent,
+                        )
                         # Retry succeeded — persist the result normally
                         if s is not None:
                             if _checkpoint_stop is not None:
@@ -11713,31 +12498,18 @@ def _run_agent_streaming(
                                         getattr(s, 'active_stream_id', None),
                                     )
                                     return
-                                _result_messages = _heal_result.get('messages') or _previous_context_messages
-                                _next_context_messages = _restore_reasoning_metadata(
-                                    _previous_context_messages, _result_messages,
-                                )
-                                # Mint ids on the shared result rows BEFORE dedupe
-                                # deep-copies any stale-user boundary row, so both
-                                # arrays share the id (#5564).
-                                _assign_stable_message_ids(
-                                    _result_messages, _previous_messages, _previous_context_messages
-                                )
-                                _next_context_messages = _dedupe_replayed_context_messages(
-                                    _previous_context_messages,
-                                    _next_context_messages,
-                                    msg_text,
-                                )
-                                s.context_messages = _deduplicate_context_messages(_next_context_messages)
-                                s.messages = _merge_display_messages_after_agent_result(
+                                _result_messages = _heal_result.get('messages')
+                                if _result_messages is None:
+                                    _result_messages = _previous_context_messages
+                                _result_messages = _settle_result_messages(
+                                    s,
                                     _previous_messages,
-                                    _previous_context_messages,
-                                    _restore_reasoning_metadata(_previous_messages, _result_messages),
+                                    _previous_owner_context_messages,
+                                    _result_messages,
                                     msg_text,
-                                    source=getattr(s, 'pending_user_source', None) or 'webui',
+                                    _turn_pending_source,
+                                    _active_turn_identity,
                                 )
-                                _compact_session_image_parts_for_persistence(s)
-                                _advance_truncation_watermark_after_commit(s)  # #3831
                                 s.save()
                         logger.info('[webui] self-heal (except path): retry succeeded')
                         return  # skip error emission
@@ -11818,7 +12590,10 @@ def _run_agent_streaming(
                             + 'send a message, switch the model/provider, or fix the credentials.'
                         )
                         _error_payload['hint'] = _exc_hint
-                _materialize_pending_user_turn_before_error(s)
+                _materialize_pending_user_turn_before_error(
+                    s,
+                    active_turn_identity=_active_turn_identity,
+                )
                 s.active_stream_id = None
                 s.pending_user_message = None
                 s.pending_attachments = []

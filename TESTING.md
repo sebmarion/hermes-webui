@@ -115,6 +115,19 @@ Run the focused automated contract with:
   tests/test_issue_1932_goal_hook_unrelated_turns.py \
   tests/test_stage326_pending_goal_continuation_race.py \
   tests/test_webui_gateway_chat_backend.py
+
+# Public deterministic browser lifecycle gate.
+pip install -r requirements.txt playwright
+python -m playwright install --with-deps chromium
+
+# Normal-path deterministic conversation lifecycle gate.
+python tests/browser_conversation_lifecycle.py
+
+# Terminal-error lifecycle gate (new row in the proof matrix).
+LIFECYCLE_SCENARIO=terminal-error python tests/browser_conversation_lifecycle.py
+
+# Historical ID-linked transcript hydration row.
+python tests/browser_historical_transcript_hydration.py
 ```
 
 For a live provider canary, use isolated WebUI state and set a goal that requires
@@ -326,6 +339,29 @@ initial and older-page duration. No `/api/session-window` request may exceed
 five seconds, and server diagnostics must remain bounded to counts, durations,
 state/reason codes, and opaque IDs—never transcript, commands, paths, arguments,
 or tool output.
+
+# Mutation bites for the public lifecycle gate.
+LIFECYCLE_TEST_BITE=drop-anchor-persistence \
+  python tests/browser_conversation_lifecycle.py
+
+# Terminal-state-specific mutation bite: remove terminal row from persisted scene
+# so hard reload cannot recover terminal status.
+LIFECYCLE_SCENARIO=terminal-error \
+LIFECYCLE_TEST_BITE=drop-terminal-anchor-row \
+  python tests/browser_conversation_lifecycle.py
+
+# Historical-hydration mutation: corrupt one persisted tool-result link so the
+# strict Anchor projection must fail instead of claiming the legacy transcript.
+HISTORICAL_HYDRATION_TEST_BITE=break-tool-link \
+  python tests/browser_historical_transcript_hydration.py
+```
+
+The dedicated `Conversation lifecycle (informational)` workflow runs the current
+proof rows (`normal`, `terminal-error`, and `historical-transcript-hydration`) and
+stays non-blocking while the public
+matrix expands to additional behavior rows. The maintainer's private QA harness
+remains broader; later public slices will add session switching, reconnect/replay,
+cancellation, compression, and recovery.
 
 
 `tests/test_static_js_runtime_lint.py` runs this automatically when eslint is present

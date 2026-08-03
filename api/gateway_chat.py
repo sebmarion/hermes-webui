@@ -34,7 +34,7 @@ from api.config import (
 )
 from api.helpers import _redact_text, redact_session_data
 from api.models import clear_process_wakeup_pause, get_session, merge_session_messages_append_only
-from api.run_journal import RunJournalWriter
+from api.run_journal import RunJournalWriter, bound_run_journal_snapshot_args
 
 logger = logging.getLogger(__name__)
 
@@ -422,7 +422,9 @@ def _gateway_tool_progress_event(payload: dict) -> tuple[str, dict] | None:
         "event_type": "tool.completed" if is_complete else "tool.started",
         "name": name,
         "preview": payload.get("label") or payload.get("preview"),
-        "args": payload.get("args") if isinstance(payload.get("args"), dict) else {},
+        "args": bound_run_journal_snapshot_args(payload.get("args"))
+        if isinstance(payload.get("args"), dict)
+        else {},
         "is_error": bool(payload.get("error")) or status in {"error", "failed"},
     }
     if tid:
@@ -756,14 +758,19 @@ def _settle_gateway_terminal_error(session_id, stream_id, workspace, model, mode
         session.workspace = str(workspace)
         session.model = model
         session.model_provider = model_provider
+        terminal_session_persisted = False
         try:
             session.save()
+            terminal_session_persisted = True
         except Exception:
             logger.debug("Failed to persist gateway terminal error settlement", exc_info=True)
         error_payload["session"] = redact_session_data(
             _session_payload_with_full_messages(session, tool_calls=[])
         )
         error_payload["session_id"] = session.session_id
+        error_payload["terminal_session_persisted"] = terminal_session_persisted
+        if terminal_session_persisted:
+            error_payload["terminal_session_persisted_session_id"] = session.session_id
         return error_payload
 
 
@@ -917,6 +924,9 @@ def _run_gateway_chat_streaming(
     def put_gateway_event(event, data):
         if cancel_event.is_set() and not success_writeback_committed and event not in ("cancel", "error", "apperror"):
             return
+        if event == "apperror" and isinstance(data, dict):
+            data = data.copy()
+            data.setdefault("session_id", session_id)
         event_id = None
         if run_journal is not None:
             try:
@@ -939,6 +949,7 @@ def _run_gateway_chat_streaming(
 
     s = None
     final_text = ""
+    terminal_error = ""
     usage = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": 0}
     try:
         s = get_session(session_id)
@@ -1045,12 +1056,17 @@ def _run_gateway_chat_streaming(
                     session=s,
                 )
             except Exception as exc:
-                put_gateway_event("apperror", {
-                    "label": "Gateway runs API error",
-                    "type": "gateway_runs_error",
-                    "message": str(exc)[:400],
-                    "hint": "Check that the Hermes Gateway runs API (/v1/runs) is available.",
-                })
+                error_payload = _settle_gateway_terminal_error(
+                    session_id,
+                    stream_id,
+                    workspace,
+                    model,
+                    model_provider,
+                    str(exc),
+                )
+                if error_payload is None:
+                    return
+                put_gateway_event("apperror", error_payload)
                 return
             if final_text is None:
                 return
@@ -1196,6 +1212,8 @@ def _run_gateway_chat_streaming(
                         sse_event = "message"
                         continue
                     last_payload = payload
+                    if payload.get("error"):
+                        terminal_error = str(payload["error"])
                     reasoning_delta = _gateway_sse_reasoning_delta(payload)
                     if reasoning_delta:
                         if stream_id in STREAM_REASONING_TEXT:
@@ -1210,6 +1228,19 @@ def _run_gateway_chat_streaming(
                     usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
             usage.update({k: v for k, v in _gateway_stream_usage(last_payload).items() if v})
         assistant_text = final_text.strip()
+        if terminal_error:
+            error_payload = _settle_gateway_terminal_error(
+                session_id,
+                stream_id,
+                workspace,
+                model,
+                model_provider,
+                terminal_error,
+            )
+            if error_payload is None:
+                return
+            put_gateway_event("apperror", error_payload)
+            return
         if not assistant_text:
             put_gateway_event("apperror", {
                 "label": "Gateway returned no response",
@@ -1399,16 +1430,23 @@ def _run_gateway_chat_streaming(
                 if decision.get("should_continue"):
                     continuation_prompt = str(decision.get("continuation_prompt") or "").strip()
                     if continuation_prompt:
-                        from api.goal_continuation import claim_goal_continuation
-
                         continuation_pending = True
-                        claim_goal_continuation(
-                            session_id=session_id,
-                            parent_run_id=stream_id,
-                            prompt=continuation_prompt,
-                            goal_revision=decision.get("goal_revision"),
-                            profile_home=profile_home,
-                        )
+                        try:
+                            from api.goal_continuation import claim_goal_continuation
+
+                            claim_goal_continuation(
+                                session_id=session_id,
+                                parent_run_id=stream_id,
+                                prompt=continuation_prompt,
+                                goal_revision=decision.get("goal_revision"),
+                                profile_home=profile_home,
+                            )
+                        except Exception:
+                            # Older local installs do not expose the durable
+                            # continuation claim helper; retain the legacy
+                            # in-process marker so the completed turn still
+                            # emits the continuation event and can be picked up.
+                            PENDING_GOAL_CONTINUATION.add(session_id)
                         put_gateway_event("goal_continue", {
                             "session_id": session_id,
                             "continuation_prompt": continuation_prompt,

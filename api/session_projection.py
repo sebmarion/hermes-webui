@@ -11,9 +11,7 @@ from pathlib import Path
 # shorter interval does not add SQLite work to the request path.
 _POLL_INTERVAL_SECONDS = 0.1
 _LOCK = threading.Lock()
-_CONNECTION_LOCK = threading.Lock()
 _STATE: dict[str, dict] = {}
-_LEGACY_CONNECTIONS: dict[str, tuple[tuple[int, int], sqlite3.Connection]] = {}
 
 
 def _path_stamp(path: Path) -> tuple[int, int]:
@@ -33,58 +31,26 @@ def _path_identity(path: Path) -> tuple[int, int]:
         return (0, 0)
 
 
-def _legacy_data_version(db_path: Path) -> tuple[int, int]:
-    """Read a legacy SQLite database's commit version without blocking callers.
+def _legacy_data_version(db_path: Path) -> tuple:
+    """Return a bounded commit fingerprint without pinning a SQLite reader.
 
-    ``PRAGMA data_version`` only advances for changes made by *other*
-    connections. That is exactly the useful signal here: Hermes Agent and the
-    WebUI write state.db through their own connections, while the projection
-    monitor keeps one read-only connection per database. Unlike mtime/size or
-    ``MAX(rowid)``, it cannot collide when SQLite reuses a rowid after cleanup.
+    Legacy databases do not have ``session_projection_meta``.  An earlier
+    implementation kept a read-only connection open so ``PRAGMA data_version``
+    could detect external commits.  That long-lived WAL reader interacts badly
+    with the vulnerable SQLite 3.50 runtime when another writer reuses/resets a
+    WAL (the exact shape exercised by archive/import flows): the reader keeps an
+    old WAL snapshot alive and later writers can become invisible or report
+    ``disk I/O error``.  The monitor is already off the request path, so use a
+    short-lived read and a content/path fingerprint instead.  Closing the
+    connection on every poll is deliberate: invalidation must never pin the
+    live state.db or its ``-wal``/``-shm`` sidecars.
     """
     identity = _path_identity(db_path)
-    key = str(db_path)
     if identity == (0, 0):
         return identity
-    with _CONNECTION_LOCK:
-        cached = _LEGACY_CONNECTIONS.get(key)
-        if cached is not None and cached[0] != identity:
-            try:
-                cached[1].close()
-            except Exception:
-                pass
-            _LEGACY_CONNECTIONS.pop(key, None)
-            cached = None
-        if cached is None:
-            try:
-                conn = sqlite3.connect(
-                    f"file:{db_path.resolve().as_posix()}?mode=ro",
-                    uri=True,
-                    timeout=0.05,
-                    check_same_thread=False,
-                )
-                conn.execute("PRAGMA busy_timeout=50")
-            except Exception:
-                return identity
-            _LEGACY_CONNECTIONS[key] = (identity, conn)
-            cached = (identity, conn)
-        try:
-            row = cached[1].execute("PRAGMA data_version").fetchone()
-            return identity + (int(row[0]) if row else 0,)
-        except Exception:
-            try:
-                cached[1].close()
-            except Exception:
-                pass
-            _LEGACY_CONNECTIONS.pop(key, None)
-            return identity
-
-
-def _read_projection_token(db_path: Path):
-    """Read generation; use legacy stamps only when the table is absent."""
-    db_path = Path(db_path)
-    if not db_path.exists():
-        return ("missing", 0)
+    db_stamp = _path_stamp(db_path)
+    wal_stamp = _path_stamp(Path(f"{db_path}-wal"))
+    parts: list[tuple[str, object]] = []
     try:
         conn = sqlite3.connect(
             f"file:{db_path.resolve().as_posix()}?mode=ro",
@@ -93,41 +59,46 @@ def _read_projection_token(db_path: Path):
         )
         try:
             conn.execute("PRAGMA busy_timeout=50")
-            try:
-                row = conn.execute(
-                    "SELECT generation FROM session_projection_meta WHERE id = 1"
-                ).fetchone()
-            except sqlite3.OperationalError as exc:
-                if "no such table" in str(exc).lower():
-                    return (
-                        "legacy",
-                        _legacy_data_version(db_path),
-                        _path_stamp(Path(f"{db_path}-wal")),
-                    )
-                raise
-            if row is not None:
-                # The Agent normally advances this generation, but external
-                # gateway writers and older WebUI integrations may commit
-                # rows without touching the projection metadata table. Keep
-                # those writes visible as well; data_version is read through a
-                # persistent connection so rowid/stat reuse cannot collide.
-                return (
-                    "projection",
-                    int(row[0] or 0),
-                    _legacy_data_version(db_path),
-                )
-            # A partially initialized or older database can have the metadata
-            # table without its singleton row. Treat it like a legacy store so
-            # external commits still invalidate the sidebar cache.
-            return (
-                "legacy",
-                _legacy_data_version(db_path),
-                _path_stamp(Path(f"{db_path}-wal")),
-            )
+            # MAX(rowid) is indexed/cheap for the legacy schema and advances
+            # for new external rows. Pair it with a per-table row count so a
+            # cleanup followed by rowid reuse still changes the fingerprint.
+            for table in ("sessions", "messages", "session_completion_events"):
+                try:
+                    row = conn.execute(
+                        f"SELECT MAX(rowid), COUNT(*) FROM {table}"
+                    ).fetchone()
+                except sqlite3.Error:
+                    row = (None, None)
+                parts.append((table, tuple(row or (None, None))))
         finally:
             conn.close()
-    except Exception:
-        raise
+    except sqlite3.Error:
+        # Keep the path/WAL stamps as a useful conservative fallback while a
+        # writer is briefly changing the database or the schema is incomplete.
+        pass
+    return (identity, db_stamp, wal_stamp, tuple(parts))
+
+
+def _read_projection_token(db_path: Path):
+    """Read a non-blocking filesystem token for the state database.
+
+    This monitor must not open SQLite at all.  A background read-only handle
+    can overlap an external ``PRAGMA journal_mode=WAL``/checkpoint and pin a
+    stale WAL index on the vulnerable SQLite runtime used by the local Agent.
+    The request/cache paths perform their own bounded read-only content checks;
+    this owner only needs to notice that the database or its WAL sidecars
+    changed and schedule a rebuild.
+    """
+    db_path = Path(db_path)
+    if not db_path.exists():
+        return ("missing", 0)
+    return (
+        "filesystem",
+        _path_identity(db_path),
+        _path_stamp(db_path),
+        _path_stamp(Path(f"{db_path}-wal")),
+        _path_stamp(Path(f"{db_path}-shm")),
+    )
 
 
 def projection_token(db_path: Path | None):
@@ -178,12 +149,5 @@ def projection_token(db_path: Path | None):
 
 
 def _reset_for_tests() -> None:
-    with _CONNECTION_LOCK:
-        for _identity, conn in _LEGACY_CONNECTIONS.values():
-            try:
-                conn.close()
-            except Exception:
-                pass
-        _LEGACY_CONNECTIONS.clear()
     with _LOCK:
         _STATE.clear()

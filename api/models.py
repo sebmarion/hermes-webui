@@ -824,23 +824,90 @@ def _active_stream_ids():
     return active_ids
 
 
+def _content_has_reasoning_only_parts(content) -> bool:
+    if not isinstance(content, list) or not content:
+        return False
+    saw_reasoning = False
+    for part in content:
+        if not isinstance(part, dict):
+            if str(part or '').strip():
+                return False
+            continue
+        part_type = str(part.get('type') or '').lower()
+        if part_type in {'thinking', 'reasoning'}:
+            text = part.get('thinking') or part.get('reasoning') or part.get('text') or ''
+            if str(text).strip():
+                saw_reasoning = True
+            continue
+        if part_type == 'text' and str(part.get('text') or part.get('content') or '').strip():
+            return False
+        if part_type not in {'text', 'thinking', 'reasoning'}:
+            return False
+    return saw_reasoning
+
+
+def _recovered_model_context_projection(message: dict) -> dict | None:
+    if not isinstance(message, dict):
+        return None
+    projected = dict(message)
+    projected.pop('reasoning', None)
+    if projected.get('_error'):
+        return None
+    if _content_has_reasoning_only_parts(projected.get('content')):
+        if projected.get('tool_calls'):
+            projected['content'] = ''
+        else:
+            return None
+    projected_text = _normalize_journal_recovery_text(projected.get('content'))
+    if not projected_text and not projected.get('tool_call_id') and not projected.get('tool_calls'):
+        return None
+    return projected
+
+
+def _append_recovered_context_projection(
+    session,
+    context_messages: list,
+    recovered: dict,
+) -> None:
+    recovered_text = _normalize_journal_recovery_text(recovered.get('content'))
+    if recovered_text:
+        if recovered.get('role') == 'user':
+            if _message_matches_pending_checkpoint(
+                context_messages[-1] if context_messages else None,
+                recovered.get('content'),
+                recovered.get('timestamp'),
+                recovered.get('_source'),
+                recovered.get('attachments'),
+            ):
+                return
+        else:
+            for existing in reversed(context_messages[-8:]):
+                if not isinstance(existing, dict) or existing.get('role') != recovered.get('role'):
+                    continue
+                if _normalize_journal_recovery_text(existing.get('content')) == recovered_text:
+                    return
+    context_messages.append(dict(recovered))
+
+
+def _seed_recovered_context_from_messages(session, context_messages: list) -> None:
+    for message in getattr(session, 'messages', None) or []:
+        projected = _recovered_model_context_projection(message)
+        if projected is None:
+            continue
+        context_messages.append(projected)
+
+
 def _append_recovered_turn_to_context(session, recovered: dict) -> None:
     context_messages = getattr(session, 'context_messages', None)
-    if not isinstance(context_messages, list) or not context_messages:
+    if not isinstance(context_messages, list):
+        context_messages = []
+        session.context_messages = context_messages
+    if not context_messages:
+        _seed_recovered_context_from_messages(session, context_messages)
+    projected = _recovered_model_context_projection(recovered)
+    if projected is None:
         return
-    role = str(recovered.get('role') or '')
-    recovered_text = " ".join(str(recovered.get('content') or '').split())
-    if not recovered_text and not recovered.get('tool_call_id') and not recovered.get('tool_calls'):
-        return
-    if recovered_text:
-        for existing in reversed(context_messages[-8:]):
-            if not isinstance(existing, dict) or existing.get('role') != role:
-                continue
-            existing_text = " ".join(str(existing.get('content') or '').split())
-            if existing_text == recovered_text:
-                return
-    context_entry = {k: v for k, v in recovered.items() if k != 'timestamp'}
-    context_messages.append(context_entry)
+    _append_recovered_context_projection(session, context_messages, projected)
 
 
 def _append_recovered_pending_turn(session, *, timestamp: int | None = None) -> dict | None:
@@ -1106,6 +1173,13 @@ def _parse_nonnegative_int(value):
     except (TypeError, ValueError):
         return None
     return parsed if parsed >= 0 else None
+
+
+def model_explicit_pick_signature(model, model_provider) -> str:
+    """Return a stable signature for deliberate model/provider selection."""
+    model_text = str(model or "").strip()
+    provider_text = str(model_provider or "").strip().lower()
+    return f"{model_text}\x1f{provider_text}"
 
 
 def _sidecar_generation_value(value) -> int:
@@ -1376,6 +1450,9 @@ class Session:
         self.workspace = str(Path(workspace).expanduser().resolve())
         self.model = model
         self.model_provider = str(model_provider).strip().lower() if model_provider else None
+        self.model_explicit_pick_signature = kwargs.get(
+            'model_explicit_pick_signature'
+        ) or None
         self.messages = messages or []
         self.tool_calls = tool_calls or []
         self.created_at = created_at or time.time()
@@ -1512,7 +1589,7 @@ class Session:
         # without parsing the full messages array (which may be 400KB+).
         # Fields are listed in the order they should appear in the JSON file.
         METADATA_FIELDS = [
-            'session_id', 'title', 'workspace', 'model', 'model_provider', 'created_at', 'updated_at',
+            'session_id', 'title', 'workspace', 'model', 'model_provider', 'model_explicit_pick_signature', 'created_at', 'updated_at',
             'pinned', 'archived', 'project_id', 'profile',
             'input_tokens', 'output_tokens', 'estimated_cost',
             'cache_read_tokens', 'cache_write_tokens',
@@ -2361,6 +2438,41 @@ def _normalize_journal_recovery_text(value) -> str:
     return " ".join(str(value or "").split())
 
 
+def _message_matches_pending_checkpoint(message, pending_text, timestamp, source, attachments):
+    if not isinstance(message, dict) or message.get('role') != 'user':
+        return False
+    try:
+        message_timestamp = int(message.get('timestamp'))
+        expected_timestamp = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    return (
+        _normalize_journal_recovery_text(message.get('content'))
+        == _normalize_journal_recovery_text(pending_text)
+        and message_timestamp == expected_timestamp
+        and (message.get('_source') or 'webui') == (source or 'webui')
+        and list(message.get('attachments') or []) == list(attachments or [])
+    )
+
+
+def _message_matches_pending_text(message, pending_text):
+    if not isinstance(message, dict) or message.get('role') != 'user':
+        return False
+    return (
+        _normalize_journal_recovery_text(message.get('content'))
+        == _normalize_journal_recovery_text(pending_text)
+    )
+
+
+def _latest_user_matches_pending_text(messages, pending_text):
+    if not isinstance(messages, list) or not pending_text:
+        return False
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get('role') == 'user':
+            return _message_matches_pending_text(message, pending_text)
+    return False
+
+
 def _partial_message_signature(message: dict) -> tuple:
     """Return a stable identity for partial assistant markers recovered on load."""
     if not isinstance(message, dict):
@@ -2412,11 +2524,23 @@ def _collapse_adjacent_duplicate_partials(messages) -> tuple[list, bool]:
     return collapsed, changed
 
 
-def _find_existing_assistant_for_journal_content(session, content: str) -> int | None:
+def _find_existing_assistant_for_journal_content(
+    session,
+    content: str,
+    *,
+    max_index: int | None = None,
+    excluded_indexes: set[int] | None = None,
+) -> int | None:
     candidate = _normalize_journal_recovery_text(content)
     if not candidate:
         return None
-    for idx, message in enumerate(session.messages or []):
+    messages = session.messages or []
+    stop = len(messages) if max_index is None else min(len(messages), max_index)
+    substring_match = None
+    for idx in range(stop):
+        if excluded_indexes and idx in excluded_indexes:
+            continue
+        message = messages[idx]
         if not isinstance(message, dict) or message.get('role') != 'assistant':
             continue
         if message.get('_error'):
@@ -2426,9 +2550,9 @@ def _find_existing_assistant_for_journal_content(session, content: str) -> int |
             continue
         if existing == candidate:
             return idx
-        if len(candidate) >= 24 and candidate in existing:
-            return idx
-    return None
+        if substring_match is None and len(candidate) >= 24 and candidate in existing:
+            substring_match = idx
+    return substring_match
 
 
 def _journal_tool_already_present(
@@ -2505,17 +2629,221 @@ def _run_journal_has_visible_output(session, stream_id: str | None) -> bool:
     return False
 
 
+def _run_journal_event_owns_run(
+    event,
+    session_id: str,
+    stream_id: str | None,
+) -> bool:
+    if not isinstance(event, dict) or not stream_id:
+        return False
+    seq = event.get('seq')
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+        return False
+    return (
+        event.get('session_id') == session_id
+        and event.get('run_id') == stream_id
+        and event.get('event_id') == f"{stream_id}:{seq}"
+    )
+
+
 def _run_journal_terminal_state(session, stream_id: str | None) -> str | None:
     if not stream_id:
         return None
     try:
-        from api.run_journal import latest_run_summary
-        summary = latest_run_summary(session.session_id, stream_id)
+        from api.run_journal import (
+            read_run_events,
+            select_authoritative_terminal_event,
+        )
+        journal = read_run_events(session.session_id, stream_id)
+        terminal = select_authoritative_terminal_event(journal.get('events') or [])
     except Exception:
         return None
-    if not summary.get('terminal'):
+    if (
+        not _run_journal_event_owns_run(
+            terminal, session.session_id, stream_id,
+        )
+        or terminal.get('terminal') is not True
+    ):
         return None
-    return str(summary.get('terminal_state') or '') or None
+    return str(terminal.get('terminal_state') or '') or None
+
+
+def _recoverable_unsaved_gateway_terminal_error(
+    session,
+    stream_id: str | None,
+) -> dict | None:
+    """Return one validated current-turn terminal error from the run journal."""
+    if not stream_id:
+        return None
+    try:
+        from api.run_journal import (
+            read_run_events,
+            select_authoritative_terminal_event,
+        )
+        journal = read_run_events(session.session_id, stream_id)
+    except Exception:
+        logger.debug(
+            "Session %s: failed to read terminal error journal for stream %s",
+            getattr(session, 'session_id', '?'),
+            stream_id,
+            exc_info=True,
+        )
+        return None
+
+    event = select_authoritative_terminal_event(journal.get('events') or [])
+    if (
+        not isinstance(event, dict)
+        or event.get('event') != 'apperror'
+        or event.get('type') != 'apperror'
+        or event.get('terminal') is not True
+    ):
+        return None
+    if (
+        not _run_journal_event_owns_run(
+            event, session.session_id, stream_id,
+        )
+    ):
+        return None
+    expected_event_id = event['event_id']
+
+    payload = event.get('payload')
+    if not isinstance(payload, dict) or payload.get('session_id') != session.session_id:
+        return None
+    embedded_session = payload.get('session')
+    if (
+        not isinstance(embedded_session, dict)
+        or embedded_session.get('session_id') != session.session_id
+    ):
+        return None
+    persisted_id = payload.get('terminal_session_persisted_session_id')
+    if (
+        payload.get('terminal_session_persisted') is True
+        and persisted_id == session.session_id
+    ):
+        return None
+
+    embedded_messages = embedded_session.get('messages')
+    if not isinstance(embedded_messages, list):
+        return None
+    current_user_idx = next(
+        (
+            idx
+            for idx in range(len(embedded_messages) - 1, -1, -1)
+            if isinstance(embedded_messages[idx], dict)
+            and embedded_messages[idx].get('role') == 'user'
+        ),
+        None,
+    )
+    if current_user_idx is None:
+        return None
+    candidate = next(
+        (
+            embedded_messages[idx]
+            for idx in range(len(embedded_messages) - 1, current_user_idx, -1)
+            if isinstance(embedded_messages[idx], dict)
+            and embedded_messages[idx].get('role') == 'assistant'
+        ),
+        None,
+    )
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get('_error') is not True
+        or not isinstance(candidate.get('content'), str)
+        or not candidate.get('content').strip()
+    ):
+        return None
+    return {
+        'event_id': expected_event_id,
+        'stream_id': stream_id,
+        'message': dict(candidate),
+    }
+
+
+def _pending_recovery_turn_start(session) -> int | None:
+    pending_text = getattr(session, 'pending_user_message', None)
+    if not pending_text:
+        return None
+    for idx in range(len(session.messages or []) - 1, -1, -1):
+        message = session.messages[idx]
+        if _message_matches_pending_checkpoint(
+            message,
+            pending_text,
+            session.pending_started_at,
+            session.pending_user_source,
+            session.pending_attachments,
+        ) or _message_matches_pending_text(message, pending_text):
+            return idx
+    return None
+
+
+def _materialize_unsaved_gateway_terminal_error(
+    session,
+    stream_id: str | None,
+    recovery: dict | None = None,
+) -> bool:
+    """Place the validated current-turn gateway error at the transcript tail."""
+    recovery = recovery or _recoverable_unsaved_gateway_terminal_error(
+        session, stream_id,
+    )
+    if not isinstance(recovery, dict):
+        return False
+    event_id = recovery.get('event_id')
+    candidate = recovery.get('message')
+    if not event_id or not isinstance(candidate, dict):
+        return False
+
+    for existing in session.messages or []:
+        if (
+            isinstance(existing, dict)
+            and existing.get('_recovered_event_id') == event_id
+        ):
+            return True
+
+    turn_start = _pending_recovery_turn_start(session)
+    if turn_start is not None:
+        for existing in reversed((session.messages or [])[turn_start + 1:]):
+            if not isinstance(existing, dict):
+                continue
+            existing_stream = existing.get('_recovered_stream_id')
+            if existing_stream and existing_stream != stream_id:
+                continue
+            if (
+                existing.get('role') == 'assistant'
+                and existing.get('_error') is True
+                and existing.get('content') == candidate.get('content')
+            ):
+                existing['_recovered_from_run_journal'] = True
+                existing['_recovered_stream_id'] = stream_id
+                existing['_recovered_event_id'] = event_id
+                return True
+
+    recovered = dict(candidate)
+    recovered['_recovered_from_run_journal'] = True
+    recovered['_recovered_stream_id'] = stream_id
+    recovered['_recovered_event_id'] = event_id
+    session.messages.append(recovered)
+    return True
+
+
+def _recover_journaled_output_and_terminal_error(
+    session,
+    stream_id: str | None,
+    *,
+    dedupe_existing: bool = False,
+    terminal_recovery: dict | None = None,
+) -> tuple[bool, bool]:
+    """Recover readable activity first, then append its authoritative terminal error."""
+    recovered_output = _append_journaled_partial_output(
+        session,
+        stream_id,
+        dedupe_existing=dedupe_existing,
+    )
+    terminal_error_recovered = _materialize_unsaved_gateway_terminal_error(
+        session,
+        stream_id,
+        terminal_recovery,
+    )
+    return recovered_output, terminal_error_recovered
 
 
 def _journal_is_still_arriving(session, stream_id: str | None) -> bool:
@@ -2560,9 +2888,10 @@ def _append_journaled_partial_output(
     """Recover already-emitted visible output from a dead stream journal.
 
     This repair path is intentionally conservative: it restores user-visible
-    assistant text and tool-card metadata that had already been emitted over
-    SSE before the WebUI process died. It does not restore hidden reasoning and
-    it does not try to continue execution.
+    assistant text, display-only reasoning, and tool-card metadata that had
+    already been emitted over SSE before the WebUI process died. Restored
+    reasoning stays out of ``context_messages`` so it cannot become provider-
+    facing history. The repair does not try to continue execution.
     """
     if not stream_id:
         return False
@@ -2585,24 +2914,120 @@ def _append_journaled_partial_output(
 
     appended_any = False
     assistant_parts: list[str] = []
+    reasoning_parts: list[str] = []
     assistant_started_at: float | None = None
     current_assistant_idx: int | None = None
     recovered_tool_calls: list[dict] = []
+    initial_message_count = len(session.messages or [])
+    claimed_existing_assistant_indexes: set[int] = set()
+
+    def content_match_can_receive_reasoning(existing_idx: int) -> bool:
+        messages = session.messages or []
+        owner_idx = None
+        for candidate_idx in range(existing_idx - 1, -1, -1):
+            candidate = messages[candidate_idx]
+            if isinstance(candidate, dict) and candidate.get('role') == 'user':
+                owner_idx = candidate_idx
+                break
+        if owner_idx is None:
+            return False
+
+        pending_text = _normalize_journal_recovery_text(session.pending_user_message)
+        if pending_text and not _message_matches_pending_checkpoint(
+            messages[owner_idx],
+            session.pending_user_message,
+            session.pending_started_at,
+            session.pending_user_source,
+            session.pending_attachments,
+        ):
+            return False
+
+        for candidate_idx in range(existing_idx + 1, initial_message_count):
+            candidate = messages[candidate_idx]
+            if not isinstance(candidate, dict) or candidate.get('role') != 'user':
+                continue
+            candidate_text = _normalize_journal_recovery_text(candidate.get('content'))
+            candidate_matches_checkpoint = pending_text and _message_matches_pending_checkpoint(
+                candidate,
+                session.pending_user_message,
+                session.pending_started_at,
+                session.pending_user_source,
+                session.pending_attachments,
+            )
+            if candidate_matches_checkpoint and candidate.get('_recovered'):
+                continue
+            if pending_text and candidate_text == pending_text:
+                return False
+            return False
+        return True
+
+    def append_context_projection(message: dict) -> None:
+        context_projection = dict(message)
+        context_projection.pop('reasoning', None)
+        _append_recovered_turn_to_context(session, context_projection)
+
+    def attach_display_reasoning(message: dict, reasoning: str) -> bool:
+        if not reasoning:
+            return False
+        existing = str(message.get('reasoning') or '').strip()
+        if existing:
+            return False
+        message['reasoning'] = reasoning
+        return True
 
     def flush_assistant() -> int | None:
-        nonlocal appended_any, assistant_parts, assistant_started_at, current_assistant_idx
+        nonlocal appended_any, assistant_parts, reasoning_parts
+        nonlocal assistant_started_at, current_assistant_idx
         content = ''.join(assistant_parts).strip()
+        reasoning = ''.join(reasoning_parts).strip()
         assistant_parts = []
-        if not content:
+        reasoning_parts = []
+        if not content and not reasoning:
             return current_assistant_idx
-        if dedupe_existing:
-            existing_idx = _find_existing_assistant_for_journal_content(session, content)
+        if dedupe_existing and content:
+            search_excluded = set(claimed_existing_assistant_indexes)
+            existing_idx = None
+            while True:
+                candidate_idx = _find_existing_assistant_for_journal_content(
+                    session,
+                    content,
+                    max_index=initial_message_count,
+                    excluded_indexes=search_excluded,
+                )
+                if candidate_idx is None:
+                    break
+                if not reasoning or content_match_can_receive_reasoning(candidate_idx):
+                    existing_idx = candidate_idx
+                    break
+                search_excluded.add(candidate_idx)
             if existing_idx is not None:
+                claimed_existing_assistant_indexes.add(existing_idx)
                 current_assistant_idx = existing_idx
                 assistant_started_at = None
                 if 0 <= existing_idx < len(session.messages):
-                    _append_recovered_turn_to_context(session, session.messages[existing_idx])
+                    existing_message = session.messages[existing_idx]
+                    append_context_projection(existing_message)
+                    if attach_display_reasoning(existing_message, reasoning):
+                        appended_any = True
                 return existing_idx
+        if dedupe_existing and reasoning and not content:
+            for existing_idx in range(initial_message_count):
+                if existing_idx in claimed_existing_assistant_indexes:
+                    continue
+                existing_message = session.messages[existing_idx]
+                if not isinstance(existing_message, dict):
+                    continue
+                if (
+                    existing_message.get('_recovered_from_run_journal')
+                    and existing_message.get('_recovered_stream_id') == stream_id
+                    and existing_message.get('role') == 'assistant'
+                    and not str(existing_message.get('content') or '').strip()
+                    and str(existing_message.get('reasoning') or '').strip() == reasoning
+                ):
+                    claimed_existing_assistant_indexes.add(existing_idx)
+                    current_assistant_idx = existing_idx
+                    assistant_started_at = None
+                    return existing_idx
         timestamp = int(assistant_started_at or time.time())
         recovered_assistant = {
             'role': 'assistant',
@@ -2611,8 +3036,9 @@ def _append_journaled_partial_output(
             '_recovered_from_run_journal': True,
             '_recovered_stream_id': stream_id,
         }
+        attach_display_reasoning(recovered_assistant, reasoning)
         session.messages.append(recovered_assistant)
-        _append_recovered_turn_to_context(session, recovered_assistant)
+        append_context_projection(recovered_assistant)
         current_assistant_idx = len(session.messages) - 1
         assistant_started_at = None
         appended_any = True
@@ -2647,6 +3073,7 @@ def _append_journaled_partial_output(
                 and _m.get('_recovered_stream_id') == stream_id
                 and _m.get('role') == 'assistant'
                 and not str(_m.get('content') or '').strip()
+                and not str(_m.get('reasoning') or '').strip()
             ):
                 current_assistant_idx = _existing_idx
                 return _existing_idx
@@ -2665,6 +3092,16 @@ def _append_journaled_partial_output(
         event_name = str(event.get('event') or event.get('type') or '')
         payload = event.get('payload') if isinstance(event.get('payload'), dict) else {}
         created_at = event.get('created_at') if isinstance(event.get('created_at'), (int, float)) else None
+        if event_name == 'reasoning':
+            text = str(
+                payload.get('text') or payload.get('reasoning') or payload.get('thinking') or ''
+            )
+            if not text:
+                continue
+            if not assistant_parts and not reasoning_parts and assistant_started_at is None:
+                assistant_started_at = created_at or time.time()
+            reasoning_parts.append(text)
+            continue
         if event_name == 'token':
             text = str(payload.get('text') or '')
             if not text:
@@ -2755,11 +3192,11 @@ def _append_journaled_partial_output(
 #     onto the marker: `_journal_retry_stream_id`, `_journal_retry_attempts`,
 #     `_journal_retry_first_seen_ts`.
 #   * Every `get_session()` call that returns the full session checks the
-#     latest assistant marker; if the flag is set it re-runs
-#     `_append_journaled_partial_output` with `dedupe_existing=True`. On
-#     success the marker is promoted in place to the recovered-output
-#     wording, the journaled rows are reordered to sit above the marker,
-#     and all retry meta is stripped. If the journal is still missing or
+#     latest assistant marker; if the flag is set it re-runs journaled output
+#     and terminal-error recovery with `dedupe_existing=True`. On success,
+#     journaled rows move above the marker. A specific gateway terminal error
+#     replaces the marker; otherwise the marker is promoted to recovered-output
+#     wording and its retry meta is stripped. If the journal is still missing or
 #     zero-byte, the retry is a no-op and does not consume attempt budget.
 #     Terminal/non-useful journals consume attempt budget and can demote
 #     immediately at the max-attempt cap.
@@ -2898,7 +3335,7 @@ def _retry_journal_recovery_in_place(
 ) -> bool:
     """Re-attempt run-journal recovery for the most recent pending marker.
 
-    Returns True if the marker was promoted to the recovered-output wording.
+    Returns True if journal output or a specific terminal error resolved the marker.
     Never raises — caller is best-effort.
     """
     try:
@@ -2952,29 +3389,39 @@ def _retry_journal_recovery_in_place(
                         exc_info=True,
                     )
                 return False
-            tail_len_before = len(session.messages)
-            ok = _append_journaled_partial_output(
-                session, stream_id, dedupe_existing=True,
+            recovered_output, terminal_error_recovered = (
+                _recover_journaled_output_and_terminal_error(
+                    session,
+                    stream_id,
+                    dedupe_existing=True,
+                )
             )
-            if ok:
-                msg['content'] = _INTERRUPTED_RECOVERED_WORDING
-                _strip_journal_retry_meta(msg)
+            if recovered_output or terminal_error_recovered:
+                if not terminal_error_recovered:
+                    msg['content'] = _INTERRUPTED_RECOVERED_WORDING
+                    _strip_journal_retry_meta(msg)
                 # The journaled rows were appended at the end of messages;
-                # only the rows past the previous tail count as "newly
-                # journaled" and need to move above the marker.
-                _ = tail_len_before  # informational; helper below scans
+                # move them above the marker before either retaining its
+                # interrupted wording or replacing it with a specific terminal
+                # error from that same stream.
                 _reorder_journal_tail_above_marker(session, idx)
+                if terminal_error_recovered:
+                    session.messages = [
+                        message
+                        for message in session.messages
+                        if message is not msg
+                    ]
                 try:
                     session.save(touch_updated_at=False)
                 except Exception:
                     logger.debug(
-                        "save() failed while promoting marker for session %s",
+                        "save() failed while applying lazy journal recovery for session %s",
                         getattr(session, 'session_id', '?'),
                         exc_info=True,
                     )
                 logger.info(
-                    "Session %s: lazy journal-recovery promoted marker for "
-                    "stream %s after %d attempts",
+                    "Session %s: lazy journal-recovery applied stream %s "
+                    "after %d attempts",
                     getattr(session, 'session_id', '?'),
                     stream_id,
                     attempts,
@@ -3051,6 +3498,10 @@ def _apply_core_sync_or_error_marker(
             return False
         if require_stream_dead and session.active_stream_id in _active_stream_ids():
             return False
+    _stream_id = stream_id_for_recheck or session.active_stream_id
+    _terminal_recovery = _recoverable_unsaved_gateway_terminal_error(
+        session, _stream_id,
+    )
 
     # When messages is already non-empty, do not overwrite history from any core
     # transcript. The pending user turn may still be the only durable copy of a
@@ -3068,7 +3519,17 @@ def _apply_core_sync_or_error_marker(
         _recovered_ts = int(time.time())
         if isinstance(session.pending_started_at, (int, float)) and session.pending_started_at > 0:
             _recovered_ts = int(session.pending_started_at)
-        _stream_id = stream_id_for_recheck or session.active_stream_id
+        _already_checkpointed = _message_matches_pending_checkpoint(
+            session.messages[-1],
+            session.pending_user_message,
+            _recovered_ts,
+            session.pending_user_source,
+            session.pending_attachments,
+        )
+        _tail_user_already_checkpointed = _already_checkpointed or _message_matches_pending_text(
+            session.messages[-1],
+            session.pending_user_message,
+        )
         _pending_started_at = session.pending_started_at
         if _run_journal_terminal_state(session, _stream_id) == 'completed':
             if not _already_checkpointed:
@@ -3101,22 +3562,26 @@ def _apply_core_sync_or_error_marker(
             if session.pending_attachments:
                 recovered['attachments'] = list(session.pending_attachments)
             _append_recovered_turn_to_context(session, recovered)
-        recovered_output = _append_journaled_partial_output(
-            session,
-            _stream_id,
+        recovered_output, terminal_error_recovered = (
+            _recover_journaled_output_and_terminal_error(
+                session,
+                _stream_id,
+                terminal_recovery=_terminal_recovery,
+            )
         )
         session.active_stream_id = None
         session.pending_user_message = None
         session.pending_attachments = []
         session.pending_started_at = None
         session.pending_user_source = None
-        session.messages.append(
-            _build_recovery_marker_with_retry_hook(
-                recovered_output=recovered_output,
-                stream_id=_stream_id,
-                pending_started_at=_pending_started_at,
+        if not terminal_error_recovered:
+            session.messages.append(
+                _build_recovery_marker_with_retry_hook(
+                    recovered_output=recovered_output,
+                    stream_id=_stream_id,
+                    pending_started_at=_pending_started_at,
+                )
             )
-        )
         session.save(touch_updated_at=touch_updated_at)
         logger.info(
             "Session %s: recovered pending user turn (messages non-empty), added error marker",
@@ -3131,33 +3596,42 @@ def _apply_core_sync_or_error_marker(
             core = json.load(f)
         core_messages = core.get('messages', [])
         if core_messages:
-            _stream_id = stream_id_for_recheck or session.active_stream_id
             session.messages = core_messages
             session.tool_calls = core.get('tool_calls', [])
             for field in ('input_tokens', 'output_tokens', 'estimated_cost'):
                 if core.get(field) is not None:
                     setattr(session, field, core[field])
             _pending_text = _normalize_journal_recovery_text(session.pending_user_message)
-            _already_checkpointed = False
-            if _pending_text and session.messages:
-                for _last_msg in reversed(session.messages):
-                    if isinstance(_last_msg, dict) and _last_msg.get('role') == 'user':
-                        _last_text = _normalize_journal_recovery_text(_last_msg.get('content'))
-                        _already_checkpointed = _last_text == _pending_text
-                        break
+            _recovered_ts = int(time.time())
+            if isinstance(session.pending_started_at, (int, float)) and session.pending_started_at > 0:
+                _recovered_ts = int(session.pending_started_at)
+            _already_checkpointed = _message_matches_pending_checkpoint(
+                session.messages[-1] if session.messages else None,
+                session.pending_user_message,
+                _recovered_ts,
+                session.pending_user_source,
+                session.pending_attachments,
+            )
+            _tail_user_already_checkpointed = _already_checkpointed or _message_matches_pending_text(
+                session.messages[-1] if session.messages else None,
+                session.pending_user_message,
+            )
             if (
                 _pending_text
-                and not _already_checkpointed
-                and _run_journal_has_visible_output(session, _stream_id)
+                and not _tail_user_already_checkpointed
+                and (
+                    _run_journal_has_visible_output(session, _stream_id)
+                    or _terminal_recovery is not None
+                )
             ):
-                _recovered_ts = int(time.time())
-                if isinstance(session.pending_started_at, (int, float)) and session.pending_started_at > 0:
-                    _recovered_ts = int(session.pending_started_at)
                 _append_recovered_pending_turn(session, timestamp=_recovered_ts)
-            recovered_output = _append_journaled_partial_output(
-                session,
-                _stream_id,
-                dedupe_existing=True,
+            recovered_output, terminal_error_recovered = (
+                _recover_journaled_output_and_terminal_error(
+                    session,
+                    _stream_id,
+                    dedupe_existing=True,
+                    terminal_recovery=_terminal_recovery,
+                )
             )
             _pending_started_at = session.pending_started_at
             session.active_stream_id = None
@@ -3165,7 +3639,7 @@ def _apply_core_sync_or_error_marker(
             session.pending_attachments = []
             session.pending_started_at = None
             session.pending_user_source = None
-            if recovered_output:
+            if recovered_output and not terminal_error_recovered:
                 session.messages.append(
                     _interrupted_recovery_marker(
                         recovered_output=True,
@@ -3202,24 +3676,27 @@ def _apply_core_sync_or_error_marker(
         if isinstance(session.pending_started_at, (int, float)) and session.pending_started_at > 0:
             _recovered_ts = int(session.pending_started_at)
         _append_recovered_pending_turn(session, timestamp=_recovered_ts)
-    recovered_output = _append_journaled_partial_output(
-        session,
-        stream_id_for_recheck or session.active_stream_id,
+    recovered_output, terminal_error_recovered = (
+        _recover_journaled_output_and_terminal_error(
+            session,
+            _stream_id,
+            terminal_recovery=_terminal_recovery,
+        )
     )
-    _stream_id = stream_id_for_recheck or session.active_stream_id
     _pending_started_at = session.pending_started_at
     session.active_stream_id = None
     session.pending_user_message = None
     session.pending_attachments = []
     session.pending_started_at = None
     session.pending_user_source = None
-    session.messages.append(
-        _build_recovery_marker_with_retry_hook(
-            recovered_output=recovered_output,
-            stream_id=_stream_id,
-            pending_started_at=_pending_started_at,
+    if not terminal_error_recovered:
+        session.messages.append(
+            _build_recovery_marker_with_retry_hook(
+                recovered_output=recovered_output,
+                stream_id=_stream_id,
+                pending_started_at=_pending_started_at,
+            )
         )
-    )
     session.save(touch_updated_at=touch_updated_at)
     logger.info("Session %s: no core transcript found, added error marker", sid)
     return True
@@ -5059,6 +5536,101 @@ class _ExternalSessionView:
         self.workspace = workspace
 
 
+class WorkspaceBindingPersistenceError(ValueError):
+    """A recovered workspace could not be durably bound to its WebUI session."""
+
+
+_EXPECTED_WORKSPACE_UNSET = object()
+
+
+def persist_recovered_workspace_binding(
+    session,
+    workspace: str | Path,
+    *,
+    expected_workspace=_EXPECTED_WORKSPACE_UNSET,
+):
+    """Atomically persist only a recovered session's workspace binding.
+
+    Existing sidecars are patched as raw JSON so metadata-only callers never
+    reserialize (or otherwise clobber) the transcript. Missing sidecars fail
+    closed so recovery cannot resurrect a concurrently deleted session. The
+    per-session mutation lock keeps compare-and-replace ordered with other
+    compliant session writers.
+    """
+    sid = str(getattr(session, "session_id", "") or "").strip()
+    if not sid or not is_safe_session_id(sid):
+        raise WorkspaceBindingPersistenceError(
+            "Failed to persist recovered workspace: invalid session id"
+        )
+    resolved = str(Path(workspace).expanduser().resolve())
+    expected_value = (
+        getattr(session, "workspace", "")
+        if expected_workspace is _EXPECTED_WORKSPACE_UNSET
+        else expected_workspace
+    )
+    expected = str(expected_value or "")
+    path = SESSION_DIR / f"{sid}.json"
+    lock = _get_session_agent_lock(sid)
+    with lock:
+        if not path.exists():
+            # Recovery only repairs an existing WebUI sidecar. Creating a new
+            # sidecar here can resurrect a session that was deleted after the
+            # recovery decision but before this lock was acquired.
+            raise WorkspaceBindingPersistenceError(
+                "Failed to persist recovered workspace: session sidecar is missing"
+            )
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise WorkspaceBindingPersistenceError(
+                "Failed to persist recovered workspace: unreadable session sidecar"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise WorkspaceBindingPersistenceError(
+                "Failed to persist recovered workspace: invalid session sidecar"
+            )
+        current = str(payload.get("workspace") or "")
+        if current != resolved:
+            if current != expected:
+                raise WorkspaceBindingPersistenceError(
+                    "Failed to persist recovered workspace: session workspace changed"
+                )
+            payload["workspace"] = resolved
+            tmp = path.with_suffix(
+                f".tmp.{os.getpid()}.{threading.current_thread().ident}"
+            )
+            try:
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, indent=2)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                _safe_replace(tmp, path)
+            except Exception as exc:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise WorkspaceBindingPersistenceError(
+                    "Failed to persist recovered workspace"
+                ) from exc
+
+        session.workspace = resolved
+        with LOCK:
+            cached = SESSIONS.get(sid)
+            if cached is not None:
+                cached.workspace = resolved
+        try:
+            _write_session_index(updates=[cached or session])
+        except Exception:
+            logger.debug(
+                "Failed to refresh session index after workspace recovery for %s",
+                sid,
+                exc_info=True,
+            )
+        return cached or session
+
+
 def get_session_for_file_ops(sid: str):
     """Return a profile-authorized session-like object for file-manager handlers.
 
@@ -5089,6 +5661,24 @@ def get_session_for_file_ops(sid: str):
             active_profile,
         )
         raise KeyError(sid)
+    try:
+        from api.workspace import resolve_implicit_workspace_with_recovery
+
+        stored_workspace = getattr(session, "workspace", None)
+        workspace, recovered = resolve_implicit_workspace_with_recovery(
+            stored_workspace,
+            get_last_workspace,
+        )
+    except ValueError:
+        # Preserve the existing file-handler behavior for non-missing trust or
+        # access errors. Recovery is deliberately limited to deleted paths.
+        return session
+    if recovered:
+        return persist_recovered_workspace_binding(
+            session,
+            workspace,
+            expected_workspace=stored_workspace,
+        )
     return session
 
 

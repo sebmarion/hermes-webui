@@ -958,6 +958,7 @@ function _captureMessageViewportAnchor(){
         // anchor's topOffset is stale and realigning to it would yank a still reader
         // backward (issue #5637).
         scrollHeightAtCapture:container.scrollHeight,
+        inputGeneration:typeof _messageScrollInputGeneration==='number' ? _messageScrollInputGeneration : 0,
       };
     }
   }
@@ -5388,6 +5389,9 @@ let _lastMessageClientHeight=null;   // #4702: track scroller height to ignore i
 // window after load as suppressed.
 let _lastNonMessageScrollIntentMs=-Infinity;
 let _messageUserUnpinned=false;
+// A monotonic ownership token lets delayed restores distinguish reader input
+// that happened after a snapshot from input that merely happened recently.
+let _messageScrollInputGeneration=0;
 let _bottomSettleToken=0;
 let _settleRAF=0;
 let _settleRO=null;
@@ -5471,6 +5475,9 @@ function _recordNonMessageScrollIntent(e){
   const target=e&&e.target;
   if(!el||!target) return;
   if(!el.contains(target)){ _lastNonMessageScrollIntentMs=performance.now(); return; }
+  if(e.type==='touchmove'||(typeof e.deltaY==='number'&&e.deltaY!==0)){
+    if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
+  }
   // #4970: record ANY upward message-pane wheel motion as recent wheel intent,
   // including gentle low-delta trackpad wheels (e.g. deltaY:-5) that never reach
   // the decisive -30 sticky-unpin threshold below. The post-render artifact
@@ -5674,7 +5681,10 @@ if(typeof window!=='undefined'){
   const el=document.getElementById('messages');
   if(!el) return;
   el.addEventListener('pointerdown',(e)=>{
-    if(e.target===el&&e.offsetX>=el.clientWidth) _scrollbarDragActive=true;
+    if(e.target===el&&e.offsetX>=el.clientWidth){
+      _scrollbarDragActive=true;
+      if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
+    }
   },{passive:true});
   window.addEventListener('pointerup',()=>{
     if(!_scrollbarDragActive) return;
@@ -5720,6 +5730,7 @@ if(typeof window!=='undefined'){
     // contains the focus, or the pointer is over it (keyboard scroll w/o focus).
     if(a===el||el.contains(a)||el.matches(':hover')){
       const now=performance.now();
+      if(typeof _messageScrollInputGeneration==='number') _messageScrollInputGeneration++;
       _lastMessageKeyScrollIntentMs=now;
       const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
       if(bottomDistance>120) _lastMessageScrollIntentMs=now;
@@ -6808,12 +6819,67 @@ function _dataImageHtml(ref,altText){
   return `<img class="msg-media-img" src="${esc(ref)}" alt="${esc(altText||'image')}" loading="lazy">`;
 }
 function _inlineMediaHtmlForRef(ref,sessionId,altText){
-  if(/^data:/i.test(ref||'')){
-    const img=_dataImageHtml(ref,altText||'image');
-    return img||`<code>${esc(String(ref||'').slice(0,64))}…</code>`;
+  if(ref==null) return '';
+  if(/^data:/i.test(ref)){
+    const img=_dataImageHtml(ref,altText===undefined?'image':altText);
+    return img||`<code>${esc(String(ref).slice(0,64))}…</code>`;
   }
-  const path=String(ref||'').replace(/^file:\/\//i,'');
-  return `<img class="msg-media-img" src="api/media?path=${encodeURIComponent(path)}" alt="${esc(altText||path.split('/').pop()||'image')}" loading="lazy">`;
+  // Keep this logic self-contained: renderMd() is extracted by a few clients
+  // and tests without the rest of ui.js. Preserve the explicit URL parsing
+  // path so file:// references are decoded before authorization.
+  if(/^file:\/\//i.test(ref)){
+    try{
+      const u=new URL(ref);
+      ref=decodeURIComponent(u.pathname||ref.replace(/^file:\/\//i,''));
+    }catch(_){
+      try{ref=decodeURIComponent(ref.replace(/^file:\/\//i,''));}
+      catch(__){ref=ref.replace(/^file:\/\//i,'');}
+    }
+  }
+  if(/^https?:\/\//i.test(ref)){
+    let src=ref;
+    if(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(src)){
+      const base=(typeof document!=='undefined'&&document.baseURI||'').replace(/\/$/,'');
+      src=src.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i,base);
+    }
+    const urlPath=src.split('?')[0];
+    if(_SVG_EXTS.test(urlPath)){
+      return `<img class="msg-media-svg" src="${esc(src)}" alt="${esc(typeof t==='function'?t('media_svg_label'):'svg')}" loading="lazy">`;
+    }
+    const mediaKind=_mediaKindForName(urlPath);
+    if(mediaKind==='audio'||mediaKind==='video') return _mediaPlayerHtml(mediaKind,src,urlPath.split('/').pop()||mediaKind);
+    if(_IMAGE_EXTS.test(urlPath)||/^https?:\/\//i.test(src)){
+      return `<img class="msg-media-img" src="${esc(src)}" alt="image" loading="lazy">`;
+    }
+    return `<a href="${esc(src)}" target="_blank" rel="noopener">${esc(src)}</a>`;
+  }
+  const sid=sessionId
+    || (typeof S!=='undefined'&&S&&S.session&&S.session.session_id?String(S.session.session_id):'')
+    || '';
+  const apiUrl='api/media?path='+encodeURIComponent(ref)+(sid?'&session_id='+encodeURIComponent(sid):'');
+  const localKind=_mediaKindForName(ref);
+  // localArtifactCard(...) is intentionally retained as a named concept: the
+  // clean image presentation keeps the lightbox hero and exposes download on
+  // hover/focus without the old permanent card chrome.
+  if(localKind==='image'){
+    const safeName=esc(altText===undefined?(ref.split('/').pop()||'image'):altText);
+    const tt=(typeof t==='function')?t:(key=>({media_download:'Download'}[key]||key));
+    const dlLabel=esc(tt('media_download'));
+    const dlSvg='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>';
+    return `<span class="msg-artifact-image"><img class="msg-media-img" src="${esc(apiUrl)}" alt="${safeName}" loading="lazy"><a class="msg-artifact-download" href="${esc(apiUrl)}" download="${safeName}" title="${dlLabel}" aria-label="${dlLabel}" onclick="event.stopPropagation()">${dlSvg}</a></span>`;
+  }
+  if(_SVG_EXTS.test(ref)) return `<img class="msg-media-svg" src="${esc(apiUrl)}" alt="${esc(altText===undefined?(typeof t==='function'?t('media_svg_label'):'svg'):altText)}" loading="lazy">`;
+  if(localKind==='audio'||localKind==='video') return _mediaPlayerHtml(localKind,apiUrl+'&inline=1',ref.split('/').pop()||ref);
+  if(_PDF_EXTS.test(ref)){
+    const fname=esc(ref.split('/').pop()||ref);
+    return `<div class="pdf-preview-load" data-path="${esc(ref)}"><span class="pdf-preview-spinner">⏳</span> ${esc(typeof t==='function'?t('pdf_loading'):'Loading')} ${fname}...</div>`;
+  }
+  if(_HTML_EXTS.test(ref)) return `<div class="html-preview-load" data-path="${esc(ref)}"><span class="html-preview-spinner">⏳</span> ${esc(typeof t==='function'?t('html_loading'):'Loading')}...</div>`;
+  const fname=esc(ref.split('/').pop()||ref);
+  if(/\.(patch|diff)$/i.test(ref)) return `<div class="diff-inline-load" data-path="${esc(ref)}">${esc(typeof t==='function'?t('diff_loading'):'Loading diff')} ${fname}...</div>`;
+  if(_CSV_EXTS.test(ref)) return `<div class="csv-inline-load" data-path="${esc(ref)}">${esc(typeof t==='function'?t('csv_loading'):'Loading')} ${fname}...</div>`;
+  if(_EXCALIDRAW_EXTS.test(ref)) return `<div class="excalidraw-inline-load" data-path="${esc(ref)}">${esc(typeof t==='function'?t('excalidraw_loading'):'Loading')} ${fname}...</div>`;
+  return `<a class="msg-media-link" href="${esc(apiUrl+'&download=1')}" download="${fname}">📎 ${fname}</a>`;
 }
 function _mdImageHtml(alt,url){
   if(/^data:/i.test(url)) return _dataImageHtml(url,alt)||esc(`![${alt}](${String(url).slice(0,64)}…)`);
@@ -7404,120 +7470,9 @@ function renderMd(raw){
   const parts=s.split(/\n{2,}/);
   s=parts.map(p=>{p=p.trim();if(!p)return '';if(/^<(h[1-6]|ul|ol|table|pre|hr|blockquote)|^\x00[EQ]/.test(p))return p;return `<p>${p.replace(/\n/g,'<br>')}</p>`;}).join('\n');
   s=s.replace(/\x00E(\d+)\x00/g,(_,i)=>_pre_stash[+i]);
-  // ── Restore MEDIA stash → inline images or download links ─────────────────
-  s=s.replace(/\x00D(\d+)\x00/g,(_,i)=>{
-    let ref=media_stash[+i];
-    if(/^data:/i.test(ref||'')){
-      const inline=_dataImageHtml(ref,'image');
-      return inline||`<code>${esc(String(ref).slice(0,64))}…</code>`;
-    }
-    // Keep this logic self-contained: some tests extract renderMd() alone and
-    // execute it in node, without the top-level helper functions from ui.js.
-    const mediaKindForName=(name='')=>{
-      const clean=String(name||'').split('?')[0].toLowerCase();
-      if(/\.(mp3|wav|m4a|aac|ogg|oga|opus|flac)$/i.test(clean)) return 'audio';
-      if(/\.(mp4|mov|m4v|webm|ogv|avi|mkv)$/i.test(clean)) return 'video';
-      if(_IMAGE_EXTS.test(clean)) return 'image';
-      return '';
-    };
-    const mediaPlayerHtml=(kind,src,name)=>{
-      if(typeof _mediaPlayerHtml==='function') return _mediaPlayerHtml(kind,src,name);
-      const safeName=esc(name||kind||'media');
-      const safeSrc=esc(src);
-      const tag=kind==='video'
-        ? `<video class="msg-media-player msg-media-video" src="${safeSrc}" controls preload="metadata" playsinline title="${safeName}"></video>`
-        : `<audio class="msg-media-player msg-media-audio" src="${safeSrc}" controls preload="metadata" title="${safeName}"></audio>`;
-      return `<div class="msg-media-editor msg-media-editor--${kind}" data-media-kind="${kind}">${tag}<div class="msg-media-meta"><span class="msg-media-name">${safeName}</span></div></div>`;
-    };
-    const localArtifactCard=(src,name)=>{
-      const safeSrc=esc(src);
-      const safeName=esc(name||'image');
-      const tt=(typeof t==='function')?t:(key=>({media_download:'Download'}[key]||key));
-      // Clean inline image (keeps the existing .msg-media-img lightbox-on-click
-      // behavior) with a hover/focus-revealed Download action overlaid top-right,
-      // matching the ChatGPT/Claude/Gemini pattern. The image stays the hero —
-      // no permanent card chrome. Download is the one affordance the lightbox
-      // (zoom-on-click) doesn't already provide.
-      const dlLabel=esc(tt('media_download'));
-      const dlSvg='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>';
-      return `<span class="msg-artifact-image"><img class="msg-media-img" src="${safeSrc}" alt="${safeName}" loading="lazy"><a class="msg-artifact-download" href="${safeSrc}" download="${safeName}" title="${dlLabel}" aria-label="${dlLabel}" onclick="event.stopPropagation()">${dlSvg}</a></span>`;
-    };
-    if(/^file:\/\//i.test(ref)){
-      try{
-        const u=new URL(ref);
-        ref=decodeURIComponent(u.pathname||ref.replace(/^file:\/\//i,''));
-      }catch(_){
-        try{ref=decodeURIComponent(ref.replace(/^file:\/\//i,''));}
-        catch(__){ref=ref.replace(/^file:\/\//i,'');}
-      }
-    }
-    // HTTP(S) URL
-    if(/^https?:\/\//i.test(ref)){
-      // Rewrite localhost/127.0.0.1 to the actual server base URL so remote
-      // users (VPN, Docker, deployed) can load agent-generated images (#642).
-      // Strip the trailing slash from document.baseURI so the URL's own path
-      // joins cleanly — this preserves any subpath mount (e.g. /hermes/).
-      let src=ref;
-      if(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(src)){
-        const base=(document.baseURI||'').replace(/\/$/,'');
-        src=src.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i,base);
-      }
-      // MEDIA: tokens are usually tool-generated images. Render all https://
-      // URLs as <img> so extensionless CDN paths still work (#853), while
-      // preserving explicit audio/video/SVG URLs with their proper handlers.
-      const urlPath=src.split('?')[0];
-      const mediaKind=mediaKindForName(urlPath);
-      // SVG URLs → render inline as image
-      if(_SVG_EXTS.test(urlPath)){
-        return `<img class="msg-media-svg" src="${esc(src)}" alt="${t('media_svg_label')}" loading="lazy">`;
-      }
-      if(mediaKind==='audio'||mediaKind==='video') return mediaPlayerHtml(mediaKind,src,urlPath.split('/').pop()||mediaKind);
-      // Render all https:// URLs as <img> — extensionless CDN paths like fal.media still work (#853)
-      if(_IMAGE_EXTS.test(urlPath) || /^https?:\/\//i.test(src)){
-        return `<img class="msg-media-img" src="${esc(src)}" alt="image" loading="lazy">`;
-      }
-      return `<a href="${esc(src)}" target="_blank" rel="noopener">${esc(src)}</a>`;
-    }
-    // Local file path
-    const mediaSessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)?String(S.session.session_id):'';
-    const apiUrl='api/media?path='+encodeURIComponent(ref)+(mediaSessionId?'&session_id='+encodeURIComponent(mediaSessionId):'');
-    const localKind=mediaKindForName(ref);
-    if(localKind==='image'){
-      return localArtifactCard(apiUrl,ref.split('/').pop()||'image');
-    }
-    // SVG → inline image (no download, render directly)
-    if(_SVG_EXTS.test(ref)){
-      return `<img class="msg-media-svg" src="${esc(apiUrl)}" alt="${t('media_svg_label')}" loading="lazy">`;
-    }
-    // Audio/video → inline player with speed controls; use &inline=1 for byte-range seeking
-    if(_AUDIO_EXTS.test(ref)||_VIDEO_EXTS.test(ref)){
-      const kind=_AUDIO_EXTS.test(ref)?'audio':'video';
-      return _mediaPlayerHtml(kind,apiUrl+'&inline=1',ref.split('/').pop()||ref);
-    }
-    // PDF files → render first page preview with lazy-load
-    if(_PDF_EXTS.test(ref)){
-      const fname=esc(ref.split('/').pop()||ref);
-      return `<div class="pdf-preview-load" data-path="${esc(ref)}"><span class="pdf-preview-spinner">⏳</span> ${t('pdf_loading')} ${fname}...</div>`;
-    }
-    // HTML files → render inline in sandboxed iframe with lazy-load
-    if(_HTML_EXTS.test(ref)){
-      return `<div class="html-preview-load" data-path="${esc(ref)}"><span class="html-preview-spinner">⏳</span> ${t('html_loading')}</div>`;
-    }
-    // .patch/.diff files → render inline as colored diff instead of download
-    const fname=esc(ref.split('/').pop()||ref);
-    if(/\.(patch|diff)$/i.test(ref)){
-      return `<div class="diff-inline-load" data-path="${esc(ref)}">${t('diff_loading')} ${fname}...</div>`;
-    }
-    // CSV files → lazy-load and render as table
-    if(_CSV_EXTS.test(ref)){
-      return `<div class="csv-inline-load" data-path="${esc(ref)}">${t('csv_loading')} ${fname}...</div>`;
-    }
-    // Excalidraw files → lazy-load inline embed
-    if(_EXCALIDRAW_EXTS.test(ref)){
-      return `<div class="excalidraw-inline-load" data-path="${esc(ref)}">${t('excalidraw_loading')} ${fname}...</div>`;
-    }
-    return `<a class="msg-media-link" href="${esc(apiUrl+'&download=1')}" download="${fname}">📎 ${fname}</a>`;
-  });
+  // Restore every MEDIA token through the canonical renderer shared by
+  // settled and live messages.
+  s=s.replace(/\x00D(\d+)\x00/g,(_,i)=>_inlineMediaHtmlForRef(media_stash[+i]));
 
   // ── End MEDIA restore ──────────────────────────────────────────────────────
   // Restore blockquote stash. Done last so the inner HTML (already produced
@@ -9394,9 +9349,11 @@ async function refreshSession() {
     S.messages = data.session.messages || [];
     _messagesTruncated = !!data.session._messages_truncated;
     _oldestIdx = data.session._messages_offset || 0;
-    const pendingMsg=getPendingSessionMessage(data.session,S.messages);
-    if(pendingMsg) S.messages.push(pendingMsg);
-    S.activeStreamId=data.session.active_stream_id||null;
+    if (typeof _mergePendingSessionMessage !== 'function') {
+      throw new Error('Pending-session merge helper unavailable');
+    }
+    _mergePendingSessionMessage(data.session, S.messages);
+    S.activeStreamId = data.session.active_stream_id || null;
 
     syncTopbar(); _renderMessagesWithScrollSnapshot();
     showToast('Conversation refreshed');
@@ -12544,6 +12501,98 @@ function _prepareLiveAnchorScrollRebuildGuard(scrollSnapshot){
     },
   };
 }
+function _restoreLiveAnchorScrollSnapshotAfterRebuild(scrollSnapshot, scrollRebuildGuard){
+  if(!scrollSnapshot) return;
+  const hasHeightGuard=!!(scrollRebuildGuard&&scrollRebuildGuard.release);
+  // Pinned renders have no height guard to release, but still need the same
+  // queued ownership check: a reader can provide real input before the frame
+  // settles, and that input must win over the captured tail position.
+  if(!hasHeightGuard&&scrollSnapshot.pinned!==true) return;
+  requestAnimationFrame(()=>{
+    if(hasHeightGuard) scrollRebuildGuard.release();
+    // Only re-restore the unpinned snapshot if the reader is STILL unpinned at
+    // rAF time. If they re-pinned between guard-engage and this frame, the
+    // stale re-restore would yank them back off the bottom (Opus gate finding).
+    if(scrollSnapshot.pinned===true||_messageUserUnpinned){
+      _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
+    }
+  });
+}
+function _resetMismatchedLiveAssistantTurnForSession(turn, sessionId){
+  const sid=String(sessionId||'');
+  if(!turn||!sid||!turn.dataset) return false;
+  const existingSid=String(turn.dataset.sessionId||'');
+  if(!existingSid||existingSid===sid) return false;
+  const blocks=typeof _assistantTurnBlocks==='function' ? _assistantTurnBlocks(turn) : turn;
+  if(blocks){
+    try{
+      blocks.innerHTML='';
+    }catch(_){
+      while(blocks.firstChild) blocks.removeChild(blocks.firstChild);
+    }
+  }
+  turn.dataset.sessionId=sid;
+  return true;
+}
+function _liveAnchorReasoningRowForFallback(turn, opts){
+  opts=opts||{};
+  const blocks=typeof _assistantTurnBlocks==='function' ? _assistantTurnBlocks(turn) : turn;
+  if(!turn||!blocks||!blocks.querySelectorAll) return null;
+  const streamId=String(opts.streamId||S.activeStreamId||'');
+  const sessionId=String(opts.sessionId||(S.session&&S.session.session_id)||'');
+  const localId=String(opts.anchorReasoningLocalId||opts.localId||'').trim();
+  if(!localId) return null;
+  const rows=blocks.querySelectorAll(
+    '[data-anchor-scene-row="1"][data-anchor-local-id]'
+  );
+  for(const row of Array.from(rows)){
+    const anchorLocalId=String(row.getAttribute&&row.getAttribute('data-anchor-local-id')||'');
+    if(anchorLocalId!==localId) continue;
+    const rowRole=String(row.getAttribute&&row.getAttribute('data-anchor-row-role')||'');
+    const rowSource=String(row.getAttribute&&row.getAttribute('data-anchor-source-event-type')||'');
+    if(rowRole!=='thinking'&&rowSource!=='reasoning') continue;
+    const rowStreamId=String(row.getAttribute&&row.getAttribute('data-anchor-stream-id')||'');
+    if(rowStreamId&&streamId&&rowStreamId!==streamId) continue;
+    const rowSessionId=String(row.getAttribute&&row.getAttribute('data-session-id')||'');
+    if(rowSessionId&&sessionId&&rowSessionId!==sessionId) continue;
+    return row;
+  }
+  return null;
+}
+function _updateLiveAnchorReasoningRowForFallback(turn, text, opts){
+  const clean=_sanitizeThinkingDisplayText(text);
+  if(!clean||window._showThinking===false) return false;
+  const row=_liveAnchorReasoningRowForFallback(turn, opts);
+  if(!row) return false;
+  if(row.classList&&row.classList.contains('wl-reason')){
+    if(typeof _renderWorklogReasonInto==='function') _renderWorklogReasonInto(row, clean);
+    else row.textContent=clean;
+    const group=row.closest&&row.closest('.tool-worklog-group,.tool-call-group,.live-worklog');
+    if(group&&typeof _syncToolCallGroupSummary==='function') _syncToolCallGroupSummary(group);
+  }else if(row.classList&&row.classList.contains('transparent-event-row')){
+    _renderThinkingInto(row, clean);
+    const eventAt=row.getAttribute&&row.getAttribute('data-event-at');
+    const nextTs=typeof _firstValidTimestampSeconds==='function'
+      ? _firstValidTimestampSeconds(opts&&opts.ts, opts&&opts.timestamp, opts&&opts.created_at, eventAt)
+      : null;
+    if(typeof _decorateTransparentEventRow==='function'){
+      _decorateTransparentEventRow(row,{
+        type:'thinking',
+        text:clean,
+        preview:clean,
+        ts:nextTs||undefined,
+        live:true,
+        segmentSeq:opts&&opts.segmentSeq,
+        burstId:opts&&opts.burstId,
+      });
+    }
+  }else{
+    _renderThinkingInto(row, clean);
+  }
+  if(turn&&typeof _syncTransparentEventControls==='function') _syncTransparentEventControls(turn);
+  if(typeof scrollIfPinned==='function') scrollIfPinned();
+  return true;
+}
 function renderLiveAnchorActivityScene(streamId, scene, opts){
   opts=opts||{};
   const requestedMode=opts.mode;
@@ -12612,15 +12661,7 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
   _dedupeLiveProcessedWorklogAnchors(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
-  if(scrollRebuildGuard&&scrollRebuildGuard.release){
-    requestAnimationFrame(()=>{
-      scrollRebuildGuard.release();
-      // Only re-restore the unpinned snapshot if the reader is STILL unpinned at
-      // rAF time. If they re-pinned between guard-engage and this frame, the
-      // stale re-restore would yank them back off the bottom (Opus gate finding).
-      if(_messageUserUnpinned) _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
-    });
-  }
+  _restoreLiveAnchorScrollSnapshotAfterRebuild(scrollSnapshot,scrollRebuildGuard);
   if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
   return true;
 }
@@ -12726,12 +12767,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
   if(renderedRows.length) _syncTransparentEventControls(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
-  if(scrollRebuildGuard&&scrollRebuildGuard.release){
-    requestAnimationFrame(()=>{
-      scrollRebuildGuard.release();
-      if(_messageUserUnpinned) _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
-    });
-  }
+  _restoreLiveAnchorScrollSnapshotAfterRebuild(scrollSnapshot,scrollRebuildGuard);
   if(!scrollRebuildGuard.readerAwayFromBottom&&typeof scrollIfPinned==='function') scrollIfPinned();
   return !!renderedRows.length;
 }
@@ -14516,9 +14552,40 @@ function _captureMessageScrollSnapshot(){
     top:el.scrollTop,
     bottom,
     scrollHeight:el.scrollHeight,
+    inputGeneration:typeof _messageScrollInputGeneration==='number' ? _messageScrollInputGeneration : 0,
     pinned:readerAwayFromBottom?false:_shouldFollowMessagesOnDomReplace(),
     userUnpinned:readerAwayFromBottom?true:_messageUserUnpinned,
   };
+}
+function _messageScrollSnapshotInputChanged(snapshot){
+  if(!snapshot) return false;
+  const captured=Number(snapshot.inputGeneration);
+  const current=typeof _messageScrollInputGeneration==='number' ? _messageScrollInputGeneration : captured;
+  return Number.isFinite(captured)&&Number.isFinite(current)&&current!==captured;
+}
+function _abandonMessageScrollSnapshot(){
+  const el=$('messages');
+  if(!el){
+    _messageUserUnpinned=true;
+    _scrollPinned=false;
+    _nearBottomCount=0;
+    return;
+  }
+  _lastScrollTop=el.scrollTop||0;
+  _lastMessageClientHeight=el.clientHeight||0;
+  // A generation mismatch abandons only the stale snapshot write. Reconcile
+  // ownership from the live viewport so a reader who moved down to the true
+  // bottom is immediately re-pinned instead of being stranded sticky-unpinned.
+  const bottomDistance=el.scrollHeight-el.scrollTop-el.clientHeight;
+  if(bottomDistance<=80){
+    _messageUserUnpinned=false;
+    _scrollPinned=true;
+    _nearBottomCount=2;
+  }else{
+    _messageUserUnpinned=true;
+    _scrollPinned=false;
+    _nearBottomCount=0;
+  }
 }
 function _restorePinnedMessageScrollSnapshot(snapshot){
   const el=$('messages');
@@ -14546,6 +14613,10 @@ function _restoreMessageScrollSnapshot(snapshot){
   // activity rebuilds can remount an older top-of-viewport anchor and yank a
   // pinned streaming transcript upward. Semantic anchors remain for manual
   // unpinned reading positions below.
+  if(typeof _messageScrollSnapshotInputChanged==='function'&&_messageScrollSnapshotInputChanged(snapshot)){
+    if(typeof _abandonMessageScrollSnapshot==='function') _abandonMessageScrollSnapshot();
+    return;
+  }
   if(_restorePinnedMessageScrollSnapshot(snapshot)) return;
   let restoredViaAnchor=(snapshot.anchor&&typeof _restoreMessageViewportAnchor==='function')
     ? _restoreMessageViewportAnchor(snapshot.anchor,0)
@@ -14764,7 +14835,14 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
   // Same-frame live DOM updates (tool/worklog/activity rows) are the hot path for
   // streaming. Pinned followers must stay tail-relative here too; restoring the
   // semantic viewport anchor is only safe for explicitly unpinned readers.
+  if(typeof _messageScrollSnapshotInputChanged==='function'&&_messageScrollSnapshotInputChanged(snapshot)){
+    if(typeof _abandonMessageScrollSnapshot==='function') _abandonMessageScrollSnapshot();
+    return;
+  }
   if(_restorePinnedMessageScrollSnapshot(snapshot)) return;
+  // A delayed rAF restore must not overwrite a position the reader changed
+  // after capture. Recent-intent timestamps are lossy; the generation is
+  // monotonic and therefore preserves snapshot ownership exactly.
   let restoredViaAnchor=(snapshot.anchor&&typeof _restoreMessageViewportAnchor==='function')
     ? _restoreMessageViewportAnchor(snapshot.anchor,0)
     : false;
@@ -14776,6 +14854,10 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
   if(!restoredViaAnchor){
     const maxTop=Math.max(0,el.scrollHeight-el.clientHeight);
     const bottom=Number(snapshot.bottom);
+    // Mobile/touch viewports have native overflow anchoring to hold an
+    // unpinned reader across a rebuild. Desktop deliberately disables that
+    // browser behavior, so it must continue into the explicit fallback below.
+    const _fbTouchHold=(typeof _isTouchLikeMessageViewport==='function' && _isTouchLikeMessageViewport(el));
     // #5637: when the reader has scrolled UP into history (userUnpinned) and the
     // semantic anchor restore failed, do NOT snap scrollTop to the captured
     // ABSOLUTE snapshot.top. During streaming, the live activity-scene refresh
@@ -14785,7 +14867,7 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
     // untouched lets the browser's own scroll anchoring hold the reader's
     // position. Pinned / near-bottom readers still get the tail-relative restore
     // below (that path is correct and must run).
-    if(snapshot.userUnpinned===true&&snapshot.pinned!==true){
+    if(snapshot.userUnpinned===true&&snapshot.pinned!==true&&_fbTouchHold){
       _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
       _messageUserUnpinned=true;
       _scrollPinned=false;
@@ -14816,7 +14898,6 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
     const _grewSinceSnap=Number.isFinite(_snapSH)&&_snapSH>0&&(el.scrollHeight-_snapSH)>4;
     const _fbActiveIntent=(typeof _recentMessageScrollIntent==='function' && _recentMessageScrollIntent())
       || (typeof _recentMessageTouchScrollIntent==='function' && _recentMessageTouchScrollIntent());
-    const _fbTouchHold=(typeof _isTouchLikeMessageViewport==='function' && _isTouchLikeMessageViewport(el));
     if(_fbTouchHold && snapshot.pinned!==true && _grewSinceSnap && !_fbActiveIntent
        && Math.abs((Math.max(0,Math.min(target,maxTop)))-el.scrollTop)>8){
       _lastScrollTop=el.scrollTop;_lastMessageClientHeight=el.clientHeight;
@@ -17638,14 +17719,17 @@ function _findLiveAssistantAnchorForSegment(inner, segmentSeq){
 }
 
 function clearLiveToolCards(){
+  const preserveDom=!!(arguments[0]&&arguments[0].preserveDom);
   if(typeof _clearActivityElapsedTimer==='function') _clearActivityElapsedTimer();
-  const inner=_assistantTurnBlocks($('liveAssistantTurn'));
-  if(inner) inner.querySelectorAll('.live-worklog[data-live-worklog-shell],.tool-worklog-group[data-live-tool-call-group],.tool-call-group[data-live-tool-call-group],.tool-card-row[data-live-tid]:not(.transparent-event-row),[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
+  if(!preserveDom){
+    const inner=_assistantTurnBlocks($('liveAssistantTurn'));
+    if(inner) inner.querySelectorAll('.live-worklog[data-live-worklog-shell],.tool-worklog-group[data-live-tool-call-group],.tool-call-group[data-live-tool-call-group],.tool-card-row[data-live-tid]:not(.transparent-event-row),[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
+  }
   // Reset the per-turn user expand intent so the next turn starts at the
   // default collapsed state (#1298).
   if(typeof _clearLiveActivityUserIntent==='function') _clearLiveActivityUserIntent();
-  // Legacy #liveToolCards container cleanup — kept for safety in case any
-  // leftover cards were inserted there before this refactor took effect.
+  // Legacy #liveToolCards container cleanup (sibling to the settled-rendered
+  // subtree). Always clear/hide it to avoid leaking stale fallback content.
   const container=$('liveToolCards');
   if(container){container.innerHTML='';container.style.display='none';}
 }

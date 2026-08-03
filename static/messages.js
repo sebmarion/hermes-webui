@@ -3928,16 +3928,26 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return false;
   }
-  function _attachProjectedAnchorSceneToLastAssistant(messages){
+  function _anchorSceneHasOwnedOutcomes(scene){
+    return !!(
+      (Array.isArray(scene&&scene.artifacts)&&scene.artifacts.length)
+      || (Array.isArray(scene&&scene.side_effects)&&scene.side_effects.length)
+    );
+  }
+  function _attachProjectedAnchorSceneToLastAssistant(messages, targetMessage=null, targetIndex=null){
     if(!_anchorRegistry||!Array.isArray(messages)) return false;
-    let lastAsst=null;
-    let lastAsstIndex=-1;
-    for(let i=messages.length-1;i>=0;i--){
-      const candidate=messages[i];
-      if(candidate&&candidate.role==='assistant'){
-        lastAsst=candidate;
-        lastAsstIndex=i;
-        break;
+    let lastAsst=targetMessage;
+    let lastAsstIndex=Number.isInteger(targetIndex)?targetIndex:-1;
+    if(lastAsst){
+      if(lastAsstIndex<0||messages[lastAsstIndex]!==lastAsst) return false;
+    }else{
+      for(let i=messages.length-1;i>=0;i--){
+        const candidate=messages[i];
+        if(candidate&&candidate.role==='assistant'){
+          lastAsst=candidate;
+          lastAsstIndex=i;
+          break;
+        }
       }
     }
     if(!lastAsst) return false;
@@ -3947,12 +3957,92 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const hasWorklogRows=_anchorSceneHasWorklogWorthyRows(scene);
       const shouldPersistScene=hasWorklogRows||scene.mode==='hide_all_activity';
       if(!shouldPersistScene) return false;
+      let sceneKey='';
+      try{ sceneKey=JSON.stringify(scene); }catch(_){ sceneKey=''; }
+      if(
+        sceneKey &&
+        lastAsst._anchor_stream_id===streamId &&
+        lastAsst._anchor_scene_persist_key===sceneKey
+      ) return hasWorklogRows;
       lastAsst._anchor_stream_id=streamId;
       lastAsst._anchor_activity_scene=scene;
+      lastAsst._anchor_scene_persist_key=sceneKey;
       _persistSettledAnchorScene(lastAsst, scene, lastAsstIndex);
       return hasWorklogRows;
     }
     return false;
+  }
+  function _settledAnchorRetryOwnerKey(messages, targetIndex, retryStreamId){
+    if(!Array.isArray(messages)||!Number.isInteger(targetIndex)) return '';
+    const target=messages[targetIndex];
+    if(!target||target.role!=='assistant') return '';
+    let turnStart=0;
+    for(let idx=targetIndex-1;idx>=0;idx-=1){
+      if(messages[idx]&&messages[idx].role==='user'){
+        turnStart=idx;
+        break;
+      }
+    }
+    let hasStableOwnerSignal=false;
+    const ownerRows=[];
+    const addUnique=(items,value)=>{
+      const normalized=String(value||'').trim();
+      if(normalized&&!items.includes(normalized)) items.push(normalized);
+    };
+    for(let idx=turnStart;idx<=targetIndex;idx+=1){
+      const message=messages[idx];
+      if(!message||typeof message!=='object') return '';
+      const explicitIds=[];
+      for(const field of ['id','message_id','turn_id','_turn_id','run_id','_run_id']){
+        addUnique(explicitIds,message[field]);
+      }
+      const toolCallIds=[];
+      addUnique(toolCallIds,message.tool_call_id);
+      const addToolOwner=(tool)=>{
+        if(!tool||typeof tool!=='object') return;
+        addUnique(toolCallIds,tool.id||tool.tid||tool.tool_call_id||tool.tool_use_id||tool.call_id);
+      };
+      for(const tool of (Array.isArray(message.tool_calls)?message.tool_calls:[])) addToolOwner(tool);
+      for(const tool of (Array.isArray(message._partial_tool_calls)?message._partial_tool_calls:[])) addToolOwner(tool);
+      for(const part of (Array.isArray(message.content)?message.content:[])) addToolOwner(part);
+      explicitIds.sort();
+      toolCallIds.sort();
+      if(explicitIds.length||toolCallIds.length) hasStableOwnerSignal=true;
+      ownerRows.push({
+        message_ref:_anchorSceneMessageRef(message),
+        reasoning:String(message.reasoning||message._reasoning||message.reasoning_content||message.thinking||'').replace(/\s+/g,' ').trim(),
+        partial:!!message._partial,
+        explicit_ids:explicitIds,
+        tool_call_ids:toolCallIds,
+      });
+    }
+    if(!hasStableOwnerSignal) return '';
+    return JSON.stringify({
+      session_id:activeSid||'',
+      stream_id:String(retryStreamId||''),
+      target_index:targetIndex,
+      messages:ownerRows,
+    });
+  }
+  function _retrySettledAnchorScene(targetMessage, targetIndex, retryStreamId, retryRegistry, retryOwnerKey){
+    if(!targetMessage||!Number.isInteger(targetIndex)) return false;
+    if(!S.session||S.session.session_id!==activeSid) return false;
+    if(S.activeStreamId&&S.activeStreamId!==retryStreamId) return false;
+    if(!_anchorRegistryMap||_anchorRegistryMap.get(retryStreamId)!==retryRegistry) return false;
+    if(!Array.isArray(S.messages)) return false;
+    const currentTarget=S.messages[targetIndex];
+    if(currentTarget!==targetMessage){
+      const currentOwnerKey=_settledAnchorRetryOwnerKey(S.messages,targetIndex,retryStreamId);
+      if(!retryOwnerKey||!currentOwnerKey||currentOwnerKey!==retryOwnerKey) return false;
+      if(targetMessage._anchor_stream_id===retryStreamId){
+        if(currentTarget._anchor_stream_id==null) currentTarget._anchor_stream_id=targetMessage._anchor_stream_id;
+        if(currentTarget._anchor_scene_persist_key==null) currentTarget._anchor_scene_persist_key=targetMessage._anchor_scene_persist_key;
+        if(!currentTarget._anchor_activity_scene&&targetMessage._anchor_activity_scene){
+          currentTarget._anchor_activity_scene=targetMessage._anchor_activity_scene;
+        }
+      }
+    }
+    return _attachProjectedAnchorSceneToLastAssistant(S.messages,currentTarget,targetIndex);
   }
   function _upsertAnchorProcessProse(displayText, options={}){
     const text=String(displayText||'').trim();
@@ -4062,6 +4152,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   window.__anchorProseIncrementalNode=_anchorProseIncrementalNode;
   function _clearAnchorProseIncrementalNode(){
     if(typeof window!=='undefined'&&window.__anchorProseIncrementalNode===_anchorProseIncrementalNode) window.__anchorProseIncrementalNode=null;
+    for(const st of _anchorProseSmdCache.values()){
+      if(!st||!st.parser) continue;
+      if(typeof _smdMediaTailFlush === 'function') _smdMediaTailFlush(st.parser);
+      if(typeof _smdMediaTailClear === 'function') _smdMediaTailClear(st.parser);
+      const body=st.node&&st.node.querySelector&&st.node.querySelector('.msg-body');
+      if(typeof _smdClearParserIdentity === 'function') _smdClearParserIdentity(body,st.parser);
+    }
     _anchorProseSmdCache.clear();
   }
   function _anchorHasReasoningEvents(){
@@ -4371,6 +4468,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const baseRenderer=fade ? _streamFadeRenderer(el) : _safeSmdRenderer(el);
     const renderer=_smdRendererWithoutUnderscoreEmphasis(baseRenderer);
     _smdParser=window.smd.parser(renderer);
+    _smdBindParserIdentity(renderer,_smdParser,el);
   }
   function _smdRendererWithoutUnderscoreEmphasis(renderer){
     if(!renderer||!window.smd) return renderer;
@@ -4407,6 +4505,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // re-sanitize the body before the DOM is handed off to highlightCode / renderMessages.
       if(assistantBody){_sanitizeSmdLinks(assistantBody);enhanceMarkdownTables(assistantBody);}
     }
+    if(typeof _smdMediaTailFlush==='function') _smdMediaTailFlush(_smdParser);
+    if(typeof _smdMediaTailFlush==='function') _smdMediaTailFlush(__SMD_PARSER_FALLBACK);
+    if(typeof _smdMediaTailClear==='function') _smdMediaTailClear(_smdParser);
+    if(typeof _smdMediaTailClear==='function') _smdMediaTailClear(__SMD_PARSER_FALLBACK);
+    if(typeof _smdClearParserIdentity==='function') _smdClearParserIdentity(assistantBody,_smdParser);
     _smdParser=null;
     _smdWrittenLen=0;
     _smdWrittenText='';
@@ -4561,12 +4664,27 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const renderer=window.smd.default_renderer(el);
     const baseAddText=renderer.add_text;
     const baseSetAttr=renderer.set_attr;
+    const parserFor=(data)=>_smdParserKey(data,el);
+    const writeFadeText=(writeParent,writeData,writeText)=>{
+      if(!writeParent||_streamFadeSkipNode(writeParent)){
+        _smdAppendPlainText(writeParent,writeData,writeText,baseAddText);
+        return;
+      }
+      _streamFadeAppendText(writeParent, writeText);
+    };
     renderer.add_text=(data,text)=>{
       const parent=data&&data.nodes&&data.nodes[data.index];
       if(!parent||_streamFadeSkipNode(parent)){baseAddText(data,text);return;}
+      const parser=parserFor(data);
+      const value=String(text||'');
+      const hasMediaTail=!!(_SMD_MEDIA_TAIL&&parser&&_SMD_MEDIA_TAIL.has&&_SMD_MEDIA_TAIL.has(parser));
+      const hasMediaPrefixTail=!!_smdMediaPrefixTail(value);
+      if(/MEDIA:/.test(value)||hasMediaTail||hasMediaPrefixTail){
+        _smdMediaAwareAddText(baseAddText, parent, data, text, _SMD_MEDIA_TAIL, parser, writeFadeText);
+        return;
+      }
       const frag=document.createDocumentFragment();
       const wordRe=/(\S+)(\s*)/g;
-      const value=String(text||'');
       const reduceMotion=_streamFadeReduceMotionEnabled();
       const appendStartedAt=performance.now();
       let last=0, match, changed=false;
@@ -4597,7 +4715,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     renderer.set_attr=(data,attr,value)=>{
       const isHref=window.smd&&attr===window.smd.HREF;
       const isSrc=window.smd&&attr===window.smd.SRC;
-      const safeUrl=isSrc?_SMD_SAFE_IMG_URL_RE:_SMD_SAFE_URL_RE;
+      const allowed=isSrc?_smdImgSrcAllowed(value):_SMD_SAFE_URL_RE.test(String(value||''));
       if(isHref&&/^(file|workspace|session):\/\//i.test(String(value||''))){
         baseSetAttr(data,attr,_smdLinkHref(value));
         if(/^session:\/\//i.test(String(value||''))){
@@ -4606,7 +4724,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         }
         return;
       }
-      if((isHref||isSrc)&&!safeUrl.test(String(value||''))){
+      if((isHref||isSrc)&&!allowed){
         const node=data&&data.nodes&&data.nodes[data.index];
         if(node&&node.setAttribute) node.setAttribute('data-blocked-scheme','1');
         return;
@@ -4617,6 +4735,202 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   // Safe renderer: wraps default_renderer with a set_attr hook that validates
   // href/src URL schemes inline — no post-hoc DOM-wide querySelectorAll needed.
+  const _SMD_MEDIA_PREFIX = 'MEDIA:';
+  function _smdMediaPrefixTail(value){
+    const text=String(value||'');
+    const max=Math.min(_SMD_MEDIA_PREFIX.length,text.length);
+    for(let len=max;len>0;len-=1){
+      const suffix=text.slice(text.length-len);
+      if(_SMD_MEDIA_PREFIX.startsWith(suffix)) return suffix;
+    }
+    return '';
+  }
+  function _smdAppendPlainText(parent, data, text, baseAddText){
+    const value=String(text||'');
+    if(parent&&parent.appendChild&&typeof document!=='undefined'&&document.createTextNode){
+      parent.appendChild(document.createTextNode(value));
+      return;
+    }
+    if(baseAddText) baseAddText(data,value);
+  }
+  function _smdMediaWriteText(parent, data, baseAddText, writeText, text){
+    if(writeText){
+      writeText(parent, data, String(text||''));
+      return;
+    }
+    if(baseAddText) baseAddText(data,String(text||''));
+  }
+  function _smdMediaTailSet(tailMap, parser, chunk, parent, baseAddText, data, writeText){
+    if(!tailMap||!parser) return;
+    if(chunk) tailMap.set(parser, {chunk, parent, baseAddText, data, writeText});
+    else tailMap.delete(parser);
+  }
+  function _smdMediaTailEntryChunk(entry){
+    return entry && typeof entry==='object' && Object.prototype.hasOwnProperty.call(entry,'chunk') ? entry.chunk : entry;
+  }
+  function _smdMediaTailSameOwner(entry, parent, baseAddText, writeText){
+    return !!entry && entry.parent===parent && entry.baseAddText===baseAddText && entry.writeText===writeText;
+  }
+  function _smdMediaRefHasReliableBoundary(rawRef){
+    const raw=String(rawRef||'');
+    if(/[?#]$/.test(raw)) return false;
+    const ref=raw.split(/[?#]/,1)[0];
+    return /\.(?:png|jpe?g|gif|webp|bmp|ico|svg|avif|mp4|webm|mov|m4v|mkv|avi|ogv|mp3|wav|ogg|m4a|aac|wma|opus|flac|oga|pdf|html?|csv|diff|patch|excalidraw)$/i.test(ref);
+  }
+  function _smdMediaTailFlushEntry(entry){
+    const chunk=_smdMediaTailEntryChunk(entry);
+    if(!chunk) return;
+    const m=/^MEDIA:([^\s\)\]]+)$/.exec(String(chunk));
+    const emitted=!!(m && entry && entry.parent && _smdAppendMediaNode(entry.parent, m[1]));
+    if(!emitted && entry) _smdMediaWriteText(entry.parent, entry.data, entry.baseAddText, entry.writeText, chunk);
+  }
+  function _smdMediaTailFlush(parser){
+    if(!_SMD_MEDIA_TAIL||!parser||!_SMD_MEDIA_TAIL.get) return;
+    const entry=_SMD_MEDIA_TAIL.get(parser);
+    if(!entry) return;
+    _SMD_MEDIA_TAIL.delete(parser);
+    _smdMediaTailFlushEntry(entry);
+  }
+  function _smdMediaAwareAddText(baseAddText, parent, data, text, tailMap, parser, writeText){
+    const value=String(text||'');
+    const tails=tailMap||(typeof _SMD_MEDIA_TAIL!=='undefined'&&_SMD_MEDIA_TAIL)||null;
+    const writeCurrent=(chunk)=>_smdMediaWriteText(parent, data, baseAddText, writeText, chunk);
+    if(!value){
+      writeCurrent('');
+      return;
+    }
+    // Pull any pending tail from a previous (split) chunk, then clear it;
+    // this call will either complete it, re-buffer it, or flush it as text.
+    let leadEntry = tails && parser && tails.get ? tails.get(parser) : null;
+    let lead = _smdMediaTailEntryChunk(leadEntry);
+    if(lead && !_smdMediaTailSameOwner(leadEntry, parent, baseAddText, writeText)){
+      if(tails && parser && tails.delete) tails.delete(parser);
+      _smdMediaTailFlushEntry(leadEntry);
+      leadEntry=null;
+      lead='';
+    }else if(lead && tails && parser && tails.delete){
+      tails.delete(parser);
+    }
+    const combined = lead ? lead + value : value;
+    // Fast path: no MEDIA tokens in the (possibly combined) string.
+    if(!/MEDIA:/.test(combined)){
+      const prefixTail=_smdMediaPrefixTail(combined);
+      if(prefixTail && tails && parser && prefixTail.length < _MEDIA_TAIL_MAX){
+        const stable=combined.slice(0, combined.length-prefixTail.length);
+        if(stable) writeCurrent(stable);
+        _smdMediaTailSet(tails, parser, prefixTail, parent, baseAddText, data, writeText);
+        return;
+      }
+      writeCurrent(combined);
+      return;
+    }
+    // Walk the combined string, slicing into prose + MEDIA token runs.
+    // Prose runs go through the owning text writer. MEDIA tokens go through
+    // the single-token DOMParser helper only after a delimiter or
+    // reliable filename suffix proves the ref is complete.
+    const re=/MEDIA:([^\s\)\]]+)/g;
+    let last=0, m;
+    let unmatchedTail=null;
+    while((m=re.exec(combined))){
+      const matchEnd = m.index + m[0].length;
+      if(m.index>last){
+        const slice = combined.slice(last, m.index);
+        writeCurrent(slice);
+      }
+      if(matchEnd===combined.length && !_smdMediaRefHasReliableBoundary(m[1])){
+        const candidate = combined.slice(m.index);
+        if(candidate.length < _MEDIA_TAIL_MAX){
+          unmatchedTail = candidate;
+        } else {
+          writeCurrent(candidate);
+        }
+        last = combined.length;
+        break;
+      }
+      if(!_smdAppendMediaNode(parent, m[1])) writeCurrent(m[0]);
+      last = matchEnd;
+    }
+    // Tail buffer — hold trailing bytes that look like an unterminated
+    // MEDIA prefix; flush any prose before the partial MEDIA suffix.
+    const rest = combined.slice(last);
+    if(rest){
+      const tailMatch = /MEDIA:[^\s\)\]]*$/.exec(rest);
+      const prefixTail = tailMatch ? '' : _smdMediaPrefixTail(rest);
+      const tailValue = tailMatch ? tailMatch[0] : prefixTail;
+      if(tailValue && rest.length < _MEDIA_TAIL_MAX){
+        const tailStart = tailMatch ? tailMatch.index : rest.length-prefixTail.length;
+        if(tailStart>0) writeCurrent(rest.slice(0, tailStart));
+        unmatchedTail = tailValue;
+      } else {
+        writeCurrent(rest);
+      }
+    }
+    if(tails && parser){
+      _smdMediaTailSet(tails, parser, unmatchedTail, parent, baseAddText, data, writeText);
+    }
+  }
+  // Single-token DOM splice. Only ever fed the output of
+  // _inlineMediaHtmlForRef (trusted markup fragment). Plain text
+  // goes through baseAddText → createTextNode — NEVER here.
+  function _smdAppendMediaNode(parent, rawRef){
+    if(!parent||!rawRef) return false;
+    const mediaHtml = (typeof _inlineMediaHtmlForRef==='function')
+      ? _inlineMediaHtmlForRef(String(rawRef))
+      : '';
+    if(!mediaHtml) return false;
+    let host=null;
+    try{
+      const doc=new DOMParser().parseFromString('<div>'+mediaHtml+'</div>','text/html');
+      host=doc.body&&doc.body.firstChild;
+    }catch(_){ host=null; }
+    if(!host||!host.childNodes||!host.childNodes.length) return false;
+    const frag=document.createDocumentFragment();
+    while(host.firstChild) frag.appendChild(host.firstChild);
+    parent.appendChild(frag);
+    _smdScheduleMediaPostProcess(parent);
+    return true;
+  }
+  function _smdScheduleMediaPostProcess(root){
+    if(!root) return;
+    if(typeof _postProcessWithAnchorSuppression!=='function'
+      && typeof postProcessRenderedMessages!=='function'
+      && typeof _applyMediaPlaybackPreferences!=='function') return;
+    const run=()=>{
+      try{
+        if(typeof _postProcessWithAnchorSuppression==='function') _postProcessWithAnchorSuppression(root);
+        else if(typeof postProcessRenderedMessages==='function') postProcessRenderedMessages(root);
+        if(typeof _applyMediaPlaybackPreferences==='function') _applyMediaPlaybackPreferences(root);
+      }catch(_){}
+    };
+    if(typeof requestAnimationFrame==='function') requestAnimationFrame(run);
+    else if(typeof setTimeout==='function') setTimeout(run,0);
+    else run();
+  }
+  // Per-parser tail buffer keyed by parser instance so concurrent
+  // smd parsers (live prose + anchor-scene rows + tool-card streams)
+  // keep their own pending bytes. Cleared inside _smdEndParser /
+  // _clearAnchorProseIncrementalNode on stream end.
+  const _SMD_MEDIA_TAIL = (typeof WeakMap!=='undefined') ? new WeakMap() : new Map();
+  // Sentinel for parserFor fallback — a dedicated object instead of
+  // a string, so WeakMap.set doesn't throw TypeError when all three
+  // parser-identity sources are unavailable (Greptile #3).
+  const __SMD_PARSER_FALLBACK = {};
+  function _smdParserKey(data, el){
+    return (data && data.parser) || (el && el.__smdParser) || __SMD_PARSER_FALLBACK;
+  }
+  function _smdBindParserIdentity(renderer, parser, el){
+    if(renderer&&renderer.data) renderer.data.parser=parser;
+    if(el) el.__smdParser=parser;
+  }
+  function _smdClearParserIdentity(el, parser){
+    if(!el || (parser && el.__smdParser!==parser)) return;
+    try{delete el.__smdParser;}catch(_){el.__smdParser=null;}
+  }
+  function _smdMediaTailClear(parser){
+    if(_SMD_MEDIA_TAIL && parser) _SMD_MEDIA_TAIL.delete(parser);
+    // Also clear the fallback key if it was ever set
+    if(_SMD_MEDIA_TAIL && parser === __SMD_PARSER_FALLBACK) _SMD_MEDIA_TAIL.delete(parser);
+  }
   // Unlike _streamFadeRenderer, this does NOT wrap add_text, so smd adds new
   // DOM nodes as plain text nodes (no animation spans). Used on the non-fade
   // streaming path to eliminate _sanitizeSmdLinks(assistantBody) O(DOM) scans
@@ -4624,10 +4938,26 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _safeSmdRenderer(el){
     const renderer=window.smd.default_renderer(el);
     const baseSetAttr=renderer.set_attr;
+    const baseAddText=renderer.add_text;
+    const parserFor=(data)=>_smdParserKey(data,el);
+    const writePlainText=(writeParent,writeData,writeText)=>
+      _smdAppendPlainText(writeParent,writeData,writeText,baseAddText);
+    renderer.add_text=(data,text)=>{
+      const parent=data&&data.nodes&&data.nodes[data.index];
+      _smdMediaAwareAddText(
+        baseAddText,
+        parent,
+        data,
+        text,
+        _SMD_MEDIA_TAIL,
+        parserFor(data),
+        writePlainText,
+      );
+    };
     renderer.set_attr=(data,attr,value)=>{
       const isHref=window.smd&&attr===window.smd.HREF;
       const isSrc=window.smd&&attr===window.smd.SRC;
-      const safeUrl=isSrc?_SMD_SAFE_IMG_URL_RE:_SMD_SAFE_URL_RE;
+      const allowed=isSrc?_smdImgSrcAllowed(value):_SMD_SAFE_URL_RE.test(String(value||''));
       if(isHref&&/^(file|workspace|session):\/\//i.test(String(value||''))){
         baseSetAttr(data,attr,_smdLinkHref(value));
         if(/^session:\/\//i.test(String(value||''))){
@@ -4636,7 +4966,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         }
         return;
       }
-      if((isHref||isSrc)&&!safeUrl.test(String(value||''))){
+      if((isHref||isSrc)&&!allowed){
         const node=data&&data.nodes&&data.nodes[data.index];
         if(node&&node.setAttribute) node.setAttribute('data-blocked-scheme','1');
         return;
@@ -5932,7 +6262,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
               _transient:true,
             });
           }
-          clearLiveToolCards();
+          // Keep the rendered live Worklog in place until the settled transcript swaps
+          // it for the settled anchor scene. Removing it first exposes an empty
+          // transcript frame on large sessions.
+          clearLiveToolCards({preserveDom:true});
           S.busy=false;
           // No-reply guard (#373): if agent returned nothing, show inline error
           if(!S.messages.some(m=>m.role==='assistant'&&String(m.content||'').trim())&&!assistantText){removeThinking();S.messages.push({role:'assistant',content:'**No response received.** Check your API key and model selection.'});}
@@ -6190,6 +6523,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _scheduleAnchorRegistryCleanup();
         clearLiveToolCards();if(!assistantText)removeThinking();
         let isRecoveryControlMessage=false;
+        let _anchorRetryTarget=null;
+        let _anchorRetryIndex=-1;
         try{
           const isRateLimit=d.type==='rate_limit';
           const isQuotaExhausted=d.type==='quota_exhausted';
@@ -6224,9 +6559,25 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             S.messages.push({role:'assistant',content:`**${label}:** ${d.message}${hint}`,provider_details:details,provider_details_label:detailsLabel,_compressionRecovery:recovery||undefined});
             _attachProjectedAnchorSceneToLastAssistant(S.messages);
           }
+          if(!isRecoveryControlMessage){
+            _anchorRetryTarget=[...S.messages].reverse().find(m=>m&&m.role==='assistant')||null;
+            _anchorRetryIndex=_anchorRetryTarget?S.messages.indexOf(_anchorRetryTarget):-1;
+          }
         }catch(_){
           S.messages.push({role:'assistant',content:'**Error:** An error occurred. Check server logs.'});
           _attachProjectedAnchorSceneToLastAssistant(S.messages);
+        }
+        if(_anchorRetryTarget&&_anchorRetryIndex>=0){
+          const _retryTarget=_anchorRetryTarget;
+          const _retryIndex=_anchorRetryIndex;
+          const _retryStreamId=streamId;
+          const _retryRegistry=_anchorRegistry;
+          const _retryOwnerKey=_settledAnchorRetryOwnerKey(S.messages,_retryIndex,_retryStreamId);
+          // Retry only for the exact terminal assistant and registry generation.
+          // A refresh replacement must prove the same full turn and tool owner.
+          setTimeout(()=>{
+            _retrySettledAnchorScene(_retryTarget,_retryIndex,_retryStreamId,_retryRegistry,_retryOwnerKey);
+          },0);
         }
         if(isRecoveryControlMessage){
           (async()=>{
