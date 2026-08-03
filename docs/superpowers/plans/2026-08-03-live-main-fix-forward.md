@@ -16,7 +16,7 @@
 - Create: `tests/test_live_main_update_policy.py`
 - Modify: `tests/test_update_check_ui.py` only for the read-only status marker
 
-- [ ] **Step 1: Write tests** for `HERMES_WEBUI_LIVE_MAIN=1` proving `apply_update`, `apply_force_update`, and `apply_clear_lock` return `agent_merge_required` without invoking Git, and for update-check payloads exposing the live-main mode.
+- [ ] **Step 1: Write tests** for `HERMES_WEBUI_LIVE_MAIN=1` proving `apply_update`, `apply_force_update`, and `apply_clear_lock` return `agent_merge_required` without invoking Git, acquiring the update lock, stashing, scheduling a restart, enumerating/removing lock files, or mutating the filesystem, and for update-check payloads exposing the live-main mode.
 - [ ] **Step 2: Run the focused tests** with `./scripts/test.sh tests/test_live_main_update_policy.py -q` and confirm they fail because the policy marker and response do not yet exist.
 - [ ] **Step 3: Run the policy tests** and confirm the strict false-value cases still fail until the implementation exists.
 
