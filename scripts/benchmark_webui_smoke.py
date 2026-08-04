@@ -46,6 +46,8 @@ BROWSER_SLOS = {
     "sidebar_ready_p95_lt_ms": 1500.0,
     "session_switch_p95_lt_ms": 1200.0,
     "transcript_render_p95_lt_ms": 750.0,
+    "thread_load_total_p95_lt_ms": 1500.0,
+    "thread_load_total_max_lt_ms": 2000.0,
 }
 CORRECTNESS_TESTS = {
     "orphan_prune": (
@@ -222,10 +224,13 @@ def browser_disabled_receipt() -> dict:
             "sidebar_ready_p95": None,
             "session_switch_p95": None,
             "transcript_render_p95": None,
+            "thread_load_total_p95": None,
+            "thread_load_total_max": None,
         },
         "slo": dict(BROWSER_SLOS),
         "invariants": {
             "virtualization_enabled": None,
+            "bounded_history_window": None,
             "max_rendered_rows": None,
             "max_anchor_drift_px": None,
             "state_unchanged": None,
@@ -245,7 +250,15 @@ def compare_receipts(current: dict, baseline: dict, *, baseline_path: str) -> di
         baseline_stage = (baseline.get("stages") or {}).get(stage_name) or {}
         current_metrics = current_stage.get("metrics_ms") or {}
         baseline_metrics = baseline_stage.get("metrics_ms") or {}
-        for metric_name in ("p95", "max", "sidebar_ready_p95", "session_switch_p95", "transcript_render_p95"):
+        for metric_name in (
+            "p95",
+            "max",
+            "sidebar_ready_p95",
+            "session_switch_p95",
+            "transcript_render_p95",
+            "thread_load_total_p95",
+            "thread_load_total_max",
+        ):
             observed = current_metrics.get(metric_name)
             previous = baseline_metrics.get(metric_name)
             if observed is None or previous is None:
@@ -422,6 +435,14 @@ def _state_tree_signature(root: Path) -> dict[str, str]:
     return result
 
 
+def _browser_state_signature(root: Path) -> dict[str, str]:
+    """Return mutable conversation state, excluding the normal model cache."""
+
+    result = _state_tree_signature(root)
+    result.pop("models_cache.json", None)
+    return result
+
+
 def _wait_for_stable_dom(page, *, timeout_ms: int = 10_000) -> None:
     page.evaluate(
         """async ({timeoutMs}) => {
@@ -442,6 +463,16 @@ def _wait_for_stable_dom(page, *, timeout_ms: int = 10_000) -> None:
           });
         }""",
         {"timeoutMs": timeout_ms},
+    )
+
+
+def _wait_for_browser_session(page, session_id: str, *, timeout_ms: int = 30_000) -> None:
+    """Wait for the app's lexical ``S`` state to point at ``session_id``."""
+
+    page.wait_for_function(
+        "sid => typeof S !== 'undefined' && S && S.session && S.session.session_id === sid",
+        arg=session_id,
+        timeout=timeout_ms,
     )
 
 
@@ -471,13 +502,26 @@ def _browser_anchor_invariants(page) -> dict:
           const rows = Array.from(document.querySelectorAll('#msgInner .msg-row'));
           const before = document.querySelector('[data-virtual-spacer="before"]');
           const after = document.querySelector('[data-virtual-spacer="after"]');
+          const virtualizationEnabled = Boolean(before && after);
+          const boundedHistoryWindow = !virtualizationEnabled
+            && typeof _messagesTruncated !== 'undefined'
+            && _messagesTruncated === true;
           if (!container || !rows.length) {
-            return {virtualization_enabled: Boolean(before && after), max_rendered_rows: rows.length, max_anchor_drift_px: null, missing: 'message rows'};
+            return {virtualization_enabled: virtualizationEnabled, bounded_history_window: boundedHistoryWindow, max_rendered_rows: rows.length, max_anchor_drift_px: null, missing: 'message rows'};
           }
           const containerRect = container.getBoundingClientRect();
           const candidates = rows.filter(row => row.dataset.messageAnchorKey && row.getClientRects().length);
           if (!candidates.length) {
-            return {virtualization_enabled: Boolean(before && after), max_rendered_rows: rows.length, max_anchor_drift_px: null, missing: 'anchor row'};
+            return {virtualization_enabled: virtualizationEnabled, bounded_history_window: boundedHistoryWindow, max_rendered_rows: rows.length, max_anchor_drift_px: null, missing: 'anchor row'};
+          }
+          if (boundedHistoryWindow) {
+            return {
+              virtualization_enabled: false,
+              bounded_history_window: true,
+              max_rendered_rows: rows.length,
+              max_anchor_drift_px: null,
+              anchor_key_present: true,
+            };
           }
           const anchor = candidates.reduce((best, row) => {
             const bestDistance = Math.abs(best.getBoundingClientRect().top - (containerRect.top + container.clientHeight / 2));
@@ -492,11 +536,12 @@ def _browser_anchor_invariants(page) -> dict:
             await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
             const current = Array.from(document.querySelectorAll('#msgInner .msg-row[data-message-anchor-key]'))
               .find(row => row.dataset.messageAnchorKey === key && row.getClientRects().length);
-            if (!current) return {virtualization_enabled: Boolean(before && after), max_rendered_rows: document.querySelectorAll('#msgInner .msg-row').length, max_anchor_drift_px: null, missing: 'anchor recycled'};
+            if (!current) return {virtualization_enabled: virtualizationEnabled, bounded_history_window: boundedHistoryWindow, max_rendered_rows: document.querySelectorAll('#msgInner .msg-row').length, max_anchor_drift_px: null, missing: 'anchor recycled'};
             drifts.push(Math.abs(current.getBoundingClientRect().top - baseline));
           }
           return {
-            virtualization_enabled: Boolean(before && after),
+            virtualization_enabled: virtualizationEnabled,
+            bounded_history_window: boundedHistoryWindow,
             max_rendered_rows: Math.max(rows.length, document.querySelectorAll('#msgInner .msg-row').length),
             max_anchor_drift_px: drifts.length ? Math.max(...drifts) : 0,
             anchor_key_present: true,
@@ -524,7 +569,7 @@ def _run_browser_lane(root: Path, env: dict[str, str], *, mode: str) -> dict:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     process = log_handle = None
     started = time.perf_counter()
-    metrics = {"sidebar": [], "switch": [], "transcript": []}
+    metrics = {"sidebar": [], "switch": [], "transcript": [], "thread_load": []}
     failures: list[str] = []
     selector_evidence = {}
     state_before = state_after = {}
@@ -581,7 +626,7 @@ def _run_browser_lane(root: Path, env: dict[str, str], *, mode: str) -> dict:
             small_id = _seed_browser_session(
                 page, workspace=workspace, messages=small_messages, title="Benchmark switch target"
             )
-            state_before = _state_tree_signature(Path(env["HERMES_WEBUI_STATE_DIR"]))
+            state_before = _browser_state_signature(Path(env["HERMES_WEBUI_STATE_DIR"]))
 
             navigation_started = time.perf_counter()
             page.reload(wait_until="domcontentloaded", timeout=30_000)
@@ -589,52 +634,48 @@ def _run_browser_lane(root: Path, env: dict[str, str], *, mode: str) -> dict:
             small_selector = f'#sessionList .session-item[data-sid="{small_id}"]'
             page.wait_for_selector(target_selector, state="visible", timeout=30_000)
             target_row = page.locator(target_selector)
+            metrics["sidebar"].append((time.perf_counter() - navigation_started) * 1000)
+            target_render_started = time.perf_counter()
             if "active" not in (target_row.get_attribute("class") or ""):
                 target_row.click()
-                page.wait_for_function(
-                    "sid => window.S && window.S.session && window.S.session.session_id === sid",
-                    arg=target_id,
-                    timeout=30_000,
-                )
-                _wait_for_stable_dom(page)
-            metrics["sidebar"].append((time.perf_counter() - navigation_started) * 1000)
-            selector_evidence["sidebar"] = target_selector
-
-            page.wait_for_selector(small_selector, state="visible", timeout=30_000)
-            switch_started = time.perf_counter()
-            page.locator(small_selector).click()
-            page.wait_for_function(
-                "sid => window.S && window.S.session && window.S.session.session_id === sid",
-                arg=small_id,
-                timeout=30_000,
-            )
-            _wait_for_stable_dom(page)
-            metrics["switch"].append((time.perf_counter() - switch_started) * 1000)
-            selector_evidence["switch"] = small_selector
-
-            transcript_started = time.perf_counter()
-            page.locator(target_selector).click()
-            page.wait_for_function(
-                "sid => window.S && window.S.session && window.S.session.session_id === sid",
-                arg=target_id,
-                timeout=30_000,
-            )
+            _wait_for_browser_session(page, target_id)
             page.wait_for_function(
                 "() => document.querySelectorAll('#msgInner .msg-row').length > 0",
                 timeout=30_000,
             )
             _wait_for_stable_dom(page)
-            metrics["transcript"].append((time.perf_counter() - transcript_started) * 1000)
+            metrics["thread_load"].append((time.perf_counter() - navigation_started) * 1000)
+            metrics["transcript"].append((time.perf_counter() - target_render_started) * 1000)
+            selector_evidence["sidebar"] = target_selector
             selector_evidence["transcript"] = "#msgInner .msg-row"
+
             invariants = _browser_anchor_invariants(page)
-            if not invariants.get("virtualization_enabled"):
-                failures.append("transcript virtualization spacers were not present")
+            if not (
+                invariants.get("virtualization_enabled")
+                or invariants.get("bounded_history_window")
+            ):
+                failures.append("transcript was neither virtualized nor bounded by history paging")
             if int(invariants.get("max_rendered_rows") or 0) >= 160:
                 failures.append("rendered row count reached the 160-row cap")
-            if invariants.get("max_anchor_drift_px") is None:
+            if (
+                invariants.get("max_anchor_drift_px") is None
+                and not invariants.get("bounded_history_window")
+            ):
                 failures.append(str(invariants.get("missing") or "anchor drift was not measured"))
-            elif float(invariants["max_anchor_drift_px"]) > 4.0:
+            elif (
+                invariants.get("max_anchor_drift_px") is not None
+                and float(invariants["max_anchor_drift_px"]) > 4.0
+            ):
                 failures.append("scroll anchor drift exceeded 4px")
+
+            page.wait_for_selector(small_selector, state="visible", timeout=30_000)
+            switch_started = time.perf_counter()
+            page.locator(small_selector).click()
+            _wait_for_browser_session(page, small_id)
+            _wait_for_stable_dom(page)
+            metrics["switch"].append((time.perf_counter() - switch_started) * 1000)
+            selector_evidence["switch"] = small_selector
+
             for metric_name, values, slo_key in (
                 ("sidebar_ready_p95", metrics["sidebar"], "sidebar_ready_p95_lt_ms"),
                 ("session_switch_p95", metrics["switch"], "session_switch_p95_lt_ms"),
@@ -642,12 +683,23 @@ def _run_browser_lane(root: Path, env: dict[str, str], *, mode: str) -> dict:
             ):
                 if nearest_rank_p95(values) >= BROWSER_SLOS[slo_key]:
                     failures.append(f"{metric_name} reached its {BROWSER_SLOS[slo_key]:.0f}ms ceiling")
+            if nearest_rank_p95(metrics["thread_load"]) >= BROWSER_SLOS["thread_load_total_p95_lt_ms"]:
+                failures.append(
+                    "thread_load_total_p95 reached its "
+                    f"{BROWSER_SLOS['thread_load_total_p95_lt_ms']:.0f}ms ceiling"
+                )
+            if max(metrics["thread_load"], default=0.0) >= BROWSER_SLOS["thread_load_total_max_lt_ms"]:
+                failures.append(
+                    "thread_load_total_max reached its "
+                    f"{BROWSER_SLOS['thread_load_total_max_lt_ms']:.0f}ms ceiling"
+                )
             if page_errors:
                 failures.extend(f"page {kind}: {message}" for kind, message in page_errors)
-            state_after = _state_tree_signature(Path(env["HERMES_WEBUI_STATE_DIR"]))
+            state_after = _browser_state_signature(Path(env["HERMES_WEBUI_STATE_DIR"]))
             browser.close()
             invariant_payload = {
                 "virtualization_enabled": bool(invariants.get("virtualization_enabled")),
+                "bounded_history_window": bool(invariants.get("bounded_history_window")),
                 "max_rendered_rows": int(invariants.get("max_rendered_rows") or 0),
                 "max_anchor_drift_px": invariants.get("max_anchor_drift_px"),
                 "state_unchanged": state_before == state_after,
@@ -656,6 +708,7 @@ def _run_browser_lane(root: Path, env: dict[str, str], *, mode: str) -> dict:
         failures.append(f"browser lane failed: {type(exc).__name__}: {exc}")
         invariant_payload = {
             "virtualization_enabled": None,
+            "bounded_history_window": None,
             "max_rendered_rows": None,
             "max_anchor_drift_px": None,
             "state_unchanged": None,
@@ -680,6 +733,8 @@ def _run_browser_lane(root: Path, env: dict[str, str], *, mode: str) -> dict:
             "sidebar_ready_p95": round(nearest_rank_p95(metrics["sidebar"]), 3) if metrics["sidebar"] else None,
             "session_switch_p95": round(nearest_rank_p95(metrics["switch"]), 3) if metrics["switch"] else None,
             "transcript_render_p95": round(nearest_rank_p95(metrics["transcript"]), 3) if metrics["transcript"] else None,
+            "thread_load_total_p95": round(nearest_rank_p95(metrics["thread_load"]), 3) if metrics["thread_load"] else None,
+            "thread_load_total_max": round(max(metrics["thread_load"]), 3) if metrics["thread_load"] else None,
         },
         "slo": dict(BROWSER_SLOS),
         "invariants": invariant_payload,

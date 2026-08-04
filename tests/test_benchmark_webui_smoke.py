@@ -132,10 +132,40 @@ def test_browser_disabled_is_explicitly_incomplete():
         "sidebar_ready_p95": None,
         "session_switch_p95": None,
         "transcript_render_p95": None,
+        "thread_load_total_p95": None,
+        "thread_load_total_max": None,
     }
     assert stage["invariants"]["virtualization_enabled"] is None
+    assert stage["invariants"]["bounded_history_window"] is None
     assert stage["failures"] == []
     assert stage["coverage_complete"] is False
+
+
+def test_browser_slos_include_user_visible_thread_budget():
+    module = _load_module()
+    assert module.BROWSER_SLOS["thread_load_total_p95_lt_ms"] == 1500.0
+    assert module.BROWSER_SLOS["thread_load_total_max_lt_ms"] == 2000.0
+
+
+def test_browser_session_probe_reads_lexical_app_state():
+    module = _load_module()
+    playwright_api = pytest.importorskip("playwright.sync_api")
+    with playwright_api.sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+        except Exception as exc:
+            pytest.skip(f"Chromium unavailable: {exc}")
+        page = browser.new_page()
+        try:
+            page.set_content(
+                "<script>let S = {session: {session_id: 'target'}};</script>"
+            )
+            module._wait_for_browser_session(page, "target", timeout_ms=1000)
+        finally:
+            browser.close()
 
 
 def test_receipt_serialization_has_required_top_level_fields():

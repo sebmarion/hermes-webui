@@ -296,6 +296,8 @@ Run the small receipt-producing benchmark from the repository root:
 ./.venv/bin/python scripts/benchmark_webui_smoke.py --output /tmp/hermes-webui-benchmark.json
 
 # include the real Chromium lane when Playwright and Chromium are installed
+./.venv/bin/python -m pip install playwright
+./.venv/bin/python -m playwright install chromium
 ./.venv/bin/python scripts/benchmark_webui_smoke.py --browser required \
   --output /tmp/hermes-webui-benchmark-browser.json
 
@@ -310,9 +312,14 @@ home below a temporary directory, scrubs credential/token environment variables,
 and removes the server when finished. The receipt records the commit, runtime,
 fixture seed/counts, resolution and message-page p50/p95/max timings, the
 separate orphan-prune/archive/gateway correctness checks, and browser metrics
-when the lane is enabled. `--browser optional` skips only when Playwright is not
-installed and reports `coverage_complete=false`; `--browser off` is an explicit
-backend-only run. Do not treat a skipped browser lane as full UI coverage.
+when the lane is enabled. The user-visible browser SLO is `thread_load_total`:
+page navigation through a stable transcript. Its target is p95 < 1500 ms and a
+hard maximum < 2000 ms; sidebar, switch, and transcript timings remain
+diagnostic breakdowns. The browser fixture uses the bounded 30-message history
+window, so either transcript virtualization or bounded paging must be reported.
+`--browser optional` skips only when Playwright is not installed and reports
+`coverage_complete=false`; `--browser off` is an explicit backend-only run. Do
+not treat a skipped browser lane as full UI coverage.
 
 ### Release-lite lazy task opening
 
