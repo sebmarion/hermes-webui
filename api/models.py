@@ -6177,6 +6177,19 @@ def _read_state_db_sidebar_overrides(
                         sid for sid in chunk
                         if sid in count_wanted or sid in messaging_ids
                     ]
+                    # Archived rows are not painted by the default sidebar.
+                    # Their message tables can be enormous, so do not pay the
+                    # COUNT/MAX aggregation cost for them just because they
+                    # occupied a recent index slot.  Keep rows whose archive
+                    # value is unknown in the tier: failing open preserves the
+                    # existing stale-index safety contract.
+                    count_chunk = [
+                        sid
+                        for sid in count_chunk
+                        if not bool(
+                            overrides.get(sid, {}).get("_state_db_archived")
+                        )
+                    ]
                     if not count_chunk:
                         continue
                     count_placeholders = ','.join('?' * len(count_chunk))

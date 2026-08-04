@@ -25,6 +25,8 @@ even when it falls beyond the cap.
 """
 from __future__ import annotations
 
+import sqlite3
+
 import api.models as models
 
 
@@ -171,3 +173,57 @@ def test_stale_cli_json_beyond_cap_stays_webui_via_real_db(monkeypatch, tmp_path
     assert sessions[400].get("session_source") == "webui", (
         "session_source must be reclassified to webui from state.db"
     )
+
+
+def test_message_count_tier_excludes_archived_state_rows(tmp_path, monkeypatch):
+    """The expensive message aggregation must not count archived sidebar rows."""
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE sessions (
+            id TEXT PRIMARY KEY,
+            source TEXT,
+            session_source TEXT,
+            title TEXT,
+            message_count INTEGER,
+            archived INTEGER,
+            pinned INTEGER
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT,
+            timestamp REAL
+        );
+        CREATE INDEX idx_messages_session ON messages(session_id, timestamp);
+        INSERT INTO sessions VALUES
+            ('archived', 'webui', 'webui', 'Old', 1000, 1, 0),
+            ('visible', 'webui', 'webui', 'Current', 2, 0, 0);
+        INSERT INTO messages VALUES
+            (1, 'archived', 1.0),
+            (2, 'visible', 2.0);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    message_queries = []
+
+    def _open_readonly(path, log=None):
+        opened = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        opened.set_trace_callback(message_queries.append)
+        return opened
+
+    monkeypatch.setattr(models, "open_state_db_readonly", _open_readonly)
+    models._read_state_db_sidebar_overrides(
+        db,
+        {"archived", "visible"},
+        count_session_ids={"archived", "visible"},
+    )
+    aggregates = [
+        statement.lower()
+        for statement in message_queries
+        if "from messages" in statement.lower() and "count(*)" in statement.lower()
+    ]
+    assert aggregates, "the fixture must exercise the message-count tier"
+    assert all("archived" not in statement for statement in aggregates)

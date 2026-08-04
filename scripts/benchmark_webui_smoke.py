@@ -27,6 +27,7 @@ from typing import Iterable
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_GENERATOR = REPO_ROOT / "scripts" / "generate_conversation_load_fixture.py"
 LOAD_RUNNER = REPO_ROOT / "scripts" / "benchmark_conversation_load.py"
+SIDEBAR_BENCHMARK = REPO_ROOT / "scripts" / "benchmark_sidebar_list.py"
 TEST_RUNNER = REPO_ROOT / "scripts" / "test.sh"
 DEFAULT_SEED = 4242
 DEFAULT_SCALE = "mini"
@@ -245,7 +246,7 @@ def browser_disabled_receipt() -> dict:
 
 def compare_receipts(current: dict, baseline: dict, *, baseline_path: str) -> dict:
     warnings: list[str] = []
-    for stage_name in ("resolution", "message_page", "browser"):
+    for stage_name in ("resolution", "message_page", "sidebar_list", "browser"):
         current_stage = (current.get("stages") or {}).get(stage_name) or {}
         baseline_stage = (baseline.get("stages") or {}).get(stage_name) or {}
         current_metrics = current_stage.get("metrics_ms") or {}
@@ -392,6 +393,37 @@ def _run_backend_stage(
     if completed.returncode != 0 and not result["failures"]:
         result["status"] = "failed"
         result["failures"].append(f"load runner exited {completed.returncode}")
+    return result
+
+
+def _run_sidebar_stage(*, root: Path, env: dict[str, str], quick: bool) -> dict:
+    """Run the isolated five-visible-thread sidebar benchmark lane."""
+
+    output_path = root / "sidebar-list.json"
+    command = [sys.executable, str(SIDEBAR_BENCHMARK)]
+    if quick:
+        command.append("--quick")
+    command.extend(["--output", str(output_path)])
+    completed = _run_command(command, env=env, timeout=180.0)
+    try:
+        result = json.loads(output_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        result = {
+            "status": "failed",
+            "metrics_ms": {"p50": 0.0, "p95": 0.0, "max": 0.0},
+            "slo": {},
+            "failures": [
+                f"sidebar benchmark exited {completed.returncode}: "
+                f"{(completed.stderr or completed.stdout)[-1000:]}"
+            ],
+            "overall_passed": False,
+        }
+    if completed.returncode != 0:
+        result.setdefault("failures", []).append(
+            f"sidebar benchmark exited {completed.returncode}"
+        )
+        result["overall_passed"] = False
+    result["status"] = "passed" if result.get("overall_passed") else "failed"
     return result
 
 
@@ -811,11 +843,17 @@ def main(argv: list[str] | None = None) -> int:
                 concurrency=2,
                 stress_rounds=stress_rounds,
             )
+            sidebar_list = _run_sidebar_stage(
+                root=root,
+                env=env,
+                quick=args.quick,
+            )
             browser = _run_browser_lane(root, env, mode=args.browser)
             correctness = _run_correctness(env)
             stages = {
                 "resolution": resolution,
                 "message_page": message_page,
+                "sidebar_list": sidebar_list,
                 "browser": browser,
             }
             coverage_complete = bool(browser.get("coverage_complete", False))
