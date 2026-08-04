@@ -230,6 +230,26 @@ untracked work in a named stash, and reapplies that stash with `git stash apply
 stash application conflicts, repair the current worktree, run the tests, and
 keep the stash until the live process is healthy.
 
+### Minimal single-user release
+
+For the local live `main` checkout, the small release command performs the
+upstream merge, focused tests, launchd restart, cheap liveness check, and one
+root-page smoke request:
+
+```bash
+export HERMES_WEBUI_LAUNCHD_LABEL="com.parantoux.hermes-webui"
+python3 scripts/release_live_main.py release
+python3 scripts/release_live_main.py status
+python3 scripts/release_live_main.py rollback
+```
+
+The label, base URL, receipt path, and extra focused tests can also be supplied
+as flags. The command refuses a dirty worktree, keeps its one receipt outside
+the checkout, and uses a normal Git revert for `rollback`; it never uses reset,
+restore, clean, rebase, selector cutover, or a background complaint watcher.
+The release gate intentionally uses cheap `/health` plus `GET /`; deep health
+is a separate diagnostic because a large local state database can make it slow.
+
 If the Web UI keeps getting respawned and you suspect the double-fork loop:
 
 ```bash
