@@ -6069,6 +6069,8 @@ def _read_state_db_sidebar_overrides(
     db_path: Path,
     session_ids: set[str],
     count_session_ids: set[str] | None = None,
+    *,
+    include_message_stats: bool = True,
 ) -> dict[str, dict]:
     """Return cheap state.db organization overrides for sidebar rows.
 
@@ -6090,7 +6092,9 @@ def _read_state_db_sidebar_overrides(
     out of the cap).
     """
     wanted = {str(sid) for sid in (session_ids or set()) if sid}
-    if count_session_ids is None:
+    if not include_message_stats:
+        count_wanted = set()
+    elif count_session_ids is None:
         count_wanted = set(wanted)
     else:
         count_wanted = {str(sid) for sid in count_session_ids if sid} & wanted
@@ -6151,7 +6155,7 @@ def _read_state_db_sidebar_overrides(
                     if state_source:
                         entry['_state_db_source'] = state_source
                         source_meta = normalize_agent_session_source(state_source)
-                        if source_meta.get('session_source') == 'messaging':
+                        if include_message_stats and source_meta.get('session_source') == 'messaging':
                             # Messaging rows are runtime sidecar overlays, so
                             # their canonical activity timestamp is needed even
                             # when the row falls outside the general top-N
@@ -6172,7 +6176,7 @@ def _read_state_db_sidebar_overrides(
                         entry['_state_db_pinned'] = bool(row['pinned'])
                     if entry:
                         overrides[sid] = entry
-                if has_messages_table and messages_has_session_id:
+                if include_message_stats and has_messages_table and messages_has_session_id:
                     count_chunk = [
                         sid for sid in chunk
                         if sid in count_wanted or sid in messaging_ids
@@ -6251,7 +6255,11 @@ def _read_state_db_sidebar_overrides(
         return {}
 
 
-def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
+def _apply_sidebar_state_db_overrides(
+    sessions: list[dict],
+    *,
+    include_message_stats: bool = True,
+) -> None:
     """Apply state.db source/title overrides without full lineage enrichment.
 
     Source classification (source/title) is corrected for ALL rows because it
@@ -6276,11 +6284,42 @@ def _apply_sidebar_state_db_overrides(sessions: list[dict]) -> None:
     else:
         count_ids = None  # cap disabled / under cap -> count every row too
     try:
-        metadata = _read_state_db_sidebar_overrides(
-            _active_state_db_path(),
-            all_ids,
-            count_session_ids=count_ids,
-        )
+        if include_message_stats:
+            # Keep the historical call shape for embedders and focused tests
+            # that replace this read seam with a two/three-argument callable.
+            metadata = _read_state_db_sidebar_overrides(
+                _active_state_db_path(),
+                all_ids,
+                count_session_ids=count_ids,
+            )
+        else:
+            try:
+                signature = inspect.signature(_read_state_db_sidebar_overrides)
+                accepts_kwarg = (
+                    "include_message_stats" in signature.parameters
+                    or any(
+                        parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in signature.parameters.values()
+                    )
+                )
+            except (TypeError, ValueError):
+                accepts_kwarg = True
+            if accepts_kwarg:
+                metadata = _read_state_db_sidebar_overrides(
+                    _active_state_db_path(),
+                    all_ids,
+                    count_session_ids=set(),
+                    include_message_stats=False,
+                )
+            else:
+                # Legacy replacement callables cannot receive the explicit
+                # flag; an empty count tier preserves their old source/title
+                # overlay path without requesting message aggregation.
+                metadata = _read_state_db_sidebar_overrides(
+                    _active_state_db_path(),
+                    all_ids,
+                    count_session_ids=set(),
+                )
     except Exception:
         return
     _apply_sidebar_state_db_override_metadata(sessions, metadata)
@@ -6453,7 +6492,11 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
             session['display_title'] = state_db_title
 
 
-def _enrich_sidebar_lineage_metadata(sessions: list[dict]) -> None:
+def _enrich_sidebar_lineage_metadata(
+    sessions: list[dict],
+    *,
+    include_message_stats: bool = True,
+) -> None:
     """Attach state.db compression lineage metadata used by sidebar collapse.
 
     Cap the DB lookup to the top-N most recent sessions to bound wall-clock
@@ -6474,11 +6517,23 @@ def _enrich_sidebar_lineage_metadata(sessions: list[dict]) -> None:
         candidates = sessions[:_cap]
     else:
         candidates = sessions
+    session_ids = {str(s.get('session_id')) for s in candidates if s.get('session_id')}
     try:
-        metadata = read_session_lineage_metadata(
-            _active_state_db_path(),
-            {str(s.get('session_id')) for s in candidates if s.get('session_id')},
-        )
+        if include_message_stats:
+            metadata = read_session_lineage_metadata(
+                _active_state_db_path(),
+                session_ids,
+            )
+        else:
+            # Archive/history views need parent/child classification but do not
+            # need fresh unread/count statistics. Avoid the unbounded messages
+            # GROUP BY that otherwise turns a large archived list into a
+            # multi-second request.
+            metadata = read_session_lineage_metadata(
+                _active_state_db_path(),
+                session_ids,
+                include_message_stats=False,
+            )
     except Exception:
         return
     _apply_sidebar_state_db_override_metadata(sessions, metadata)
@@ -6565,7 +6620,12 @@ def read_session_index_projection() -> list[dict]:
     return projected
 
 
-def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
+def all_sessions(
+    diag=None,
+    *,
+    include_lineage_metadata: bool = True,
+    include_message_stats: bool = True,
+):
     _diag_stage(diag, "all_sessions.active_streams")
     active_stream_ids = _active_stream_ids()
     # Phase C: try index first for O(1) read; fall back to full scan
@@ -6739,7 +6799,10 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
                 _enrich_sidebar_lineage_metadata(result)
             else:
                 _diag_stage(diag, "all_sessions.state_db_overrides")
-                _apply_sidebar_state_db_overrides(result)
+                _apply_sidebar_state_db_overrides(
+                    result,
+                    include_message_stats=include_message_stats,
+                )
                 _diag_stage(diag, "all_sessions.lineage_metadata_skipped")
             result = _prefer_fuller_snapshots_for_sidebar(result)
             sidebar_candidates = result
@@ -6801,7 +6864,10 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
         _enrich_sidebar_lineage_metadata(result)
     else:
         _diag_stage(diag, "all_sessions.state_db_overrides")
-        _apply_sidebar_state_db_overrides(result)
+        _apply_sidebar_state_db_overrides(
+            result,
+            include_message_stats=include_message_stats,
+        )
         _diag_stage(diag, "all_sessions.lineage_metadata_skipped")
     result = _prefer_fuller_snapshots_for_sidebar(result)
     sidebar_candidates = result

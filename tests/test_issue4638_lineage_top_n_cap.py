@@ -87,3 +87,21 @@ def test_enrichment_failure_is_swallowed(monkeypatch):
     monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
     # Must not raise.
     models._enrich_sidebar_lineage_metadata(_sessions(10))
+
+
+def test_enrichment_can_skip_message_stats_for_sidebar_archive_reads(monkeypatch):
+    seen = {}
+
+    def _fake_read(db_path, id_set, *, include_message_stats=True):
+        seen["include_message_stats"] = include_message_stats
+        return {}
+
+    monkeypatch.setattr(models, "read_session_lineage_metadata", _fake_read)
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: ":memory:")
+
+    models._enrich_sidebar_lineage_metadata(
+        _sessions(10),
+        include_message_stats=False,
+    )
+
+    assert seen["include_message_stats"] is False

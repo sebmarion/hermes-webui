@@ -6587,6 +6587,45 @@ def _models_cache_file_fingerprint(path: Path) -> dict:
     return fingerprint
 
 
+def _models_cache_content_fingerprint(path: Path) -> dict:
+    """Return a stable model-set identity for a local catalog file.
+
+    Some provider resolvers rewrite their catalog file (or touch it while
+    refreshing credentials) without changing the model set.  A stat- or
+    byte-based fingerprint would turn that harmless write into a full
+    live-provider rebuild.  For the Codex JSON shape, hash only ``models`` so
+    refresh metadata such as ``fetched_at`` cannot invalidate the persisted
+    /api/models cache; a real model-list change still does.
+    """
+    p = Path(path).expanduser()
+    fingerprint = {"path": str(p)}
+    try:
+        payload = p.read_bytes()
+    except OSError:
+        fingerprint["missing"] = True
+        return fingerprint
+    try:
+        try:
+            parsed = json.loads(payload.decode("utf-8"))
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("models"), list):
+            encoded = json.dumps(
+                parsed["models"],
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                default=str,
+            ).encode("utf-8")
+        else:
+            encoded = payload
+        fingerprint["sha256"] = hashlib.sha256(encoded).hexdigest()
+    except Exception:
+        # Keep the invalidation path conservative if hashing ever fails.
+        fingerprint.update(_models_cache_file_fingerprint(p))
+    return fingerprint
+
+
 def _models_cache_catalog_fingerprint() -> dict:
     """Return non-secret model-catalog identity metadata for cache invalidation.
 
@@ -6595,7 +6634,8 @@ def _models_cache_catalog_fingerprint() -> dict:
     small local catalogs such as Codex's models_cache.json. Keep this cheap and
     deterministic so a server restart after catalog changes does not keep
     serving an otherwise-valid persisted models_cache.json until the 24h TTL
-    expires (#2443).
+    expires (#2443). Codex's file uses a content fingerprint because its mtime
+    can churn during a refresh even when the catalog bytes are unchanged.
     """
     catalog_payload = {
         "provider_models": _PROVIDER_MODELS,
@@ -6616,7 +6656,7 @@ def _models_cache_catalog_fingerprint() -> dict:
     codex_home = Path(os.getenv("CODEX_HOME", "").strip() or (HOME / ".codex")).expanduser()
     return {
         "provider_catalog_sha256": provider_catalog_sha,
-        "codex_models_cache": _models_cache_file_fingerprint(codex_home / "models_cache.json"),
+        "codex_models_cache": _models_cache_content_fingerprint(codex_home / "models_cache.json"),
     }
 
 

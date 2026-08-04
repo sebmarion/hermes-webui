@@ -215,6 +215,40 @@ def test_sessions_api_can_limit_archived_rows_without_hiding_visible_rows(monkey
     assert enriched_batches == [["visible-a", "visible-b", "archived-new", "archived-mid"]]
 
 
+def test_sessions_api_skips_archive_message_aggregation(monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_SESSION_PROJECTION_V2", "0")
+    _force_full_route_builder(monkeypatch)
+    all_sessions_kwargs = []
+    enrichment_modes = []
+
+    def fake_all_sessions(**kwargs):
+        all_sessions_kwargs.append(kwargs)
+        return _sessions_payload_rows()
+
+    monkeypatch.setattr(routes, "all_sessions", fake_all_sessions)
+    monkeypatch.setattr(
+        routes,
+        "_enrich_sidebar_lineage_metadata",
+        lambda rows, *, include_message_stats=True: enrichment_modes.append(
+            (tuple(row["session_id"] for row in rows), include_message_stats)
+        ),
+    )
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda rows: False)
+    monkeypatch.setattr(routes, "load_settings", lambda: {"show_cli_sessions": False})
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+
+    handler = _FakeHandler()
+    routes.handle_get(handler, urlparse("http://example.com/api/sessions?include_archived=1"))
+
+    assert handler.status == 200
+    assert len(all_sessions_kwargs) == 1
+    assert all_sessions_kwargs[0]["include_lineage_metadata"] is False
+    assert all_sessions_kwargs[0]["include_message_stats"] is False
+    assert enrichment_modes == [
+        (("visible-active", "archived-history"), False),
+    ]
+
+
 def test_archived_limit_varies_session_list_cache_key():
     base = routes._session_list_cache_key(
         active_profile="default",

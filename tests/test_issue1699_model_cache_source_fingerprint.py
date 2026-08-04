@@ -7,6 +7,7 @@ PRIMARY badge until the cache is manually cleared or expires.
 """
 
 import json
+import os
 import sys
 import time
 import types
@@ -144,6 +145,70 @@ def test_disk_models_cache_still_loads_when_auth_and_config_sources_are_unchange
     # The disk-cache hit reconstructs `aliases` from current config (the save
     # path doesn't persist aliases); no config aliases here, so it's {}.
     assert result == {**fresh_opencode, "aliases": {}}
+
+
+def test_codex_catalog_cache_fingerprint_ignores_mtime_only_churn(tmp_path, monkeypatch):
+    """Refreshing Codex's cache file without changing its bytes must not
+    force a full provider-catalog rebuild on the next /api/models request.
+
+    The Codex resolver rewrites/touches its local models cache during normal
+    operation.  The model catalog depends on the file contents, not the write
+    timestamp; using mtime as the identity turned each touch into a multi-
+    second cold request.
+    """
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    cache_path = codex_home / "models_cache.json"
+    cache_path.write_bytes(b'{"models":[{"slug":"gpt-5.6"}]}\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    first = config._models_cache_catalog_fingerprint()["codex_models_cache"]
+    stat = cache_path.stat()
+    os.utime(cache_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+    second = config._models_cache_catalog_fingerprint()["codex_models_cache"]
+
+    assert first == second
+    assert "sha256" in first
+
+
+def test_codex_catalog_cache_fingerprint_ignores_refresh_metadata_churn(tmp_path, monkeypatch):
+    """Refreshing fetched_at/etag metadata without changing models is inert."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    cache_path = codex_home / "models_cache.json"
+    first_payload = {
+        "fetched_at": "2026-08-04T21:00:00Z",
+        "etag": 'W/"first"',
+        "client_version": "0.146.0",
+        "models": [{"slug": "gpt-5.6", "display_name": "GPT-5.6"}],
+    }
+    cache_path.write_text(json.dumps(first_payload), encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    first = config._models_cache_catalog_fingerprint()["codex_models_cache"]
+    second_payload = {**first_payload, "fetched_at": "2026-08-04T21:15:00Z"}
+    cache_path.write_text(json.dumps(second_payload), encoding="utf-8")
+
+    second = config._models_cache_catalog_fingerprint()["codex_models_cache"]
+
+    assert first == second
+
+
+def test_codex_catalog_cache_fingerprint_changes_when_contents_change(tmp_path, monkeypatch):
+    """A real Codex catalog update still invalidates the /api/models cache."""
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    cache_path = codex_home / "models_cache.json"
+    cache_path.write_bytes(b'{"models":[{"slug":"gpt-5.6"}]}\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    first = config._models_cache_catalog_fingerprint()["codex_models_cache"]
+    cache_path.write_bytes(b'{"models":[{"slug":"gpt-5.7"}]}\n')
+
+    second = config._models_cache_catalog_fingerprint()["codex_models_cache"]
+
+    assert first != second
 
 
 def test_memory_models_cache_invalidates_when_static_catalog_changes(tmp_path, monkeypatch):

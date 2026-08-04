@@ -243,7 +243,12 @@ def _queue_generated_title_for_imported_session(session, cli_meta: dict | None) 
 
 def _on_session_list_changed(profile: str | None = None) -> None:
     """Invalidate in-process /api/sessions cache when sidebar state mutates."""
-    _clear_session_list_cache(profile)
+    try:
+        _clear_session_list_cache(profile, preserve_stale=True)
+    except TypeError:
+        # Focused tests and embedders may still replace this seam with the
+        # historical one-argument cache clearer.
+        _clear_session_list_cache(profile)
     # #4842: also drop the inner CLI/cron projection cache. While a turn streams
     # that cache is frozen on a stable streaming marker (so per-token message
     # writes don't bust it), which means it no longer self-invalidates via the
@@ -1939,6 +1944,7 @@ _session_list_cache_claim_rebuild = _route_session_list_cache._session_list_cach
 _session_list_cache_done = _route_session_list_cache._session_list_cache_done
 _session_list_cache_get = _route_session_list_cache._session_list_cache_get
 _session_list_cache_invalidation_stamp = _route_session_list_cache._session_list_cache_invalidation_stamp
+_session_list_cache_mark_stale = _route_session_list_cache._session_list_cache_mark_stale
 _route_session_list_cache_key = _route_session_list_cache._session_list_cache_key
 _session_list_cache_overlay_runtime_rows = _route_session_list_cache._session_list_cache_overlay_runtime_rows
 _session_list_cache_path_stamp = _route_session_list_cache._session_list_cache_path_stamp
@@ -1965,6 +1971,24 @@ def _callable_accepts_kwarg(callable_obj, kwarg_name: str) -> bool:
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in signature.parameters.values()
     )
+
+
+def _enrich_sidebar_lineage_metadata_for_request(
+    rows: list[dict],
+    *,
+    include_message_stats: bool,
+) -> None:
+    """Enrich sidebar rows while tolerating legacy test/caller seams."""
+    if _callable_accepts_kwarg(
+        _enrich_sidebar_lineage_metadata,
+        "include_message_stats",
+    ):
+        _enrich_sidebar_lineage_metadata(
+            rows,
+            include_message_stats=include_message_stats,
+        )
+        return
+    _enrich_sidebar_lineage_metadata(rows)
 
 
 def _session_list_cache_key(
@@ -2596,7 +2620,10 @@ def _build_session_list_seed_payload(
         archived_rows = [row for row in selected if row.get("archived")]
         selected = visible_rows + archived_rows[offset: offset + limit]
 
-    _enrich_sidebar_lineage_metadata(selected)
+    _enrich_sidebar_lineage_metadata_for_request(
+        selected,
+        include_message_stats=not include_archived,
+    )
     selected, late_child_reference_candidates = _partition_parent_only_sidebar_rows(selected)
     child_reference_candidates.extend(late_child_reference_candidates)
     selected, late_lineage_reference_candidates = _collapse_parent_only_sidebar_lineages(selected)
@@ -2681,6 +2708,15 @@ def _build_session_list_cache_payload(
 
     def _all_sessions_for_sidebar():
         if _callable_accepts_kwarg(all_sessions, "include_lineage_metadata"):
+            if include_archived and _callable_accepts_kwarg(
+                all_sessions,
+                "include_message_stats",
+            ):
+                return all_sessions(
+                    diag=diag,
+                    include_lineage_metadata=False,
+                    include_message_stats=False,
+                )
             return all_sessions(diag=diag, include_lineage_metadata=False)
         # Focused tests and third-party callers sometimes monkeypatch
         # routes.all_sessions with the historical diag-only signature.
@@ -3031,7 +3067,10 @@ def _build_session_list_cache_payload(
                 normalized_archived_offset: normalized_archived_offset + normalized_archived_limit
             ]
     diag_stage("visible_lineage_metadata")
-    _enrich_sidebar_lineage_metadata(scoped)
+    _enrich_sidebar_lineage_metadata_for_request(
+        scoped,
+        include_message_stats=not include_archived,
+    )
     scoped, late_child_reference_candidates = _partition_parent_only_sidebar_rows(scoped)
     child_reference_candidates.extend(late_child_reference_candidates)
     scoped, late_lineage_reference_candidates = _collapse_parent_only_sidebar_lineages(scoped)
@@ -3222,6 +3261,7 @@ def _get_cached_session_list_payload(
     builder,
     seed_builder=None,
     diag=None,
+    retry_on_invalidation: bool = True,
 ) -> dict:
     if diag is not None:
         try:
@@ -3265,8 +3305,24 @@ def _get_cached_session_list_payload(
                             rebuild_attempts + 1,
                         )
                         return
+                    if not retry_on_invalidation:
+                        # A request-local mutation can race a cold projection
+                        # (for example stale-stream repair). Return this
+                        # coherent snapshot once, mark it stale, and let the
+                        # next request refresh in the background rather than
+                        # blocking the caller through repeated full rebuilds.
+                        _session_list_cache_set(key, payload)
+                        _session_list_cache_mark_stale(
+                            profile=key[0] if key else None,
+                        )
+                        return
                     rebuild_attempts += 1
                     if rebuild_attempts >= 3:
+                        # Keep the last coherent projection available even
+                        # when a noisy invalidation stream prevents a clean
+                        # rebuild; otherwise each sidebar request repeats all
+                        # three expensive attempts forever.
+                        _session_list_cache_set(key, payload)
                         return
             finally:
                 _session_list_cache_done(key, event)
@@ -3350,7 +3406,20 @@ def _get_cached_session_list_payload(
                         diag.stage("session_list_cache_invalidated_during_rebuild")
                     except Exception:
                         pass
+                if not retry_on_invalidation:
+                    # Serve the just-built snapshot once and keep it available
+                    # as stale data while a later request refreshes it.
+                    _session_list_cache_set(key, payload)
+                    _session_list_cache_mark_stale(
+                        profile=key[0] if key else None,
+                    )
+                    return payload
                 if rebuild_attempts >= 3:
+                    # Keep the last coherent projection available even when a
+                    # noisy invalidation stream prevents a clean rebuild.
+                    # Returning without caching turns one transient race into
+                    # a permanent rebuild-on-every-request loop.
+                    _session_list_cache_set(key, payload)
                     return payload
         finally:
             _session_list_cache_done(key, event)
@@ -15283,6 +15352,12 @@ def handle_get(handler, parsed) -> bool:
             # heavy lifting now lives in the cache builder: profile scoping via
             # `_profiles_match(s.get("profile"), active_profile)` still happens
             # before `_keep_latest_messaging_session_per_source(`.
+            cache_kwargs = {}
+            if _callable_accepts_kwarg(
+                _get_cached_session_list_payload,
+                "retry_on_invalidation",
+            ):
+                cache_kwargs["retry_on_invalidation"] = False
             payload = _get_cached_session_list_payload(
                 key=key,
                 builder=lambda: _build_session_list_cache_payload(
@@ -15322,6 +15397,7 @@ def handle_get(handler, parsed) -> bool:
                     )
                 ) if projection_v2_enabled and not show_cli_sessions else None,
                 diag=diag,
+                **cache_kwargs,
             )
             diag.stage("response_write")
             return j(handler, _session_list_payload_to_response(payload), pretty=False)

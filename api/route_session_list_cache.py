@@ -244,8 +244,52 @@ def _session_list_cache_clear(profile: str | None = None) -> None:
                 _SESSIONS_CACHE.pop(cache_key, None)
 
 
-def _clear_session_list_cache(profile: str | None = None) -> None:
-    _session_list_cache_clear(profile=profile)
+def _session_list_cache_mark_stale(profile: str | None = None) -> None:
+    """Invalidate entries without throwing away the last coherent payload.
+
+    Session-list mutations are frequent enough that evicting the only payload
+    turns the next request into a synchronous rebuild. Keep each affected
+    entry with an expired timestamp so callers can serve it immediately while
+    the singleflight background refresh converges it to the new state.
+    Explicit cache clears still use ``_session_list_cache_clear`` when callers
+    require a hard reset (tests, configuration/profile changes, or failures).
+    """
+    normalized_profile = _session_list_cache_profile_scope(profile) if profile else None
+    with _SESSIONS_CACHE_LOCK:
+        global _SESSIONS_CACHE_GLOBAL_INVALIDATION_VERSION
+        global _SESSIONS_CACHE_ALL_PROFILES_INVALIDATION_VERSION
+        if not profile:
+            _SESSIONS_CACHE_GLOBAL_INVALIDATION_VERSION += 1
+            _SESSIONS_CACHE_ALL_PROFILES_INVALIDATION_VERSION += 1
+            _SESSIONS_CACHE_PROFILE_INVALIDATION_VERSION.clear()
+            affected = list(_SESSIONS_CACHE.keys())
+        else:
+            _SESSIONS_CACHE_ALL_PROFILES_INVALIDATION_VERSION += 1
+            _SESSIONS_CACHE_PROFILE_INVALIDATION_VERSION[normalized_profile] = (
+                _SESSIONS_CACHE_PROFILE_INVALIDATION_VERSION.get(normalized_profile, 0) + 1
+            )
+            affected = []
+            for cache_key in _SESSIONS_CACHE:
+                cache_profile, cache_all_profiles, *_rest = cache_key
+                if cache_all_profiles or _profiles_match(cache_profile, normalized_profile):
+                    affected.append(cache_key)
+        for cache_key in affected:
+            entry = _SESSIONS_CACHE.get(cache_key)
+            if entry is None:
+                continue
+            _stamp, source_stamp, payload = entry
+            _SESSIONS_CACHE[cache_key] = (0.0, source_stamp, payload)
+
+
+def _clear_session_list_cache(
+    profile: str | None = None,
+    *,
+    preserve_stale: bool = False,
+) -> None:
+    if preserve_stale:
+        _session_list_cache_mark_stale(profile=profile)
+    else:
+        _session_list_cache_clear(profile=profile)
 
 
 def _session_list_cache_invalidation_stamp(key: tuple) -> tuple[int, int]:

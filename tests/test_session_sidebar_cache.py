@@ -543,6 +543,43 @@ def test_session_list_cache_invalidated_on_session_list_publish(monkeypatch):
     assert routes._session_list_cache_get(key_b)[0] is not None
 
 
+def test_session_list_cache_invalidation_keeps_stale_payload_for_background_refresh(
+    monkeypatch,
+):
+    monkeypatch.setattr(routes, "_session_list_cache_source_stamp", lambda _key: ("stable",))
+    routes._session_list_cache_clear()
+
+    key = routes._session_list_cache_key(
+        active_profile="profile-a",
+        all_profiles=False,
+        show_cli_sessions=False,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+    stale_payload = _session_cache_payload("stale")
+    routes._session_list_cache_set(key, stale_payload)
+    routes._session_list_cache_mark_stale("profile-a")
+
+    cached, is_fresh = routes._session_list_cache_get(key, allow_stale=True)
+    assert cached == stale_payload
+    assert is_fresh is False
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def builder():
+        started.set()
+        release.wait(1.0)
+        return _session_cache_payload("fresh")
+
+    try:
+        result = routes._get_cached_session_list_payload(key=key, builder=builder)
+        assert result == stale_payload
+        assert started.wait(1.0)
+    finally:
+        release.set()
+
+
 def test_session_list_cache_rebuild_retries_after_invalidation():
     routes._session_list_cache_clear()
 
@@ -566,6 +603,62 @@ def test_session_list_cache_rebuild_retries_after_invalidation():
 
     assert payload == _session_cache_payload("fresh")
     assert calls == ["build", "build"]
+
+
+def test_session_list_cache_can_serve_one_invalidated_build_without_retry():
+    routes._session_list_cache_clear()
+
+    key = routes._session_list_cache_key(
+        active_profile="profile-a",
+        all_profiles=False,
+        show_cli_sessions=False,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+    calls = []
+
+    def builder():
+        calls.append("build")
+        routes._session_list_cache_clear("profile-a")
+        return _session_cache_payload("first-build")
+
+    payload = routes._get_cached_session_list_payload(
+        key=key,
+        builder=builder,
+        retry_on_invalidation=False,
+    )
+
+    assert payload == _session_cache_payload("first-build")
+    assert calls == ["build"]
+
+
+def test_session_list_cache_keeps_last_payload_after_repeated_invalidations():
+    routes._session_list_cache_clear()
+
+    key = routes._session_list_cache_key(
+        active_profile="profile-a",
+        all_profiles=False,
+        show_cli_sessions=False,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+    calls = []
+
+    def builder():
+        calls.append("build")
+        routes._session_list_cache_clear("profile-a")
+        return _session_cache_payload(f"attempt-{len(calls)}")
+
+    payload = routes._get_cached_session_list_payload(key=key, builder=builder)
+
+    assert payload == _session_cache_payload("attempt-3")
+    assert calls == ["build", "build", "build"]
+
+    # The bounded retry must leave a usable cache entry; otherwise every
+    # request repeats all three expensive rebuild attempts forever.
+    payload = routes._get_cached_session_list_payload(key=key, builder=builder)
+    assert payload == _session_cache_payload("attempt-3")
+    assert calls == ["build", "build", "build"]
 
 
 def test_session_list_cache_source_stamp_tracks_projection_generation(tmp_path, monkeypatch):
