@@ -290,6 +290,11 @@ def _payload_for_rows_webui(
     monkeypatch.setattr(
         routes, "prune_session_from_index", lambda sid: pruned.append(sid)
     )
+    monkeypatch.setattr(
+        routes,
+        "_schedule_imported_orphan_prune",
+        lambda ids: pruned.extend(sorted(ids)),
+    )
 
     payload = routes._build_session_list_cache_payload(
         active_profile="default",

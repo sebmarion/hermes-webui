@@ -11538,8 +11538,8 @@ _SETTINGS_DEFAULTS = {
     "show_busy_placeholder_hint": False,  # opt-in busy composer placeholder hint
     "hide_empty_state_suggestions": False,  # hide the default new-chat suggestion buttons
     "new_chat_on_workspace_switch": False,  # #5473 opt-in: switching to a DIFFERENT workspace starts a new chat (leaving the current conversation on its original workspace) instead of mutating the current session's workspace in place. Default OFF preserves the shipped in-place-switch behavior.
-    "virtualize_transcript": False,  # #4343: virtualize long (>80 msg) transcripts. EXPERIMENTAL, opt-IN (default OFF). Was opt-out/default-on in #4325 but caused scroll-up flicker on long sessions with tall tool-call rows (variable-height anchor oscillation) — flipped off for everyone in #4343; re-enabling requires an explicit opt-in (see virtualize_transcript_optin migration in load_settings).
-    "virtualize_transcript_optin": False,  # #4343 migration marker: True only once the user explicitly enables virtualize_transcript AFTER the default-off flip. A stored virtualize_transcript=True WITHOUT this marker is a stale pre-flip value and is reset to False on load (force-off-for-everyone migration).
+    "virtualize_transcript": True,  # Virtualize long (>80 msg) transcripts by default so historical sessions keep a bounded DOM. Users can opt out in Preferences.
+    "virtualize_transcript_optin": False,  # Legacy marker retained so older settings files remain schema-compatible.
     "show_tps": False,  # show tokens-per-second chip in assistant message headers
     "fade_text_effect": False,  # animate newly streamed words with a lightweight fade-in effect
     "show_cli_sessions": True,  # merge CLI/TUI/messaging sessions from state.db into the sidebar by default (#3988); established installs are grandfathered OFF by the load_settings backfill
@@ -11797,17 +11797,10 @@ def load_settings() -> dict:
             bool(stored.get("onboarding_completed")) or _established_keys
         ):
             settings["show_cli_sessions"] = False
-        # Force-off-for-everyone migration for virtualize_transcript (#4343).
-        # The feature shipped opt-OUT/default-on in #4325, then proved to
-        # cause scroll-up flicker on long sessions (variable-height anchor
-        # oscillation). It is now EXPERIMENTAL/opt-IN (default off). Any
-        # stored virtualize_transcript=True from the #4325 window is a stale
-        # pre-flip value and must be reset to off, so 100% of existing users
-        # land on off — re-enabling requires an explicit opt-in made AFTER
-        # the flip, which writes virtualize_transcript_optin=True alongside.
-        # Honor a stored True only when that marker is present.
-        if not bool(stored.get("virtualize_transcript_optin")):
-            settings["virtualize_transcript"] = False
+        # Historical installs that do not carry the preference inherit the
+        # bounded-DOM default above; an explicit stored False remains an opt
+        # out.  The old opt-in marker is intentionally ignored but retained in
+        # the schema for backwards-compatible settings round-trips.
     settings["theme"], settings["skin"] = _normalize_appearance(
         stored.get("theme") if isinstance(stored, dict) else settings.get("theme"),
         stored.get("skin") if isinstance(stored, dict) else settings.get("skin"),

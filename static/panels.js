@@ -951,28 +951,48 @@ function _gatewayStatusReason(status) {
   return typeof health.reason === 'string' ? health.reason.trim() : '';
 }
 
-function _cronGatewayNoticeHtml(status) {
-  if (!status || (status.configured && status.running)) return '';
+function _gatewayStatusKind(status) {
+  if (!status || !status.configured) return 'unconfigured';
+  const health = status && typeof status.health === 'object' ? status.health : {};
+  const admission = String(
+    health.admission_effective_state || health.admission_state || ''
+  ).trim().toLowerCase();
+  const drainRequested = health.drain_requested === true || health.admission_rejection_requested === true;
+  if (['rejecting_new_work', 'draining', 'drain_requested', 'fenced', 'pair-gated', 'checkpoint-fenced', 'checkpoint-stopping', 'stopping'].includes(admission) || drainRequested) {
+    return 'drained';
+  }
   const reason = _gatewayStatusReason(status);
-  const isStaleMetadata = reason === 'gateway_stale_running_state';
-  const isRemoteUnreachable = reason === 'remote_gateway_unreachable';
-  const notConfigured = !status.configured;
-  const title = notConfigured
+  if (reason === 'remote_gateway_unreachable') return 'unreachable';
+  if (reason === 'gateway_stale_running_state' || reason === 'gateway_status_unavailable' || health.state === 'unknown' || health.state === 'degraded') {
+    return 'degraded';
+  }
+  if (status.running) return 'ready';
+  return 'stopped';
+}
+
+function _cronGatewayNoticeHtml(status) {
+  const kind = _gatewayStatusKind(status);
+  if (kind === 'ready') return '';
+  const title = kind === 'unconfigured'
     ? 'Gateway not configured'
-    : isStaleMetadata
-      ? 'Gateway metadata stale'
-      : isRemoteUnreachable
+    : kind === 'drained'
+      ? 'Gateway is draining'
+      : kind === 'degraded'
+        ? 'Gateway health degraded'
+        : kind === 'unreachable'
         ? 'Gateway endpoint not reachable'
         : 'Gateway not running';
-  const body = notConfigured
+  const body = kind === 'unconfigured'
     ? 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon. If this is a single-container Docker install, jobs can be created and run manually here, but scheduled ticks need a gateway container or `hermes gateway` running outside the WebUI.'
-    : isStaleMetadata
-      ? 'The gateway is marked as configured, but its health metadata has gone stale. In Docker, scheduled jobs require a live gateway daemon that refreshes runtime metadata while ticking cron.'
-      : isRemoteUnreachable
+    : kind === 'drained'
+      ? 'The gateway is reachable but is currently rejecting new work while it drains. Scheduled ticks will resume after admission reopens.'
+      : kind === 'degraded'
+        ? 'The gateway is marked as configured, but its health metadata has gone stale. In Docker, scheduled jobs require a live gateway daemon that refreshes runtime metadata while ticking cron.'
+        : kind === 'unreachable'
         ? 'The gateway health endpoint is not reachable from WebUI. Verify the configured gateway URL env var (`GATEWAY_HEALTH_URL`, `HERMES_GATEWAY_HEALTH_URL`, `HERMES_API_URL`, or `HERMES_WEBUI_GATEWAY_BASE_URL`) points to a reachable gateway service and network path before relying on cron ticking.'
         : 'In Hermes WebUI, scheduled jobs require the Hermes gateway daemon to be running. Start the gateway container or `hermes gateway` before relying on offline scheduled runs.';
   const docsHref = 'https://github.com/nesquena/hermes-webui/blob/master/docs/docker.md#scheduled-jobs-and-the-gateway-daemon';
-  const helpLink = notConfigured || isRemoteUnreachable || isStaleMetadata
+  const helpLink = kind === 'unconfigured' || kind === 'unreachable' || kind === 'degraded'
     ? `<p><a href="${docsHref}" target="_blank" rel="noopener">How to enable scheduled jobs in Docker ↗</a></p>`
     : '';
   return `
@@ -9223,10 +9243,9 @@ async function loadSettingsPanel(){
     }
     const virtualizeTranscriptCb=$('settingsVirtualizeTranscript');
     if(virtualizeTranscriptCb){
-      // #4343: EXPERIMENTAL/opt-IN, default OFF. Honor a stored true only when
-      // it came from an explicit post-flip opt-in (===true); a pre-flip true is
-      // already reset to false server-side by the load_settings migration.
-      virtualizeTranscriptCb.checked=settings.virtualize_transcript===true;
+      // Keep the long-transcript render window enabled unless the user has
+      // explicitly opted out in Preferences.
+      virtualizeTranscriptCb.checked=settings.virtualize_transcript!==false;
       window._virtualizeTranscript=virtualizeTranscriptCb.checked;
       virtualizeTranscriptCb.addEventListener('change',()=>{
         window._virtualizeTranscript=virtualizeTranscriptCb.checked;
@@ -13048,23 +13067,25 @@ function _gatewayActionButton(action){
 }
 function _gatewayActionControls(r){
   const actions=(r&&r.running)?['stop','restart']:['start'];
-  return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">${actions.map(_gatewayActionButton).join('')}</div>`;
+  return `<div class="gateway-action-controls">${actions.map(_gatewayActionButton).join('')}</div>`;
 }
 function _renderGatewayStatus(r){
   const card=$('gatewayStatusCard');
   if(!card||!r) return;
-  if(!r.configured){
+  const kind = _gatewayStatusKind(r);
+  if(kind === 'unconfigured'){
     card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#f59e0b;display:inline-block"></span>${esc(t('gateway_not_configured'))}</div>${_gatewayActionControls(r)}`;
     return;
   }
-  if(!r.running){
-    const reason = _gatewayStatusReason(r);
-    const statusLabel = reason === 'gateway_stale_running_state'
-      ? t('gateway_metadata_stale')
-      : reason === 'remote_gateway_unreachable'
-        ? t('gateway_endpoint_unreachable')
-        : t('gateway_not_running');
-    card.innerHTML=`<div style="color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px"><span style="width:8px;height:8px;border-radius:50%;background:#ef4444;display:inline-block"></span>${esc(statusLabel)}</div>${_gatewayActionControls(r)}`;
+  if(kind !== 'ready'){
+    const statusLabel = kind === 'drained'
+      ? 'Gateway is draining'
+      : kind === 'degraded'
+        ? t('gateway_metadata_stale')
+        : kind === 'unreachable'
+          ? t('gateway_endpoint_unreachable')
+          : t('gateway_not_running');
+    card.innerHTML=`<div class="gateway-status-state gateway-status-state--${kind}"><span class="gateway-status-dot" aria-hidden="true"></span>${esc(statusLabel)}</div>${_gatewayActionControls(r)}`;
     return;
   }
   const platformIcons={telegram:'💬',discord:'🎮',slack:'📝',web:'🌐',api:'🔌'};

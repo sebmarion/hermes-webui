@@ -139,7 +139,7 @@ def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_err
     assert payload["session"]["session_id"] == new_sid
     assert payload["old_session_id"] == old_sid
     assert payload["new_session_id"] == new_sid
-    assert payload["recommended_recovery_action"] == "reduce_current_request"
+    assert payload["recommended_recovery_action"] == "start_focused_continuation"
     assert payload["compression_recovery"]["terminal_state"] == "compression_exhausted"
     assert payload["compression_recovery"]["source_session_id"] == new_sid
 
@@ -151,10 +151,10 @@ def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_err
     assert new_payload["session_id"] == new_sid
     assert new_payload["parent_session_id"] == old_sid
     assert new_payload["pre_compression_snapshot"] is False
-    assert new_payload["recommended_recovery_action"] == "reduce_current_request"
-    assert new_payload["compression_recovery"]["recommended_action"] == "reduce_current_request"
+    assert new_payload["recommended_recovery_action"] == "start_focused_continuation"
+    assert new_payload["compression_recovery"]["recommended_action"] == "start_focused_continuation"
     assert new_payload["messages"][-1]["_error"] is True
-    assert new_payload["messages"][-1]["_compressionRecovery"]["recommended_action"] == "reduce_current_request"
+    assert new_payload["messages"][-1]["_compressionRecovery"]["recommended_action"] == "start_focused_continuation"
     assert "Context compression exhausted" in new_payload["messages"][-1]["content"]
     assert not any(
         "Context budget rejected locally: compaction_made_no_progress." in str(message.get("content") or "")
@@ -449,8 +449,8 @@ def test_apperror_payload_enriched_before_enqueue(tmp_path, monkeypatch):
     assert payload_after["session_id"] == new_sid
     assert payload_after["old_session_id"] == old_sid
     assert payload_after["new_session_id"] == new_sid
-    assert payload_after["recommended_recovery_action"] == "reduce_current_request"
-    assert payload_after["compression_recovery"]["recommended_action"] == "reduce_current_request"
+    assert payload_after["recommended_recovery_action"] == "start_focused_continuation"
+    assert payload_after["compression_recovery"]["recommended_action"] == "start_focused_continuation"
 
 
 def test_exception_apperror_payload_includes_session_id_before_enqueue():

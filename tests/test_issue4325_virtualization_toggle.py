@@ -1,15 +1,12 @@
-"""Regression coverage for transcript virtualization preference (#4325 + #4343).
+"""Regression coverage for the bounded transcript render preference.
 
 The stream-end freeze/jump fix (#4328, semantic viewport anchoring) is covered by
 test_issue500_message_list_virtualization.py. This file covers the Preferences
 toggle and its #4343 contract change:
 
-- #4325 added an opt-OUT toggle (default ON).
-- #4343 flipped it to EXPERIMENTAL / opt-IN (default OFF) because virtualization
-  caused a scroll-up flicker on long sessions, with a force-off-for-everyone
-  migration: a stored virtualize_transcript=True from the #4325 window is reset
-  to off unless an explicit post-flip opt-in marker (virtualize_transcript_optin)
-  is present.
+- Long transcripts now render through the existing bounded window by default.
+- The preference remains an explicit opt-out for users who need browser Find to
+  cover every historical node.
 """
 import json
 from pathlib import Path
@@ -25,32 +22,27 @@ I18N = REPO_ROOT / "static" / "i18n.js"
 CONFIG = REPO_ROOT / "api" / "config.py"
 
 
-def test_virtualize_transcript_setting_is_default_off_and_allowed():
-    """#4343 opt-IN model: default False (virtualization off), bool-allowlisted,
-    plus the opt-in migration marker."""
+def test_virtualize_transcript_setting_is_default_on_and_allowed():
+    """Bounded transcript rendering is the default and remains bool-allowlisted."""
     src = CONFIG.read_text(encoding="utf-8")
-    assert '"virtualize_transcript": False' in src, "must default OFF (experimental/opt-in)"
+    assert '"virtualize_transcript": True' in src, "must default ON for bounded transcript DOM"
     assert '"virtualize_transcript",' in src, "must be in _SETTINGS_BOOL_KEYS"
     assert '"virtualize_transcript_optin": False' in src, "opt-in migration marker must exist + default False"
     assert '"virtualize_transcript_optin",' in src, "opt-in marker must be in _SETTINGS_BOOL_KEYS"
 
 
-def test_settings_preferences_expose_virtualize_toggle_experimental():
+def test_settings_preferences_expose_virtualize_toggle():
     html = INDEX.read_text(encoding="utf-8")
     assert 'id="settingsVirtualizeTranscript"' in html
     assert 'data-i18n="settings_label_virtualize_transcript"' in html
     assert 'data-i18n="settings_desc_virtualize_transcript"' in html
-    # #4343: checkbox must NOT render checked by default (opt-in, default off).
-    cb_line = next(l for l in html.splitlines() if 'id="settingsVirtualizeTranscript"' in l)
-    assert "checked" not in cb_line, "opt-in toggle must not be pre-checked"
+    assert "Virtualize long transcripts" in html
 
 
-def test_boot_applies_saved_virtualize_preference_default_off():
+def test_boot_applies_saved_virtualize_preference_default_on():
     js = BOOT.read_text(encoding="utf-8")
-    # #4343 default-off semantics: ===true (only an explicit true enables it).
-    assert "window._virtualizeTranscript=s.virtualize_transcript===true" in js
-    # Settings-load-failed fallback also defaults OFF.
-    assert "window._virtualizeTranscript=false" in js
+    assert "window._virtualizeTranscript=s.virtualize_transcript!==false" in js
+    assert "window._virtualizeTranscript=true" in js
 
 
 def test_ui_gate_forces_full_render_when_disabled():
@@ -65,10 +57,9 @@ def test_panels_round_trip_and_hot_apply_virtualize_toggle():
     js = PANELS.read_text(encoding="utf-8")
     assert "const virtualizeTranscriptCb=$('settingsVirtualizeTranscript');" in js
     assert "payload.virtualize_transcript=virtualizeTranscriptCb.checked;" in js
-    # #4343: enabling records the explicit post-flip opt-in marker.
+    # Keep the legacy marker in the payload for settings-file compatibility.
     assert "payload.virtualize_transcript_optin=virtualizeTranscriptCb.checked;" in js
-    # #4343: checkbox load honors only an explicit opt-in (===true), not !==false.
-    assert "virtualizeTranscriptCb.checked=settings.virtualize_transcript===true;" in js
+    assert "virtualizeTranscriptCb.checked=settings.virtualize_transcript!==false;" in js
     assert "window._virtualizeTranscript=virtualizeTranscriptCb.checked;" in js
     # Hot-apply: toggling re-renders the open transcript immediately.
     assert "renderMessages({preserveScroll:true})" in js
@@ -97,19 +88,18 @@ def _write(sf, payload):
     sf.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def test_migration_unset_defaults_off(_settings_env):
-    """No stored value (fresh / pre-#4325 install) → off."""
+def test_migration_unset_defaults_on(_settings_env):
+    """No stored value inherits the bounded-DOM default."""
     config, sf = _settings_env
     _write(sf, {"onboarding_completed": True})
-    assert config.load_settings()["virtualize_transcript"] is False
+    assert config.load_settings()["virtualize_transcript"] is True
 
 
-def test_migration_stale_pre_flip_true_is_reset_off(_settings_env):
-    """A stored virtualize_transcript=True from the #4325 window WITHOUT the
-    opt-in marker is stale → force-reset to off for everyone."""
+def test_migration_stored_true_remains_on(_settings_env):
+    """An existing true preference remains enabled."""
     config, sf = _settings_env
     _write(sf, {"onboarding_completed": True, "virtualize_transcript": True})
-    assert config.load_settings()["virtualize_transcript"] is False
+    assert config.load_settings()["virtualize_transcript"] is True
 
 
 def test_migration_explicit_post_flip_optin_is_honored(_settings_env):

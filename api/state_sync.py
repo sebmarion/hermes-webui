@@ -427,6 +427,28 @@ def _ensure_shared_pinned_column(db) -> None:
         logger.debug("Failed to ensure state.db sessions.pinned column", exc_info=True)
 
 
+def _ensure_shared_archived_column(db) -> None:
+    """Add the shared archive bit to older Hermes Agent state databases."""
+    execute_write = getattr(db, "_execute_write", None)
+    if not callable(execute_write):
+        return
+
+    def _write(conn):
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "archived" not in columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
+            )
+
+    try:
+        execute_write(_write)
+    except Exception:
+        logger.debug("Failed to ensure state.db sessions.archived column", exc_info=True)
+
+
 def _set_shared_pinned(db, session_id: str, pinned: bool) -> None:
     """Persist a pin using the Agent API when available, else additive SQL."""
     setter = getattr(db, "set_session_pinned", None)
@@ -504,6 +526,7 @@ def sync_session_start(session_id: str, model=None, profile: Optional[str] = Non
             model=model,
         )
         _ensure_shared_pinned_column(db)
+        _ensure_shared_archived_column(db)
     except Exception:
         logger.debug("Failed to sync session start to state.db")
     finally:
@@ -653,6 +676,80 @@ def _sync_compression_lineage_field(db, session_id: str, field: str, value) -> b
         return False
 
 
+def _sync_session_metadata_sqlite_fallback(
+    db_path: Path | None,
+    session_id: str,
+    *,
+    title: Optional[str] = None,
+    cwd: Optional[str] = None,
+    archived: Optional[bool] = None,
+    pinned: Optional[bool] = None,
+) -> bool:
+    """Apply safe metadata updates when an older state schema cannot open.
+
+    Some gateway deployments expose a deliberately small ``sessions`` table
+    while the full Agent ``SessionDB`` schema is being upgraded. Metadata
+    mutations must not disappear just because the richer wrapper rejects that
+    database. Only additive columns and allowlisted scalar fields are touched;
+    transcript tables are never read or rewritten here.
+    """
+    if db_path is None or not session_id:
+        return False
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=_ACTIVITY_SQLITE_TIMEOUT_SECONDS)
+        conn.execute(
+            f"PRAGMA busy_timeout={int(_ACTIVITY_SQLITE_TIMEOUT_SECONDS * 1000)}"
+        )
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "id" not in columns:
+            return False
+        if archived is not None and "archived" not in columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"
+            )
+            columns.add("archived")
+        if pinned is not None and "pinned" not in columns:
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+            )
+            columns.add("pinned")
+        updates: dict[str, object] = {}
+        if title is not None and "title" in columns:
+            updates["title"] = str(title).strip() or None
+        if cwd is not None and "cwd" in columns:
+            updates["cwd"] = str(cwd)
+        if archived is not None and "archived" in columns:
+            updates["archived"] = 1 if archived else 0
+        if pinned is not None and "pinned" in columns:
+            updates["pinned"] = 1 if pinned else 0
+        if not updates:
+            return False
+        assignments = ", ".join(f"{name} = ?" for name in updates)
+        cursor = conn.execute(
+            f"UPDATE sessions SET {assignments} WHERE id = ?",
+            (*updates.values(), session_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+    except Exception:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        logger.debug("Failed to sync metadata through SQLite compatibility path", exc_info=True)
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def sync_session_metadata(
     session_id: str,
     *,
@@ -665,7 +762,14 @@ def sync_session_metadata(
     """Update shared conversation metadata without touching usage counters."""
     db = _get_state_db(profile=profile)
     if not db:
-        return False
+        return _sync_session_metadata_sqlite_fallback(
+            _get_state_db_path(profile),
+            session_id,
+            title=title,
+            cwd=cwd,
+            archived=archived,
+            pinned=pinned,
+        )
     try:
         db.ensure_session(session_id=session_id, source="webui")
         if pinned is not None:
@@ -675,8 +779,15 @@ def sync_session_metadata(
                 db, session_id, "pinned", 1 if pinned else 0
             )
         if cwd is not None:
-            db.update_session_cwd(session_id, str(cwd))
+            try:
+                db.update_session_cwd(session_id, str(cwd))
+            except Exception:
+                # Older state databases may not carry the optional workspace
+                # column; a missing display hint must not suppress archive or
+                # title metadata in the same mutation.
+                logger.debug("Failed to sync shared session workspace", exc_info=True)
         if archived is not None:
+            _ensure_shared_archived_column(db)
             setter = getattr(db, "set_session_archived", None)
             if callable(setter):
                 setter(session_id, bool(archived))
@@ -730,6 +841,7 @@ def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=
     try:
         # Ensure session exists first (idempotent)
         db.ensure_session(session_id=session_id, source='webui', model=model)
+        _ensure_shared_archived_column(db)
         if pinned is not None:
             _ensure_shared_pinned_column(db)
             try:
@@ -745,6 +857,7 @@ def sync_session_usage(session_id: str, input_tokens: int=0, output_tokens: int=
             except Exception:
                 logger.debug("Failed to sync session workspace to state.db")
         if archived is not None:
+            _ensure_shared_archived_column(db)
             try:
                 db.set_session_archived(session_id, bool(archived))
             except Exception:
@@ -875,6 +988,7 @@ def sync_session_archived(
         return
     try:
         db.ensure_session(session_id=session_id, source="webui")
+        _ensure_shared_archived_column(db)
         setter = getattr(db, "set_session_archived", None)
         if callable(setter):
             setter(session_id, bool(archived))

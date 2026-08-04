@@ -199,6 +199,7 @@ _SESSION_INDEX_REBUILD_THREAD_TARGET: tuple[Path, Path] | None = None
 # WebUI sidebar polling path is single-process) but must wrap the WHOLE
 # load-modify-write/unlink sequence in both helpers.
 _WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_LOCK = threading.Lock()
+_IMPORTED_ORPHAN_TOMBSTONE_LOCK = threading.Lock()
 _WEBUI_DELETED_SESSION_TOMBSTONE_LOCK = threading.Lock()
 
 # Path-safety contract for session IDs.  Accept alphanumerics, underscore, and
@@ -522,6 +523,60 @@ def prune_session_from_index(session_id: str) -> None:
         _write_session_index(updates=None)
 
 
+def prune_sessions_from_index(session_ids) -> None:
+    """Remove a batch of session rows with one index read/write cycle.
+
+    Imported-session repair can discover many stale sidecars in one sidebar
+    pass.  Keeping the batch operation at the index boundary prevents one
+    full JSON rewrite and fsync per sid, while the single-item helper above
+    remains available to callers that genuinely mutate one row.
+    """
+    sids = {
+        str(session_id or "").strip()
+        for session_id in (session_ids or [])
+        if str(session_id or "").strip()
+    }
+    if not sids or not SESSION_INDEX_FILE.exists():
+        return
+    tmp = SESSION_INDEX_FILE.with_suffix(
+        f'.tmp.{os.getpid()}.{threading.current_thread().ident}'
+    )
+
+    fallback = False
+    with _INDEX_WRITE_LOCK:
+        try:
+            with LOCK:
+                existing = json.loads(SESSION_INDEX_FILE.read_bytes())
+                if not isinstance(existing, list):
+                    raise ValueError("session index must be a list")
+                pruned = [
+                    entry
+                    for entry in existing
+                    if str(entry.get('session_id') or '') not in sids
+                ]
+                if len(pruned) == len(existing):
+                    return
+                payload = json.dumps(pruned, ensure_ascii=False, indent=2)
+
+            try:
+                with open(tmp, 'w', encoding='utf-8') as f:
+                    f.write(payload)
+                    f.flush()
+                    os.fsync(f.fileno())
+                _safe_replace(tmp, SESSION_INDEX_FILE)
+            except Exception:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                raise
+        except Exception:
+            fallback = True
+
+    if fallback:
+        _write_session_index(updates=None)
+
+
 # ---------------------------------------------------------------------------
 # #4985 webui zero-message orphan tombstone
 # ---------------------------------------------------------------------------
@@ -553,6 +608,8 @@ def prune_session_from_index(session_id: str) -> None:
 
 WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_CAP = 500
 WEBUI_ZERO_MESSAGE_ORPHAN_TOMBSTONE_VERSION = 1
+IMPORTED_ORPHAN_TOMBSTONE_CAP = 1000
+IMPORTED_ORPHAN_TOMBSTONE_VERSION = 1
 WEBUI_DELETED_SESSION_TOMBSTONE_CAP = 1000
 WEBUI_DELETED_SESSION_TOMBSTONE_VERSION = 1
 
@@ -714,6 +771,115 @@ def _clear_webui_zero_message_orphan_tombstone(sid: str) -> None:
         except Exception:
             logger.debug(
                 "Failed to remove empty webui zero-message orphan tombstone",
+                exc_info=True,
+            )
+
+
+def _imported_orphan_tombstone_file() -> "Path":
+    """Return the profile-local tombstone for pruned imported sidecars."""
+    return SESSION_DIR / "_pruned_imported_orphans.json"
+
+
+def _load_imported_orphan_tombstone() -> frozenset[str]:
+    """Return imported sidecars whose backing state row was pruned."""
+    p = _imported_orphan_tombstone_file()
+    if not p.exists():
+        return frozenset()
+    try:
+        raw = json.loads(p.read_text(encoding='utf-8'))
+    except Exception:
+        logger.debug("Failed to load imported orphan tombstone", exc_info=True)
+        return frozenset()
+    if not isinstance(raw, dict):
+        return frozenset()
+    try:
+        if int(raw.get("version", 0)) != IMPORTED_ORPHAN_TOMBSTONE_VERSION:
+            return frozenset()
+    except (TypeError, ValueError):
+        return frozenset()
+    ids = raw.get("ids", [])
+    if not isinstance(ids, list):
+        return frozenset()
+    return frozenset(
+        str(sid).strip() for sid in ids if str(sid or "").strip()
+    )
+
+
+def _save_imported_orphan_tombstone(ids) -> None:
+    """Persist imported orphan ids atomically with a bounded size."""
+    try:
+        sorted_ids = sorted(set(
+            str(sid).strip() for sid in (ids or []) if str(sid or "").strip()
+        ))
+    except TypeError:
+        return
+    if len(sorted_ids) > IMPORTED_ORPHAN_TOMBSTONE_CAP:
+        sorted_ids = sorted_ids[-IMPORTED_ORPHAN_TOMBSTONE_CAP:]
+    payload = {
+        "version": IMPORTED_ORPHAN_TOMBSTONE_VERSION,
+        "ids": sorted_ids,
+    }
+    p = _imported_orphan_tombstone_file()
+    tmp = None
+    try:
+        SESSION_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(
+            f'.tmp.{os.getpid()}.{threading.current_thread().ident}'
+        )
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    except Exception:
+        logger.debug("Failed to save imported orphan tombstone", exc_info=True)
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _record_imported_orphan_tombstones(session_ids) -> None:
+    """Remember missing imported rows with one tombstone read/write cycle."""
+    ids = {
+        str(session_id or "").strip()
+        for session_id in (session_ids or [])
+        if str(session_id or "").strip()
+    }
+    if not ids:
+        return
+    with _IMPORTED_ORPHAN_TOMBSTONE_LOCK:
+        current = set(_load_imported_orphan_tombstone())
+        updated = current | ids
+        if updated == current:
+            return
+        _save_imported_orphan_tombstone(updated)
+
+
+def _record_imported_orphan_tombstone(sid: str) -> None:
+    """Remember one missing imported backing row."""
+    _record_imported_orphan_tombstones((sid,))
+
+
+def _clear_imported_orphan_tombstone(sid: str) -> None:
+    """Forget an imported orphan when its session is legitimately recreated."""
+    sid = str(sid or "").strip()
+    if not sid:
+        return
+    with _IMPORTED_ORPHAN_TOMBSTONE_LOCK:
+        current = set(_load_imported_orphan_tombstone())
+        if sid not in current:
+            return
+        current.discard(sid)
+        if current:
+            _save_imported_orphan_tombstone(current)
+            return
+        try:
+            _imported_orphan_tombstone_file().unlink(missing_ok=True)
+        except Exception:
+            logger.debug(
+                "Failed to remove empty imported orphan tombstone",
                 exc_info=True,
             )
 
@@ -1657,10 +1823,9 @@ class Session:
         if not skip_index:
             _write_session_index(updates=[self])
 
-        # #4985 belt-and-suspenders self-heal: a successful save with at
-        # least one real message on the sidecar is unconditional proof the
-        # row is alive (the #4985 "zero-message orphan" only ever exists
-        # when ``len(self.messages) == 0``). Clear the tombstone so the
+        # #4985/#3238 belt-and-suspenders self-heal: a successful save with
+        # at least one real message on the sidecar is unconditional proof the
+        # row is alive. Clear either orphan tombstone so the
         # next ``/api/sessions`` poll does not need the prune helper to
         # run before the row re-appears — useful when the message-commit
         # happens on a poll that does not yet see state.db.messages rows
@@ -1673,6 +1838,7 @@ class Session:
         if self.messages:
             try:
                 _clear_webui_zero_message_orphan_tombstone(self.session_id)
+                _clear_imported_orphan_tombstone(self.session_id)
                 _clear_webui_deleted_session_tombstone(self.session_id)
             except Exception:
                 logger.debug(
@@ -4998,13 +5164,14 @@ def new_session(workspace=None, model=None, profile=None, model_provider=None, p
         worktree_created_at=wt.get('created_at') if wt else None,
         enabled_toolsets=enabled_toolsets,
     )
-    # #4985: defensive — auto-generated uuids don't collide with the
-    # tombstone, but if a future caller ever passes an explicit id that
-    # was previously pruned, clear the entry so the new session isn't
+    # #4985/#3238: defensive — auto-generated uuids don't collide with the
+    # tombstones, but if a future caller ever passes an explicit id that
+    # was previously pruned, clear the entries so the new session isn't
     # shadowed on the next poll. Wrapped because a tombstone failure
     # must never block new-session creation.
     try:
         _clear_webui_zero_message_orphan_tombstone(s.session_id)
+        _clear_imported_orphan_tombstone(s.session_id)
         _clear_webui_deleted_session_tombstone(s.session_id)
     except Exception:
         logger.debug(
@@ -6361,24 +6528,49 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
             with LOCK:
                 in_memory_ids = set(SESSIONS.keys())
             persisted_ids = _persisted_session_ids_snapshot()
-            if not index and _session_dir_has_persisted_session_files():
-                raise ValueError("empty session index while session files exist")
+            # #3238/#4591: imported sidecars whose backing state.db row was
+            # already proven absent stay out of recovery. Unlike the WebUI
+            # zero-message tombstone below, this is a hard filter: live CLI
+            # rows and explicit imports clear it before a future recovery.
+            imported_orphan_tombstones = _load_imported_orphan_tombstone()
+            has_non_tombstoned_persisted_files = None
+            if not index:
+                has_non_tombstoned_persisted_files = any(
+                    p.stem not in imported_orphan_tombstones
+                    for p in SESSION_DIR.glob('*.json')
+                    if not p.name.startswith('_')
+                )
+                if has_non_tombstoned_persisted_files:
+                    raise ValueError("empty session index while session files exist")
             index = [
                 s for s in index
                 if (
-                    str(s.get('session_id') or '') in in_memory_ids
-                    or (
-                        persisted_ids is not None
-                        and str(s.get('session_id') or '') in persisted_ids
-                    )
-                    or (
-                        persisted_ids is None
-                        and _index_entry_exists(s.get('session_id'), in_memory_ids=in_memory_ids)
+                    str(s.get('session_id') or '') not in imported_orphan_tombstones
+                    and (
+                        str(s.get('session_id') or '') in in_memory_ids
+                        or (
+                            persisted_ids is not None
+                            and str(s.get('session_id') or '') in persisted_ids
+                        )
+                        or (
+                            persisted_ids is None
+                            and _index_entry_exists(
+                                s.get('session_id'),
+                                in_memory_ids=in_memory_ids,
+                            )
+                        )
                     )
                 )
             ]
-            if not index and _session_dir_has_persisted_session_files():
-                raise ValueError("session index has no live rows while session files exist")
+            if not index:
+                if has_non_tombstoned_persisted_files is None:
+                    has_non_tombstoned_persisted_files = any(
+                        p.stem not in imported_orphan_tombstones
+                        for p in SESSION_DIR.glob('*.json')
+                        if not p.name.startswith('_')
+                    )
+                if has_non_tombstoned_persisted_files:
+                    raise ValueError("session index has no live rows while session files exist")
             backfilled = []
             for i, s in enumerate(index):
                 if 'last_message_at' not in s:
@@ -6409,6 +6601,8 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
             with LOCK:
                 live_sessions = list(SESSIONS.values())
             for s in live_sessions:
+                if s.session_id in imported_orphan_tombstones:
+                    continue
                 index_map[s.session_id] = s.compact(
                     include_runtime=True,
                     active_stream_ids=active_stream_ids,
@@ -6418,7 +6612,11 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
                 indexed_ids = {str(sid) for sid in index_map.keys() if sid}
                 missing_persisted_ids = sorted(
                     str(sid) for sid in persisted_ids
-                    if sid and str(sid) not in indexed_ids
+                    if (
+                        sid
+                        and str(sid) not in indexed_ids
+                        and str(sid) not in imported_orphan_tombstones
+                    )
                 )
             # #4985: the tombstone is intentionally NOT a blind-drop filter
             # on missing_persisted_ids. A tombstoned sid whose sidecar is
@@ -6516,8 +6714,13 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
     # helper clears the tombstone and the row stays visible. A blind-drop
     # here would be strictly worse than the orphan it suppresses — silently
     # swallowing a legitimately-resurfaced row forever.
+    # #3238/#4591 imported-orphan tombstones are the deliberate exception:
+    # their backing state row was already probed as absent, and explicit
+    # import/save paths clear the entry when that id is legitimately reused.
+    imported_orphan_tombstones = _load_imported_orphan_tombstone()
     for p in SESSION_DIR.glob('*.json'):
-        if p.name.startswith('_'): continue
+        if p.name.startswith('_') or p.stem in imported_orphan_tombstones:
+            continue
         try:
             s = Session.load(p.stem)
             if s: out.append(s)
@@ -6525,6 +6728,8 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
             logger.debug("Failed to load session from %s", p)
     _diag_stage(diag, "all_sessions.full_scan_overlay")
     for s in SESSIONS.values():
+        if s.session_id in imported_orphan_tombstones:
+            continue
         if all(s.session_id != x.session_id for x in out): out.append(s)
     _diag_stage(diag, "all_sessions.full_scan_sort_filter")
     out.sort(key=lambda s: (getattr(s, 'pinned', False), _session_sort_timestamp(s)), reverse=True)
@@ -6831,13 +7036,13 @@ def import_cli_session(
         updated_at=updated_at,
         parent_session_id=parent_session_id,
     )
-    # #4985: import_cli_session uses an explicit sid (the CLI sidecar's id).
-    # If that sid was previously tombstoned as a webui zero-message orphan,
-    # clear the tombstone entry so the freshly-imported session is visible
-    # on the next poll. Wrapped because a tombstone failure must never block
-    # an import.
+    # #4985/#3238: import_cli_session uses an explicit sid (the CLI
+    # sidecar's id). Clear either orphan tombstone so the freshly-imported
+    # session is visible on the next poll. Wrapped because a tombstone
+    # failure must never block an import.
     try:
         _clear_webui_zero_message_orphan_tombstone(s.session_id)
+        _clear_imported_orphan_tombstone(s.session_id)
         _clear_webui_deleted_session_tombstone(s.session_id)
     except Exception:
         logger.debug(

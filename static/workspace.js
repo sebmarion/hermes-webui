@@ -783,6 +783,18 @@ async function loadDir(path, opts={}){
       showToast(t('external_link_grant_expired') || t('file_open_failed'), 5000, 'error');
       return;
     }
+    // A stale workspace request can race a session switch or cleanup.  The
+    // API's 404 is an expected empty-tree state, not an app-owned warning; it
+    // should not pollute the console or leave the previous session's files on
+    // screen.  Preserve the normal warning for unexpected failures.
+    if(e&&e.status===404&&S.session&&S.session.session_id===sessionId&&treeGen===_wsTreeGen){
+      S.entries=[];
+      S._dirCache={};
+      S.currentDir='.';
+      renderBreadcrumb();
+      renderFileTree();
+      return;
+    }
     console.warn('loadDir',e);
   }
 }

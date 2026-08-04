@@ -255,6 +255,25 @@ def test_gateway_status_includes_gateway_health_metadata(monkeypatch):
     }
 
 
+def test_gateway_status_exposes_redacted_draining_metadata(monkeypatch):
+    result = _call_gateway_status(
+        monkeypatch,
+        agent_health_alive=True,
+        identity_map={},
+        details={
+            "state": "alive",
+            "reason": "remote_gateway",
+            "admission_state": "rejecting_new_work",
+            "drain_requested": True,
+            "admission_rejection_requested": True,
+        },
+    )
+    assert result["running"] is True
+    assert result["health"]["admission_state"] == "rejecting_new_work"
+    assert result["health"]["drain_requested"] is True
+    assert result["health"]["admission_rejection_requested"] is True
+
+
 def test_gateway_status_last_active_empty_when_alive_and_no_sessions_path(monkeypatch):
     """Bonus: alive=true + identity_map={} → last_active is empty string.
     This guards the 'if running and sessions_path.exists()' guard from being

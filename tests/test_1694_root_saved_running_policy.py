@@ -99,6 +99,18 @@ def test_root_saved_running_sidebar_only_path_renders_empty_state_and_sidebar():
     assert return_pos > render_pos, "sidebar-only path should return before loadSession(saved)"
 
 
+def test_root_boot_starts_sidebar_projection_without_blocking_saved_session_load():
+    """The sidebar request must begin before, but not gate, transcript restore."""
+    start_pos = BOOT_JS.find("const _bootSessionListReady = renderSessionList();")
+    load_pos = BOOT_JS.find("await loadSession(saved, {preserveActiveInput:true})")
+    assert start_pos >= 0, "boot should start the session-list request immediately"
+    assert start_pos < load_pos, "sidebar projection should start before saved-session restore"
+    assert "await renderSessionList();" not in BOOT_JS[start_pos:start_pos + 320], (
+        "the initial sidebar request must be fire-and-forget so transcript "
+        "restore can begin immediately"
+    )
+
+
 def test_root_archived_saved_session_clears_stale_localstorage_pointer():
     """Archived root-restore skips projection and clears stale saved-session state."""
     block = _boot_saved_session_block()

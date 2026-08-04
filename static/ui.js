@@ -9323,7 +9323,29 @@ function _setAgentHealthDismissed(value){
 }
 function _hideAgentHealthAlert(){
   const banner=$('agentHealthBanner');
-  if(banner){banner.classList.remove('visible');banner.hidden=true;}
+  if(banner){
+    banner.classList.remove('visible');
+    banner.hidden=true;
+    banner.className=banner.className.replace(/\bagent-health-state--\S+/g,'').trim();
+  }
+}
+function _agentHealthClassification(payload){
+  const details=payload&&payload.details&&typeof payload.details==='object'?payload.details:{};
+  const admission=payload&&payload.admission&&typeof payload.admission==='object'
+    ?payload.admission:details;
+  const admissionState=String(admission.admission_effective_state||admission.admission_state||admission.effective_state||admission.state||'').trim().toLowerCase();
+  const drainRequested=admission.drain_requested===true||admission.admission_rejection_requested===true||admission.effective_rejection_requested===true;
+  if(['rejecting_new_work','draining','drain_requested','fenced','pair-gated','checkpoint-fenced','checkpoint-stopping','stopping'].includes(admissionState)||admission.pair_gate_status==='active'||drainRequested) return 'drained';
+  const reason=String(details.reason||'').trim();
+  if(payload&&payload.alive===false){
+    return reason==='remote_gateway_unreachable'?'unreachable':'stopped';
+  }
+  if(payload&&payload.alive===true){
+    if(reason==='gateway_stale_running_state'||reason==='gateway_status_unavailable'||details.state==='unknown'||details.state==='degraded') return 'degraded';
+    return 'ready';
+  }
+  if(reason==='gateway_stale_running_state'||reason==='gateway_status_unavailable') return 'degraded';
+  return 'unknown';
 }
 function _showAgentHealthAlert(payload){
   if(_agentHealthDismissed()) return;
@@ -9331,9 +9353,25 @@ function _showAgentHealthAlert(payload){
   const title=$('agentHealthTitle');
   const details=$('agentHealthDetails');
   if(!banner) return;
-  if(title) title.textContent='Hermes agent is not responding';
-  const state=payload&&payload.details&&payload.details.gateway_state?` State: ${payload.details.gateway_state}.`:'';
-  if(details) details.textContent=`Gateway heartbeat failed.${state} Messages may not be delivered until it comes back.`;
+  const kind=_agentHealthClassification(payload);
+  const titles={
+    unreachable:'Gateway endpoint is unreachable',
+    stopped:'Gateway is not running',
+    drained:'Gateway is draining',
+    degraded:'Gateway health is degraded',
+    unknown:'Gateway status unavailable',
+  };
+  const messages={
+    unreachable:'WebUI cannot reach the configured gateway health endpoint. Messages may not be delivered until the connection returns.',
+    stopped:'The gateway process is not running. Messages may not be delivered until it comes back.',
+    drained:'The gateway is reachable but rejecting new work while it drains. New messages will resume after admission reopens.',
+    degraded:'The gateway responded, but its health state is inconclusive. Check the gateway runtime before sending new work.',
+    unknown:'The gateway health state is unavailable. Check the gateway runtime before sending new work.',
+  };
+  if(title) title.textContent=titles[kind]||titles.unknown;
+  if(details) details.textContent=messages[kind]||messages.unknown;
+  banner.className=banner.className.replace(/\bagent-health-state--\S+/g,'').trim();
+  banner.classList.add(`agent-health-state--${kind}`);
   banner.hidden=false;
   banner.classList.add('visible');
 }
@@ -9373,19 +9411,25 @@ async function pollAgentHealth(){
   try{
     const payload=await api('/api/health/agent',{timeoutToast:false});
     if(payload.alive === true){
-      _agentHealthLastState='alive';
-      _setAgentHealthDismissed(false);
-      _hideAgentHealthAlert();
+      const kind=_agentHealthClassification(payload);
+      _agentHealthLastState=kind;
+      if(kind==='ready'){
+        _setAgentHealthDismissed(false);
+        _hideAgentHealthAlert();
+      }else{
+        _showAgentHealthAlert(payload);
+      }
       return;
     }
     if(payload.alive === false){
-      _agentHealthLastState='down';
+      _agentHealthLastState=_agentHealthClassification(payload);
       _showAgentHealthAlert(payload);
       return;
     }
     if(payload.alive == null){
-      _agentHealthLastState='unknown';
-      _hideAgentHealthAlert();
+      _agentHealthLastState=_agentHealthClassification(payload);
+      if(_agentHealthLastState==='degraded') _showAgentHealthAlert(payload);
+      else _hideAgentHealthAlert();
     }
   }catch(_){
     _agentHealthLastState='unknown';

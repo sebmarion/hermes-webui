@@ -206,6 +206,8 @@ def test_agent_health_banner_markup_and_styles_exist():
     assert ".agent-health-banner" in STYLE_CSS
     assert ".agent-health-banner.visible" in STYLE_CSS
     assert ".agent-health-dismiss" in STYLE_CSS
+    assert ".agent-health-actions button{width:100%;min-height:44px;}" in STYLE_CSS
+    assert "@container main-view-content (max-width: 620px)" in STYLE_CSS
 
 
 def test_agent_health_frontend_polls_only_visible_and_distinguishes_states():
@@ -218,6 +220,9 @@ def test_agent_health_frontend_polls_only_visible_and_distinguishes_states():
     assert "if(payload.alive == null)" in UI_JS
     assert "_showAgentHealthAlert(payload)" in UI_JS
     assert "_hideAgentHealthAlert()" in UI_JS
+    assert "function _agentHealthClassification(payload)" in UI_JS
+    assert "Gateway is draining" in UI_JS
+    assert "Gateway endpoint is unreachable" in UI_JS
 
 
 def test_agent_health_dismiss_persists_until_recovery():

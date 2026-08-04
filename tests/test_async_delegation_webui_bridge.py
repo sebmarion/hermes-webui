@@ -789,7 +789,12 @@ def test_real_core_restart_delivers_async_completion_exactly_once(tmp_path):
         pytest.skip(f"hermes-agent async delegation module unavailable: {exc}")
     if not all(
         hasattr(ad, name)
-        for name in ("claim_event_delivery", "complete_event_delivery", "release_event_delivery")
+        for name in (
+            "claim_event_delivery",
+            "complete_event_delivery",
+            "release_event_delivery",
+            "get_durable_delegation",
+        )
     ):
         pytest.skip("installed hermes-agent predates durable completion claims")
 
@@ -1107,5 +1112,4 @@ def test_next_turn_drain_respects_origin_over_session_key_index(monkeypatch):
     assert [consumer for _evt, consumer in delivery["claim"]] == ["webui-next-turn"]
     assert len(delivery["complete"]) == 1
     assert delivery["release"] == []
-
 

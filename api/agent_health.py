@@ -576,6 +576,54 @@ def _cached_remote_result_locked(base_url: str, current: float) -> dict[str, Any
     return None
 
 
+def _remote_admission_details(payload: object) -> dict[str, Any]:
+    """Extract non-sensitive admission/drain state from a gateway health body.
+
+    Health responses have appeared in two compatible shapes: the admission
+    object is either top-level or nested under ``drain``.  Keep only the state
+    fields the WebUI needs to distinguish a live gateway that is draining from
+    one that is ready; never copy release ids, leases, or active-work detail.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    # Current gateways expose the fields at the top level; older detailed
+    # responses nested them under ``admission`` or ``drain``.  Prefer the
+    # top-level shape so a partial nested object cannot hide a more complete
+    # health status.
+    candidates: list[object] = [payload, payload.get("admission")]
+    drain = payload.get("drain")
+    if isinstance(drain, dict):
+        candidates.append(drain.get("admission"))
+        candidates.append(drain)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        state = candidate.get("state")
+        if not isinstance(state, str):
+            state = candidate.get("admission_state")
+        effective_state = candidate.get("effective_state")
+        if not isinstance(effective_state, str):
+            effective_state = candidate.get("admission_effective_state")
+        drain_requested = candidate.get("drain_requested")
+        rejection_requested = candidate.get("effective_rejection_requested")
+        if not isinstance(rejection_requested, bool):
+            rejection_requested = candidate.get("admission_rejection_requested")
+        if not isinstance(rejection_requested, bool):
+            rejection_requested = candidate.get("rejection_requested")
+        details: dict[str, Any] = {}
+        if isinstance(state, str) and state.strip():
+            details["admission_state"] = state.strip()
+        if isinstance(effective_state, str) and effective_state.strip():
+            details["admission_effective_state"] = effective_state.strip()
+        if isinstance(drain_requested, bool):
+            details["drain_requested"] = drain_requested
+        if isinstance(rejection_requested, bool):
+            details["admission_rejection_requested"] = rejection_requested
+        if details:
+            return details
+    return {}
+
+
 def _run_remote_probe(base_url: str) -> dict[str, Any]:
     """Walk the remote gateway health paths and build a payload (no caching/locking).
 
@@ -603,8 +651,10 @@ def _run_remote_probe(base_url: str) -> dict[str, Any]:
             if body and len(body) <= _REMOTE_PROBE_BODY_LIMIT_BYTES:
                 try:
                     data = json.loads(body)
-                    if isinstance(data, dict) and "gateway_state" in data:
-                        details["gateway_state"] = data["gateway_state"]
+                    if isinstance(data, dict):
+                        if "gateway_state" in data:
+                            details["gateway_state"] = data["gateway_state"]
+                        details.update(_remote_admission_details(data))
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass
             # An over-cap body (len > limit, i.e. the +1 sentinel byte was read)

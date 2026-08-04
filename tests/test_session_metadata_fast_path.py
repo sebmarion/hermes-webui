@@ -45,7 +45,7 @@ def test_session_switch_defers_model_resolution_without_blocking():
     assert "messages=0&resolve_model=0" in src
     assert "function _resolveSessionModelForDisplaySoon" in src
     assert "messages=0&resolve_model=1" in src
-    assert "_modelResolutionDeferred=true" in src
+    assert re.search(r"S\.session\._modelResolutionDeferred\s*=\s*!_useLazyTail", src)
     assert "deferModelCorrection" in ui
     assert "if(fallback&&!deferModelCorrection)" in ui
 
@@ -144,10 +144,11 @@ def test_boot_renders_session_list_before_workspace_and_onboarding_settle():
     src = (ROOT / "static" / "boot.js").read_text(encoding="utf-8")
     workspace_start = src.index("const _workspaceListReady=loadWorkspaceList();")
     onboarding_start = src.index("const _onboardingReady=_bootSettings.onboarding_completed?Promise.resolve(false):loadOnboardingWizard();")
-    render_pos = src.index("await renderSessionList();", onboarding_start)
+    render_pos = src.index("const _bootSessionListReady = renderSessionList();", onboarding_start)
     workspace_await = src.index("await _workspaceListReady;", render_pos)
     onboarding_await = src.index("await _onboardingReady;", render_pos)
 
     assert workspace_start < render_pos < workspace_await
     assert onboarding_start < render_pos < onboarding_await
+    assert "await renderSessionList();" not in src[render_pos:workspace_await]
     assert "_bootSettings.onboarding_completed" in src

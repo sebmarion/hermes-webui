@@ -20,6 +20,7 @@ existing session can fall out of that window and look deleted.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -225,6 +226,12 @@ def _payload_for_rows(monkeypatch, rows, existing_ids):
         "agent_session_rows_existing",
         lambda ids, profile=None: frozenset(existing_ids),
     )
+    monkeypatch.setattr(
+        routes,
+        "_schedule_imported_orphan_prune",
+        lambda ids: pruned.extend(sorted(ids)),
+        raising=False,
+    )
     monkeypatch.setattr(routes, "prune_session_from_index", lambda sid: pruned.append(sid))
 
     payload = routes._build_session_list_cache_payload(
@@ -304,3 +311,175 @@ def test_webui_owned_session_with_api_metadata_is_not_pruned(monkeypatch):
 
     assert [session["session_id"] for session in payload["sessions"]] == ["webui-native"]
     assert pruned == []
+
+
+def test_imported_orphan_repair_is_one_background_batch(monkeypatch):
+    """A sidebar GET schedules one repair batch and performs no index write."""
+    import api.routes as routes
+
+    rows = [
+        {
+            "session_id": "api-orphan-a",
+            "title": "API Session A",
+            "profile": "default",
+            "updated_at": 20,
+            "last_message_at": 20,
+            "message_count": 2,
+            "read_only": True,
+            "source_tag": "api_server",
+            "raw_source": "api_server",
+            "session_source": "api",
+            "source_label": "API",
+            "is_cli_session": False,
+        },
+        {
+            "session_id": "api-orphan-b",
+            "title": "API Session B",
+            "profile": "default",
+            "updated_at": 10,
+            "last_message_at": 10,
+            "message_count": 1,
+            "read_only": True,
+            "source_tag": "api_server",
+            "raw_source": "api_server",
+            "session_source": "api",
+            "source_label": "API",
+            "is_cli_session": False,
+        },
+    ]
+    scheduled: list[tuple[str, ...]] = []
+    direct_prunes: list[str] = []
+    monkeypatch.setattr(routes, "all_sessions", lambda diag=None: list(rows))
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        routes,
+        "_reconcile_stale_stream_state_for_session_rows",
+        lambda _sessions: False,
+    )
+    monkeypatch.setattr(
+        routes,
+        "agent_session_rows_existing",
+        lambda ids, profile=None: frozenset(),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_schedule_imported_orphan_prune",
+        lambda ids: scheduled.append(tuple(sorted(ids))),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        routes,
+        "prune_session_from_index",
+        lambda sid: direct_prunes.append(sid),
+    )
+
+    payload = routes._build_session_list_cache_payload(
+        active_profile="default",
+        all_profiles=False,
+        show_cli_sessions=True,
+        show_previous_messaging_sessions=False,
+        show_cron_sessions=False,
+    )
+
+    assert [session["session_id"] for session in payload["sessions"]] == []
+    assert scheduled == [("api-orphan-a", "api-orphan-b")]
+    assert direct_prunes == []
+
+
+def test_imported_orphan_does_not_retrigger_prune_on_second_poll(tmp_path, monkeypatch):
+    """A pruned imported sidecar must stay out of the next real sidebar poll.
+
+    ``prune_session_from_index`` intentionally leaves the sidecar on disk.  If
+    the next ``all_sessions()`` call recovers that sidecar (including the empty
+    index/full-scan fallback), the route pays the state.db probe and index write
+    again forever.  This is the imported-session analogue of the #4985
+    zero-message tombstone regression.
+    """
+    from api import models, profiles, routes
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    index_file = session_dir / "_index.json"
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", index_file)
+
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", hermes_home)
+    models.SESSIONS.clear()
+
+    sid = "cli-imported-orphan"
+    row = {
+        "session_id": sid,
+        "title": "Imported CLI session",
+        "profile": "default",
+        "created_at": 1700000000.0,
+        "updated_at": 1700000000.0,
+        "last_message_at": 1700000000.0,
+        "pinned": False,
+        "archived": False,
+        "message_count": 1,
+        "is_cli_session": True,
+        "source_tag": "cli",
+        "raw_source": "cli",
+        "session_source": "cli",
+        "source_label": "CLI",
+        "read_only": True,
+        "messages": [{"role": "user", "content": "hello"}],
+        "tool_calls": [],
+    }
+    (session_dir / f"{sid}.json").write_text(
+        json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    index_file.write_text(json.dumps([row], ensure_ascii=False, indent=2), encoding="utf-8")
+    _make_state_db(hermes_home / "state.db", [])
+
+    # Keep the test on the real all_sessions/recovery path while isolating
+    # unrelated state-db projection and stale-stream side effects.
+    monkeypatch.setattr(routes, "shared_interactive_sidebar_projection", lambda rows, **_: (rows, []))
+    monkeypatch.setattr(routes, "_reconcile_stale_stream_state_for_session_rows", lambda _rows: False)
+    monkeypatch.setattr(routes, "get_cli_sessions", lambda *args, **kwargs: [])
+    monkeypatch.setattr(routes, "agent_session_rows_existing", lambda ids, profile=None: frozenset())
+
+    pruned: list[str] = []
+    direct_prunes: list[str] = []
+
+    def record_and_repair(values):
+        batch = sorted(values)
+        pruned.extend(batch)
+        models.prune_sessions_from_index(batch)
+        for value in batch:
+            models._record_imported_orphan_tombstone(value)
+
+    monkeypatch.setattr(routes, "_schedule_imported_orphan_prune", record_and_repair)
+    monkeypatch.setattr(
+        routes,
+        "prune_session_from_index",
+        lambda value: direct_prunes.append(value),
+    )
+
+    def poll():
+        return routes._build_session_list_cache_payload(
+            active_profile="default",
+            all_profiles=False,
+            show_cli_sessions=True,
+            show_previous_messaging_sessions=False,
+            show_cron_sessions=False,
+        )
+
+    try:
+        first = poll()
+        assert sid not in [session["session_id"] for session in first["sessions"]]
+        assert pruned == [sid]
+        assert direct_prunes == []
+        assert sid in models._load_imported_orphan_tombstone()
+
+        second = poll()
+        assert sid not in [session["session_id"] for session in second["sessions"]]
+        assert pruned == [sid], (
+            "The second poll must not recover and re-prune the same imported "
+            f"orphan; got prune calls {pruned!r}."
+        )
+    finally:
+        models.SESSIONS.clear()

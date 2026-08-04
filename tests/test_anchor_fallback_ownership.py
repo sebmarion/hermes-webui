@@ -589,6 +589,7 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
         function _messageVirtualWindowKeyFor() {{ return 'all'; }}
         function _messageRenderCacheSignature() {{ return 'sig'; }}
         function _compressionStateForCurrentSession() {{ return null; }}
+        function _compressionRecoverySourceHtml() {{ return ''; }}
         function clearCompressionUi() {{}}
         function _handoffStateForCurrentSession() {{ return null; }}
         function _captureWorklogDetailDisclosureState() {{ return null; }}

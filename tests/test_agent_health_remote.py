@@ -124,6 +124,55 @@ def test_gateway_state_populated_from_health_detailed(monkeypatch):
     assert payload["details"]["reason"] == "remote_gateway"
 
 
+def test_admission_state_populated_from_nested_drain_health(monkeypatch):
+    """A live gateway that is draining must not be reported as ready-only."""
+    monkeypatch.setenv("HERMES_API_URL", "http://fake-gateway:8642")
+    body = json.dumps({
+        "status": "ok",
+        "drain": {
+            "admission": {
+                "state": "rejecting_new_work",
+                "drain_requested": True,
+                "effective_rejection_requested": True,
+            }
+        },
+    }).encode()
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeResp(200, body=body)
+
+    with mock.patch.object(agent_health.urllib_request, "urlopen", fake_urlopen):
+        payload = agent_health.build_agent_health_payload()
+
+    assert payload["alive"] is True
+    assert payload["details"]["admission_state"] == "rejecting_new_work"
+    assert payload["details"]["drain_requested"] is True
+    assert payload["details"]["admission_rejection_requested"] is True
+
+
+def test_admission_state_populated_from_top_level_health(monkeypatch):
+    """The compact /health shape keeps drain state at the response root."""
+    monkeypatch.setenv("HERMES_API_URL", "http://fake-gateway:8642")
+    body = json.dumps({
+        "status": "ok",
+        "gateway_state": None,
+        "admission_state": "rejecting_new_work",
+        "effective_state": None,
+        "drain_requested": True,
+        "rejection_requested": None,
+    }).encode()
+
+    def fake_urlopen(req, timeout=None):
+        return _FakeResp(200, body=body)
+
+    with mock.patch.object(agent_health.urllib_request, "urlopen", fake_urlopen):
+        payload = agent_health.build_agent_health_payload()
+
+    assert payload["alive"] is True
+    assert payload["details"]["admission_state"] == "rejecting_new_work"
+    assert payload["details"]["drain_requested"] is True
+
+
 def test_probe_order_prefers_health_detailed(monkeypatch):
     """First probe path should be /health/detailed so gateway_state is available."""
     monkeypatch.setenv("HERMES_API_URL", "http://fake-gateway:8642")

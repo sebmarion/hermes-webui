@@ -18,6 +18,25 @@ PROFILE_CONCEPT_KEYS = [
     "profile_concept_label_example",
 ]
 
+# These report-capture labels are deliberately English-owned for now.  The
+# locale runtime falls back to LOCALES.en for missing keys; keep the coverage
+# tests aligned with that explicit contract until translations are added.
+ENGLISH_FALLBACK_KEYS = {
+    *PROFILE_CONCEPT_KEYS,
+    "nextfix_action",
+    "nextfix_cancel",
+    "nextfix_capture",
+    "nextfix_capture_copy",
+    "nextfix_capture_error",
+    "nextfix_capture_title",
+    "nextfix_captured",
+    "nextfix_capturing",
+    "nextfix_expected_label",
+    "nextfix_expected_placeholder",
+    "nextfix_expected_required",
+    "nextfix_observed_label",
+}
+
 
 def _locale_blocks():
     """Extract every top-level locale block from static/i18n.js."""
@@ -45,14 +64,14 @@ def test_i18n_keys_are_english_fallback_owned():
     """Profile concept keys live in English and fall back from every other locale."""
     locale_blocks = _locale_blocks()
     en_block = locale_blocks["en"]
-    for key in PROFILE_CONCEPT_KEYS:
+    for key in ENGLISH_FALLBACK_KEYS:
         assert re.search(rf"\b{re.escape(key)}:\s*'", en_block), (
             f"missing key {key!r} in en locale block"
         )
     for locale, block in locale_blocks.items():
         if locale == "en":
             continue
-        for key in PROFILE_CONCEPT_KEYS:
+        for key in ENGLISH_FALLBACK_KEYS:
             assert not re.search(rf"\b{re.escape(key)}:\s*'", block), (
                 f"key {key!r} must be absent from non-English locale {locale!r}"
             )

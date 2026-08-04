@@ -91,6 +91,11 @@ def test_target_turn_delegation_id_is_durable_and_duplicate_returns_same_turn(tm
     monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "legacy-direct")
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(turn_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    monkeypatch.setattr(
+        routes,
+        "_resolve_chat_workspace_with_recovery",
+        lambda _session, _requested: str(tmp_path),
+    )
     session = models.Session(
         session_id="session-a", title="Test", messages=[], workspace=str(tmp_path),
         model="openai/gpt-5.4-mini", model_provider="openai",
@@ -124,6 +129,11 @@ def test_target_turn_fails_closed_when_submitted_journal_cannot_persist(tmp_path
     monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "legacy-direct")
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(turn_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    monkeypatch.setattr(
+        routes,
+        "_resolve_chat_workspace_with_recovery",
+        lambda _session, _requested: str(tmp_path),
+    )
     session = models.Session(
         session_id="session-journal-fail", title="Test", messages=[],
         workspace=str(tmp_path), model="openai/gpt-5.4-mini",
@@ -230,6 +240,11 @@ def test_inflight_worker_acceptance_completes_atomically_past_wait_timeout(
     monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "legacy-direct")
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(turn_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    monkeypatch.setattr(
+        routes,
+        "_resolve_chat_workspace_with_recovery",
+        lambda _session, _requested: str(tmp_path),
+    )
     monkeypatch.setattr(routes, "_DELEGATION_WORKER_ACCEPT_TIMEOUT_SECONDS", 0.05)
     session = models.Session(
         session_id="session-timeout", title="Test", messages=[],
@@ -294,6 +309,11 @@ def test_timeout_rejection_prevents_any_late_worker_started_append(
     monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "legacy-direct")
     monkeypatch.setattr(models, "SESSION_DIR", tmp_path / "sessions")
     monkeypatch.setattr(turn_journal, "_default_session_dir", lambda: tmp_path / "sessions")
+    monkeypatch.setattr(
+        routes,
+        "_resolve_chat_workspace_with_recovery",
+        lambda _session, _requested: str(tmp_path),
+    )
     monkeypatch.setattr(routes, "_DELEGATION_WORKER_ACCEPT_TIMEOUT_SECONDS", 0.05)
     session = models.Session(
         session_id="session-terminal-decision", title="Test", messages=[],

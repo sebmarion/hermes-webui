@@ -119,7 +119,6 @@ def _sync_session_title_to_insights(session) -> None:
     """Write shared session metadata without touching canonical usage totals."""
     try:
         from api.state_sync import sync_session_metadata
-
         sync_session_metadata(
             session_id=session.session_id,
             title=session.title,
@@ -1210,17 +1209,26 @@ def _gateway_status_payload() -> dict:
             last_active = datetime.datetime.fromtimestamp(mtime).isoformat()
         except Exception:
             pass
+    health_payload = {
+        "state": health_state,
+        "reason": health_reason,
+        "gateway_state": health_gateway_state,
+    }
+    for _health_key in (
+        "admission_state",
+        "admission_effective_state",
+        "drain_requested",
+        "admission_rejection_requested",
+    ):
+        if _health_key in details:
+            health_payload[_health_key] = details[_health_key]
     return {
         "running": running,
         "configured": configured,
         "platforms": platforms,
         "last_active": last_active,
         "session_count": len(identity_map),
-        "health": {
-            "state": health_state,
-            "reason": health_reason,
-            "gateway_state": health_gateway_state,
-        },
+        "health": health_payload,
     }
 
 
@@ -2015,6 +2023,77 @@ def _composer_draft_has_payload(draft):
     )
 
 
+_IMPORTED_ORPHAN_REPAIR_LOCK = threading.Lock()
+_IMPORTED_ORPHAN_REPAIR_PENDING: set[str] = set()
+_IMPORTED_ORPHAN_REPAIR_ACTIVE = False
+
+
+def _schedule_imported_orphan_prune(session_ids) -> bool:
+    """Repair imported orphan sidecars once, outside the sidebar GET path."""
+    normalized = {
+        str(session_id or "").strip()
+        for session_id in (session_ids or [])
+        if str(session_id or "").strip()
+    }
+    if not normalized:
+        return False
+
+    global _IMPORTED_ORPHAN_REPAIR_ACTIVE
+    with _IMPORTED_ORPHAN_REPAIR_LOCK:
+        _IMPORTED_ORPHAN_REPAIR_PENDING.update(normalized)
+        if _IMPORTED_ORPHAN_REPAIR_ACTIVE:
+            return True
+        _IMPORTED_ORPHAN_REPAIR_ACTIVE = True
+
+    def _run_repair() -> None:
+        global _IMPORTED_ORPHAN_REPAIR_ACTIVE
+        try:
+            while True:
+                with _IMPORTED_ORPHAN_REPAIR_LOCK:
+                    batch = sorted(_IMPORTED_ORPHAN_REPAIR_PENDING)
+                    _IMPORTED_ORPHAN_REPAIR_PENDING.clear()
+                    if not batch:
+                        _IMPORTED_ORPHAN_REPAIR_ACTIVE = False
+                        return
+                try:
+                    prune_sessions_from_index(batch)
+                except Exception:
+                    logger.debug(
+                        "Failed to batch-prune imported orphan sidecars",
+                        exc_info=True,
+                    )
+                try:
+                    _record_imported_orphan_tombstones(batch)
+                except Exception:
+                    logger.debug(
+                        "Failed to tombstone imported orphan batch",
+                        exc_info=True,
+                    )
+                _on_session_list_changed()
+        except Exception:
+            logger.debug(
+                "Imported orphan repair worker failed",
+                exc_info=True,
+            )
+            with _IMPORTED_ORPHAN_REPAIR_LOCK:
+                _IMPORTED_ORPHAN_REPAIR_ACTIVE = False
+
+    try:
+        started = start_admitted_auxiliary_thread(
+            kind="session_index_repair",
+            target=_run_repair,
+            name="imported-orphan-repair",
+        )
+    except Exception:
+        started = False
+        logger.debug("Failed to start imported orphan repair worker", exc_info=True)
+    if not started:
+        with _IMPORTED_ORPHAN_REPAIR_LOCK:
+            _IMPORTED_ORPHAN_REPAIR_ACTIVE = False
+        return False
+    return True
+
+
 def _prune_orphaned_webui_zero_message_sessions(rows, *, diag_stage=None):
     """#4985 second-pass orphan prune for native-WebUI rows whose ``state.db.messages`` is empty.
 
@@ -2674,6 +2753,19 @@ def _build_session_list_cache_payload(
             )
         diag_stage("merge_cli_sessions")
         cli_by_id = {s["session_id"]: s for s in cli}
+        # A backing CLI/API row that reappears is a legitimate resurrection,
+        # not the deleted orphan recorded by the previous poll. Clear its
+        # imported-sidecar tombstone before the next all_sessions recovery.
+        imported_orphan_tombstones = _load_imported_orphan_tombstone()
+        for _sid in set(cli_by_id) & imported_orphan_tombstones:
+            try:
+                _clear_imported_orphan_tombstone(_sid)
+            except Exception:
+                logger.debug(
+                    "Failed to clear imported orphan tombstone for live sid %s",
+                    _sid,
+                    exc_info=True,
+                )
         # #3238/#4591: reconcile orphaned imported sidecars. When a CLI or
         # API-server session is clicked in WebUI it gets a WebUI-owned sidecar
         # that all_sessions() returns independently of state.db. If the user
@@ -2729,20 +2821,19 @@ def _build_session_list_cache_payload(
                     _sid = str(row.get("session_id") or "").strip()
                     if _sid and _sid not in existing:
                         missing_orphan_ids.add(_sid)
+            if missing_orphan_ids:
+                try:
+                    _schedule_imported_orphan_prune(missing_orphan_ids)
+                except Exception:
+                    logger.debug(
+                        "Failed to schedule imported orphan repair",
+                        exc_info=True,
+                    )
+                diag_stage("prune_orphaned_agent_sidecar")
             for s in _orphan_probe_rows:
                 _sid = str(s.get("session_id") or "").strip()
-                if _sid in missing_orphan_ids:
-                    try:
-                        prune_session_from_index(_sid)
-                    except Exception:
-                        logger.debug(
-                            "Failed to prune orphaned agent sidecar %s",
-                            _sid,
-                            exc_info=True,
-                        )
-                    diag_stage("prune_orphaned_agent_sidecar")
-                    continue
-                _kept_after_orphan_prune.append(s)
+                if _sid not in missing_orphan_ids:
+                    _kept_after_orphan_prune.append(s)
         # #4985 second pass — probe state.db.messages for native-WebUI rows
         # that *survived* the upstream all_sessions() #1171 keep-filter (so
         # the row is TITLED or has a POSITIVE message_count, meaning it IS
@@ -9989,8 +10080,13 @@ from api.models import (
     _is_empty_partial_activity_message,
     _hide_from_default_sidebar,
     prune_session_from_index,
+    prune_sessions_from_index,
     agent_session_rows_existing,
     agent_session_zero_message_sids,
+    _load_imported_orphan_tombstone,
+    _record_imported_orphan_tombstones,
+    _record_imported_orphan_tombstone,
+    _clear_imported_orphan_tombstone,
     _load_webui_zero_message_orphan_tombstone,
     _record_webui_zero_message_orphan_tombstone,
     _clear_webui_zero_message_orphan_tombstone,
@@ -13635,6 +13731,22 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path == "/api/health/agent":
         payload = build_agent_health_payload()
         payload["gateway_chat"] = gateway_chat_config_status()
+        # Keep the browser's health banner truthful when this WebUI process is
+        # itself behind a release/admission fence.  Expose only redacted state
+        # fields; transaction ids and reservation details stay server-side.
+        try:
+            admission = api_config.run_admission_snapshot()
+            redacted_admission = {
+                key: admission.get(key)
+                for key in ("state", "effective_state")
+                if key in admission
+            }
+            pair_gate = admission.get("pair_gate")
+            if isinstance(pair_gate, dict) and isinstance(pair_gate.get("status"), str):
+                redacted_admission["pair_gate_status"] = pair_gate["status"]
+            payload["admission"] = redacted_admission
+        except Exception:
+            logger.debug("Failed to read admission state for agent health", exc_info=True)
         j(handler, payload)
         return True
 
