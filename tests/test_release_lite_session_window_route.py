@@ -349,3 +349,109 @@ def test_app_shell_injects_independent_literal_browser_gate(monkeypatch):
     monkeypatch.setenv("HERMES_WEBUI_LAZY_TAIL_BROWSER_V1", "0")
     disabled = routes._render_index_shell_base()
     assert "lazyTailV1:false" in disabled
+
+
+def test_legacy_compat_builder_accepts_only_a_ready_bounded_window(
+    tmp_path, monkeypatch
+):
+    import api.routes as routes
+    import api.session_window as session_window
+    from tests.test_release_lite_session_window import _ready_dependencies
+
+    resolution = SimpleNamespace(requested_id="root", canonical_id="tip")
+    payload = {
+        "requested_session_id": "root",
+        "canonical_session_id": "tip",
+        "messages": [{"role": "assistant", "content": "tail"}],
+        "session_metadata": {
+            "session_id": "tip",
+            "read_only": False,
+            "model_provider": None,
+        },
+        "conversation_window": {
+            "schema": "lazy_tail_v1",
+            "state": "ready",
+        },
+    }
+    request_seen = []
+    monkeypatch.setattr(
+        session_window,
+        "default_session_window_dependencies",
+        lambda **_kwargs: _ready_dependencies(),
+    )
+    monkeypatch.setattr(
+        session_window,
+        "build_session_window",
+        lambda request, **_kwargs: request_seen.append(request) or payload,
+    )
+
+    result = routes._build_legacy_compat_session_window(
+        handler=SimpleNamespace(),
+        resolution=resolution,
+        profile="default",
+        db_path=tmp_path / "state.db",
+        visible_limit=30,
+    )
+
+    assert result is payload
+    assert request_seen[0].session_id == "root"
+    assert request_seen[0].visible_limit == 30
+    assert request_seen[0].older_cursor is None
+
+
+def test_legacy_compat_builder_retries_tool_heavy_50_row_overflow_at_30(
+    tmp_path, monkeypatch
+):
+    import api.routes as routes
+    import api.session_window as session_window
+    from tests.test_release_lite_session_window import _ready_dependencies
+
+    resolution = SimpleNamespace(requested_id="root", canonical_id="tip")
+    fallback = {
+        "requested_session_id": "root",
+        "canonical_session_id": "tip",
+        "messages": [],
+        "session_metadata": None,
+        "conversation_window": {
+            "schema": "lazy_tail_v1",
+            "state": "legacy_required",
+            "status_reason": "visible_limit_exceeded",
+        },
+    }
+    ready = {
+        "requested_session_id": "root",
+        "canonical_session_id": "tip",
+        "messages": [{"role": "assistant", "content": "tail"}],
+        "session_metadata": {
+            "session_id": "tip",
+            "read_only": False,
+            "model_provider": None,
+        },
+        "conversation_window": {
+            "schema": "lazy_tail_v1",
+            "state": "ready",
+        },
+    }
+    request_seen = []
+    responses = iter((fallback, ready))
+    monkeypatch.setattr(
+        session_window,
+        "default_session_window_dependencies",
+        lambda **_kwargs: _ready_dependencies(),
+    )
+    monkeypatch.setattr(
+        session_window,
+        "build_session_window",
+        lambda request, **_kwargs: request_seen.append(request) or next(responses),
+    )
+
+    result = routes._build_legacy_compat_session_window(
+        handler=SimpleNamespace(),
+        resolution=resolution,
+        profile="default",
+        db_path=tmp_path / "state.db",
+        visible_limit=50,
+    )
+
+    assert result is ready
+    assert [request.visible_limit for request in request_seen] == [50, 30]

@@ -12948,6 +12948,97 @@ def _lazy_tail_session_metadata(profile: str, resolution) -> dict | None:
     return metadata
 
 
+def _build_legacy_compat_session_window(
+    *, handler, resolution, profile: str, db_path: Path, visible_limit: int
+) -> dict | None:
+    """Read a bounded tail for clients that still call ``/api/session``.
+
+    Hermex versions that predate the negotiated cursor endpoint still request
+    ``/api/session?...&msg_limit=N&expand_renderable=1``.  Keep their response
+    envelope, but reuse the release-lite state.db reader so a large sidecar is
+    never parsed on the successful path.  The helper is deliberately fail
+    closed: any target, metadata, runtime, or bounded-reader uncertainty
+    returns ``None`` and lets the caller use the unchanged legacy oracle.
+    """
+    from dataclasses import replace
+
+    from api.session_window import (
+        SessionWindowRequest,
+        build_session_window,
+        default_session_window_dependencies,
+    )
+
+    try:
+        requested_id = str(getattr(resolution, "requested_id", "") or "")
+        canonical_id = str(getattr(resolution, "canonical_id", "") or "")
+        if not requested_id or not canonical_id:
+            return None
+        requested_limit = int(visible_limit)
+        request = SessionWindowRequest(
+            session_id=requested_id,
+            visible_limit=requested_limit,
+            older_cursor=None,
+            resolve_model=False,
+        )
+        dependencies = default_session_window_dependencies(
+            capture_runtime=lambda _profile, canonical: _lazy_tail_runtime_snapshot(
+                handler, canonical
+            ),
+            capture_metadata=_lazy_tail_session_metadata,
+        )
+
+        def resolve_bound(_db_path, requested):
+            if str(requested or "") != requested_id:
+                raise ValueError("request target changed")
+            return resolution
+
+        dependencies = replace(
+            dependencies,
+            active_profile=lambda: str(profile or "default"),
+            state_db_path=lambda _profile: Path(db_path),
+            resolve_shared_session=resolve_bound,
+        )
+        payload = build_session_window(request, deps=dependencies)
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    window = payload.get("conversation_window")
+    metadata = payload.get("session_metadata")
+    # A tool-heavy page may be valid at the release-lite 30-row baseline but
+    # exceed the bounded closure budget at 50. Retry only that typed condition;
+    # all other fallback reasons remain on the exact legacy path.
+    if (
+        isinstance(window, dict)
+        and window.get("state") == "legacy_required"
+        and window.get("status_reason") == "visible_limit_exceeded"
+        and requested_limit > 30
+    ):
+        try:
+            payload = build_session_window(
+                replace(request, visible_limit=30),
+                deps=dependencies,
+            )
+        except Exception:
+            return None
+        window = payload.get("conversation_window") if isinstance(payload, dict) else None
+        metadata = payload.get("session_metadata") if isinstance(payload, dict) else None
+    if not isinstance(window, dict) or not isinstance(metadata, dict):
+        return None
+    if (
+        window.get("schema") != "lazy_tail_v1"
+        or window.get("state") not in {"ready", "reconnecting"}
+        or payload.get("requested_session_id") != requested_id
+        or payload.get("canonical_session_id") != canonical_id
+        or metadata.get("session_id") != canonical_id
+        or not isinstance(metadata.get("read_only"), bool)
+        or not isinstance(payload.get("messages"), list)
+    ):
+        return None
+    return payload
+
+
 def _handle_session_window(handler, parsed):
     from api.session_window import (
         SessionWindowRequest,
@@ -14146,6 +14237,20 @@ def handle_get(handler, parsed) -> bool:
         # the flag no longer changes the server-side pagination semantics.
         _expand_renderable = query.get("expand_renderable", [None])[0]
         expand_renderable = str(_expand_renderable).strip() in ("1", "true", "True")
+        # Older Hermex clients identify their bounded tail request with the
+        # compatibility-only expand flag. Keep unmarked legacy requests on
+        # their exact existing path, while allowing this known request shape
+        # to use the state-backed release-lite reader below.
+        _legacy_bounded_compat_requested = (
+            _lazy_tail_server_enabled()
+            and expand_renderable
+            and not message_paging.requested
+            and load_messages
+            and msg_limit is not None
+            and 1 <= msg_limit <= 50
+            and msg_before is None
+            and resolution.status == "found"
+        )
         _shadow_comparison_epoch = None
         if (
             _message_cursor_gate == "shadow"
@@ -14166,10 +14271,14 @@ def handle_get(handler, parsed) -> bool:
         try:
             _t1 = _time.monotonic()
             if _diag: _diag.stage("t1_after_get_session_check")
-            _bounded_metadata_only = (
+            _bounded_cursor_metadata_only = (
                 _message_cursor_gate == "on"
                 and message_paging.requested
                 and load_messages
+            )
+            _bounded_metadata_only = (
+                _bounded_cursor_metadata_only
+                or _legacy_bounded_compat_requested
             )
             s = get_session(
                 sid,
@@ -14222,8 +14331,10 @@ def handle_get(handler, parsed) -> bool:
             bounded_cursor_result = None
             bounded_visible_count = 0
             bounded_todo_snapshot = None
+            bounded_legacy_payload = None
+            bounded_legacy_message_count = None
             bounded_mode = (
-                _bounded_metadata_only
+                _bounded_cursor_metadata_only
                 and not is_messaging_session
                 and resolution.status == "found"
                 and not original_stream_id
@@ -14281,6 +14392,40 @@ def handle_get(handler, parsed) -> bool:
                         status=409,
                     )
 
+            bounded_legacy_mode = (
+                _legacy_bounded_compat_requested
+                and not is_messaging_session
+                and not original_stream_id
+                and not getattr(s, "pending_user_message", None)
+                and _bounded_runtime_owner_absent(
+                    str(_session_profile or "default"), resolution.member_ids
+                )
+            )
+            if bounded_legacy_mode:
+                bounded_legacy_payload = _build_legacy_compat_session_window(
+                    handler=handler,
+                    resolution=resolution,
+                    profile=str(_session_profile or "default"),
+                    db_path=state_db_path,
+                    visible_limit=msg_limit,
+                )
+                if bounded_legacy_payload is not None:
+                    canonical_row = dict(resolution.canonical_row or {})
+                    count_candidates = [
+                        getattr(s, "_metadata_message_count", None),
+                        canonical_row.get("message_count"),
+                        len(bounded_legacy_payload.get("messages") or []),
+                    ]
+                    valid_counts = []
+                    for candidate in count_candidates:
+                        try:
+                            value = int(candidate)
+                        except (TypeError, ValueError):
+                            continue
+                        if value >= 0:
+                            valid_counts.append(value)
+                    bounded_legacy_message_count = max(valid_counts or [0])
+
             if (
                 _bounded_metadata_only
                 and message_paging.cursor_token is not None
@@ -14296,10 +14441,15 @@ def handle_get(handler, parsed) -> bool:
                     status=409,
                 )
 
-            # The first bounded attempt intentionally used metadata only.  Any
+            # The first bounded attempt intentionally used metadata only. Any
             # initial miss resumes the exact pre-existing oracle with a full
-            # sidecar load; the cursor-success path never reaches this branch.
-            if _bounded_metadata_only and bounded_cursor_result is None:
+            # sidecar load; a cursor or legacy-compat success never reaches
+            # this branch.
+            if (
+                _bounded_metadata_only
+                and bounded_cursor_result is None
+                and bounded_legacy_payload is None
+            ):
                 s = get_session(sid, metadata_only=False)
                 _session_profile = getattr(s, "profile", None) or None
                 if not _session_visible_to_active_profile(_session_profile, handler):
@@ -14334,6 +14484,11 @@ def handle_get(handler, parsed) -> bool:
             if bounded_cursor_result is not None:
                 # All conversation data is already the validated bounded page.
                 # Do not read state history or parse the full sidecar.
+                pass
+            elif bounded_legacy_payload is not None:
+                # The compatibility projection already contains the complete
+                # bounded response page. Do not enter either legacy history
+                # reader or sidecar/lineage merger.
                 pass
             elif is_messaging_session:
                 cli_messages = get_cli_session_messages(sid)
@@ -14396,6 +14551,8 @@ def handle_get(handler, parsed) -> bool:
             if load_messages:
                 if bounded_cursor_result is not None:
                     _all_msgs = []
+                elif bounded_legacy_payload is not None:
+                    _all_msgs = []
                 elif is_messaging_session and cli_messages:
                     # Recovery/aggregate sidecars can intentionally contain a
                     # longer visible conversation than the single state.db
@@ -14451,6 +14608,15 @@ def handle_get(handler, parsed) -> bool:
             if load_messages:
                 if bounded_cursor_result is not None:
                     _truncated_msgs = list(bounded_cursor_result.messages)
+                    _messages_offset = 0
+                elif bounded_legacy_payload is not None:
+                    _truncated_msgs = _messages_for_limited_payload(
+                        bounded_legacy_payload.get("messages") or []
+                    )
+                    # The lazy-tail cursor is opaque to legacy clients. Keep
+                    # the numeric offset at zero so an old client cannot issue
+                    # an unsafe guessed msg_before coordinate; newer WebUI
+                    # code adopts _lazy_tail_window below.
                     _messages_offset = 0
                 else:
                     _truncated_msgs, _messages_offset = _message_window_for_display(
@@ -14545,7 +14711,7 @@ def handle_get(handler, parsed) -> bool:
                         "message_page_shadow %s",
                         json.dumps(_shadow_diagnostic, sort_keys=True),
                     )
-                if bounded_cursor_result is None:
+                if bounded_cursor_result is None and bounded_legacy_payload is None:
                     _truncated_msgs = _hydrate_anchor_activity_scenes(
                         _truncated_msgs,
                         getattr(s, "anchor_activity_scenes", None),
@@ -14560,6 +14726,7 @@ def handle_get(handler, parsed) -> bool:
             _windowed_messages = (
                 load_messages
                 and bounded_cursor_result is None
+                and bounded_legacy_payload is None
                 and msg_limit is not None
                 and (msg_before is not None or len(_truncated_msgs) < len(_all_msgs))
             )
@@ -14619,7 +14786,11 @@ def handle_get(handler, parsed) -> bool:
                             _fb_cl,
                         )
                     _persisted_cl = _fb_cl
-            _session_tool_calls = getattr(s, "tool_calls", []) if load_messages else []
+            _session_tool_calls = (
+                []
+                if bounded_legacy_payload is not None
+                else (getattr(s, "tool_calls", []) if load_messages else [])
+            )
             # Always include session-level tool_calls so the browser can merge
             # them with per-message tool_calls for messages that lack the
             # per-message variant (older messages whose tool_calls live only
@@ -14635,9 +14806,13 @@ def handle_get(handler, parsed) -> bool:
                 bounded_cursor_result.message_count
                 if bounded_cursor_result is not None
                 else (
-                    _summary_message_count
-                    if _summary_message_count is not None
-                    else len(_all_msgs)
+                    bounded_legacy_message_count
+                    if bounded_legacy_payload is not None
+                    else (
+                        _summary_message_count
+                        if _summary_message_count is not None
+                        else len(_all_msgs)
+                    )
                 )
             )
             _merged_last_message_at = _summary_last_message_at if _summary_last_message_at is not None else 0
@@ -14671,6 +14846,27 @@ def handle_get(handler, parsed) -> bool:
                 "threshold_tokens": _threshold_tokens,
                 "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
             }
+            if bounded_legacy_payload is not None:
+                # Project the bounded endpoint's metadata into the historical
+                # session envelope. The opaque window is additive, so current
+                # WebUI code can page with its cursor while old clients still
+                # receive the fields they already know.
+                bounded_metadata = bounded_legacy_payload.get("session_metadata")
+                if isinstance(bounded_metadata, dict):
+                    raw.update(bounded_metadata)
+                raw["session_id"] = sid
+                raw["title"] = str(bounded_legacy_payload.get("title") or raw.get("title") or "")
+                raw["model"] = str(bounded_legacy_payload.get("model") or raw.get("model") or "")
+                raw["workspace"] = str(
+                    bounded_legacy_payload.get("workspace") or raw.get("workspace") or ""
+                )
+                bounded_window = bounded_legacy_payload.get("conversation_window")
+                if isinstance(bounded_window, dict):
+                    raw["_lazy_tail_window"] = dict(bounded_window)
+                    raw["active_stream_id"] = bounded_window.get("active_stream_id")
+                runtime_snapshot = bounded_legacy_payload.get("runtime_snapshot")
+                raw["runtime_journal_snapshot"] = runtime_snapshot
+                raw["message_count"] = _merged_message_count
             raw["canonical_session_id"] = sid
             if requested_sid != sid:
                 raw["requested_session_id"] = requested_sid
@@ -14734,7 +14930,15 @@ def handle_get(handler, parsed) -> bool:
             # Signal to the frontend that older messages were omitted. The
             # message window cursor already reflects visible-row pagination and
             # avoids false positives when raw hidden tool rows exceed msg_limit.
-            _truncated = load_messages and msg_limit is not None and _messages_offset > 0
+            _truncated = (
+                bool(
+                    bounded_legacy_payload
+                    and isinstance(bounded_legacy_payload.get("conversation_window"), dict)
+                    and bounded_legacy_payload["conversation_window"].get("has_older")
+                )
+                if bounded_legacy_payload is not None
+                else load_messages and msg_limit is not None and _messages_offset > 0
+            )
             raw["_messages_truncated"] = _truncated
             raw["_messages_offset"] = _messages_offset
             raw["_msg_limit_max"] = _MAX_MSG_LIMIT

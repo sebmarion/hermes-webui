@@ -204,6 +204,73 @@ def test_proven_initial_cursor_avoids_legacy_history_and_full_sidecar_load(tmp_p
     }
 
 
+def test_legacy_tail_compat_avoids_full_history_for_unnegotiated_clients(
+    tmp_path, monkeypatch
+):
+    import api.routes as routes
+
+    page_messages = [
+        {"role": "user", "content": "recent user", "_state_db_message_id": 8},
+        {"role": "assistant", "content": "recent answer", "_state_db_message_id": 9},
+    ]
+    lazy_payload = {
+        "requested_session_id": "root",
+        "canonical_session_id": "tip",
+        "title": "Canonical title",
+        "model": "canonical-model",
+        "workspace": "/canonical",
+        "messages": page_messages,
+        "session_metadata": {
+            "session_id": "tip",
+            "profile": "default",
+            "read_only": False,
+            "model_provider": None,
+        },
+        "runtime_snapshot": None,
+        "conversation_window": {
+            "schema": "lazy_tail_v1",
+            "state": "ready",
+            "source": "state_db",
+            "visible_count": 2,
+            "has_older": True,
+            "older_cursor": "opaque-older-cursor",
+            "newest_message_id": "9",
+            "active_stream_id": None,
+            "reconnect_token": None,
+            "exact_total_available": False,
+            "status_reason": None,
+        },
+    }
+    monkeypatch.setattr(
+        routes,
+        "_build_legacy_compat_session_window",
+        lambda **_kwargs: lazy_payload,
+    )
+
+    captured, _resolve_calls, get_calls = _run_browser_session_route(
+        monkeypatch,
+        db_path=tmp_path / "state.db",
+        resolution=_resolution(db_path=tmp_path / "state.db"),
+        session_or_error=_BrowserSession(),
+        query=(
+            "session_id=root&messages=1&resolve_model=0&msg_limit=2"
+            "&expand_renderable=1"
+        ),
+        history_reader=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy full history must not be read")
+        ),
+    )
+
+    session = captured["payload"]["session"]
+    assert captured["status"] == 200
+    assert session["messages"] == page_messages
+    assert session["_lazy_tail_window"]["older_cursor"] == "opaque-older-cursor"
+    assert session["_messages_truncated"] is True
+    assert session["_messages_offset"] == 0
+    assert session["canonical_session_id"] == "tip"
+    assert get_calls == [("tip", True)]
+
+
 def test_proven_cursor_continuation_failure_has_no_session_or_messages(tmp_path, monkeypatch):
     import api.routes as routes
     from api.bounded_conversation_integration import PublicCursorGate

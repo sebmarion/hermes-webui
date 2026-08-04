@@ -363,6 +363,12 @@ HERMES_WEBUI_LAZY_TAIL_V1=1
 HERMES_WEBUI_LAZY_TAIL_BROWSER_V1=1
 ```
 
+Legacy Hermex clients that still request `/api/session` with `msg_limit` and
+`expand_renderable=1` use the same bounded state.db tail automatically. Verify
+that a successful response includes `_lazy_tail_window` and never enters the
+full sidecar/history merge; if the bounded reader cannot prove a safe page, the
+route must fall back to the unchanged legacy response.
+
 For manual verification, use isolated `HERMES_HOME` and
 `HERMES_WEBUI_STATE_DIR`. Open a large task and verify the newest response
 paints first, five upward-scroll pages preserve the first visible row, and an
