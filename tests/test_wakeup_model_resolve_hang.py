@@ -255,6 +255,41 @@ def test_prefer_cache_kw_exists_and_skips_live_rebuild(monkeypatch):
     assert "default_model" in result and "groups" in result
 
 
+def test_prefer_cache_does_not_wait_for_concurrent_live_rebuild(monkeypatch):
+    """A cache-only caller must not queue behind a live catalog rebuild.
+
+    ``get_available_models(prefer_cache=True)`` is used by hot session display
+    and server wakeups.  If another request is rebuilding the provider catalog,
+    waiting on the shared condition reintroduces the exact multi-second (or
+    hung) latency that this path is meant to avoid.  The cache-only caller can
+    safely serve the network-free minimal catalog while the owner publishes.
+    """
+    from api import config as cfg
+
+    cfg.invalidate_models_cache()
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: None, raising=True)
+    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: None, raising=True)
+    monkeypatch.setattr(cfg, "_cache_build_in_progress", True, raising=False)
+
+    def _forbid_wait(*_args, **_kwargs):
+        raise AssertionError(
+            "prefer_cache caller waited for a concurrent live provider rebuild"
+        )
+
+    monkeypatch.setattr(cfg._cache_build_cv, "wait_for", _forbid_wait, raising=True)
+    try:
+        result = cfg.get_available_models(prefer_cache=True)
+    finally:
+        # The test owns only the flag, not a real builder.  Clear it before the
+        # next test even when the regression assertion fails.
+        cfg._cache_build_in_progress = False
+        with cfg._cache_build_cv:
+            cfg._cache_build_cv.notify_all()
+
+    assert isinstance(result, dict)
+    assert isinstance(result.get("groups"), list)
+
+
 # ---------------------------------------------------------------------------
 # Source-grep wiring guards
 # ---------------------------------------------------------------------------

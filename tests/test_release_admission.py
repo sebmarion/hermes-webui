@@ -469,6 +469,61 @@ def test_reserved_worker_can_upgrade_while_fenced_but_unreserved_cannot(
     assert committed["state"] == "committing"
 
 
+def test_auxiliary_timeout_preserves_worker_ownership_after_registration_claim(
+    monkeypatch,
+    isolated_admission,
+):
+    """A timeout cannot report failure after the worker consumed admission.
+
+    Stale-stream reconciliation transfers its cleanup lock to the target only
+    when this helper returns true.  Pause the worker after its
+    reservation-to-active-run upgrade so the caller's registration wait expires
+    at the exact ownership boundary.
+    """
+    real_thread = threading.Thread
+    registration_claimed = threading.Event()
+    release_registration = threading.Event()
+    target_finished = threading.Event()
+    worker_threads = []
+    original_register = config.register_active_run
+
+    def paused_register(*args, **kwargs):
+        original_register(*args, **kwargs)
+        registration_claimed.set()
+        assert release_registration.wait(2.0), "registration pause was not released"
+
+    class CoordinatedThread:
+        def __init__(self, *, target, name, daemon):
+            self._thread = real_thread(target=target, name=name, daemon=daemon)
+            worker_threads.append(self._thread)
+
+        def start(self):
+            self._thread.start()
+            assert registration_claimed.wait(2.0), "worker did not claim admission"
+
+    monkeypatch.setattr(config, "register_active_run", paused_register)
+    monkeypatch.setattr(config, "_ensure_active_activity_heartbeat_thread", lambda: None)
+    monkeypatch.setattr(config, "_sync_active_delegation_activity", lambda: None)
+    monkeypatch.setattr(config.threading, "Thread", CoordinatedThread)
+
+    try:
+        started = config.start_admitted_auxiliary_thread(
+            kind="timeout-ownership-race",
+            target=target_finished.set,
+            name="timeout-ownership-race",
+            registration_timeout=0.0,
+        )
+    finally:
+        release_registration.set()
+        for worker in worker_threads:
+            worker.join(2.0)
+
+    assert target_finished.is_set() is True
+    assert started is True
+    assert config.run_admission_snapshot()["reservations"] == 0
+    assert config.run_admission_snapshot()["active_runs"] == 0
+
+
 def test_abort_requires_exact_token_and_process_identity(isolated_admission):
     fenced = config.fence_run_admission(isolated_admission)
 

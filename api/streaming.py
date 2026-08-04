@@ -11128,7 +11128,7 @@ def _run_agent_streaming(
                         _finalize_cancelled_turn(s, ephemeral=False)
                         try:
                             append_turn_journal_event_for_stream(
-                                s.session_id,
+                                session_id,
                                 stream_id,
                                 {
                                     "event": "interrupted",
@@ -11169,7 +11169,7 @@ def _run_agent_streaming(
                     _finalize_cancelled_turn(s, ephemeral=False)
                     try:
                         append_turn_journal_event_for_stream(
-                            s.session_id,
+                            session_id,
                             stream_id,
                             {
                                 "event": "interrupted",
@@ -11282,7 +11282,7 @@ def _run_agent_streaming(
                         _finalize_cancelled_turn(s, ephemeral=False)
                         try:
                             append_turn_journal_event_for_stream(
-                                s.session_id,
+                                session_id,
                                 stream_id,
                                 {
                                     "event": "interrupted",
@@ -11673,7 +11673,7 @@ def _run_agent_streaming(
                         if not ephemeral:
                             try:
                                 append_turn_journal_event_for_stream(
-                                    s.session_id,
+                                    session_id,
                                     stream_id,
                                     {
                                         "event": "interrupted",
@@ -11937,6 +11937,22 @@ def _run_agent_streaming(
                         if _err_type == 'tool_limit_reached':
                             _error_payload['terminal_state'] = 'tool_limit_reached'
                             _error_payload['terminal_reason'] = 'max_iterations'
+                        if not ephemeral:
+                            try:
+                                append_turn_journal_event_for_stream(
+                                    session_id,
+                                    stream_id,
+                                    {
+                                        "event": "interrupted",
+                                        "created_at": time.time(),
+                                        "reason": _err_type,
+                                    },
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "Failed to append terminal-result turn journal event",
+                                    exc_info=True,
+                                )
                         put('apperror', _error_payload)
                         # Legacy #373 source tests and clients look for the
                         # no_response type; #1765 keeps that type but improves
@@ -12343,7 +12359,7 @@ def _run_agent_streaming(
                         _latest_assistant = s.messages[_latest_assistant_idx]
                         try:
                             append_turn_journal_event_for_stream(
-                                s.session_id,
+                                session_id,
                                 stream_id,
                                 {
                                     "event": "assistant_started",
@@ -12357,7 +12373,7 @@ def _run_agent_streaming(
                     _finalize_cancelled_turn(s, ephemeral=False)
                     try:
                         append_turn_journal_event_for_stream(
-                            s.session_id,
+                            session_id,
                             stream_id,
                             {
                                 "event": "interrupted",
@@ -12402,7 +12418,7 @@ def _run_agent_streaming(
                     _finalize_cancelled_turn(s, ephemeral=False)
                     try:
                         append_turn_journal_event_for_stream(
-                            s.session_id,
+                            session_id,
                             stream_id,
                             {
                                 "event": "interrupted",
@@ -12417,7 +12433,7 @@ def _run_agent_streaming(
                 if not ephemeral:
                     try:
                         append_turn_journal_event_for_stream(
-                            s.session_id,
+                            session_id,
                             stream_id,
                             {
                                 "event": "completed",
@@ -12507,7 +12523,7 @@ def _run_agent_streaming(
                     _finalize_cancelled_turn(s, ephemeral=False)
                     try:
                         append_turn_journal_event_for_stream(
-                            s.session_id,
+                            session_id,
                             stream_id,
                             {
                                 "event": "interrupted",
@@ -12543,7 +12559,7 @@ def _run_agent_streaming(
                         _finalize_cancelled_turn(s, ephemeral=False)
                         try:
                             append_turn_journal_event_for_stream(
-                                s.session_id,
+                                session_id,
                                 stream_id,
                                 {
                                     "event": "interrupted",
@@ -12592,7 +12608,7 @@ def _run_agent_streaming(
                         _finalize_cancelled_turn(s, ephemeral=False)
                         try:
                             append_turn_journal_event_for_stream(
-                                s.session_id,
+                                session_id,
                                 stream_id,
                                 {
                                     "event": "interrupted",
@@ -13006,7 +13022,7 @@ def _run_agent_streaming(
                     if not ephemeral:
                         try:
                             append_turn_journal_event_for_stream(
-                                s.session_id,
+                                session_id,
                                 stream_id,
                                 {
                                     "event": "interrupted",
@@ -13124,7 +13140,7 @@ def _run_agent_streaming(
                                     if not ephemeral:
                                         try:
                                             append_turn_journal_event_for_stream(
-                                                s.session_id,
+                                                session_id,
                                                 stream_id,
                                                 {
                                                     "event": "interrupted",
@@ -13402,7 +13418,7 @@ def _run_agent_streaming(
                 if not ephemeral:
                     try:
                         append_turn_journal_event_for_stream(
-                            s.session_id,
+                            session_id,
                             stream_id,
                             {
                                 "event": "interrupted",

@@ -6044,27 +6044,46 @@ def _static_models_catalog_without_live_probes() -> dict:
                     if has_local_signal:
                         detected_providers.add(canonical)
 
-        for provider_id in set(_PROVIDER_MODELS) | set(_PROVIDER_DISPLAY):
-            canonical = _canonicalise_provider_id(provider_id)
-            if canonical and _provider_has_key(canonical):
-                detected_providers.add(canonical)
-
-        # Plugin-only providers (e.g. 9router) are not in the static
-        # _PROVIDER_MODELS / _PROVIDER_DISPLAY tables and are detected above
-        # only when the user puts them in `providers.<slug>`.  Plugins ship
-        # with their own env-var wiring, so an installed-and-keyed plugin
-        # provider should also enter the static catalog even without a
-        # `providers:` block — otherwise the picker silently drops the
-        # group when the live-rebuild cache is cold.
+        # Static fallback is a latency-critical, network-free path.  The
+        # normal credential-pool loader may seed singleton credentials (for
+        # example by exchanging a Copilot token), which can sleep for several
+        # seconds even though this catalog is explicitly avoiding live probes.
+        # Keep local .env/config/auth.json detection intact while forcing pool
+        # checks to read raw persisted entries only for this bounded section.
+        _previous_pool_env_block = getattr(
+            _thread_ctx, "block_process_env_fallback", False
+        )
+        _thread_ctx.block_process_env_fallback = True
         try:
-            for _plugin_pid in list(_plugin_model_provider_profiles().keys()):
-                if not _plugin_pid or not _provider_has_key(_plugin_pid):
-                    continue
-                _canonical = _canonicalise_provider_id(_plugin_pid) or _plugin_pid
-                if _canonical:
-                    detected_providers.add(_canonical)
-        except Exception:
-            logger.debug("Plugin provider detection failed in static catalog", exc_info=True)
+            for provider_id in set(_PROVIDER_MODELS) | set(_PROVIDER_DISPLAY):
+                canonical = _canonicalise_provider_id(provider_id)
+                if canonical and _provider_has_key(canonical):
+                    detected_providers.add(canonical)
+
+            # Plugin-only providers (e.g. 9router) are not in the static
+            # _PROVIDER_MODELS / _PROVIDER_DISPLAY tables and are detected above
+            # only when the user puts them in `providers.<slug>`.  Plugins ship
+            # with their own env-var wiring, so an installed-and-keyed plugin
+            # provider should also enter the static catalog even without a
+            # `providers:` block — otherwise the picker silently drops the
+            # group when the live-rebuild cache is cold.
+            try:
+                for _plugin_pid in list(_plugin_model_provider_profiles().keys()):
+                    if not _plugin_pid or not _provider_has_key(_plugin_pid):
+                        continue
+                    _canonical = _canonicalise_provider_id(_plugin_pid) or _plugin_pid
+                    if _canonical:
+                        detected_providers.add(_canonical)
+            except Exception:
+                logger.debug("Plugin provider detection failed in static catalog", exc_info=True)
+        finally:
+            if _previous_pool_env_block:
+                _thread_ctx.block_process_env_fallback = True
+            else:
+                try:
+                    del _thread_ctx.block_process_env_fallback
+                except AttributeError:
+                    pass
 
         fallback_cfg = cfg.get("fallback_providers", []) if isinstance(cfg, dict) else []
         if isinstance(fallback_cfg, list):
@@ -8775,7 +8794,11 @@ def get_available_models(
     # Mark that a build may be in progress BEFORE acquiring the lock.
     # If another thread has already started the cold path, we will wait for
     # its result rather than running the cold path concurrently.
-    should_wait = _cache_build_in_progress
+    # Cache-only callers are latency-sensitive hot paths (session display and
+    # server wakeups).  They never need the live provider result, so do not
+    # queue behind a rebuild owned by another request; the minimal network-free
+    # catalog below is safe while that owner publishes in the background.
+    should_wait = _cache_build_in_progress and not prefer_cache
     force_refresh_started_at = time.monotonic() if force_refresh else None
 
     # Check config mtime OUTSIDE the lock so this cheap check doesn't serialize
@@ -11034,6 +11057,7 @@ def start_admitted_auxiliary_thread(
     except RunAdmissionError:
         return False
     ready = threading.Event()
+    registered = threading.Event()
     run_id = f"aux:{kind}:{reservation_id[:8]}"
     startup_acceptor_transaction = getattr(
         _RUN_ADMISSION_LOCAL,
@@ -11063,6 +11087,7 @@ def start_admitted_auxiliary_thread(
                 release_run_admission(reservation_id)
                 ready.set()
                 return
+            registered.set()
             ready.set()
             try:
                 target(*args, **(kwargs or {}))
@@ -11090,9 +11115,16 @@ def start_admitted_auxiliary_thread(
         release_run_admission(reservation_id)
         raise
     if not ready.wait(max(0.0, float(registration_timeout))):
-        release_run_admission(reservation_id)
+        # Arbitrate timeout cancellation against the worker's reservation
+        # upgrade under the same lock.  Once registration won, callers must
+        # transfer cleanup ownership to the target even if ``ready.set()`` was
+        # delayed; otherwise both caller and worker may release that resource.
+        with ACTIVE_RUNS_LOCK:
+            if registered.is_set() or run_id in ACTIVE_RUNS:
+                return True
+            _RUN_ADMISSION_RESERVATIONS.pop(str(reservation_id), None)
         return False
-    return True
+    return registered.is_set()
 
 
 def _remember_session_activity_profile_locked(entry: dict) -> None:

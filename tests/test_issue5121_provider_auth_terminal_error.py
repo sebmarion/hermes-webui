@@ -13,6 +13,7 @@ import api.config as config
 import api.models as models
 import api.streaming as streaming
 from api.models import Session
+from api.turn_journal import read_turn_journal
 
 
 @pytest.fixture(autouse=True)
@@ -500,6 +501,16 @@ def test_non_auth_silent_failure_still_uses_no_response(tmp_path, monkeypatch):
     assert apperrors[-1]["type"] == "no_response"
     assert apperrors[-1]["type"] != "auth_mismatch"
     assert saved.messages[-1]["_error"] is True
+
+    journal_events = read_turn_journal("silent_failure")["events"]
+    terminal = [
+        event
+        for event in journal_events
+        if event.get("stream_id") == "stream_silent_failure"
+        and event.get("event") == "interrupted"
+    ]
+    assert terminal
+    assert terminal[-1]["reason"] == "no_response"
 
 
 def test_live_settlement_empty_hint_does_not_append_empty_emphasis(tmp_path, monkeypatch):
