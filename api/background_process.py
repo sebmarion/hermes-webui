@@ -1638,7 +1638,7 @@ def record_deferred_wakeup(
     completion_event: dict | None = None,
     execution_lineage_key: str | None = None,
     target_profile: str | None = None,
-) -> None:
+) -> bool:
     """Persist a deferred process-completion wakeup for later redelivery.
 
     Called from ``_process_one`` when a completion arrives while a turn is
@@ -1653,7 +1653,7 @@ def record_deferred_wakeup(
     twice. Best-effort — never raises into the drain loop.
     """
     if not session_id or not wakeup_prompt:
-        return
+        return False
     from api import config as _cfg
 
     try:
@@ -1677,7 +1677,7 @@ def record_deferred_wakeup(
                         existing["async_delegation_id"] = async_delegation_id
                     if completion_event and not existing.get("completion_event"):
                         existing["completion_event"] = completion_event
-                    return
+                    return True
             entry = {
                 "process_id": process_id,
                 "wakeup_prompt": wakeup_prompt,
@@ -1704,10 +1704,12 @@ def record_deferred_wakeup(
             if completion_event:
                 entry["completion_event"] = completion_event
             entries.append(entry)
+            return True
     except Exception:
         logger.debug(
             "record_deferred_wakeup failed for session %s", session_id, exc_info=True
         )
+        return False
 
 
 def claim_deferred_wakeups(
@@ -2367,6 +2369,11 @@ def recover_processes_for_webui(process_registry=None, get_session_fn=None) -> i
             if not session_key or get_session_fn(session_key, metadata_only=True) is None:
                 continue
             register_process_session(session_key, session_key)
+        recover_notifications = getattr(
+            process_registry, "recover_completion_notifications", None
+        )
+        if callable(recover_notifications):
+            recover_notifications()
         _PROCESS_RECOVERY_DONE = True
         return recovered
 

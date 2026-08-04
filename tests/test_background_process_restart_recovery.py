@@ -86,6 +86,30 @@ def test_recovery_runs_once_and_rebuilds_session_mapping(monkeypatch):
     }
 
 
+def test_recovery_replays_durable_completion_notifications(monkeypatch):
+    calls = []
+
+    class FakeRegistry:
+        def recover_from_checkpoint(self):
+            calls.append("checkpoint")
+            return 0
+
+        def recover_completion_notifications(self):
+            calls.append("notifications")
+            return 1
+
+        def list_sessions(self):
+            return []
+
+    monkeypatch.setattr(bp, "_PROCESS_CHECKPOINT_RECOVERED", False)
+    monkeypatch.setattr(bp, "_PROCESS_RECOVERY_DONE", False)
+
+    assert bp.recover_processes_for_webui(
+        FakeRegistry(), lambda *_args, **_kwargs: None
+    ) == 0
+    assert calls == ["checkpoint", "notifications"]
+
+
 def test_partial_recovery_retry_does_not_repeat_checkpoint_adoption(monkeypatch):
     calls = {"recover": 0, "list": 0}
 
