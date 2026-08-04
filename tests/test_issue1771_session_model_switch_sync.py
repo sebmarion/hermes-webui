@@ -310,7 +310,9 @@ def test_sync_topbar_missing_model_falls_back_to_configured_default_not_previous
     got = _run_sync(driver_path, session_model="")
 
     assert got["selectValue"] == "@safe:gpt-4o-mini"
-    assert got["sessionModel"] == "@safe:gpt-4o-mini"
+    # Session state stores the normalized model/provider pair; the qualified
+    # value remains the picker value used for routing.
+    assert got["sessionModel"] == "gpt-4o-mini"
     assert got["sessionProvider"] == "safe"
     assert got["selectValue"] != "@expensive:gpt-5.5"
 
@@ -319,7 +321,7 @@ def test_sync_topbar_unknown_model_falls_back_to_configured_default_not_first_op
     got = _run_sync(driver_path, session_model="unknown")
 
     assert got["selectValue"] == "@safe:gpt-4o-mini"
-    assert got["sessionModel"] == "@safe:gpt-4o-mini"
+    assert got["sessionModel"] == "gpt-4o-mini"
     assert got["sessionProvider"] == "safe"
 
 

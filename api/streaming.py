@@ -12,6 +12,7 @@ import mimetypes
 import os
 import queue
 import re
+import sqlite3
 import shlex
 import sys
 import subprocess
@@ -212,6 +213,64 @@ def _cancel_event_payload(
 # in _run_agent_streaming (line ~2719) and profile_env_for_background_worker
 # (api/profiles.py:715).
 _ENV_LOCK = threading.Lock()
+
+# Optional task-local Hermes-home override provided by newer hermes-agent
+# releases.  Keep the small adapter here for streaming callers and tests that
+# need to replace the provider independently of the process-global env mirror.
+_streaming_hermes_home_override_available = None
+
+
+def _resolve_streaming_hermes_home_override():
+    """Return ``hermes_constants`` when task-local home scoping is available."""
+    global _streaming_hermes_home_override_available
+    if _streaming_hermes_home_override_available is False:
+        return None
+    module = sys.modules.get("hermes_constants")
+    if module is None and _streaming_hermes_home_override_available is None:
+        try:
+            import hermes_constants as module  # type: ignore[no-redef]
+        except Exception:
+            _streaming_hermes_home_override_available = False
+            return None
+    if module is not None and all(
+        callable(getattr(module, name, None))
+        for name in ("set_hermes_home_override", "reset_hermes_home_override")
+    ):
+        _streaming_hermes_home_override_available = True
+        return module
+    _streaming_hermes_home_override_available = False
+    return None
+
+
+def _set_streaming_hermes_home_override(profile_home: str):
+    """Install a task-local Hermes home and return its reset tuple."""
+    if not profile_home:
+        return None, None, False
+    module = _resolve_streaming_hermes_home_override()
+    if module is None:
+        return None, None, False
+    try:
+        return module, module.set_hermes_home_override(profile_home), True
+    except Exception:
+        logger.debug(
+            "Failed to set streaming Hermes home override; continuing with env mirror",
+            exc_info=True,
+        )
+        return None, None, False
+
+
+def _reset_streaming_hermes_home_override(
+    override_mod,
+    override_token,
+    override_installed: bool,
+) -> None:
+    """Restore a task-local Hermes home installed by the adapter."""
+    if override_mod is None or not override_installed:
+        return
+    try:
+        override_mod.reset_hermes_home_override(override_token)
+    except Exception:
+        logger.debug("Failed to reset streaming Hermes home override", exc_info=True)
 
 _KEYLESS_CUSTOM_API_KEY = "dummy-key"
 _STREAM_WRITEBACK_DIAG_DEFAULT_THRESHOLD_MS = 250.0
@@ -6941,6 +7000,7 @@ def _save_streaming_checkpoint(session):
         session,
         "streaming checkpoint",
         logger_override=logger,
+        patch_skill_modules=False,
     ):
         session.save(skip_index=True)
 
@@ -7590,15 +7650,34 @@ def _session_lacks_final_assistant_answer(messages) -> bool:
             return True
         if role == 'assistant':
             content = msg.get('content')
+            has_output_text_part = False
             if isinstance(content, list):
-                text = '\n'.join(
-                    str(part.get('text') or part.get('content') or '')
-                    for part in content
-                    if isinstance(part, dict)
-                )
+                text_parts = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = str(part.get('type') or '').strip().lower()
+                    part_output = part.get('output_text')
+                    if part_type == 'output_text' or part_output is not None:
+                        has_output_text_part = bool(str(part_output or '').strip())
+                    text_parts.append(
+                        str(
+                            part.get('text')
+                            or part.get('content')
+                            or part_output
+                            or ''
+                        )
+                    )
+                text = '\n'.join(text_parts)
             else:
                 text = str(content or '')
-            if msg.get('tool_calls'):
+            # A Responses-style assistant message can contain tool metadata and
+            # a terminal ``output_text`` item in the same content array.  The
+            # latter is the actual final answer; do not leave the session marked
+            # as incomplete merely because the provider also retained the call.
+            # A plain ``text`` item remains an in-progress/tool-boundary shape
+            # and keeps the historical conservative behavior.
+            if msg.get('tool_calls') and not has_output_text_part:
                 return True
             if text.strip():
                 return False
@@ -8317,10 +8396,53 @@ def _build_session_db_for_stream(state_db_path):
     """
     try:
         from hermes_state import SessionDB
-        return SessionDB(db_path=state_db_path)
+        attempts = 3
+        last_error = None
+        for attempt in range(attempts):
+            try:
+                return SessionDB(db_path=state_db_path)
+            except sqlite3.OperationalError as db_error:
+                error_text = str(db_error).lower()
+                if "locked" not in error_text and "busy" not in error_text:
+                    raise
+                last_error = db_error
+                if attempt < attempts - 1:
+                    print(
+                        f"[webui] WARNING: SessionDB init attempt {attempt + 1}/{attempts} failed, retrying: {db_error}",
+                        flush=True,
+                    )
+                    time.sleep(0.05 * (2 ** attempt) + random.uniform(0, 0.05))
+        raise last_error or RuntimeError("SessionDB construction exhausted all attempts")
     except Exception as _db_err:
         print(f"[webui] WARNING: SessionDB init failed - session_search will be unavailable: {_db_err}", flush=True)
         return None
+
+
+def _session_db_is_open(session_db) -> bool:
+    """Return whether a SessionDB handle still owns a live connection."""
+    return session_db is not None and getattr(session_db, "_conn", None) is not None
+
+
+def _adopt_session_db_for_cached_agent(agent, new_session_db):
+    """Reuse an open cached handle so live subagents are not invalidated."""
+    if agent is None:
+        return new_session_db
+    existing = getattr(agent, "_session_db", None)
+    if new_session_db is None or existing is new_session_db:
+        return existing if new_session_db is None else existing
+    if _session_db_is_open(existing):
+        try:
+            new_session_db.close()
+        except Exception:
+            logger.debug("Failed to close unused session_db handle in adopt helper", exc_info=True)
+        return existing
+    if existing is not None:
+        try:
+            existing.close()
+        except Exception:
+            logger.debug("Failed to close previous session_db handle in adopt helper", exc_info=True)
+    agent._session_db = new_session_db
+    return new_session_db
 
 
 def _replace_session_db_in_kwargs(agent_kwargs, state_db_path):
@@ -8330,6 +8452,19 @@ def _replace_session_db_in_kwargs(agent_kwargs, state_db_path):
 
     _old_session_db = agent_kwargs.get("session_db")
     _next_session_db = _build_session_db_for_stream(state_db_path)
+    if _next_session_db is None:
+        if _session_db_is_open(_old_session_db):
+            return _old_session_db
+        agent_kwargs["session_db"] = None
+        return None
+    if _session_db_is_open(_old_session_db):
+        try:
+            if _next_session_db is not _old_session_db:
+                _next_session_db.close()
+        except Exception:
+            logger.debug("Failed to close unused session_db handle during self-heal", exc_info=True)
+        agent_kwargs["session_db"] = _old_session_db
+        return _old_session_db
     if _old_session_db is not None and _old_session_db is not _next_session_db:
         try:
             _old_session_db.close()
@@ -8915,6 +9050,7 @@ def _run_agent_streaming(
     old_session_platform = None
     old_hermes_home = None
     old_profile_env = {}
+    _streaming_skill_home_snapshot = None
 
     # MCP discovery moved to AFTER the per-profile HERMES_HOME mutation below
     # (was here at v0.51.30) — the previous placement always read the default
@@ -9356,6 +9492,7 @@ def _run_agent_streaming(
     # to the `try:` (preserves the Issue #765 static-locator invariant).
     _turn_session_identity_tokens = None
     _streaming_cron_profile_home_token = None
+    _streaming_hermes_home_override_ctx = (None, None, False)
     _agent_home_override_module = None
     _agent_home_override_token = None
     _turn_pending_source = 'webui'
@@ -9430,7 +9567,10 @@ def _run_agent_streaming(
         try:
             from api.profiles import (
                 filter_runtime_env_for_gateway_parity,
+                _skill_modules_support_profile_home,
                 patch_skill_home_modules,
+                snapshot_skill_home_modules,
+                restore_skill_home_modules,
                 get_hermes_home_for_profile,
                 get_profile_runtime_env,
             )
@@ -9444,33 +9584,22 @@ def _run_agent_streaming(
             _profile_runtime_env = {}
             _safe_profile_runtime_env = {}
             patch_skill_home_modules = None
+            _skill_modules_support_profile_home = None
+            snapshot_skill_home_modules = None
+            restore_skill_home_modules = None
 
         # Bind the resolved profile home to the Agent's task-local resolver for
-        # the whole construction + conversation lifetime. The process-global
-        # HERMES_HOME mirror below remains for legacy consumers, but concurrent
-        # profile workers can overwrite it while this turn is running. Newer
-        # Agent builds therefore receive an exact ContextVar token that the
-        # outer finally restores on every success and failure path. Older Agent
-        # builds expose no override API and keep the previous behavior.
-        if _profile_home:
-            try:
-                from api.profiles import _resolve_hermes_home_override
-
-                _agent_home_override_module = _resolve_hermes_home_override()
-                if _agent_home_override_module is not None:
-                    _agent_home_override_token = (
-                        _agent_home_override_module.set_hermes_home_override(
-                            _profile_home
-                        )
-                    )
-            except Exception:
-                _agent_home_override_module = None
-                _agent_home_override_token = None
-                logger.debug(
-                    "Failed to bind task-local Agent home for profile %s",
-                    getattr(s, 'profile', None),
-                    exc_info=True,
-                )
+        # the whole construction + conversation lifetime. The adapter remains
+        # optional for older agent releases and gives tests a narrow setup /
+        # teardown seam without changing the process-global env mirror.
+        _streaming_hermes_home_override_ctx = _set_streaming_hermes_home_override(
+            _profile_home
+        )
+        (
+            _agent_home_override_module,
+            _agent_home_override_token,
+            _override_installed,
+        ) = _streaming_hermes_home_override_ctx
 
         _turn_session_identity_tokens = _set_turn_session_identity(
             session_id,
@@ -9540,6 +9669,17 @@ def _run_agent_streaming(
         # block other concurrent sessions waiting on _ENV_LOCK (#2024).
         _prewarm_skill_tool_modules()
         _install_streaming_cronjob_profile_wrapper()
+        # Probe after prewarm so the dynamic capability check sees the actual
+        # skill modules used by this turn rather than treating an import miss
+        # as a legacy runtime.
+        _skill_modules_dynamic = False
+        if _override_installed and _skill_modules_support_profile_home is not None:
+            try:
+                _skill_modules_dynamic = _skill_modules_support_profile_home(
+                    Path(_profile_home)
+                )
+            except Exception:
+                _skill_modules_dynamic = False
         # Still set process-level env as fallback for tools that bypass thread-local
         # Acquire lock only for the env mutation, then release before the agent runs.
         # The finally block re-acquires to restore — keeping critical sections short
@@ -9574,7 +9714,9 @@ def _run_agent_streaming(
                 # above, so we only do lightweight sys.modules lookups and
                 # attribute assignments here — no first-time import under
                 # the lock (#2024).
-                if patch_skill_home_modules is not None:
+                if patch_skill_home_modules is not None and not _skill_modules_dynamic:
+                    if snapshot_skill_home_modules is not None:
+                        _streaming_skill_home_snapshot = snapshot_skill_home_modules()
                     patch_skill_home_modules(Path(_profile_home))
         # Lock released — agent runs without holding it
         # ── MCP Server Discovery (lazy import, idempotent) ──
@@ -10641,15 +10783,7 @@ def _run_agent_streaming(
                     if 'prefill_messages' in _agent_kwargs and hasattr(agent, 'prefill_messages'):
                         agent.prefill_messages = list(_agent_kwargs.get('prefill_messages') or [])
                     if _session_db is not None:
-                        # Close any previously held SessionDB connection before
-                        # replacing it. Without this, each streaming request creates
-                        # a new SessionDB whose WAL handles leak indefinitely,
-                        # eventually causing EMFILE crashes (#streaming FD leak).
-                        if hasattr(agent, '_session_db') and agent._session_db is not None:
-                            try:
-                                agent._session_db.close()
-                            except Exception:
-                                pass
+                        _session_db = _adopt_session_db_for_cached_agent(agent, _session_db)
                         agent._session_db = _session_db
                     if hasattr(agent, '_api_call_count'):
                         agent._api_call_count = 0
@@ -11446,13 +11580,14 @@ def _run_agent_streaming(
                     _previous_context_messages,
                     msg_text,
                 )
+                _captured_terminal_failure = bool(_captured_terminal_error[0])
                 _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
                 # #5940: if the Agent aborted on a non-retryable provider error
                 # (captured from its lifecycle status_callback) but left no error on
                 # the result/agent, use the captured message so the classifier can
                 # surface the real cause (model_not_found / auth) instead of the
                 # misleading no_response "silent rate limit, try again" fallback.
-                if not _last_err and _captured_terminal_error[0]:
+                if not _last_err and _captured_terminal_failure:
                     _last_err = _captured_terminal_error[0]
                 if _structured_compression_exhausted:
                     # The result flag is the authoritative contract. Local
@@ -11491,7 +11626,8 @@ def _run_agent_streaming(
                     _assistant_added = True
                 _is_agent_result_terminal = _agent_result_terminal_failure(result)
                 _terminal_failure = (
-                    (
+                    _captured_terminal_failure
+                    or (
                         _is_agent_result_terminal
                         and not (
                             _tool_limit_reached
@@ -11738,6 +11874,7 @@ def _run_agent_streaming(
                             s,
                             active_turn_identity=_active_turn_identity,
                         )
+                        _terminal_error_turn_duration = _terminal_turn_duration(s)
                         s.active_stream_id = None
                         s.pending_user_message = None
                         s.pending_attachments = []
@@ -11758,6 +11895,8 @@ def _run_agent_streaming(
                             'timestamp': int(time.time()),
                             '_error': True,
                         }
+                        if _terminal_error_turn_duration is not None:
+                            _error_message['_turnDuration'] = _terminal_error_turn_duration
                         if _err_type == 'compression_exhausted':
                             _recovery = stamp_compression_exhausted_recovery(
                                 s,
@@ -12828,6 +12967,8 @@ def _run_agent_streaming(
                 else: os.environ['HERMES_SESSION_CHAT_ID'] = old_session_chat_id
                 if old_hermes_home is None: os.environ.pop('HERMES_HOME', None)
                 else: os.environ['HERMES_HOME'] = old_hermes_home
+                if _streaming_skill_home_snapshot is not None and restore_skill_home_modules is not None:
+                    restore_skill_home_modules(_streaming_skill_home_snapshot)
 
     except Exception as e:
         print('[webui] stream error:\n' + traceback.format_exc(), flush=True)
@@ -13212,6 +13353,7 @@ def _run_agent_streaming(
                     s,
                     active_turn_identity=_active_turn_identity,
                 )
+                _terminal_error_turn_duration = _terminal_turn_duration(s)
                 s.active_stream_id = None
                 s.pending_user_message = None
                 s.pending_attachments = []
@@ -13228,6 +13370,8 @@ def _run_agent_streaming(
                     'timestamp': int(time.time()),
                     '_error': True,
                 }
+                if _terminal_error_turn_duration is not None:
+                    _error_message['_turnDuration'] = _terminal_error_turn_duration
                 if _exc_type == 'compression_exhausted':
                     _recovery = stamp_compression_exhausted_recovery(
                         s,
@@ -13339,19 +13483,6 @@ def _run_agent_streaming(
             update_active_run(stream_id, phase="finalizing")
             _last_resort_sync_from_core(s, stream_id, _agent_lock)
         _clear_thread_env()  # TD1: always clear thread-local context
-        if (
-            _agent_home_override_module is not None
-            and _agent_home_override_token is not None
-        ):
-            try:
-                _agent_home_override_module.reset_hermes_home_override(
-                    _agent_home_override_token
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to restore task-local Agent home override",
-                    exc_info=True,
-                )
         if _streaming_cron_profile_home_token is not None:
             _STREAMING_CRON_PROFILE_HOME.reset(_streaming_cron_profile_home_token)
         # xsession wakeup misroute root fix (Option 1): restore the per-turn
@@ -13360,6 +13491,11 @@ def _run_agent_streaming(
         # CLI/cron env fallback resumes — same lifecycle slot as the env
         # restore above.
         _reset_turn_session_identity(_turn_session_identity_tokens)
+        # The turn identity binds the same Hermes-home ContextVar after the
+        # streaming adapter. Reset nested tokens in reverse order; resetting
+        # the outer adapter first can leave the inner token stranded on a
+        # reused worker thread when the two setters are both available.
+        _reset_streaming_hermes_home_override(*_streaming_hermes_home_override_ctx)
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
             CANCEL_FLAGS.pop(stream_id, None)

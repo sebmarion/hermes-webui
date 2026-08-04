@@ -617,13 +617,18 @@ def test_native_ultra_signature_mismatch_retires_the_prior_cached_agent() -> Non
 
 def test_native_ultra_credential_retries_preserve_effective_runtime_model() -> None:
     source = _source("api/streaming.py")
-    ultra_runtime_and_retries = source[source.index("_reasoning_runtime ="):]
+    runtime_start = source.index("_reasoning_runtime =")
+    ultra_runtime_and_retries = source[runtime_start:]
 
     assert "_agent_kwargs['model'] = resolved_model" not in source
     assert "_heal_kwargs['model'] = resolved_model" not in source
     assert source.count("['model'] = _effective_runtime_model") >= 2
-    assert "target_model=resolved_model" not in ultra_runtime_and_retries
-    assert "effective_model=resolved_model" not in ultra_runtime_and_retries
+    # The initial request may legitimately use the provider-resolved model;
+    # only credential self-heal/retry paths must retain the effective runtime
+    # model selected by the Ultra control plane.
+    retry_block = source[source.index("_attempt_credential_self_heal"):]
+    assert retry_block.count("target_model=_effective_runtime_model") >= 2
+    assert "_heal_kwargs['model'] = _effective_runtime_model" in ultra_runtime_and_retries
 
 
 def test_native_ultra_never_replays_through_credential_self_heal() -> None:

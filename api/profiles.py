@@ -57,6 +57,43 @@ _loaded_profile_env_keys: set[str] = set()
 _tls = threading.local()
 
 _SKILL_HOME_MODULES = ("tools.skills_tool", "tools.skill_manager_tool")
+# Compatibility sentinel for checkpoint callers and older integrations. The
+# active profile paths are synchronized by the bounded environment lock; this
+# lock is deliberately not acquired by checkpoint saves.
+_SKILL_HOME_MODULE_PATCH_LOCK = threading.Lock()
+
+
+def _skill_modules_support_profile_home(profile_home: Path) -> bool:
+    """Return whether both skill modules resolve paths from the active home.
+
+    Newer hermes-agent skill modules expose a callable ``_skills_dir`` resolver
+    and retain the import-time ``_SKILLS_DIR_AT_IMPORT`` value for diagnostics.
+    When both modules have that shape, a context-local Hermes-home override is
+    sufficient and mutating their process-global caches would reintroduce the
+    cross-profile race this capability is meant to avoid.  Treat any missing,
+    already-mutated, or failing module as legacy and let callers use the
+    snapshot/patch/restore fallback.
+    """
+    expected = Path(profile_home).expanduser() / "skills"
+    for module_name in _SKILL_HOME_MODULES:
+        module = sys.modules.get(module_name)
+        if module is None:
+            return False
+        resolver = getattr(module, "_skills_dir", None)
+        if not callable(resolver):
+            return False
+        if not hasattr(module, "_SKILLS_DIR_AT_IMPORT"):
+            return False
+        imported = getattr(module, "_SKILLS_DIR_AT_IMPORT")
+        current = getattr(module, "SKILLS_DIR", imported)
+        if current != imported:
+            return False
+        try:
+            if Path(resolver()).expanduser() != expected:
+                return False
+        except Exception:
+            return False
+    return True
 
 
 def snapshot_skill_home_modules() -> dict[str, dict[str, object]]:
@@ -1101,6 +1138,8 @@ def profile_env_for_background_worker(
     session,
     purpose: str = "background worker",
     logger_override: Optional[logging.Logger] = None,
+    *,
+    patch_skill_modules: bool = True,
 ):
     """Temporarily route detached worker config reads through a profile.
 
@@ -1144,6 +1183,7 @@ def profile_env_for_background_worker(
     # os.getenv() directly for provider credentials.  Keep the _ENV_LOCK scope
     # narrow: serialize only setup/restore, not the whole worker body.
     skill_home_snapshot = None
+    skill_modules_dynamic = False
     old_runtime_env: dict[str, Optional[str]] = {}
     old_hermes_home = None
     had_hermes_home = False
@@ -1157,6 +1197,10 @@ def profile_env_for_background_worker(
     # older agents → graceful no-op (falls back to the os.environ mirror below).
     _home_override_mod = None
     _home_override_token = None
+    _home_override_installed = False
+    should_restore_skill_modules = False
+    _acquired_skill_home_patch_lock = False
+    _secret_scope_mod = None
     try:
         _set_thread_env(**thread_env)
         _thread_ctx.block_process_env_fallback = True
@@ -1181,58 +1225,110 @@ def profile_env_for_background_worker(
                 _home_override_token = _home_override_mod.set_hermes_home_override(
                     str(profile_home_path)
                 )
+                _home_override_installed = True
             except Exception:
                 _home_override_token = None
-        with _ENV_LOCK:
-            old_runtime_env = _apply_profile_env_to_process(
-                os.environ,
-                safe_runtime_env,
-                secret_env_names=secret_env_names,
-            )
-            had_hermes_home = "HERMES_HOME" in os.environ
-            old_hermes_home = os.environ.get("HERMES_HOME")
-            skill_home_snapshot = snapshot_skill_home_modules()
-            os.environ.update(safe_runtime_env)
-            os.environ["HERMES_HOME"] = str(profile_home_path)
+                _home_override_installed = False
+        if patch_skill_modules and _home_override_installed:
             try:
-                patch_skill_home_modules(profile_home_path)
+                skill_modules_dynamic = _skill_modules_support_profile_home(
+                    profile_home_path
+                )
             except Exception:
                 log.debug(
-                    "Failed to patch skill modules for %s profile %s",
-                    purpose,
+                    "Failed to evaluate profile-home skill module capability for %s in %s",
                     profile,
+                    purpose,
                     exc_info=True,
                 )
-        yield
+                skill_modules_dynamic = False
+        # Legacy skill modules retain process-global path constants.  Hold the
+        # fallback lock for the complete worker scope so a second profile cannot
+        # observe the first profile's patched module globals mid-body.
+        should_restore_skill_modules = bool(
+            patch_skill_modules
+            and not (_home_override_installed and skill_modules_dynamic)
+        )
+        if should_restore_skill_modules:
+            _SKILL_HOME_MODULE_PATCH_LOCK.acquire()
+            _acquired_skill_home_patch_lock = True
+        try:
+            with _ENV_LOCK:
+                if should_restore_skill_modules:
+                    skill_home_snapshot = snapshot_skill_home_modules()
+                    try:
+                        patch_skill_home_modules(profile_home_path)
+                    except Exception:
+                        log.debug(
+                            "Failed to patch skill modules for %s profile %s",
+                            purpose,
+                            profile,
+                            exc_info=True,
+                        )
+                old_runtime_env = _apply_profile_env_to_process(
+                    os.environ,
+                    safe_runtime_env,
+                    secret_env_names=secret_env_names,
+                )
+                had_hermes_home = "HERMES_HOME" in os.environ
+                old_hermes_home = os.environ.get("HERMES_HOME")
+                os.environ.update(safe_runtime_env)
+                os.environ["HERMES_HOME"] = str(profile_home_path)
+            yield
+        finally:
+            try:
+                with _ENV_LOCK:
+                    for key, old_value in old_runtime_env.items():
+                        if old_value is None:
+                            os.environ.pop(key, None)
+                        else:
+                            os.environ[key] = old_value
+                    if had_hermes_home:
+                        os.environ["HERMES_HOME"] = old_hermes_home or ""
+                    else:
+                        os.environ.pop("HERMES_HOME", None)
+                    if skill_home_snapshot is not None:
+                        restore_skill_home_modules(skill_home_snapshot)
+            finally:
+                if _acquired_skill_home_patch_lock:
+                    _SKILL_HOME_MODULE_PATCH_LOCK.release()
+                    _acquired_skill_home_patch_lock = False
+                if _home_override_mod is not None and _home_override_installed:
+                    try:
+                        _home_override_mod.reset_hermes_home_override(
+                            _home_override_token
+                        )
+                    except Exception:
+                        pass
+                    _home_override_installed = False
+                if _has_scope and _secret_scope_mod is not None:
+                    try:
+                        _secret_scope_mod.reset_secret_scope(_scope_token)
+                    except Exception:
+                        pass
+                _thread_ctx.block_process_env_fallback = previous_block_process_env
+                if previous_thread_env:
+                    _set_thread_env(**previous_thread_env)
+                else:
+                    _clear_thread_env()
+        return
     finally:
-        # #5567: pop the context-local home override first (reverse of setup order).
-        if _home_override_mod is not None and _home_override_token is not None:
+        # Setup failures before the nested scope reaches its ``finally`` still
+        # need to release the legacy lock and restore any partial module patch.
+        if _acquired_skill_home_patch_lock:
+            try:
+                with _ENV_LOCK:
+                    if skill_home_snapshot is not None:
+                        restore_skill_home_modules(skill_home_snapshot)
+            finally:
+                _SKILL_HOME_MODULE_PATCH_LOCK.release()
+                _acquired_skill_home_patch_lock = False
+        if _home_override_mod is not None and _home_override_installed:
             try:
                 _home_override_mod.reset_hermes_home_override(_home_override_token)
             except Exception:
                 pass
-        if _has_scope and _secret_scope_mod is not None:
-            try:
-                _secret_scope_mod.reset_secret_scope(_scope_token)
-            except Exception:
-                pass
-        _thread_ctx.block_process_env_fallback = previous_block_process_env
-        if previous_thread_env:
-            _set_thread_env(**previous_thread_env)
-        else:
-            _clear_thread_env()
-        with _ENV_LOCK:
-            for key, old_value in old_runtime_env.items():
-                if old_value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = old_value
-            if had_hermes_home:
-                os.environ["HERMES_HOME"] = old_hermes_home or ""
-            else:
-                os.environ.pop("HERMES_HOME", None)
-            if skill_home_snapshot is not None:
-                restore_skill_home_modules(skill_home_snapshot)
+            _home_override_installed = False
 
 
 @contextmanager

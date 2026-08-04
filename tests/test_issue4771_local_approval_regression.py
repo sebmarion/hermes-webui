@@ -406,15 +406,19 @@ def test_gateway_mirrored_approval_without_run_retires_locally():
 
 
 def test_gateway_pending_without_run_id_flag_detection():
-    """Unit-level: the helper detects a mirrored (flagged) head correctly.
+    """Unit-level: the helper distinguishes local and remote mirrors.
 
-    This is the predicate the 409 hinges on; it must report True for a
-    gateway-mirror entry regardless of backend (the backend gate lives in the
-    handler, not the predicate).
+    A local parked producer is not a missing gateway run, even though its
+    polling mirror carries the same flag. A retained mirror with no local
+    producer is the gateway-only missing-run case.
     """
     sid = f"flag-detect-{uuid.uuid4().hex[:8]}"
     try:
         entry, approval_id = _seed_local_pending_approval(sid)
+        assert routes._gateway_pending_approval_without_run_id(sid, approval_id) is False
+        with ta._lock:
+            ta._gateway_queues.pop(sid, None)
+            ta._pending[sid][0][ra._GATEWAY_MIRROR_RETAINED] = True
         assert routes._gateway_pending_approval_without_run_id(sid, approval_id) is True
         # A non-existent approval_id must not match.
         assert routes._gateway_pending_approval_without_run_id(sid, "no-such-id") is False

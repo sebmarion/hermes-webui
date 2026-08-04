@@ -3442,6 +3442,7 @@ from api.config import (
     set_reasoning_effort,
     create_stream_channel,
     get_webui_session_save_mode,
+    get_config_snapshot,
     STREAM_GOAL_RELATED,
     PENDING_GOAL_CONTINUATION,
     PENDING_GOAL_CONTINUATION_GUARDS,
@@ -3711,13 +3712,34 @@ def _run_journal_snapshot_tool_id(payload: dict | None) -> str:
     return ""
 
 
-def _truncate_journal_snapshot_value(value, *, limit: int = 120):
+_JOURNAL_CONTENT_ARG_KEYS = frozenset(
+    {
+        "command",
+        "cmd",
+        "script",
+        "code",
+        "patch",
+        "diff",
+        "old_string",
+        "new_string",
+        "content",
+        "path",
+        "file_path",
+    }
+)
+
+
+def _truncate_journal_snapshot_value(value, *, limit: int = 256, key: str | None = None):
     if isinstance(value, str):
-        return value if len(value) <= limit else value[:limit] + "..."
+        cap = 4096 if str(key or "").lower() in _JOURNAL_CONTENT_ARG_KEYS else limit
+        return value if len(value) <= cap else value[:cap] + "..."
     if isinstance(value, dict):
-        return {str(k): _truncate_journal_snapshot_value(v, limit=limit) for k, v in value.items()}
+        return {
+            str(k): _truncate_journal_snapshot_value(v, limit=limit, key=str(k))
+            for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [_truncate_journal_snapshot_value(v, limit=limit) for v in value[:20]]
+        return [_truncate_journal_snapshot_value(v, limit=limit) for v in value[:64]]
     return value
 
 
@@ -3777,6 +3799,14 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             call_id = _run_journal_snapshot_tool_id(call)
             if (tool_id and call_id == tool_id) or (not tool_id and name and call.get("name") == name):
                 call["done"] = True
+                if isinstance(payload.get("args"), dict):
+                    # A tool may emit a lightweight start payload and only
+                    # provide its complete command/arguments on completion.
+                    # Replace the preview args so durable recovery does not
+                    # regress to the abbreviated start record.
+                    call["args"] = _truncate_journal_snapshot_value(
+                        payload.get("args") or {}
+                    )
                 if payload.get("preview") is not None:
                     call["snippet"] = str(payload.get("preview") or "")
                     call["preview"] = call.get("preview") or call["snippet"]
@@ -10043,6 +10073,7 @@ def _keep_latest_messaging_session_per_source(
 from api.models import (
     Session,
     get_session,
+    get_session_for_scan,
     find_compression_recovery_session,
     get_session_for_file_ops,
     persist_recovered_workspace_binding,
@@ -10391,6 +10422,7 @@ from api.route_approvals import (  # noqa: F401 — re-exports for backward comp
     _approval_sse_notify,
     _GATEWAY_MIRROR_FLAG,
     _GATEWAY_MIRROR_TOKEN,
+    _GATEWAY_ENTRY_DATA_TOKEN_KEY,
     _GATEWAY_AGENT_IDENTITY_V1,
     _gateway_mirror_entry_token,
     claim_gateway_approval_relay_owner,
@@ -10398,6 +10430,7 @@ from api.route_approvals import (  # noqa: F401 — re-exports for backward comp
     gateway_pending_mirror,
     retire_gateway_pending_mirror,
     resolve_gateway_pending_local_no_run_mirror,
+    resolve_gateway_pending_local,
     reconcile_gateway_pending_mirror_locked,
     submit_gateway_pending_mirror,
     submit_pending,
@@ -10565,8 +10598,17 @@ def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None
         item["cwd"] = item.get("workspace")
     if isinstance(item.get("title"), str):
         item["title"] = _redact_text(item["title"], _enabled=redact_enabled)
+    _redact_sidebar_title_fields(item, redact_enabled)
     item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
     return item
+
+
+def _redact_sidebar_title_fields(item: dict, redact_enabled: bool | None = None) -> None:
+    """Redact user-content-derived title fields shared by sidebar and search rows."""
+    for field in ("display_title", "_state_db_title", "parent_title"):
+        value = item.get(field)
+        if isinstance(value, str):
+            item[field] = _redact_text(value, _enabled=redact_enabled)
 
 
 # ── Login page locale strings ─────────────────────────────────────────────────
@@ -16822,6 +16864,7 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Subagent sessions are view-only and cannot be deleted from WebUI", 400)
         is_messaging_session = _is_messaging_session_id(sid)
         worktree_retained = _worktree_retained_payload_for_session_id(sid)
+        state_db_cleanup_failed = False
         try:
             event_profile = getattr(get_session(sid, metadata_only=True), "profile", None)
         except KeyError:
@@ -16935,11 +16978,19 @@ def handle_post(handler, parsed) -> bool:
             try:
                 from api.models import delete_cli_session
 
-                delete_cli_session(sid)
+                state_db_cleanup_failed = not bool(delete_cli_session(sid))
             except Exception:
                 logger.debug("Failed to delete CLI session %s", sid)
+                state_db_cleanup_failed = True
         _publish_session_list_changed("session_delete", profile=event_profile)
-        return j(handler, {"ok": True, **worktree_retained})
+        return j(
+            handler,
+            {
+                "ok": True,
+                "state_db_cleanup_failed": state_db_cleanup_failed,
+                **worktree_retained,
+            },
+        )
 
     if parsed.path == "/api/session/clear":
         try:
@@ -19203,12 +19254,17 @@ def _handle_sessions_search(handler, parsed):
         depth = max(0, int(qs.get("depth", ["5"])[0]))
     except (ValueError, TypeError):
         depth = 5
+    try:
+        _search_redact_enabled = bool(load_settings().get("api_redact_enabled", True))
+    except Exception:
+        _search_redact_enabled = True
     if not q:
         safe_sessions = []
         for s in sessions:
             item = dict(s)
             if isinstance(item.get("title"), str):
-                item["title"] = _redact_text(item["title"])
+                item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
+            _redact_sidebar_title_fields(item, _search_redact_enabled)
             safe_sessions.append(item)
         return j(handler, {
             "sessions": safe_sessions,
@@ -19221,12 +19277,15 @@ def _handle_sessions_search(handler, parsed):
         if title_match:
             item = dict(s, match_type="title")
             if isinstance(item.get("title"), str):
-                item["title"] = _redact_text(item["title"])
+                item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
+            _redact_sidebar_title_fields(item, _search_redact_enabled)
             results.append(item)
             continue
         if content_search:
             try:
-                sess = get_session(s["session_id"])
+                sess = get_session_for_scan(s["session_id"])
+                if sess is None:
+                    continue
                 msgs = sess.messages[:depth] if depth else sess.messages
                 for m in msgs:
                     c = _session_search_message_text(m)
@@ -19234,9 +19293,14 @@ def _handle_sessions_search(handler, parsed):
                         item = dict(s, match_type="content")
                         preview = _session_search_preview(c, q)
                         if preview:
-                            item["match_preview"] = _redact_text(preview)
+                            item["match_preview"] = _redact_text(
+                                preview, _enabled=_search_redact_enabled
+                            )
                         if isinstance(item.get("title"), str):
-                            item["title"] = _redact_text(item["title"])
+                            item["title"] = _redact_text(
+                                item["title"], _enabled=_search_redact_enabled
+                            )
+                        _redact_sidebar_title_fields(item, _search_redact_enabled)
                         results.append(item)
                         break
             except (KeyError, Exception):
@@ -23985,18 +24049,34 @@ def _start_chat_stream_for_session(
     if stale_response is not None:
         stale_response["_status"] = 409
         return stale_response
-    try:
-        _bind_execution_lineage(s, _admission_reservation_id)
-    except RunAdmissionLineageBusy as exc:
-        return _execution_lineage_error_payload(exc)
-    except Exception as exc:
-        from api.execution_lineage import ExecutionLineageUnavailable
-
-        if isinstance(exc, ExecutionLineageUnavailable):
-            return _execution_lineage_error_payload(exc)
-        raise
     attachments = attachments or []
     process_completion_events: list[dict] = []
+    lineage_bound = False
+
+    def _bind_lineage_before_turn_mutation() -> dict | None:
+        """Bind admission only after this session's lock is authoritative.
+
+        Human chat and watchdog recovery can resolve the same Session object
+        concurrently. Binding the process-wide lineage before acquiring the
+        per-session lock lets the later caller win the global reservation even
+        when it has not won the session. The lock is the ownership boundary;
+        bind immediately after the active-run checks while holding it.
+        """
+        nonlocal lineage_bound
+        if lineage_bound:
+            return None
+        try:
+            _bind_execution_lineage(s, _admission_reservation_id)
+        except RunAdmissionLineageBusy as exc:
+            return _execution_lineage_error_payload(exc)
+        except Exception as exc:
+            from api.execution_lineage import ExecutionLineageUnavailable
+
+            if isinstance(exc, ExecutionLineageUnavailable):
+                return _execution_lineage_error_payload(exc)
+            raise
+        lineage_bound = True
+        return None
 
     def _claim_process_completion_events_for_worker() -> None:
         nonlocal process_completion_events
@@ -24199,6 +24279,9 @@ def _start_chat_stream_for_session(
                     "active_stream_id": blocking_run_stream_id,
                     "_status": 409,
                 }
+            lineage_error = _bind_lineage_before_turn_mutation()
+            if lineage_error:
+                return lineage_error
             _goal_guard_error = _claim_goal_continuation_guard()
             if _goal_guard_error:
                 return _goal_guard_error
@@ -24240,6 +24323,9 @@ def _start_chat_stream_for_session(
                         "_status": 409,
                     }
                 needs_stale_cleanup = False
+                lineage_error = _bind_lineage_before_turn_mutation()
+                if lineage_error:
+                    return lineage_error
                 _goal_guard_error = _claim_goal_continuation_guard()
                 if _goal_guard_error:
                     return _goal_guard_error
@@ -25755,7 +25841,8 @@ def _handle_chat_start(handler, body, diag=None):
         explicit_model_pick = bool(body.get("explicit_model_pick"))
         moa_config = None
         bestplan_config = None
-        gateway_chat_enabled = webui_gateway_chat_enabled(get_config())
+        config_snapshot = get_config_snapshot()
+        gateway_chat_enabled = webui_gateway_chat_enabled(config_snapshot)
         if body.get("moa_config"):
             if gateway_chat_enabled:
                 return bad(handler, "MoA override is unavailable on gateway-backed sessions", 409)
@@ -25806,9 +25893,25 @@ def _handle_chat_start(handler, body, diag=None):
             explicit_model_pick=explicit_model_pick,
             profile_provider=catalog_profile_provider,
         )
-        if model_provider == "moa" and moa_config is None:
-            if webui_gateway_chat_enabled(get_config()):
+        if model_provider == "moa" and gateway_chat_enabled:
+            from api.config import get_effective_default_model
+
+            model_config = config_snapshot.get("model") if isinstance(config_snapshot, dict) else None
+            configured_default, configured_default_provider, configured_default_is_moa = (
+                _moa_fast_path_model_state(get_effective_default_model(config_snapshot))
+            )
+            configured_provider = _clean_session_model_provider(
+                model_config.get("provider") if isinstance(model_config, dict) else None
+            )
+            if configured_provider is None and configured_default_is_moa:
+                configured_provider = configured_default_provider
+            if (
+                configured_provider != "moa"
+                or model != configured_default
+                or explicit_model_pick
+            ):
                 return bad(handler, "MoA override is unavailable on gateway-backed sessions", 409)
+        elif model_provider == "moa" and moa_config is None:
             from api.commands import resolve_moa_config
 
             try:
@@ -26005,6 +26108,7 @@ def _handle_chat_sync(handler, body):
                 _restore_reasoning_metadata,
                 _sanitize_messages_for_api,
                 _context_messages_for_new_turn,
+                _compact_session_image_parts_for_persistence,
                 _workspace_context_prefix,
             )
             workspace_ctx = _workspace_context_prefix(str(s.workspace))
@@ -26081,6 +26185,7 @@ def _handle_chat_sync(handler, body):
             msg,
             source=getattr(s, "pending_user_source", None) or "webui",
         )
+        _compact_session_image_parts_for_persistence(s)
         # Only auto-generate title when still default; preserves user renames
         if s.title == "Untitled":
             s.title = title_from(s.messages, s.title)
@@ -27746,17 +27851,19 @@ def _handle_approval_respond(handler, body):
                                "error": _GATEWAY_APPROVAL_RELAY_UNAVAILABLE}, status=409)
         # A no-run mirror is local visibility state only. Resolve it only while
         # the exact parked producer still exists; otherwise keep the card live
-        # and fail closed instead of claiming success.
-        if webui_gateway_chat_enabled(_get_config()):
-            handled_no_run_mirror, resolved_count, _, _ = resolve_gateway_pending_local_no_run_mirror(
-                sid, approval_id, choice
-            )
-            if handled_no_run_mirror and resolved_count == 1:
-                return j(handler, {"ok": True, "choice": choice, "local_retired": True})
-            if handled_no_run_mirror:
-                return j(handler, {"ok": False, "choice": choice, "relayed": False,
-                                   "code": "gateway_run_unavailable",
-                                   "error": _GATEWAY_APPROVAL_RELAY_UNAVAILABLE}, status=409)
+        # and fail closed instead of claiming success. This also handles local
+        # approvals whose browser id was rewritten with a ``gwrun:`` prefix:
+        # the stable mirror token still identifies the parked entry.
+        gateway_enabled = webui_gateway_chat_enabled(_get_config())
+        handled_no_run_mirror, resolved_count, _, _ = resolve_gateway_pending_local_no_run_mirror(
+            sid, approval_id, choice
+        )
+        if handled_no_run_mirror and resolved_count == 1:
+            return j(handler, {"ok": True, "choice": choice, "local_retired": True})
+        if gateway_enabled and handled_no_run_mirror:
+            return j(handler, {"ok": False, "choice": choice, "relayed": False,
+                               "code": "gateway_run_unavailable",
+                               "error": _GATEWAY_APPROVAL_RELAY_UNAVAILABLE}, status=409)
     except Exception:
         pass  # fall through to local approval path
 
@@ -28105,7 +28212,14 @@ def _handle_session_compress_status(handler, sid):
         return j(handler, payload)
 
 
-def _handle_session_compress(handler, body):
+@_admit_stream_start("compression")
+def _handle_session_compress(
+    handler,
+    body,
+    *,
+    _admission_reservation_id=None,
+    _admission_transfer_state=None,
+):
     def _anchor_message_key(m):
         if not isinstance(m, dict):
             return None
@@ -28882,7 +28996,33 @@ def _handle_handoff_summary(handler, body):
             if getattr(agent, "api_mode", "") == "codex_responses":
                 codex_kwargs = agent._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)
-                codex_kwargs["max_output_tokens"] = max_tokens
+                # ChatGPT's Codex Responses endpoint rejects the generic
+                # output cap, while ordinary Responses-compatible proxies
+                # require it. Resolve the provider/base URL together so a
+                # named custom provider and a whitespace-padded URL take the
+                # same compatibility path.
+                provider_id = str(getattr(agent, "provider", "") or "").strip().lower()
+                base_url = str(
+                    getattr(agent, "base_url", None)
+                    or getattr(agent, "_base_url", None)
+                    or ""
+                ).strip()
+                codex_chatgpt = provider_id == "openai-codex" or provider_id == "custom:chatgpt-codex"
+                if base_url:
+                    try:
+                        parsed_base = urlsplit(base_url)
+                        codex_chatgpt = codex_chatgpt or (
+                            parsed_base.hostname == "chatgpt.com"
+                            and parsed_base.path.rstrip("/") == "/backend-api/codex"
+                        )
+                    except ValueError:
+                        # The Agent will surface malformed endpoint details;
+                        # do not let compatibility probing mask that error.
+                        pass
+                if codex_chatgpt:
+                    codex_kwargs.pop("max_output_tokens", None)
+                else:
+                    codex_kwargs["max_output_tokens"] = max_tokens
                 resp = agent._run_codex_stream(codex_kwargs)
                 assistant_message, _ = agent._normalize_codex_response(resp)
                 result["text"] = str((assistant_message.content or "") if assistant_message else "").strip()

@@ -140,6 +140,9 @@ function buildRuntime() {
   globalThis._currentMessageRenderWindowSize = () => scenario.currentWindowSize || 12;
   globalThis._messageRenderWindowSize = 20;
   globalThis._streamFinalized = !!scenario.streamFinalized;
+  // _restoreSettledSession is extracted from its attachLiveStream closure for
+  // these focused tests; the production closure always defines this flag.
+  globalThis.lazyTailStream = false;
   globalThis._persistTimer = null;
   globalThis.api = async () => scenario.apiPayload || { session: null };
   globalThis.msgContent = undefined;

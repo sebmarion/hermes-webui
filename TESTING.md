@@ -283,6 +283,37 @@ cross-session ownership, and the one-restart-then-legacy policy. Keep
 `HERMES_WEBUI_BOUNDED_CONVERSATION_BROWSER` unset in production until proof-v1
 capability and the durable zero-difference evidence threshold are both present.
 
+### Periodic WebUI benchmark
+
+Run the small receipt-producing benchmark from the repository root:
+
+```bash
+# quick backend + correctness check (about 10–15 seconds on a developer Mac)
+./.venv/bin/python scripts/benchmark_webui_smoke.py --quick --browser off \
+  --output /tmp/hermes-webui-benchmark.json
+
+# default backend sample counts (20 warm / 3 process-cold / 2 stress rounds)
+./.venv/bin/python scripts/benchmark_webui_smoke.py --output /tmp/hermes-webui-benchmark.json
+
+# include the real Chromium lane when Playwright and Chromium are installed
+./.venv/bin/python scripts/benchmark_webui_smoke.py --browser required \
+  --output /tmp/hermes-webui-benchmark-browser.json
+
+# compare with a prior receipt; timing changes are warnings, SLO/invariant
+# failures remain hard failures
+./.venv/bin/python scripts/benchmark_webui_smoke.py --quick --browser off \
+  --compare /tmp/hermes-webui-benchmark.json
+```
+
+Every run creates its fixture, WebUI state, config, workspace, and agent-free
+home below a temporary directory, scrubs credential/token environment variables,
+and removes the server when finished. The receipt records the commit, runtime,
+fixture seed/counts, resolution and message-page p50/p95/max timings, the
+separate orphan-prune/archive/gateway correctness checks, and browser metrics
+when the lane is enabled. `--browser optional` skips only when Playwright is not
+installed and reports `coverage_complete=false`; `--browser off` is an explicit
+backend-only run. Do not treat a skipped browser lane as full UI coverage.
+
 ### Release-lite lazy task opening
 
 The release-lite path reads only the newest 30 settled messages from `state.db`

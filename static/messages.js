@@ -2083,6 +2083,7 @@ function closeLiveStream(sessionId, streamId, source){
         lastAssistantText:INFLIGHT[sessionId].lastAssistantText||'',
         lastReasoningText:INFLIGHT[sessionId].lastReasoningText||'',
         lastRunJournalSeq:INFLIGHT[sessionId].lastRunJournalSeq||0,
+        lastRunJournalEventId:INFLIGHT[sessionId].lastRunJournalEventId||'',
         journalReplayFromStart:true,
         currentActivityBurstId:INFLIGHT[sessionId].currentActivityBurstId||0,
         currentLiveSegmentSeq:INFLIGHT[sessionId].currentLiveSegmentSeq||0,
@@ -2254,6 +2255,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   else {
     if(uploaded.length) INFLIGHT[activeSid].uploaded=[...uploaded];
     if(!Array.isArray(INFLIGHT[activeSid].toolCalls)) INFLIGHT[activeSid].toolCalls=[];
+  }
+  const _priorInflightStreamId=String(INFLIGHT[activeSid].streamId||'').trim();
+  if(!reconnecting||(_priorInflightStreamId&&_priorInflightStreamId!==String(streamId))){
+    INFLIGHT[activeSid].streamId=streamId;
+    INFLIGHT[activeSid].lastRunJournalEventId='';
+  } else {
+    INFLIGHT[activeSid].streamId=streamId;
   }
   if(!Array.isArray(INFLIGHT[activeSid].activityBurstAnchors)) INFLIGHT[activeSid].activityBurstAnchors=[];
   if(INFLIGHT[activeSid].currentActivityBurstId===undefined) INFLIGHT[activeSid].currentActivityBurstId=0;
@@ -2470,6 +2478,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       lastAssistantText:inflight.lastAssistantText||'',
       lastReasoningText:inflight.lastReasoningText||'',
       lastRunJournalSeq:inflight.lastRunJournalSeq||0,
+      lastRunJournalEventId:inflight.lastRunJournalEventId||'',
       journalReplayFromStart:!!inflight.journalReplayFromStart,
       anchorActivityScene:inflight.anchorActivityScene||null,
       currentActivityBurstId:inflight.currentActivityBurstId||0,
@@ -2611,6 +2620,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   }
   function _updateLiveThinkingCard(text){
     const opts=_liveThinkingPlacement();
+    const fallbackOpts={
+      ...opts,
+      sessionId:activeSid,
+      streamId,
+      anchorReasoningLocalId:`live-reasoning:${streamId}:${opts.segmentSeq}`,
+    };
+    const liveTurn=$('liveAssistantTurn');
+    if(typeof _updateLiveAnchorReasoningRowForFallback==='function'
+      && _updateLiveAnchorReasoningRowForFallback(liveTurn,text,fallbackOpts)) return;
     if(typeof updateThinking==='function') updateThinking(text, opts);
     else appendThinking(text, opts);
   }
@@ -2820,7 +2838,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _lastRunJournalSeq=reconnecting
     ? Number((INFLIGHT[activeSid]&&INFLIGHT[activeSid].lastRunJournalSeq)||0)
     : 0;
-  let _lastRunJournalEventId='';
+  let _lastRunJournalEventId=reconnecting
+    ? String((INFLIGHT[activeSid]&&INFLIGHT[activeSid].lastRunJournalEventId)||'')
+    : '';
   const _STREAM_FADE_MS=620;
   const _STREAM_FADE_MAX_MS=900;
   const _STREAM_FADE_DONE_MAX_MS=1000;
@@ -2842,6 +2862,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _anchorShadowWarned=false;
   let _anchorReasoningFlushed=false;
   let _anchorLocalSeq=0;
+  // The shadow event is durable even when a DOM projection declines a paint
+  // (for example while the active turn is being rebuilt).  Keep the outcome of
+  // the most recent projection so the reasoning handler can use its visible
+  // fallback for that first frame instead of treating a stored event as a
+  // successfully rendered row.
+  let _lastAnchorLiveSceneRendered=false;
   if(_anchorRegistryMap&&_anchorRegistry) _anchorRegistryMap.set(streamId,_anchorRegistry);
   function _scheduleAnchorRegistryCleanup(delayMs=600000){
     if(!_anchorRegistryMap||!_anchorRegistry) return;
@@ -2879,6 +2905,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return true;
   }
   function _applyToAnchor(sourceEventType, rawEventData, sseEvent){
+    _lastAnchorLiveSceneRendered=false;
     if(!_anchorRegistry||!_anchorApi||typeof _anchorApi.applyAssistantTurnAnchorSourceEvent!=='function') return null;
     const raw=(rawEventData&&typeof rawEventData==='object')?rawEventData:{};
     const previousLifecycle=(_anchorRegistry.anchor&&_anchorRegistry.anchor.lifecycle)||{};
@@ -2918,9 +2945,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         previousTerminalState,
         previousTerminalReason,
       );
-      _renderAnchorLiveScene();
+      _lastAnchorLiveSceneRendered=!!_renderAnchorLiveScene();
       return result;
     }catch(err){
+      _lastAnchorLiveSceneRendered=false;
       if(!_anchorShadowWarned&&typeof console!=='undefined'&&console.warn){
         _anchorShadowWarned=true;
         console.warn('assistant turn anchor live shadow feed failed',err);
@@ -3954,9 +3982,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(!lastAsst) return false;
     const projectedScene=_projectLiveAnchorActivityScene();
     const scene=_completeSettledAnchorSceneForTurn(messages,lastAsstIndex,projectedScene);
-    if(scene&&Array.isArray(scene.activity_rows)&&scene.activity_rows.length){
+    const hasOwnedOutcomes=_anchorSceneHasOwnedOutcomes(scene);
+    if(scene&&Array.isArray(scene.activity_rows)&&(scene.activity_rows.length||hasOwnedOutcomes)){
       const hasWorklogRows=_anchorSceneHasWorklogWorthyRows(scene);
-      const shouldPersistScene=hasWorklogRows||scene.mode==='hide_all_activity';
+      const shouldPersistScene=hasWorklogRows||scene.mode==='hide_all_activity'||hasOwnedOutcomes;
       if(!shouldPersistScene) return false;
       let sceneKey='';
       try{ sceneKey=JSON.stringify(scene); }catch(_){ sceneKey=''; }
@@ -4178,8 +4207,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         status:options.sealed?'completed':'running',
         payload:{text:clean,activitySegmentSeq:segmentSeq,activityBurstId:_currentActivityBurstId},
       });
-      _renderAnchorLiveScene();
-      return replaced;
+      _lastAnchorLiveSceneRendered=!!_renderAnchorLiveScene();
+      return _lastAnchorLiveSceneRendered ? replaced : null;
     }
     _applyToAnchor('reasoning',{
       text:clean,
@@ -4189,7 +4218,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       activitySegmentSeq:segmentSeq,
       activityBurstId:_currentActivityBurstId,
     },null);
-    return _findAnchorActivityEventByLocalId(localId,'reasoning');
+    return _lastAnchorLiveSceneRendered
+      ? _findAnchorActivityEventByLocalId(localId,'reasoning')
+      : null;
   }
   function _compactVisibleEchoText(value){
     return String(value||'').replace(/\s+/g,'');
@@ -5242,6 +5273,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const inflight=INFLIGHT[activeSid];
       if(inflight){
         inflight.lastRunJournalSeq=seq;
+        inflight.lastRunJournalEventId=raw;
         if(typeof _throttledPersist==='function') _throttledPersist();
       }
     }
@@ -5759,15 +5791,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(_terminalStateReached||_streamFinalized) return;
       const d=JSON.parse(e.data);
       const text=d.text||'';
+      // A superseded stream may still deliver queued reasoning frames after a
+      // session switch or stream replacement. It must not mutate the active
+      // transcript, shadow registry, or inflight payload.
+      if(!text||!S.session||S.session.session_id!==activeSid||S.activeStreamId!==streamId) return;
       reasoningText += text;
       liveReasoningText += text;
-      if(d.text&&S.session&&S.session.session_id===activeSid) _completeAutomaticCompressionOnLiveProgress(activeSid);
+      _completeAutomaticCompressionOnLiveProgress(activeSid);
       syncInflightAssistantMessage();
-      if(text&&S.session&&S.session.session_id===activeSid){
-        const liveThinkingText=_liveThinkingText();
-        if(!_upsertAnchorReasoning(liveThinkingText)){
-          _updateLiveThinkingCard(liveThinkingText);
-        }
+      const liveThinkingText=_liveThinkingText();
+      if(!_upsertAnchorReasoning(liveThinkingText)){
+        _updateLiveThinkingCard(liveThinkingText);
       }
     });
 
@@ -6298,10 +6332,16 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           // render also populates the cache with the correctly-collapsed DOM, and
           // the same-frame JS restore absorbs the collapse so there is no jump.
           // (#5260 gate-cert: keep-open must be transient + uncached for everyone.)
+          // #6385: capture the scroll snapshot from the LIVE DOM before arming
+          // keep-open, so the collapse render below anchors to the content the
+          // reader was actually viewing rather than an intermediate expanded DOM.
+          const _doneLiveScrollSnapshot=typeof _captureMessageScrollSnapshot==='function'
+            ? _captureMessageScrollSnapshot()
+            : null;
           if(typeof _armKeepSettledWorklogOpen==='function') _armKeepSettledWorklogOpen(_settledStreamId);
           syncTopbar();renderMessages({preserveScroll:true});
           if(typeof _disarmKeepSettledWorklogOpen==='function') _disarmKeepSettledWorklogOpen();
-          if(typeof _renderMessagesWithScrollSnapshot==='function') _renderMessagesWithScrollSnapshot();
+          if(typeof _renderMessagesWithScrollSnapshot==='function') _renderMessagesWithScrollSnapshot({_prescrollSnapshot:_doneLiveScrollSnapshot});
           else renderMessages({preserveScroll:true});
           if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
           if(typeof noteWorkspaceMutationsFromToolCalls==='function') noteWorkspaceMutationsFromToolCalls(S.toolCalls);
@@ -6940,6 +6980,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return `${m.role}|${ts}|${body.slice(0,160)}`;
   }
   const _EPHEMERAL_TURN_FIELDS=['_turnUsage','_turnDuration','_turnTps','_gatewayRouting','_statusCard','_anchor_stream_id','_anchor_activity_scene'];
+  function _isHistoricalAnchorActivityScene(scene){
+    if(!scene||typeof scene!=='object') return false;
+    const identity=scene.identity&&typeof scene.identity==='object'?scene.identity:null;
+    const turnId=identity&&typeof identity.turn_id==='string'?identity.turn_id:'';
+    return turnId.indexOf('historical:')===0;
+  }
   function _carryForwardEphemeralTurnFields(prevMessages, nextMessages){
     if(!Array.isArray(prevMessages)||!Array.isArray(nextMessages)) return nextMessages;
     if(!prevMessages.length||!nextMessages.length) return nextMessages;
@@ -6954,6 +7000,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const k=_messageIdentityKey(nm); if(!k) continue;
       const pm=prevIdx.get(k); if(!pm) continue;
       for(const f of _EPHEMERAL_TURN_FIELDS){
+        if(f==='_anchor_activity_scene'&&_isHistoricalAnchorActivityScene(pm[f])) continue;
         if(pm[f]!=null && nm[f]==null) nm[f]=pm[f];
       }
     }
@@ -7203,12 +7250,30 @@ function transcript(){
 }
 
 let _composerAutoResizeRaf=0;
+let _composerLastResizeValue='';
 function autoResize(){
   if(_composerAutoResizeRaf && typeof cancelAnimationFrame==='function'){
     cancelAnimationFrame(_composerAutoResizeRaf);
     _composerAutoResizeRaf=0;
   }
   const el=$('msg');
+  const _nextValue=String(el.value||'');
+  const _isAppendOnly=_nextValue.length>_composerLastResizeValue.length&&_nextValue.startsWith(_composerLastResizeValue);
+  const _fitsCurrentHeight=el.scrollHeight<=el.offsetHeight;
+  // Only a direct append at the natural one-row height can skip the height
+  // round trip. Replacements and an already-tall composer must remeasure so the
+  // textarea can shrink back to its natural height.
+  // Parse min-height with a strict finite-pixel check. A percentage or calc
+  // value must fail closed; parseFloat('50%') would otherwise masquerade as a
+  // 50px minimum and leave an oversized composer stuck tall.
+  const _minHeightRaw=_isAppendOnly&&_fitsCurrentHeight?getComputedStyle(el).minHeight:'';
+  const _minHeight=/^(?:\d+(?:\.\d+)?|\.\d+)px$/.test(_minHeightRaw)?parseFloat(_minHeightRaw):NaN;
+  const _isAtMinimumHeight=Number.isFinite(_minHeight)&&el.offsetHeight<=Math.ceil(_minHeight)+1;
+  if(_isAppendOnly&&_fitsCurrentHeight&&_isAtMinimumHeight){
+    _composerLastResizeValue=_nextValue;
+    updateSendBtn();
+    return;
+  }
   const _prevComposerH=el.offsetHeight;
   // #5514: autoResize() momentarily sets the textarea to height:'auto' (collapses
   // a multi-row composer toward its 1-row min) before reading scrollHeight and
@@ -7233,6 +7298,7 @@ function autoResize(){
   const _prevScrollTop=_msgs?_msgs.scrollTop:0;
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,200)+'px';
+  _composerLastResizeValue=_nextValue;
   if(_msgs&&_msgs.scrollTop!==_prevScrollTop) _msgs.scrollTop=_prevScrollTop;
   updateSendBtn();
   // Genuine NET growth (a new row that keeps the composer taller than before)

@@ -634,11 +634,19 @@ def resolve_gateway_pending_local_no_run_mirror(
         )
         if matched_mirror is None:
             return False, 0, entries[0] if entries else None, len(entries)
+        mirror_token = str(matched_mirror.get(_GATEWAY_MIRROR_TOKEN) or "").strip()
 
         gateway_queue = _gateway_queues.get(session_key) or []
         for index, entry in enumerate(gateway_queue):
             data = getattr(entry, "data", None) or {}
-            if str(data.get("approval_id") or "").strip() == approval_id:
+            if (
+                str(data.get("approval_id") or "").strip() == approval_id
+                or (
+                    mirror_token
+                    and str(data.get(_GATEWAY_ENTRY_DATA_TOKEN_KEY) or "").strip()
+                    == mirror_token
+                )
+            ):
                 target = gateway_queue.pop(index)
                 break
         if target is None:

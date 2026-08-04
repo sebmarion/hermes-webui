@@ -24,16 +24,11 @@ def _extract_function(src: str, name: str) -> str:
 
 def test_shutdown_description_uses_split_i18n_spans_in_index_html():
     html = (REPO / "static" / "index.html").read_text(encoding="utf-8")
-    start = html.find('<div class="settings-field" id="shutdownServerBlock"')
-    assert start != -1, "Shutdown settings field must exist."
-    button_idx = html.find('id="btnShutdownServer"', start)
-    assert button_idx != -1, "Shutdown settings field must include the stop button."
-    block = html[start:button_idx]
-    assert 'data-i18n="settings_desc_shutdown_before_cmd"' in block
-    assert 'data-i18n="settings_desc_shutdown_between_cmds"' in block
-    assert 'data-i18n="settings_desc_shutdown_after_cmd"' in block
-    assert block.count("<code>./ctl.sh start</code>") == 2
-    assert 'data-i18n="settings_desc_shutdown"' not in block
+    # Self-shutdown is intentionally not exposed in the settings UI: restart
+    # requires fresh external approval. Keep the split locale keys for older
+    # clients, but never reintroduce a destructive stop control here.
+    assert 'id="shutdownServerBlock"' not in html
+    assert 'id="btnShutdownServer"' not in html
 
 
 def test_shutdown_locale_strings_no_longer_embed_code_tags():

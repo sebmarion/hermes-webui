@@ -14,13 +14,16 @@ REPO = Path(__file__).resolve().parent.parent
 
 def _catalog(label: str) -> dict:
     return {
-        "active_provider": "openai",
+        # The public picker intentionally hides the generic OpenAI provider;
+        # use the visible Codex provider so this fixture exercises freshness
+        # and rebuild coalescing rather than provider filtering policy.
+        "active_provider": "openai-codex",
         "default_model": label,
         "configured_model_badges": {},
         "groups": [
             {
-                "provider": "OpenAI",
-                "provider_id": "openai",
+                "provider": "OpenAI Codex",
+                "provider_id": "openai-codex",
                 "models": [{"id": label, "label": label, "supports_fast_tier": False}],
             }
         ],

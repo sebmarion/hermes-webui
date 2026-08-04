@@ -162,12 +162,12 @@ def test_attachLiveStream_reconnect_seeds_from_INFLIGHT_not_querySelector():
     """
     fn_start = MESSAGES_JS.find("function attachLiveStream(")
     assert fn_start != -1, "attachLiveStream() not found in messages.js."
-    # Capture up to 60 lines after the function signature for the seed section.
-    fn_head_end = fn_start
-    for _ in range(60):
-        fn_head_end = MESSAGES_JS.find("\n", fn_head_end + 1)
-        if fn_head_end == -1:
-            break
+    # Capture through the assistant-text declaration instead of a fixed line
+    # count; reconnect setup grew beyond the old 60-line window while retaining
+    # the same INFLIGHT ownership contract.
+    assistant_decl = MESSAGES_JS.find("let assistantText", fn_start)
+    assert assistant_decl != -1, "let assistantText not found in attachLiveStream()"
+    fn_head_end = assistant_decl + len("let assistantText")
     seed_section = MESSAGES_JS[fn_start:fn_head_end]
 
     # The reconnect seed must come from INFLIGHT[activeSid].
@@ -181,7 +181,7 @@ def test_attachLiveStream_reconnect_seeds_from_INFLIGHT_not_querySelector():
     )
     # The seed must NOT use querySelector to read DOM content for the initial text.
     idx = seed_section.find("let assistantText")
-    assert idx != -1, "let assistantText not found in seed section — capture window too narrow or variable renamed"
+    assert idx != -1, "let assistantText not found in seed section — variable renamed"
     seed_up_to_assistantText = seed_section[:idx]
     assert "querySelector" not in seed_up_to_assistantText, (
         "attachLiveStream() reads DOM via querySelector before seeding assistantText. "

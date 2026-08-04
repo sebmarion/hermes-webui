@@ -168,7 +168,10 @@ def test_static_catalog_budget_fallback_lists_local_providers(
     catalog = cfg._static_models_catalog_without_live_probes()
     provider_ids = [group["provider_id"] for group in catalog["groups"]]
 
-    assert provider_ids[0] == "openai-api"
+    # The static catalog is already the public picker payload: intentionally
+    # hidden providers (including direct OpenAI API) are filtered at this
+    # boundary while runtime resolution remains supported.
+    assert provider_ids[0] != "openai-api"
     assert "anthropic" in provider_ids
     assert "custom:zenmux" in provider_ids
     assert "copilot" not in provider_ids
@@ -531,6 +534,11 @@ def test_provider_models_list_of_dicts_without_id_does_not_collapse_catalog(
         },
     }
 
+    # Exercise the rich builder itself; the public picker filter intentionally
+    # hides direct OpenAI API while runtime/catalog construction still needs to
+    # retain these normalized model ids.
+    monkeypatch.setattr(cfg, "_filter_picker_hidden_provider_groups", lambda payload: payload)
+
     catalog = cfg._static_models_catalog_without_live_probes()
     provider_ids = [group["provider_id"] for group in catalog["groups"]]
 
@@ -541,7 +549,10 @@ def test_provider_models_list_of_dicts_without_id_does_not_collapse_catalog(
     )
     assert "openai-api" in provider_ids
     openai_group = next(g for g in catalog["groups"] if g["provider_id"] == "openai-api")
-    group_model_ids = {str(m.get("id") or "") for m in openai_group["models"]}
+    group_model_ids = {
+        str(model.get("id") or "")
+        for model in openai_group.get("models", [])
+    }
     # All three identifiable models survive; the unusable entry is dropped.
     assert any(mid.endswith("gpt-5.5") for mid in group_model_ids)
     assert any(mid.endswith("gpt-4.1") for mid in group_model_ids)

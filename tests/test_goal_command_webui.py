@@ -13,6 +13,7 @@ COMMANDS_JS = (REPO_ROOT / "static" / "commands.js").read_text(encoding="utf-8")
 MESSAGES_JS = (REPO_ROOT / "static" / "messages.js").read_text(encoding="utf-8")
 ROUTES_PY = (REPO_ROOT / "api" / "routes.py").read_text(encoding="utf-8")
 STREAMING_PY = (REPO_ROOT / "api" / "streaming.py").read_text(encoding="utf-8")
+BACKGROUND_PROCESS_PY = (REPO_ROOT / "api" / "background_process.py").read_text(encoding="utf-8")
 
 
 def test_goal_command_payload_matches_gateway_controls(monkeypatch):
@@ -417,6 +418,9 @@ def test_chat_start_forwards_goal_related_to_gateway_worker(monkeypatch, tmp_pat
     monkeypatch.setattr(routes, "_get_session_agent_lock", lambda *args, **kwargs: threading.Lock())
     monkeypatch.setattr(routes, "_active_stream_blocks_chat_start", lambda *args, **kwargs: False)
     monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda *args, **kwargs: None)
+    # This test covers gateway forwarding only.  FakeSession has no durable
+    # admission state, so keep the fail-closed lineage guard out of scope.
+    monkeypatch.setattr(routes, "_bind_execution_lineage", lambda *args, **kwargs: None)
     monkeypatch.setattr(routes, "_prepare_chat_start_session_for_stream", fake_prepare)
     monkeypatch.setattr(routes, "_is_hidden_empty_session", lambda *args, **kwargs: False)
     monkeypatch.setattr(routes, "publish_session_list_changed", lambda *args, **kwargs: None)
@@ -492,8 +496,9 @@ def test_goal_continuation_is_claimed_then_started_at_server_teardown_boundary()
     settle = STREAMING_PY.index("settle_goal_continuation")
     finish = STREAMING_PY.index("finish_session_activity(", settle)
     cleanup = STREAMING_PY.index("unregister_active_run(stream_id", finish)
-    recover = STREAMING_PY.index("recover_pending_goal_continuations", cleanup)
-    assert settle < finish < cleanup < recover
+    successor_hook = STREAMING_PY.index("recover_successors_after_unregister", cleanup)
+    assert settle < finish < cleanup < successor_hook
+    assert "recover_pending_goal_continuations" in BACKGROUND_PROCESS_PY
     assert 'source == "goal_continuation"' in ROUTES_PY
     assert "_recover_goal_continuations_on_startup" in ROUTES_PY
     assert "recover_pending_goal_continuations" in ROUTES_PY

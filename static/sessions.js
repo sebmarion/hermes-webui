@@ -595,15 +595,24 @@ function _saveSessionCompletionUnread() {
   }
 }
 
-function _markSessionCompletionUnread(sid, messageCount = 0) {
+function _markSessionCompletionUnread(sid, messageCount = 0, meta = null) {
   if (!sid) return;
   const unread = _getSessionCompletionUnread();
   const count = Number.isFinite(messageCount) ? Number(messageCount) : 0;
-  unread[sid] = {message_count: count, completed_at: Date.now()};
+  const entry = {message_count: count, completed_at: Date.now()};
+  // Cron markers carry source+profile so a profile switch can clear only the
+  // inactive-profile dot without erasing ordinary chat completion unread.
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    if (meta.source) entry.source = String(meta.source);
+    if (typeof meta.profile === 'string' && meta.profile.trim()) {
+      entry.profile = meta.profile.trim();
+    }
+  }
+  unread[sid] = entry;
   _saveSessionCompletionUnread();
 }
 
-function _markSessionCompletionUnreadIfBackground(sid, messageCount = null) {
+function _markSessionCompletionUnreadIfBackground(sid, messageCount = null, meta = null) {
   if (!sid) return false;
   let count = Number.isFinite(messageCount) ? Number(messageCount) : NaN;
   if (!Number.isFinite(count)) {
@@ -617,7 +626,7 @@ function _markSessionCompletionUnreadIfBackground(sid, messageCount = null) {
     if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
     return false;
   }
-  _markSessionCompletionUnread(sid, count);
+  _markSessionCompletionUnread(sid, count, meta);
   if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
   return true;
 }
@@ -638,6 +647,114 @@ function _clearSessionCompletionUnread(sid) {
       _saveSessionCompletionReceipts();
     }
   }
+}
+
+// True when a session row originated from cron and its completion dot is
+// therefore scoped to the profile that owns the cron job.
+function _isCronSessionForUnread(session) {
+  if (!session) return false;
+  const key = (typeof _sourceKeyForSession === 'function')
+    ? _sourceKeyForSession(session)
+    : String(
+      session.raw_source
+      || session.source_tag
+      || session.source
+      || session.session_source
+      || ''
+    ).toLowerCase();
+  if (key === 'cron') return true;
+  return String(session.session_source || '').toLowerCase() === 'cron';
+}
+
+// Build the ownership metadata persisted with a cron completion marker.
+function _cronCompletionUnreadMetaForSession(session) {
+  if (!_isCronSessionForUnread(session)) return null;
+  const rowProfile = session && typeof session.profile === 'string'
+    ? session.profile.trim()
+    : '';
+  const activeProfile = (typeof S !== 'undefined' && S
+    && typeof S.activeProfile === 'string' && S.activeProfile.trim())
+    ? S.activeProfile.trim()
+    : 'default';
+  return {source: 'cron', profile: rowProfile || activeProfile};
+}
+
+// Resolve legacy untagged markers from current sidebar metadata, and migrate
+// the result in memory so later switches do not depend on the row still being
+// present in the current profile's list.
+function _resolveCronCompletionMarkerOrigin(sid, marker) {
+  let isCron = !!(marker && marker.source === 'cron');
+  let profile = marker && typeof marker.profile === 'string' && marker.profile.trim()
+    ? marker.profile.trim()
+    : '';
+  let session = null;
+  if (typeof _allSessions !== 'undefined' && Array.isArray(_allSessions)) {
+    session = _allSessions.find((row) => row && row.session_id === sid) || null;
+  }
+  if (session) {
+    if (!isCron && _isCronSessionForUnread(session)) isCron = true;
+    if (!profile && typeof session.profile === 'string' && session.profile.trim()) {
+      profile = session.profile.trim();
+    }
+  }
+  if (marker && isCron) {
+    if (marker.source !== 'cron') marker.source = 'cron';
+    if (profile && marker.profile !== profile) marker.profile = profile;
+  }
+  return {isCron, profile: profile || ''};
+}
+
+// A name is a proven root-profile alias only when it is literal `default` or
+// the loaded profile roster marks it as the default. Unknown names fail closed.
+function _cronProfileNameIsRootAlias(name) {
+  if (name === 'default') return true;
+  if (typeof _profilesCache !== 'undefined' && _profilesCache
+    && Array.isArray(_profilesCache.profiles)) {
+    const entry = _profilesCache.profiles.find((profile) => profile && profile.name === name);
+    if (entry && entry.is_default) return true;
+  }
+  return false;
+}
+
+// Match a marker owner to the active profile, including the proven
+// default/renamed-root equivalence. Do not treat every profile as the root
+// merely because the active surface is named `default`.
+function _cronMarkerProfileMatchesActive(origin, activeProfile) {
+  const originName = typeof origin === 'string' && origin.trim() ? origin.trim() : '';
+  const activeName = typeof activeProfile === 'string' && activeProfile.trim()
+    ? activeProfile.trim()
+    : 'default';
+  if (!originName) return false;
+  if (originName === activeName) return true;
+  if (typeof _profileMatchesActiveProfile === 'function'
+    && _profileMatchesActiveProfile(originName, activeName)) return true;
+  if (typeof S !== 'undefined' && S && S.activeProfileIsDefault
+    && typeof _cronProfileNameIsRootAlias === 'function'
+    && _cronProfileNameIsRootAlias(originName)) return true;
+  return false;
+}
+
+// Clear only inactive-profile cron markers. Ordinary completion markers remain
+// because the all-profile sidebar still needs to surface those.
+function _clearCronSessionCompletionUnreadForInactiveProfiles(activeProfile) {
+  const active = typeof activeProfile === 'string' && activeProfile.trim()
+    ? activeProfile.trim()
+    : 'default';
+  const unread = _getSessionCompletionUnread();
+  let changed = false;
+  for (const sid of Object.keys(unread)) {
+    const marker = unread[sid];
+    if (!marker || typeof marker !== 'object' || Array.isArray(marker)) continue;
+    const resolved = _resolveCronCompletionMarkerOrigin(sid, marker);
+    if (!resolved.isCron || !resolved.profile) continue;
+    if (_cronMarkerProfileMatchesActive(resolved.profile, active)) continue;
+    delete unread[sid];
+    changed = true;
+  }
+  if (!changed) return false;
+  _saveSessionCompletionUnread();
+  if (typeof renderSessionListFromCache === 'function') renderSessionListFromCache();
+  return true;
 }
 
 function _clearSessionViewedCount(sid) {
@@ -932,11 +1049,57 @@ function _rememberRenderedStreamingState(s, isStreaming) {
   _rememberObservedStreamingSession(s);
 }
 
-function _selectLiveRecoveryInflight(sessionId, snapshot){
-  const sid=String(sessionId||'');
-  const live=(typeof INFLIGHT!=='undefined'&&INFLIGHT&&INFLIGHT[sid])||null;
-  if(live&&_inflightHasVisibleState(live)) return live;
-  return snapshot&&typeof snapshot==='object' ? snapshot : null;
+function _selectLiveRecoveryInflight(localOrSessionId, serverSnapshot, expectedStreamId){
+  // The recovery boundary has two callers: the legacy session-id path and
+  // the run-aware path, which passes local/server snapshots explicitly. Keep
+  // both shapes here so a reload cannot silently fall back to an unrelated
+  // stream while the durable journal is being assembled.
+  let local=localOrSessionId;
+  let server=serverSnapshot;
+  let streamId=String(expectedStreamId||'').trim();
+  if(typeof localOrSessionId==='string'){
+    streamId=streamId||String(localOrSessionId||'').trim();
+    local=(typeof INFLIGHT!=='undefined'&&INFLIGHT&&INFLIGHT[streamId])||null;
+  }
+  const identity=(entry)=>String(entry&&(entry.streamId||entry.stream_id||entry.runId||entry.run_id)||'').trim();
+  const belongs=(entry)=>{
+    if(!entry||typeof entry!=='object') return false;
+    const identityValue=identity(entry);
+    return !streamId||!identityValue||identityValue===streamId;
+  };
+  const usableLocal=belongs(local)?local:null;
+  const usableServer=belongs(server)?server:null;
+  if(!usableLocal) return usableServer;
+  if(!usableServer) return usableLocal;
+  const sequence=(entry)=>{
+    const raw=entry.lastRunJournalSeq!=null?entry.lastRunJournalSeq:entry.last_seq;
+    const value=Number(raw);
+    return Number.isFinite(value)?value:0;
+  };
+  const localSeq=sequence(usableLocal);
+  const serverSeq=sequence(usableServer);
+  const preserveLocalTodoProjection=(selected)=>{
+    // Todo state is an independent UI projection. Keep it when the durable
+    // journal wins, but only when the browser persisted its ownership marker;
+    // an unscoped list can belong to an older stream and must not be revived.
+    if(
+      Array.isArray(usableLocal.todos)&&
+      usableLocal.todos.length&&
+      usableLocal.todoStateMeta&&
+      !Array.isArray(selected.todos)
+    ){
+      return Object.assign({},selected,{
+        todos:usableLocal.todos,
+        todoStateMeta:usableLocal.todoStateMeta,
+      });
+    }
+    return selected;
+  };
+  if(localSeq>serverSeq) return usableLocal;
+  if(localSeq<serverSeq) return preserveLocalTodoProjection(usableServer);
+  // Durable data wins an equal-sequence tie. Preserve local todo state only
+  // when the server snapshot did not carry that independent UI projection.
+  return preserveLocalTodoProjection(usableServer);
 }
 
 function _inflightHasVisibleLiveState(inflight) {
@@ -1012,6 +1175,8 @@ function _serverLiveSnapshotInflight(snapshot, uploaded){
     messages,
     uploaded:Array.isArray(uploaded)?[...uploaded]:[],
     toolCalls,
+    streamId:String(snapshot.stream_id||snapshot.streamId||snapshot.run_id||snapshot.runId||'').trim(),
+    lastRunJournalEventId:String(snapshot.last_event_id||snapshot.lastEventId||'').trim(),
     todos:null,
     todoStateMeta:null,
     reattach:true,
@@ -1026,19 +1191,33 @@ function _serverLiveSnapshotInflight(snapshot, uploaded){
   };
 }
 
-function _runtimeJournalAnchorActivitySceneForSession(sid){
+function _anchorActivitySceneStreamId(scene){
+  if(!scene||typeof scene!=='object') return '';
+  const identity=scene.identity&&typeof scene.identity==='object'?scene.identity:{};
+  return String(identity.stream_id||identity.streamId||scene.stream_id||scene.streamId||identity.run_id||identity.runId||'').trim();
+}
+
+function _anchorActivitySceneMatchesStream(scene, streamId){
+  if(!scene||scene.version!=='activity_scene_v1') return false;
+  const expected=String(streamId||'').trim();
+  if(!expected) return true;
+  const actual=_anchorActivitySceneStreamId(scene);
+  return !!actual&&actual===expected;
+}
+
+function _runtimeJournalAnchorActivitySceneForSession(sid, expectedStreamId){
   const inflight=INFLIGHT&&sid?INFLIGHT[sid]:null;
-  if(inflight&&inflight.anchorActivityScene&&inflight.anchorActivityScene.version==='activity_scene_v1'){
+  if(inflight&&_anchorActivitySceneMatchesStream(inflight.anchorActivityScene, expectedStreamId)){
     return inflight.anchorActivityScene;
   }
   const snapshot=S.session&&S.session.runtime_journal_snapshot;
   const scene=snapshot&&(snapshot.anchor_activity_scene||snapshot.anchorActivityScene);
-  return scene&&scene.version==='activity_scene_v1'?scene:null;
+  return _anchorActivitySceneMatchesStream(scene, expectedStreamId)?scene:null;
 }
 
 function _renderRuntimeJournalAnchorActivityScene(activeStreamId, sid){
   if(!activeStreamId||typeof window==='undefined'||typeof window._renderLiveAnchorActivitySceneSnapshotForStream!=='function') return false;
-  const scene=_runtimeJournalAnchorActivitySceneForSession(sid);
+  const scene=_runtimeJournalAnchorActivitySceneForSession(sid, activeStreamId);
   if(!scene) return false;
   return !!window._renderLiveAnchorActivitySceneSnapshotForStream(activeStreamId, scene, sid);
 }
@@ -1136,7 +1315,26 @@ function _markPollingCompletionUnreadTransitions(sessions) {
     const completedPersistedObservedStream = Boolean(observedStreaming && !isStreaming);
     if (completedObservedStream || completedPersistedObservedStream || completedWithNewMessages) {
       if (!_isSessionActivelyViewedForList(sid)) {
-        _markSessionCompletionUnread(sid, s.message_count);
+        const meta = (typeof _cronCompletionUnreadMetaForSession === 'function')
+          ? _cronCompletionUnreadMetaForSession(s)
+          : null;
+        const allProfilesOn = (typeof _showAllProfiles !== 'undefined' && !!_showAllProfiles);
+        if (
+          meta
+          && meta.source === 'cron'
+          && meta.profile
+          && !allProfilesOn
+          && typeof _cronMarkerProfileMatchesActive === 'function'
+          && !_cronMarkerProfileMatchesActive(
+            meta.profile,
+            (typeof S !== 'undefined' && S && S.activeProfile) || 'default'
+          )
+        ) {
+          // A stale response from the profile we just left must not recreate
+          // its cron dot in a single-profile sidebar.
+        } else {
+          _markSessionCompletionUnread(sid, s.message_count, meta);
+        }
       } else {
         // Sync viewed count so we don't flag stale unread on tab switch (#3020)
         _setSessionViewedCount(sid, messageCount);
@@ -1293,7 +1491,9 @@ async function newSession(flash, options={}){
       profile:S.activeProfile||'default',
     };
     if(S.session&&S.session.session_id) reqBody.prev_session_id=S.session.session_id;
-    if(options&&options.worktree) reqBody.worktree=true;
+    if(options&&Object.prototype.hasOwnProperty.call(options,'worktree')){
+      reqBody.worktree=!!options.worktree;
+    }
     if(Object.prototype.hasOwnProperty.call(options,'project_id')){
       reqBody.project_id=options.project_id;
     } else if(_activeProject&&_activeProject!==NO_PROJECT_FILTER){
@@ -1522,6 +1722,7 @@ async function _switchProfileForSessionLoad(profile){
     const data=await api('/api/profile/switch',{method:'POST',body:JSON.stringify({name}),timeoutToast:false});
     S.activeProfile=data.active||name;
     S.activeProfileIsDefault=!!data.is_default;
+    if(typeof _resetCronUnreadForProfileSwitch==='function') _resetCronUnreadForProfileSwitch();
     if(typeof _clearPersistedModelState==='function') _clearPersistedModelState();
     else localStorage.removeItem('hermes-webui-model');
     if(data.default_model) window._defaultModel=data.default_model;
@@ -2056,6 +2257,8 @@ async function loadSession(sid){
         lastAssistantText:String(stored.lastAssistantText||''),
         lastReasoningText:String(stored.lastReasoningText||''),
         lastRunJournalSeq:Number(stored.lastRunJournalSeq||0)||0,
+        streamId:String(stored.streamId||''),
+        lastRunJournalEventId:String(stored.lastRunJournalEventId||''),
         journalReplayFromStart:!!stored.journalReplayFromStart,
         anchorActivityScene:(stored.anchorActivityScene&&stored.anchorActivityScene.version==='activity_scene_v1')?stored.anchorActivityScene:null,
         currentActivityBurstId:Number(stored.currentActivityBurstId||0)||0,
@@ -4832,6 +5035,7 @@ function _renderBatchActionBar(){
         return {response,session:sessionsById.get(sid)||null};
       }));
       const retainedCount=_worktreeResponseCount(results);
+      const cleanupFailedCount=results.filter(result=>result.response&&result.response.state_db_cleanup_failed).length;
       ids.forEach(_clearHandoffStorageForSession);
       if(S.session&&ids.includes(S.session.session_id)){
         S.session=null;S.messages=[];S.entries=[];localStorage.removeItem('hermes-webui-session');
@@ -4840,6 +5044,7 @@ function _renderBatchActionBar(){
         if(remaining.sessions&&remaining.sessions.length){await loadSession(remaining.sessions[0].session_id);}
         else{$('msgInner').innerHTML='';$('emptyState').style.display='';}
       }
+      if(cleanupFailedCount) showToast(t('delete_failed')+' ('+cleanupFailedCount+'/'+ids.length+')',0,'error');
       showToast((retainedCount?t('session_deleted_worktree'):t('session_delete'))+' ('+ids.length+')');exitSessionSelectMode();await renderSessionList();
     }catch(e){showToast('Delete failed: '+(e.message||e));}
   };bar.appendChild(deleteBtn);
@@ -5881,7 +6086,9 @@ function _applySessionListPayload(sessData, projData, opts){
   _reconcileActiveSessionIdleStateFromList(serverSessions);
   _allSessions = _mergeOptimisticFirstTurnSessions(serverSessions);
   if(typeof _updateExternalSessionsToggle === 'function') _updateExternalSessionsToggle(_allSessions);
-  _reconcileDurableCompletionReceipts(_allSessions);
+  if(typeof _reconcileDurableCompletionReceipts==='function') {
+    _reconcileDurableCompletionReceipts(_allSessions);
+  }
   // Tag the cache with the scope it was loaded under (active profile +
   // all-profiles flag). If a later /api/sessions fails right after a profile
   // switch, the catch path checks this so it won't re-render the PRIOR
@@ -9545,6 +9752,7 @@ async function deleteSession(sid, beforeDelete=null){
     return false;
   }
   const response=deleteResult&&deleteResult.response;
+  const cleanupFailed=!!(response&&response.state_db_cleanup_failed);
   if(typeof _clearPersistedSessionQueue==='function') _clearPersistedSessionQueue(sid);
   if(!optimisticRendered){
     _pendingSessionReflowPositions=reflowPositions;
@@ -9568,10 +9776,11 @@ async function deleteSession(sid, beforeDelete=null){
       if(typeof syncAppTitlebar==='function') syncAppTitlebar();
     }
   }
+  if(cleanupFailed) showToast(t('delete_failed'),0,'error');
   showToast(_sessionResponseRetainsWorktree(response,session)?t('session_deleted_worktree'):t('session_deleted'));
   if(optimisticRendered) void renderSessionList().finally(()=>_optimisticallyRemovedSessionIds.delete(sid));
   else await renderSessionList();
-  return true;
+  return !cleanupFailed;
 }
 
 // ── Project helpers ─────────────────────────────────────────────────────

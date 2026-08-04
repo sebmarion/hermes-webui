@@ -6131,6 +6131,15 @@ function _syncTransparentEventTimestamp(row, header, opts){
     return null;
   }
   const source=explicitTs||toolTs||attrTs?'event':'live';
+  // The setting controls only the visible per-event chip.  Keep the canonical
+  // event timestamp on the row even when the chip is hidden so chronology,
+  // tool replacement, and the response footer can still use it.
+  row.setAttribute('data-event-at',String(ts));
+  row.setAttribute('data-event-at-source',source);
+  if(typeof window!=='undefined'&&window._transparentEventTimestamps===false){
+    if(timeEl) timeEl.remove();
+    return ts;
+  }
   if(!timeEl){
     timeEl=document.createElement('span');
     timeEl.className='transparent-event-time';
@@ -8833,6 +8842,7 @@ function _compactInflightState(state){
     lastAssistantText:state.lastAssistantText||'',
     lastReasoningText:state.lastReasoningText||'',
     lastRunJournalSeq:state.lastRunJournalSeq||0,
+    lastRunJournalEventId:state.lastRunJournalEventId||'',
     journalReplayFromStart:!!state.journalReplayFromStart,
     currentActivityBurstId:state.currentActivityBurstId||0,
     currentLiveSegmentSeq:state.currentLiveSegmentSeq||0,
@@ -11010,7 +11020,7 @@ function _transparentToolSummary(tc){
   // with only {workdir} or an unknown tool with {mode:"dry-run"}) must yield an
   // EMPTY collapsed preview rather than dumping a raw arg snippet — that keeps the
   // collapsed row quiet and consistent with the no-args case (#4658 review).
-  const target=typeof _toolVisibleTargetLabel==='function'?_toolVisibleTargetLabel(tc,{limit:160}):'';
+  const target=typeof _toolVisibleTargetLabel==='function'?_toolVisibleTargetLabel(tc,{limit:160,rangeFirst:true}):'';
   if(target) return target;
   return '';
 }
@@ -12357,6 +12367,7 @@ function _anchorSceneNodeForRow(row, opts){
   if(!node) return null;
   node.setAttribute('data-anchor-scene-row','1');
   node.setAttribute('data-anchor-row-id',String(row.row_id||row.local_id||''));
+  if(row.local_id) node.setAttribute('data-anchor-local-id',String(row.local_id));
   node.setAttribute('data-anchor-row-role',String(row.role||'activity'));
   node.setAttribute('data-anchor-source-event-type',String(row.source_event_type||''));
   return node;
@@ -12426,6 +12437,7 @@ function _anchorSceneTransparentNodeForRow(row, opts){
   if(settled) node.setAttribute('data-anchor-settled-scene-row','1');
   if(live) node.setAttribute('data-anchor-live-scene-row','1');
   node.setAttribute('data-anchor-row-id',String(row.row_id||row.local_id||''));
+  if(row.local_id) node.setAttribute('data-anchor-local-id',String(row.local_id));
   node.setAttribute('data-anchor-row-role',String(row.role||'activity'));
   node.setAttribute('data-anchor-source-event-type',String(row.source_event_type||''));
   if(opts&&opts.streamId) node.setAttribute('data-anchor-stream-id',String(opts.streamId));
@@ -15079,7 +15091,7 @@ function _restoreMessageScrollSnapshotSameFrame(snapshot){
   }
 }
 function _renderMessagesWithScrollSnapshot(options){
-  const scrollSnapshot=_captureMessageScrollSnapshot();
+  const scrollSnapshot=(options&&options._prescrollSnapshot)||_captureMessageScrollSnapshot();
   renderMessages({...(options||{}),preserveScroll:true});
   _restoreMessageScrollSnapshotSameFrame(scrollSnapshot);
 }
@@ -17056,6 +17068,20 @@ function _toolTargetLabel(tc){
   else raw=a.cmd||a.command||a.path||a.file_path||a.file||a.uri||a.url||a.query||a.pattern||a.dir||a.task||a.name||'';
   return _redactToolTargetLabel(_decodeToolLabelEntities(String(raw).split('\n')[0].trim()));
 }
+function _toolReadRangeLabel(tc){
+  const name=String(tc&&tc.name||'').toLowerCase().replace(/[^a-z0-9]+/g,'_');
+  if(name!=='read_file') return '';
+  const args=tc&&tc.args||{};
+  const offset=args.offset;
+  if(!Number.isSafeInteger(offset)||offset<=0) return '';
+  const limit=args.limit;
+  if(limit===undefined) return `L${offset}`;
+  if(!Number.isSafeInteger(limit)||limit<=0) return '';
+  if(limit===1) return `L${offset}`;
+  const span=limit-1;
+  if(offset>Number.MAX_SAFE_INTEGER-span) return '';
+  return `L${offset}-${offset+span}`;
+}
 function _toolFullCommandLabel(tc){
   // Full (multi-line) shell command for the EXPANDED detail lead. Mirrors the
   // shell raw-extraction in _toolTargetLabel but WITHOUT the .split('\n')[0]
@@ -17070,7 +17096,12 @@ function _toolVisibleTargetLabel(tc, opts){
   const target=_toolTargetLabel(tc);
   if(!target) return '';
   const kind=_toolActionKind(tc);
-  if(kind==='read'||kind==='write') return _shortToolLabel(_toolPathBasename(target)||target, opts.limit||112);
+  if(kind==='read'||kind==='write'){
+    let text=_toolPathBasename(target)||target;
+    const range=kind==='read'?_toolReadRangeLabel(tc):'';
+    if(range) text=opts.rangeFirst?`${range} · ${text}`:`${text} · ${range}`;
+    return _shortToolLabel(text, opts.limit||112);
+  }
   if(kind==='skill'){
     const suffix=_toolI18n('tool_target_skill_suffix', 'skill');
     const text=target.toLowerCase().endsWith(String(suffix).toLowerCase())?target:`${target} ${suffix}`;
@@ -18860,6 +18891,14 @@ function appendThinking(text='', options){
   const allowPendingPlaceholder=!!(options&&options.pending===true);
   if(typeof isFinalAnswerOnlyMode==='function'&&isFinalAnswerOnlyMode()) return;
   if(!S.session||(!S.activeStreamId&&!allowPendingPlaceholder)) return;
+  // A deferred anchor projection can decline a paint after its durable event
+  // already exists. Update that exact anchor row in place before the normal
+  // live-owner guard, which otherwise would only re-render the unchanged scene.
+  if(options.anchorRenderFallback===true&&options.anchorReasoningLocalId){
+    const fallbackTurn=$('liveAssistantTurn');
+    if(typeof _updateLiveAnchorReasoningRowForFallback==='function'
+      && _updateLiveAnchorReasoningRowForFallback(fallbackTurn,text,options)) return;
+  }
   if(!allowPendingPlaceholder&&isLiveAnchorActivitySceneOwner(S.activeStreamId)){
     _renderLiveAnchorActivitySceneForStream(S.activeStreamId, S.session.session_id);
     return;

@@ -541,6 +541,25 @@ def get_config() -> dict:
     return _cfg_cache
 
 
+def get_config_snapshot() -> dict:
+    """Return a request-owned config snapshot captured under the cache lock."""
+    with _cfg_lock:
+        config_path = _get_config_path()
+        try:
+            current_mtime = config_path.stat().st_mtime
+        except OSError:
+            current_mtime = 0.0
+        path_changed = _cfg_path != config_path
+        mtime_stale = current_mtime != _cfg_mtime
+        if not _cfg_cache or path_changed or (mtime_stale and not _cfg_has_in_memory_overrides()):
+            _refresh_config_cache(config_path)
+        try:
+            active_cfg = cfg if cfg is not _cfg_cache else _cfg_cache
+        except NameError:
+            active_cfg = _cfg_cache
+        return copy.deepcopy(active_cfg)
+
+
 def get_webui_session_save_mode(config_data: dict | None = None) -> str:
     """Return the validated first-turn session persistence mode.
 
@@ -1809,17 +1828,22 @@ def _filter_picker_hidden_provider_groups(payload: dict | None) -> dict | None:
     payload["groups"] = filtered_groups
     badges = payload.get("configured_model_badges")
     if isinstance(badges, dict):
+        def _badge_allowed(value) -> bool:
+            # Cache payloads from older agents may contain shape-only badge
+            # values (for example a label string).  They are not provider
+            # records and must survive this provider filter unchanged.
+            if not isinstance(value, dict):
+                return True
+            provider = value.get("provider")
+            return not _is_picker_hidden_provider(provider) and _is_picker_allowed_provider(
+                provider,
+                provider,
+            )
+
         payload["configured_model_badges"] = {
             key: value
             for key, value in badges.items()
-            if not (
-                isinstance(value, dict)
-                and _is_picker_hidden_provider(value.get("provider"))
-            )
-            and _is_picker_allowed_provider(
-                value.get("provider"),
-                value.get("provider"),
-            )
+            if _badge_allowed(value)
         }
     return _filter_codex_pro_models(payload)
 
@@ -9339,7 +9363,7 @@ LOCK = threading.Lock()
 #   1. config.yaml  webui.sessions_cache_max   (preferred, no new env var)
 #   2. HERMES_WEBUI_SESSIONS_MAX env var        (legacy operator override)
 #   3. DEFAULT_SESSIONS_CACHE_MAX               (sane bounded default)
-DEFAULT_SESSIONS_CACHE_MAX = 300
+DEFAULT_SESSIONS_CACHE_MAX = 100
 SESSIONS_MAX = _env_int("HERMES_WEBUI_SESSIONS_MAX", DEFAULT_SESSIONS_CACHE_MAX)
 
 
@@ -11573,6 +11597,7 @@ _SETTINGS_DEFAULTS = {
     "structured_code_auto_tree_lines": 10,  # in 'auto' mode, minimum line count to default a JSON/YAML block to Tree view (preserves the original hardcoded >=10 behavior)
     "session_endless_scroll": False,  # auto-load older transcript pages while scrolling upward
     "chat_activity_display_mode": "compact_worklog",  # compact_worklog | transparent_stream | hide_all_activity
+    "transparent_stream_event_timestamps": True,  # show per-event timestamp chips inside Transparent Stream
     "auto_scroll_follow": True,  # follow new output to the bottom while streaming (Codex/Claude-Code-style sticky bottom); the user scrolling up unpins and is respected
     "worklog_details_expanded_default": False,  # opt-in: expand Worklog details by default; default remains folded
     "hide_composer_attach": False,  # hide attach button in composer footer
@@ -11882,6 +11907,7 @@ _SETTINGS_BOOL_KEYS = {
     "large_text_paste_as_attachment",
     "project_quick_create_buttons",
     "session_endless_scroll",
+    "transparent_stream_event_timestamps",
     "auto_scroll_follow",
     "worklog_details_expanded_default",
     "auth_disabled_acknowledged",

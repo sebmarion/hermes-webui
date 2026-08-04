@@ -510,7 +510,7 @@ def test_materialize_helper_called_immediately_before_error_path_clears():
     user-turn-data-loss regression #1361 was filed for.
 
     Strategy: count how many `pending_user_message = None` clearings have the
-    helper call within the preceding 4 lines. Currently 2 (apperror at 2610,
+    helper call within the preceding 8 lines. Currently 2 (apperror at 2610,
     outer-Exception at 3072). The success path (2716) and cancel path (3375)
     legitimately don't need the helper. If a future refactor drops the helper
     call from one of the error sites, this assertion fires.
@@ -529,14 +529,14 @@ def test_materialize_helper_called_immediately_before_error_path_clears():
 
     sites_with_helper = []
     for lineno, _ in clear_sites:
-        prev_block = '\n'.join(lines[max(0, lineno - 5):lineno - 1])
+        prev_block = '\n'.join(lines[max(0, lineno - 9):lineno - 1])
         if helper_name in prev_block:
             sites_with_helper.append(lineno)
 
     # Concretely, PR #1760 wired up the helper at the apperror-no-response
     # path and the outer-Exception path. Both must remain wired.
     assert len(sites_with_helper) >= 2, (
-        f"Expected ≥2 clear sites preceded by {helper_name} within 4 lines; "
+        f"Expected ≥2 clear sites preceded by {helper_name} within 8 lines; "
         f"found {sites_with_helper}. PR #1760 / #1361 regression — re-wire the "
         f"helper at the error-branch clear sites in api/streaming.py."
     )

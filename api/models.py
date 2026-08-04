@@ -2790,6 +2790,12 @@ def _run_journal_has_visible_output(session, stream_id: str | None) -> bool:
                 continue
             if str(payload.get('text') or '').strip():
                 return True
+        if event_name == 'reasoning':
+            reasoning_text = str(
+                payload.get('text') or payload.get('reasoning') or payload.get('thinking') or ''
+            )
+            if reasoning_text.strip():
+                return True
         if event_name == 'tool':
             return True
     return False
@@ -4792,6 +4798,14 @@ def _persisted_session_meta_prefix(sid) -> dict | None:
         return None
 
 
+# Grace window (seconds) during which a never-persisted, empty, draftless
+# session shell is protected from LRU eviction. ``new_session()`` defers its
+# first disk write until the first message, so a just-opened tab lives only in
+# memory. Once the shell is stale and still untouched, it is safe to bound it
+# like any other abandoned empty tab (#4765).
+_UNSAVED_SHELL_GRACE_S = 1800
+
+
 def _session_is_evictable(s) -> bool:
     """Return True only when *s* can be safely dropped from the LRU (#4765).
 
@@ -4826,14 +4840,22 @@ def _session_is_evictable(s) -> bool:
     if getattr(s, '_loaded_metadata_only', False):
         return True
     in_memory_count = len(getattr(s, 'messages', None) or [])
-    if in_memory_count == 0:
-        # A zero-message session has nothing to lose. If it was never persisted
-        # (brand new, no sidecar) dropping it only discards an empty shell; the
-        # next access recreates it. If it is persisted, it is trivially clean.
-        return True
     disk_count = _persisted_message_count(sid)
     if disk_count is None:
-        return False  # cannot prove it is on disk → keep it resident
+        # A never-persisted shell is the only copy of a newly opened tab. Keep
+        # it while fresh or while a draft exists; stale, empty, draftless shells
+        # are abandoned and may be evicted to keep the cache bounded.
+        if in_memory_count > 0:
+            return False
+        if getattr(s, 'composer_draft', None):
+            return False
+        created_at = getattr(s, 'created_at', None)
+        if isinstance(created_at, (int, float)):
+            return (time.time() - created_at) > _UNSAVED_SHELL_GRACE_S
+        return False
+    if in_memory_count == 0:
+        # Persisted and empty: there is no in-memory data to lose.
+        return True
     return disk_count >= in_memory_count
 
 
@@ -4883,7 +4905,16 @@ def _evict_sessions_over_cap(cap: int | None = None) -> int:
     return evicted
 
 
-def get_session(sid, metadata_only=False):
+def get_session_for_scan(sid):
+    """Read a session for a one-pass scan without disturbing the LRU."""
+    try:
+        return _resolve_session(sid, promote_cache=False, cache_on_miss=False)
+    except Exception:
+        logger.debug("scan load failed for session %s", sid, exc_info=True)
+        return None
+
+
+def _resolve_session(sid, metadata_only=False, *, promote_cache=True, cache_on_miss=True):
     """Load a session, optionally with metadata only (skipping the messages array).
 
     Metadata-only loads intentionally do not populate the full-session cache.
@@ -4893,7 +4924,7 @@ def get_session(sid, metadata_only=False):
     """
     with LOCK:
         cached = SESSIONS.get(sid)
-        if cached is not None:
+        if cached is not None and promote_cache:
             SESSIONS.move_to_end(sid)  # LRU: mark as recently used
     if cached is not None:
         # Defensive cache ownership check: compression/continuation and recovery
@@ -4917,7 +4948,8 @@ def get_session(sid, metadata_only=False):
                 disk_session = Session.load(sid)
                 with LOCK:
                     SESSIONS[sid] = disk_session
-                    SESSIONS.move_to_end(sid)
+                    if promote_cache:
+                        SESSIONS.move_to_end(sid)
                 cached = disk_session
             except Exception:
                 logger.debug(
@@ -4930,7 +4962,8 @@ def get_session(sid, metadata_only=False):
                 if _cache_has_stale_unsaved_user_tail(cached, disk_session):
                     with LOCK:
                         SESSIONS[sid] = disk_session
-                        SESSIONS.move_to_end(sid)
+                        if promote_cache:
+                            SESSIONS.move_to_end(sid)
                     cached = disk_session
             except Exception:
                 logger.debug(
@@ -4961,10 +4994,12 @@ def get_session(sid, metadata_only=False):
     else:
         s = Session.load(sid)
     if s:
-        with LOCK:
-            SESSIONS[sid] = s
-            SESSIONS.move_to_end(sid)
-            _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
+        if cache_on_miss:
+            with LOCK:
+                SESSIONS[sid] = s
+                if promote_cache:
+                    SESSIONS.move_to_end(sid)
+                _evict_sessions_over_cap()  # #4765: safe LRU eviction (never active/unsaved)
         if not metadata_only:
             try:
                 synced_from_state = _sync_sidecar_from_state_db_if_newer(s)
@@ -4985,7 +5020,7 @@ def get_session(sid, metadata_only=False):
                 # do not pin the still-stale sidecar in the LRU cache forever.
                 # Leaving it cached would prevent future get_session() calls from
                 # re-entering the cache-miss repair path after the lock holder exits.
-                if not repaired and (len(s.messages) == 0
+                if cache_on_miss and not repaired and (len(s.messages) == 0
                         and s.pending_user_message
                         and s.active_stream_id
                         and s.active_stream_id not in _active_stream_ids()):
@@ -4996,6 +5031,11 @@ def get_session(sid, metadata_only=False):
                 pass  # repair is best-effort
         return s
     raise KeyError(sid)
+
+
+def get_session(sid, metadata_only=False):
+    """Load a session, optionally with metadata only (skipping messages)."""
+    return _resolve_session(sid, metadata_only=metadata_only)
 
 
 _COMPRESSION_RECOVERY_PROFILE_UNSET = object()

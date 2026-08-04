@@ -42,7 +42,9 @@ def test_providers_only_configured_flag_does_not_create_picker_group(monkeypatch
         _reset_models_cache()
 
     provider_ids = _provider_ids(payload)
-    assert "openai" in provider_ids
+    # Direct OpenAI is intentionally hidden from the picker; the config flag
+    # must not resurrect it or turn the flag itself into a provider group.
+    assert "openai" not in provider_ids
     assert "only-configured" not in provider_ids
     assert all("Only-Configured" not in str(group.get("provider")) for group in payload["groups"])
 
@@ -75,5 +77,5 @@ def test_unknown_scalar_provider_config_flags_are_ignored(monkeypatch):
         _reset_models_cache()
 
     provider_ids = _provider_ids(payload)
-    assert "openai" in provider_ids
+    assert "openai" not in provider_ids
     assert "future-toggle" not in provider_ids

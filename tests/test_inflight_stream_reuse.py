@@ -148,7 +148,8 @@ def test_load_session_reattach_path_uses_attach_live_stream_for_running_sessions
     assert active_pos != -1
     assert reattach_pos != -1
     assert active_pos < reattach_pos
-    assert "{reconnecting:true}" in body[reattach_pos : reattach_pos + 200]
+    reattach_block = re.sub(r"\s+", "", body[reattach_pos : reattach_pos + 320])
+    assert "reconnecting:true" in reattach_block
 
 
 def test_load_session_same_sid_noop_does_not_mask_pending_switch_back():

@@ -153,12 +153,23 @@ def test_only_one_synchronous_messages_clear_in_loadsession_force_block():
 
 
 def test_ensure_messages_loaded_called_with_keep_stale_flag():
-    # Both _ensureMessagesLoaded call sites inside loadSession must forward
-    # the keep-stale flag so the early-return inside _ensureMessagesLoaded
-    # cannot skip the swap when stale messages are still in place.
+    # Every _ensureMessagesLoaded call site inside loadSession must forward the
+    # keep-stale flag and load-generation token so the early-return cannot skip
+    # the swap while stale messages are still in place, and a stale async load
+    # cannot overwrite a newer session load. The bounded/lazy paths also carry
+    # their initial-data/legacy options, so assert the invariant rather than an
+    # exact option-object spelling.
     block = _load_session_block(_compact(SESSIONS_JS))
-    # Both INFLIGHT and idle paths.
-    assert block.count("await_ensureMessagesLoaded(sid,{force:_keepStaleUntilLoaded,loadGeneration:_loadGeneration})") == 2
+    calls = [
+        line for line in block.split(";")
+        if "await_ensureMessagesLoaded(sid," in line
+    ]
+    assert len(calls) == 4
+    assert all(
+        "force:_keepStaleUntilLoaded" in call
+        and "loadGeneration:_loadGeneration" in call
+        for call in calls
+    )
 
 
 def test_ensure_messages_loaded_supports_force_override():
