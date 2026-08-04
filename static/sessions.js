@@ -8647,30 +8647,6 @@ function renderSessionListFromCache(){
       list.appendChild(more);
     }
   }
-  if(_legacyWebuiArchive.length>0){
-    const legacySection=document.createElement('div');
-    legacySection.className='session-date-group legacy-webui-archive';
-    const legacyHeader=document.createElement('div');
-    legacyHeader.className='session-date-header';
-    legacyHeader.textContent='Legacy WebUI Archive';
-    legacySection.appendChild(legacyHeader);
-    const legacyBody=document.createElement('div');
-    legacyBody.className='session-date-body';
-    for(const legacy of _legacyWebuiArchive){
-      const row=document.createElement('button');
-      row.type='button';
-      row.className='session-item archived legacy-webui-archive-item';
-      row.dataset.sid=String(legacy.session_id||legacy.canonical_id||'');
-      const title=document.createElement('span');
-      title.className='session-title';
-      title.textContent=String(legacy.title||'Untitled');
-      row.appendChild(title);
-      row.onclick=()=>_resumeLegacyWebuiArchiveSession(legacy);
-      legacyBody.appendChild(row);
-    }
-    legacySection.appendChild(legacyBody);
-    list.appendChild(legacySection);
-  }
   // Select mode toggle button (only when NOT in select mode)
   if(!_sessionSelectMode){
     const toggleBtn=document.createElement('div');toggleBtn.className='session-select-toggle';

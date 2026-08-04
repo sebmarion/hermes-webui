@@ -111,6 +111,45 @@ def _wait_for_health(timeout=30):
     return False
 
 
+def _measure_legacy_sidebar_visibility(page):
+    return page.evaluate(
+        """
+        () => {
+          if (
+            typeof _legacyWebuiArchive === "undefined" ||
+            typeof renderSessionListFromCache !== "function"
+          ) {
+            throw new Error("legacy sidebar fixture could not reach the session renderer");
+          }
+          const list = document.getElementById("sessionList");
+          if (!list) throw new Error("legacy sidebar fixture is missing #sessionList");
+
+          const previousArchive = _legacyWebuiArchive;
+          _legacyWebuiArchive = [{
+            session_id: "browser-smoke-legacy-session",
+            canonical_id: "browser-smoke-legacy-session",
+            title: "Browser smoke legacy conversation",
+            archived: true,
+            message_count: 3,
+          }];
+          renderSessionListFromCache();
+
+          const result = {
+            sectionCount: list.querySelectorAll(".legacy-webui-archive").length,
+            rowCount: list.querySelectorAll(".legacy-webui-archive-item").length,
+            headingCount: Array.from(list.querySelectorAll(".session-date-header"))
+              .filter((node) => node.textContent.trim() === "Legacy WebUI Archive")
+              .length,
+          };
+
+          _legacyWebuiArchive = previousArchive;
+          renderSessionListFromCache();
+          return result;
+        }
+        """
+    )
+
+
 def _show_clarify_layout_fixture(page, case_name):
     payload = {
         **CLARIFY_LAYOUT_PROMPT,
@@ -409,6 +448,19 @@ def main():
                 time.sleep(1.5)
 
                 if path == "/":
+                    legacy_visibility = _measure_legacy_sidebar_visibility(page)
+                    if legacy_visibility != {
+                        "sectionCount": 0,
+                        "rowCount": 0,
+                        "headingCount": 0,
+                    }:
+                        failures.append(
+                            "  [legacy-sidebar] sidecar-only archive entered the sidebar DOM: "
+                            f"{legacy_visibility!r}"
+                        )
+                    else:
+                        print("OK  legacy WebUI archive remains hidden from the sidebar")
+
                     for case_name, width, height, show_prompt in CLARIFY_LAYOUT_CASES:
                         page.set_viewport_size({"width": width, "height": height})
                         if show_prompt:
