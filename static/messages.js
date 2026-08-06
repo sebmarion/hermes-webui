@@ -1286,6 +1286,108 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
   return restoredVisible;
 }
 
+// The chat-start endpoint returns a structured 409 after a session has entered
+// terminal compression recovery. Keep this parser strict: a generic 409 or a
+// payload for another session must remain on the ordinary error path and must
+// never mutate the visible pane.
+function _compressionRecoveryPayloadFrom409(err, sid){
+  if(!err || Number(err.status)!==409 || typeof err.body!=='string') return null;
+  let body;
+  try{ body=JSON.parse(err.body); }catch(_){ return null; }
+  if(!body || body.type!=='compression_recovery_required') return null;
+  const targetSid=String(sid||'').trim();
+  const bodySid=String(body.session_id||'').trim();
+  if(!targetSid || (bodySid && bodySid!==targetSid)) return null;
+  const recovery=body.compression_recovery;
+  if(!recovery || typeof recovery!=='object') return null;
+  if(String(recovery.terminal_state||'')!=='compression_exhausted') return null;
+  const sourceSid=String(recovery.source_session_id||'').trim();
+  if(!sourceSid || sourceSid!==targetSid) return null;
+  const action=String(
+    recovery.recommended_action||body.recommended_recovery_action||''
+  ).trim();
+  if(action!=='start_focused_continuation') return null;
+  return {body,recovery};
+}
+
+// Reconcile a late terminal 409 without losing the attempted composer turn.
+// This is deliberately a same-session reload: the explicit recovery card owns
+// the child-session transition, while this path owns optimistic-row cleanup,
+// draft/file restoration, and authoritative source-session refresh.
+async function _handleCompressionRecovery409(
+  err, sid, optimisticUser, draftText, filesSnapshot, clearPromise
+){
+  const parsed=_compressionRecoveryPayloadFrom409(err,sid);
+  if(!parsed) return false;
+  const visibleSid=(S.session&&S.session.session_id)||null;
+  const visible=visibleSid===sid;
+
+  delete INFLIGHT[sid];
+  if(typeof clearInflightState==='function') clearInflightState(sid);
+
+  if(visible){
+    const optimisticIndex=Array.isArray(S.messages)
+      ? S.messages.indexOf(optimisticUser)
+      : -1;
+    if(optimisticIndex>=0) S.messages.splice(optimisticIndex,1);
+    S.toolCalls=[];
+    S.activeStreamId=null;
+    if(S.session) delete S.session.pending_started_at;
+    stopApprovalPolling();
+    stopClarifyPolling();
+    if(!_approvalSessionId || _approvalSessionId===sid) hideApprovalCard(true);
+    if(!_clarifySessionId || _clarifySessionId===sid) hideClarifyCard(true,'terminal');
+    removeThinking();
+    // A compression-recovery 409 is not a completed turn. Keep any queued
+    // successor durable and let the explicit recovery flow decide when it can
+    // run; draining here would overwrite the failed draft restored below.
+    setBusy(false,{drainQueue:false});
+    setComposerStatus('');
+  }
+
+  // Restore synchronously before the reload so preserveActiveInput can protect
+  // it from the authoritative session response. The helper also persists a
+  // stale-aware server draft after the original clear request settles.
+  _restoreComposerDraftAfterFailedSend(
+    draftText, filesSnapshot, sid, clearPromise
+  );
+  if(typeof clearOptimisticSessionStreaming==='function'){
+    clearOptimisticSessionStreaming(sid);
+  }
+
+  if(!visible) return true;
+
+  if(S.session){
+    S.session.compression_recovery=parsed.recovery;
+    if(typeof renderMessages==='function') renderMessages();
+  }
+  if(typeof renderSessionList==='function') void renderSessionList();
+
+  try{
+    await loadSession(sid, {
+      force:true,
+      keepStaleUntilLoaded:true,
+      preserveActiveInput:true,
+    });
+  }catch(_){
+    // Keep the locally merged recovery card and restored composer if the
+    // reconciliation GET is temporarily unavailable.
+  }
+
+  // A session switch may have raced the reload. Never focus or toast a card in
+  // a different visible session.
+  if(S.session&&S.session.session_id===sid){
+    if(!Object.prototype.hasOwnProperty.call(S.session,'compression_recovery')){
+      S.session.compression_recovery=parsed.recovery;
+    }
+    if(typeof renderMessages==='function') renderMessages();
+    if(typeof showCompressionRecoveryContinuationHint==='function'){
+      showCompressionRecoveryContinuationHint();
+    }
+  }
+  return true;
+}
+
 function _composerOwnershipSnapshot(text, files){
   const targetSid=(S.session&&S.session.session_id)||null;
   const ownerApiAvailable=typeof _composerDraftOwnerSessionId==='function';
@@ -1849,6 +1951,14 @@ async function send(){
     postStartData = startData;
   }catch(e){
     const errMsg=String((e&&e.message)||'');
+    if(await _handleCompressionRecovery409(
+      e,
+      activeSid,
+      userMsg,
+      _failedSendDraftText,
+      _failedSendFilesSnapshot,
+      _composerDraftClearPromise,
+    )) return;
     // If /api/chat/start returns 404, the session was deleted server-side
     // (its sidecar is gone) while GET kept returning a CLI stub (#2782). Strip
     // the stale /session/<id> URL and clear localStorage so a reload does not

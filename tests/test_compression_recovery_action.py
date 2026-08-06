@@ -608,9 +608,221 @@ def test_compression_recovery_send_redirect_starts_recovery_without_submit(
 ):
     assert recovery_ui_node_result["redirect"] == {
         "result": True,
-        "starts": 1,
-        "hinted": 0,
+        "starts": 0,
+        "hinted": 1,
     }
+
+
+@pytest.fixture(scope="module")
+def compression_recovery_409_node_result():
+    node = shutil.which("node")
+    if not node:  # pragma: no cover
+        pytest.skip("node not available")
+    harness = textwrap.dedent(
+        r"""
+        const fs = require('fs');
+        const src = fs.readFileSync(process.argv[1], 'utf8');
+        function extractFunc(name) {
+          const re = new RegExp('(?:async\\s+)?function\\s+' + name + '\\s*\\(');
+          const start = src.search(re);
+          if (start < 0) throw new Error(name + ' not found');
+          let i = src.indexOf('{', start);
+          let depth = 1; i++;
+          while (depth > 0 && i < src.length) {
+            if (src[i] === '{') depth++;
+            else if (src[i] === '}') depth--;
+            i++;
+          }
+          return src.slice(start, i);
+        }
+        let parsed = null;
+        let missing = false;
+        try {
+          eval(extractFunc('_compressionRecoveryPayloadFrom409'));
+          const body = {
+            type: 'compression_recovery_required',
+            session_id: 'parent-1',
+            recommended_recovery_action: 'start_focused_continuation',
+            compression_recovery: {
+              source_session_id: 'parent-1',
+              terminal_state: 'compression_exhausted',
+              recommended_action: 'start_focused_continuation',
+            },
+          };
+          parsed = {
+            valid: !!_compressionRecoveryPayloadFrom409(
+              {status: 409, body: JSON.stringify(body)},
+              'parent-1',
+            ),
+            wrongSession: !!_compressionRecoveryPayloadFrom409(
+              {status: 409, body: JSON.stringify(body)},
+              'parent-2',
+            ),
+            malformed: !!_compressionRecoveryPayloadFrom409(
+              {status: 409, body: '{not-json'},
+              'parent-1',
+            ),
+          };
+        } catch (err) {
+          missing = true;
+          parsed = {error: String(err && err.message || err)};
+        }
+        console.log(JSON.stringify({missing, parsed}));
+        """
+    )
+    proc = subprocess.run(
+        [node, "-e", harness, str(ROOT / "static" / "messages.js")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_compression_recovery_409_parser_is_session_scoped(
+    compression_recovery_409_node_result,
+):
+    assert compression_recovery_409_node_result["missing"] is False
+    assert compression_recovery_409_node_result["parsed"] == {
+        "valid": True,
+        "wrongSession": False,
+        "malformed": False,
+    }
+
+
+@pytest.fixture(scope="module")
+def compression_recovery_409_handler_node_result():
+    node = shutil.which("node")
+    if not node:  # pragma: no cover
+        pytest.skip("node not available")
+    harness = textwrap.dedent(
+        r"""
+        const fs = require('fs');
+        const src = fs.readFileSync(process.argv[1], 'utf8');
+        const uiSrc = fs.readFileSync(process.argv[2], 'utf8');
+        function extractFunc(name, source = src) {
+          const re = new RegExp('(?:async\\s+)?function\\s+' + name + '\\s*\\(');
+          const start = source.search(re);
+          if (start < 0) throw new Error(name + ' not found');
+          let i = source.indexOf('{', start);
+          let depth = 1; i++;
+          while (depth > 0 && i < source.length) {
+            if (source[i] === '{') depth++;
+            else if (source[i] === '}') depth--;
+            i++;
+          }
+          return source.slice(start, i);
+        }
+        const sid = 'parent-1';
+        const optimistic = {role: 'user', content: 'draft'};
+        const input = {value: ''};
+        const S = {
+          session: {session_id: sid},
+          messages: [optimistic],
+          pendingFiles: [],
+          toolCalls: [],
+          activeStreamId: 'stream-1',
+        };
+        const INFLIGHT = {[sid]: {messages: [optimistic]}};
+        const $ = name => name === 'msg' ? input : null;
+        const calls = {load: null, hint: 0, render: 0, starts: 0, shifts: 0, sends: 0};
+        const autoResize = () => {};
+        const updateSendBtn = () => {};
+        const renderTray = () => {};
+        const _saveComposerDraftNow = () => {};
+        const clearInflightState = () => {};
+        const stopApprovalPolling = () => {};
+        const stopClarifyPolling = () => {};
+        const hideApprovalCard = () => {};
+        const hideClarifyCard = () => {};
+        const removeThinking = () => {};
+        const setComposerStatus = () => {};
+        const clearOptimisticSessionStreaming = () => {};
+        const renderSessionList = () => {};
+        const renderMessages = () => { calls.render += 1; };
+        const showCompressionRecoveryContinuationHint = () => { calls.hint += 1; };
+        const _clearActivityElapsedTimer = () => {};
+        const setStatus = () => {};
+        const updateQueueBadge = () => {};
+        const shiftQueuedSessionMessage = () => {
+          calls.shifts += 1;
+          return {text: 'queued follow-up', files: [{name: 'queued.txt'}]};
+        };
+        const send = () => { calls.sends += 1; };
+        const setTimeout = fn => { fn(); return 1; };
+        let _queueDrainSid = sid;
+        async function loadSession(_sid, opts) { calls.load = opts; }
+        let _approvalSessionId = null;
+        let _clarifySessionId = null;
+        eval(extractFunc('setBusy', uiSrc));
+        eval(extractFunc('_restoreComposerDraftAfterFailedSend'));
+        eval(extractFunc('_compressionRecoveryPayloadFrom409'));
+        eval(extractFunc('_handleCompressionRecovery409'));
+        const body = {
+          type: 'compression_recovery_required',
+          session_id: sid,
+          recommended_recovery_action: 'start_focused_continuation',
+          compression_recovery: {
+            source_session_id: sid,
+            terminal_state: 'compression_exhausted',
+            recommended_action: 'start_focused_continuation',
+          },
+        };
+        (async () => {
+          const handled = await _handleCompressionRecovery409(
+            {status: 409, body: JSON.stringify(body)},
+            sid,
+            optimistic,
+            'draft',
+            [{name: 'a.txt'}, {name: 'b.txt'}],
+            null,
+          );
+          console.log(JSON.stringify({
+            handled,
+            messages: S.messages.length,
+            draft: input.value,
+            files: S.pendingFiles.length,
+            load: calls.load,
+            hint: calls.hint,
+            starts: calls.starts,
+            queueShifts: calls.shifts,
+            queuedSends: calls.sends,
+          }));
+        })().catch(err => { console.error(err); process.exit(1); });
+        """
+    )
+    proc = subprocess.run(
+        [
+            node,
+            "-e",
+            harness,
+            str(ROOT / "static" / "messages.js"),
+            str(ROOT / "static" / "ui.js"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+def test_compression_recovery_409_restores_draft_and_never_starts_child(
+    compression_recovery_409_handler_node_result,
+):
+    result = compression_recovery_409_handler_node_result
+    assert result["handled"] is True
+    assert result["messages"] == 0
+    assert result["draft"] == "draft"
+    assert result["files"] == 2
+    assert result["load"]["force"] is True
+    assert result["load"]["keepStaleUntilLoaded"] is True
+    assert result["load"]["preserveActiveInput"] is True
+    assert result["hint"] == 1
+    assert result["starts"] == 0
+    assert result["queueShifts"] == 0
+    assert result["queuedSends"] == 0
 
 
 def test_compression_recovery_child_renders_safe_source_history_link(

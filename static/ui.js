@@ -544,12 +544,9 @@ function showCompressionRecoveryContinuationHint(){
 }
 
 async function redirectCompressionRecoverySend(){
-  if(typeof startCompressionRecovery==='function'){
-    await startCompressionRecovery(null);
-    return true;
-  }
   if(typeof showCompressionRecoveryContinuationHint==='function'){
     showCompressionRecoveryContinuationHint();
+    return true;
   }
   return false;
 }
@@ -7788,7 +7785,7 @@ async function handleComposerPrimaryAction(){
   await send();
 }
 
-function setBusy(v){
+function setBusy(v, options){
   S.busy=v;
   updateSendBtn();
   if(!v){
@@ -7800,7 +7797,8 @@ function setBusy(v){
     updateQueueBadge(sid);
     // Drain one queued message for the finished session after UI settles
     const _isViewedSid=!S.session||sid===S.session.session_id;
-    const next=sid&&_isViewedSid?shiftQueuedSessionMessage(sid):null;
+    const drainQueue=!(options&&options.drainQueue===false);
+    const next=drainQueue&&sid&&_isViewedSid?shiftQueuedSessionMessage(sid):null;
     if(next){
       updateQueueBadge(sid);
       setTimeout(()=>{
