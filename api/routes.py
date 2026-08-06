@@ -7019,13 +7019,35 @@ def _repair_foreign_session_model_provider(
     explicit_model_pick: bool,
     profile_provider: str | None,
 ) -> str | None:
-    """Repair a stale provider only when the cached catalog names one owner."""
+    """Repair a stale provider from durable session identity or catalog ownership."""
     stored_model = str(getattr(session, "model", "") or "").strip()
     stored_provider = _clean_session_model_provider(getattr(session, "model_provider", None))
     requested_provider = _clean_session_model_provider(requested_provider)
     resolved_provider = _clean_session_model_provider(resolved_provider)
     profile_provider = _clean_session_model_provider(profile_provider)
     _, qualified_provider = _split_provider_qualified_model(requested_model)
+    stored_bare_model, stored_qualified_provider = _split_provider_qualified_model(stored_model)
+    stored_authoritative_provider = stored_qualified_provider or stored_provider
+
+    # A reload can transiently strip ``@provider:`` from the browser's model
+    # value and pair the resulting bare id with the profile's active provider.
+    # For an ordinary send, the durable session pair is authoritative when the
+    # requested model still names the same model.  A real picker change carries
+    # either ``explicit_model_pick`` or its own qualified model and therefore
+    # bypasses this repair.  This prevents e.g. a persisted
+    # ``@custom:deepseek-novita:moonshotai/kimi-k3`` session from dispatching
+    # ``moonshotai/kimi-k3`` through ``openai-codex`` after a reload.
+    if (
+        not explicit_model_pick
+        and not qualified_provider
+        and stored_model
+        and stored_authoritative_provider
+        and requested_provider
+        and requested_provider != stored_authoritative_provider
+        and str(requested_model or "").strip() in {stored_model, stored_bare_model}
+    ):
+        return stored_authoritative_provider
+
     if (
         explicit_model_pick
         or qualified_provider

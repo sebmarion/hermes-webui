@@ -127,6 +127,82 @@ def test_equivalent_request_model_repairs_poisoned_pair(monkeypatch):
     ) == "kilocode"
 
 
+def test_stale_client_provider_inference_restores_session_qualified_provider(
+    monkeypatch,
+    tmp_path,
+):
+    """A reload must not send a custom model through the active Codex lane.
+
+    The browser can transiently expose a provider-qualified session model as its
+    bare model id while attaching the profile's active provider.  The durable
+    session model remains the authoritative owner when the request is not an
+    explicit picker action.
+    """
+    session = SimpleNamespace(
+        session_id="issue-5731-custom-codex",
+        workspace=str(tmp_path),
+        model="@custom:deepseek-novita:moonshotai/kimi-k3",
+        model_provider="custom:deepseek-novita",
+        profile="default",
+        messages=[],
+        context_messages=[],
+        pending_user_message=None,
+    )
+    captured = {}
+
+    monkeypatch.setattr(routes, "_get_or_materialize_session", lambda _sid, **_kwargs: session)
+    monkeypatch.setattr(routes, "_resolve_chat_workspace_with_recovery", lambda _s, _w: str(tmp_path))
+    monkeypatch.setattr(
+        routes,
+        "_read_profile_model_config",
+        lambda _s, _p: (None, "gpt-5.6-luna", {"model": {"provider": "openai-codex"}}),
+    )
+    monkeypatch.setattr(
+        routes,
+        "get_available_models",
+        lambda **_kwargs: pytest.fail("durable session identity should repair before catalog lookup"),
+    )
+    monkeypatch.setattr(routes, "_start_run", lambda _s, **kwargs: captured.update(kwargs) or {"ok": True})
+    monkeypatch.setattr(routes, "j", lambda _handler, payload, status=200: payload)
+
+    routes._handle_chat_start(
+        None,
+        {
+            "session_id": session.session_id,
+            "message": "contrast the three items",
+            "model": "moonshotai/kimi-k3",
+            "model_provider": "openai-codex",
+        },
+    )
+
+    assert captured["model"] == "moonshotai/kimi-k3"
+    assert captured["model_provider"] == "custom:deepseek-novita"
+
+
+def test_explicit_same_model_cross_provider_pick_is_not_repaired(monkeypatch):
+    session = _session(
+        model="@custom:deepseek-novita:moonshotai/kimi-k3",
+        provider="custom:deepseek-novita",
+    )
+    monkeypatch.setattr(
+        routes,
+        "get_available_models",
+        lambda **_kwargs: pytest.fail("an explicit pick must bypass repair"),
+    )
+
+    repaired = routes._repair_foreign_session_model_provider(
+        session,
+        requested_model="moonshotai/kimi-k3",
+        requested_provider="openai-codex",
+        resolved_model="moonshotai/kimi-k3",
+        resolved_provider="openai-codex",
+        explicit_model_pick=True,
+        profile_provider="openai-codex",
+    )
+
+    assert repaired == "openai-codex"
+
+
 @pytest.mark.parametrize("provider", ["ollama", "lmstudio"])
 def test_self_hosted_exact_owner_is_preserved(monkeypatch, provider):
     session = _session(model="vendor/model/with/slashes", provider=provider)
