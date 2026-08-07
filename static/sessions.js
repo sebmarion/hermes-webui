@@ -1472,6 +1472,37 @@ async function newSession(flash, options={}){
   }
   _setNewSessionPending(true);
   _newSessionInFlight=(async()=>{
+    // An explicit New Chat can be clicked while the previous conversation's
+    // composer still contains unsent text. Persist that text against the
+    // confirmed old owner, then clear the visible composer before replacing
+    // S.session. Otherwise the new session inherits the old text while the
+    // ownership guard still points at the old session and its first send is
+    // rejected as an unowned cross-thread draft.
+    const _previousSession=S.session;
+    const _previousSid=_previousSession&&_previousSession.session_id;
+    const _previousComposerText=($('msg')||{}).value||'';
+    const _previousComposerFiles=Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[];
+    const _previousHasComposerPayload=typeof _composerDraftHasPayload==='function'
+      && _composerDraftHasPayload(_previousComposerText,_previousComposerFiles);
+    if(_previousSid&&_previousHasComposerPayload){
+      const _previousDraftSid=typeof _composerDraftSessionForSave==='function'
+        ? _composerDraftSessionForSave(_previousSid,_previousComposerText,_previousComposerFiles)
+        : _previousSid;
+      if(_previousDraftSid!==_previousSid){
+        if(typeof showToast==='function') showToast(
+          'New Chat paused while the current draft owner is unresolved. Your draft was kept.',
+          4000
+        );
+        return;
+      }
+      if(typeof _saveComposerDraftNow==='function'){
+        await _saveComposerDraftNow(_previousSid,_previousComposerText,_previousComposerFiles);
+      }
+      $('msg').value='';
+      autoResize();
+      S.pendingFiles=[];
+      if(typeof renderTray==='function') renderTray();
+    }
     // Starting a brand-new chat must not carry named context blocks selected in
     // the previous conversation (#2543). loadSession() clears these on a sidebar
     // switch, but the New Chat path replaces S.session here without going through
@@ -1572,6 +1603,7 @@ async function newSession(flash, options={}){
       _clearEmptyComposerModelOverride();
     }
     S.session=data.session;S.messages=data.session.messages||[];
+    if(typeof _claimComposerDraftOwner==='function') _claimComposerDraftOwner(S.session.session_id);
     S._pendingSessionToolsets=null;
     if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
     S.lastUsage={...(data.session.last_usage||{})};

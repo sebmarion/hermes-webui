@@ -41,6 +41,32 @@ def test_new_session_remembers_regular_empty_session_id():
     )
 
 
+def test_new_session_flushes_old_composer_before_replacing_visible_session():
+    """Explicit New Chat must not carry an old-session draft into the new owner.
+
+    Without this boundary, the textarea still contains text owned by the
+    previous session after ``S.session`` is replaced.  The ownership guard then
+    pauses the first send in the new conversation with "no confirmed owner".
+    """
+    start = SESSIONS_JS.find("async function newSession(")
+    end = SESSIONS_JS.find("async function loadSession(", start)
+    assert start != -1 and end != -1, "newSession block not found"
+    body = SESSIONS_JS[start:end]
+    prepare_idx = body.find("_saveComposerDraftNow")
+    api_idx = body.find("const data=await api('/api/session/new'")
+    clear_idx = body.find("$('msg').value='';")
+    assign_idx = body.find("S.session=data.session")
+    claim_idx = body.find("_claimComposerDraftOwner(S.session.session_id)")
+    assert prepare_idx != -1, "newSession must flush the previous session draft"
+    assert clear_idx != -1, "newSession must clear the composer before showing a new session"
+    assert prepare_idx < api_idx and clear_idx < api_idx, (
+        "the old draft must be persisted and the visible composer cleared before the new session is created"
+    )
+    assert claim_idx > assign_idx, (
+        "the new session must become the composer owner after the server confirms it"
+    )
+
+
 def test_new_chat_button_restores_remembered_draft_before_creating_session():
     body = _btn_new_chat_handler()
     restore_idx = body.find("_restoreRememberedNewChatDraftSession")
