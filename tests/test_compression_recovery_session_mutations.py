@@ -810,6 +810,97 @@ def test_rotated_canonical_human_send_supersedes_stale_source_receipt_in_place(
             routes.unregister_stream_owner(human_stream_id)
 
 
+def test_resend_to_recovery_rotation_source_reuses_canonical_owner(
+    isolated_session_state,
+    monkeypatch,
+):
+    """A stale original ID must not split recovery ownership after rotation."""
+    from api import compression_recovery_receipts as receipts
+    from api import config, models, routes
+    from api.models import Session
+
+    source = _seed_session(
+        isolated_session_state,
+        sid="rotated-original-resend-source",
+    )
+    claim = _claim_recovery(
+        source,
+        parent_run_id="rotated-original-resend-parent",
+    )
+    started = _mark_started_recovery_without_terminal_proof(
+        source,
+        claim,
+        persist_terminal_transcript=False,
+    )
+    recovery_stream_id = started["child_stream_id"]
+    with config.STREAMS_LOCK:
+        config.STREAMS.pop(recovery_stream_id, None)
+    with config.ACTIVE_RUNS_LOCK:
+        config.ACTIVE_RUNS.pop(recovery_stream_id, None)
+
+    source_sid = source.session_id
+    source.pre_compression_snapshot = True
+    source.save(touch_updated_at=False)
+    canonical = _rotated_canonical_session(
+        isolated_session_state,
+        source,
+        started,
+        phase="running",
+    )
+    receipts.bind_recovery_presentation_session(
+        canonical,
+        source_session_id=source_sid,
+        child_stream_id=recovery_stream_id,
+    )
+    source_before_resend = source.path.read_bytes()
+
+    # Reproduce a stale browser URL after the in-place=false Agent rotation:
+    # only the archived source ID is supplied, with no mutated in-memory
+    # canonical Session object left to hide an ownership split.
+    models.SESSIONS.clear()
+    requested_source = Session.load(source_sid)
+    assert requested_source is not None
+    assert requested_source.pre_compression_snapshot is True
+
+    monkeypatch.setattr(routes.threading, "Thread", _ObservedNoopThread)
+    monkeypatch.setattr(routes, "set_last_workspace", lambda _workspace: None)
+    monkeypatch.setattr(
+        routes,
+        "_agent_runtime_barrier_response",
+        lambda **_kwargs: None,
+    )
+    human_request = "Continue from the original conversation URL."
+    response = routes._start_chat_stream_for_session(
+        requested_source,
+        msg=human_request,
+        attachments=[],
+        workspace=str(isolated_session_state.workspace),
+        model="gpt-4o",
+        model_provider=None,
+        source="webui",
+        external_runtime_owned=False,
+    )
+
+    try:
+        saved_receipt = receipts.load_receipts()["receipts"][claim["claim_key"]]
+        saved_canonical = Session.load(canonical.session_id)
+        assert response.get("_status", 200) < 400, response
+        assert response["session_id"] == canonical.session_id
+        assert saved_receipt["state"] == "discarded"
+        assert saved_receipt["discarded_reason"] == "superseded_by_user"
+        assert saved_receipt["presentation_session_id"] == canonical.session_id
+        assert saved_canonical is not None
+        assert saved_canonical.pending_user_message == human_request
+        assert saved_canonical.pending_user_source == "webui"
+        assert source.path.read_bytes() == source_before_resend
+    finally:
+        human_stream_id = response.get("stream_id")
+        if human_stream_id:
+            with config.STREAMS_LOCK:
+                config.STREAMS.pop(human_stream_id, None)
+            routes.unregister_stream_owner(human_stream_id)
+
+
 def test_deleting_rotated_canonical_purges_blocking_source_receipt_seed(
     isolated_session_state,
     monkeypatch,

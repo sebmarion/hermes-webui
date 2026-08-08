@@ -3,6 +3,7 @@
 import copy
 import json
 import queue
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -21,6 +22,38 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _read(relpath: str) -> str:
     return (ROOT / relpath).read_text(encoding="utf-8")
+
+
+def _make_state_db(path: Path, sid: str, rows: list[dict]) -> None:
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, "
+            "model TEXT, started_at REAL, message_count INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_id TEXT, role TEXT, content TEXT, timestamp REAL)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, source, title, model, started_at, message_count) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (sid, "webui", "Native recovery", "test-model", 1.0, len(rows)),
+        )
+        for row in rows:
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    sid,
+                    row["role"],
+                    row["content"],
+                    row.get("timestamp", 1.0),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _started_native_recovery(tmp_path, monkeypatch, *, stream_id):
@@ -115,6 +148,111 @@ def _started_native_recovery(tmp_path, monkeypatch, *, stream_id):
     session.save(touch_updated_at=False)
     config.STREAMS[stream_id] = queue.Queue()
     return session, claimed
+
+
+def test_native_recovery_dispatch_uses_exact_seed_not_state_db_history(
+    tmp_path,
+    monkeypatch,
+):
+    stream_id = "native-recovery-exact-seed"
+    session, claimed = _started_native_recovery(
+        tmp_path,
+        monkeypatch,
+        stream_id=stream_id,
+    )
+    state_db_path = tmp_path / "state.db"
+    _make_state_db(
+        state_db_path,
+        session.session_id,
+        [
+            {"role": "user", "content": "stale database request", "timestamp": 1.0},
+            {
+                "role": "assistant",
+                "content": "stale database answer",
+                "timestamp": 2.0,
+            },
+        ],
+    )
+    monkeypatch.setattr(models, "_active_state_db_path", lambda: state_db_path)
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, session_id=None, **_kwargs):
+            self.session_id = session_id
+            self.context_compressor = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.reasoning_config = None
+            self.ephemeral_system_prompt = None
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            history = list(kwargs.get("conversation_history") or [])
+            captured["conversation_history"] = copy.deepcopy(history)
+            return {
+                "completed": True,
+                "final_response": "Recovered answer",
+                "messages": history
+                + [
+                    {"role": "user", "content": kwargs["persist_user_message"]},
+                    {"role": "assistant", "content": "Recovered answer"},
+                ],
+            }
+
+        def interrupt(self, _message):
+            return None
+
+    fake_hermes_state = types.ModuleType("hermes_state")
+    fake_hermes_state.SessionDB = lambda *_args, **_kwargs: object()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(streaming, "get_session", lambda _sid: session)
+        scoped.setattr(
+            streaming,
+            "_set_streaming_session_id_mirror_suppression",
+            lambda: None,
+            raising=False,
+        )
+        scoped.setattr(
+            streaming,
+            "_set_streaming_secret_scope",
+            lambda *_args, **_kwargs: None,
+            raising=False,
+        )
+        scoped.setattr(
+            streaming,
+            "_set_streaming_runtime_env",
+            lambda *_args, **_kwargs: None,
+            raising=False,
+        )
+        scoped.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
+        scoped.setattr(
+            streaming,
+            "resolve_model_provider",
+            lambda *_args, **_kwargs: ("test-model", "openai", None),
+        )
+        scoped.setattr("api.config.get_config", lambda *_args, **_kwargs: {})
+        scoped.setattr("api.config._resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+        scoped.setitem(sys.modules, "hermes_state", fake_hermes_state)
+        streaming._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text=compression_recovery_receipts.RECOVERY_CONTROL_PROMPT,
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id=stream_id,
+            attachments=[],
+        )
+
+    expected_seed = claimed["seed"]["context_messages"]
+    assert [
+        (row.get("role"), row.get("content"))
+        for row in captured["conversation_history"]
+    ] == [
+        (row.get("role"), row.get("content"))
+        for row in expected_seed
+    ]
 
 
 def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_errors_on_continuation(

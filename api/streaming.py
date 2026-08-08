@@ -11151,13 +11151,24 @@ def _run_agent_streaming(
                     state_messages=_external_state_messages,
                 ) or []
             )
-            _previous_owner_context_messages = list(
-                reconciled_state_db_messages_for_session(
-                    s,
-                    prefer_context=True,
-                    state_messages=_external_state_messages,
-                ) or []
-            )
+            if _turn_pending_source == 'compression_recovery':
+                # Recovery admission has already validated the durable receipt
+                # and installed its bounded seed as context_messages.  That seed
+                # is the model-context authority for this turn: replaying a
+                # state.db delta here can restore the exhausted transcript and
+                # immediately exhaust the recovery worker before provider
+                # dispatch.  Display reconciliation above remains unchanged.
+                _previous_owner_context_messages = copy.deepcopy(
+                    list(getattr(s, 'context_messages', None) or [])
+                )
+            else:
+                _previous_owner_context_messages = list(
+                    reconciled_state_db_messages_for_session(
+                        s,
+                        prefer_context=True,
+                        state_messages=_external_state_messages,
+                    ) or []
+                )
             _previous_owner_context_messages = _deduplicate_context_messages(
                 _previous_owner_context_messages
             )

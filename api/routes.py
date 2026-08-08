@@ -24602,6 +24602,35 @@ def _start_chat_stream_for_session(
     if stale_response is not None:
         stale_response["_status"] = 409
         return stale_response
+    if getattr(s, "pre_compression_snapshot", False):
+        # A stale URL or server wakeup may still name the archived source after
+        # Agent compression rotated the physical session (in_place=false).
+        # Resolve that write through the existing canonical-visible lineage
+        # contract before taking a lock or touching recovery receipts; otherwise
+        # the source snapshot and continuation can each become a live owner.
+        continuation_sid = _pre_compression_continuation_session_id(s)
+        if continuation_sid:
+            try:
+                canonical_session = get_session(continuation_sid)
+            except KeyError:
+                canonical_session = None
+            if (
+                canonical_session is None
+                or getattr(canonical_session, "pre_compression_snapshot", False)
+            ):
+                logger.warning(
+                    "canonical compression continuation unavailable for write: "
+                    "source_sid=%s continuation_sid=%s",
+                    getattr(s, "session_id", None),
+                    continuation_sid,
+                )
+                return {
+                    "error": "Canonical conversation continuation is unavailable",
+                    "type": "canonical_session_unavailable",
+                    "retryable": True,
+                    "_status": 503,
+                }
+            s = canonical_session
     attachments = attachments or []
     process_completion_events: list[dict] = []
     lineage_bound = False
