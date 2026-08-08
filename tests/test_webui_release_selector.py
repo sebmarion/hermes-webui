@@ -10760,7 +10760,7 @@ def test_frozen_writer_verification_rejects_recorded_non_descendant(monkeypatch)
 
 
 def test_cutover_controller_starts_adopts_and_exactly_stops_ingress_gate(tmp_path):
-    gate_script = Path(cutover.__file__).resolve().parents[2] / "evidence" / "ingress_gate.py"
+    gate_script = Path(__file__).resolve().parent / "fixtures" / "ingress_gate.py"
     assert gate_script.is_file()
     control = tmp_path / "gate-control"
     control.mkdir(mode=0o700)
