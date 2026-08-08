@@ -20,3 +20,22 @@ def test_api_config_uses_pytest_state_dir():
     assert config.SESSION_DIR == test_state_dir / "sessions"
     assert config.STATE_DIR != production_state_dir
     assert production_state_dir not in config.SESSION_DIR.resolve().parents
+
+
+def test_auto_state_dir_name_distinguishes_reused_port_across_processes(
+    monkeypatch, tmp_path
+):
+    import tests.conftest as conftest
+
+    repo_root = tmp_path / "repo"
+    port = 43210
+
+    monkeypatch.setattr(conftest.os, "getpid", lambda: 111)
+    first_name = conftest._auto_state_dir_name(repo_root, port=port)
+    assert conftest._auto_state_dir_name(repo_root, port=port) == first_name
+    assert first_name.endswith("-111-43210")
+
+    monkeypatch.setattr(conftest.os, "getpid", lambda: 222)
+    second_name = conftest._auto_state_dir_name(repo_root, port=port)
+    assert second_name != first_name
+    assert second_name.endswith("-222-43210")

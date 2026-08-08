@@ -93,18 +93,22 @@ def _auto_test_port(repo_root) -> int:
     return 20000 + (h % 10000)
 
 def _auto_state_dir_name(repo_root, port=None) -> str:
-    """Per-(repo, port) state dir name.
+    """Per-pytest-process state dir name.
 
-    Including the port makes the state dir unique PER pytest PROCESS (the port is
-    now a free per-process port, see _auto_test_port), so two concurrent runs
-    from the same worktree — e.g. a developer's suite + a Codex/Opus gate's
-    ./scripts/test.sh — get DISTINCT state dirs and never clobber each other's
-    sessions/db or race on teardown rmtree. Falls back to repo-hash-only when no
-    port is supplied (legacy callers).
+    Include the pytest PID as well as its free port. Ephemeral ports can be
+    reused immediately by a later process, while abandoned test-state writers
+    may still recreate the preceding run's directory after teardown. The PID
+    keeps sequential and concurrent runs distinct even when macOS reissues the
+    same port. Falls back to repo-hash-plus-PID when no port is supplied.
     """
     import hashlib
     h = hashlib.md5(str(repo_root).encode()).hexdigest()[:8]
-    return f"webui-test-{h}-{port}" if port else f"webui-test-{h}"
+    process_id = os.getpid()
+    return (
+        f"webui-test-{h}-{process_id}-{port}"
+        if port
+        else f"webui-test-{h}-{process_id}"
+    )
 
 # Whether the test port was explicitly pinned (vs auto-allocated). An auto port
 # is a fresh free OS port unique to this process, so it never needs the
