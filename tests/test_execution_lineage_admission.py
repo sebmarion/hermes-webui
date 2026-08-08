@@ -107,6 +107,29 @@ def test_lineage_key_is_profile_and_root_digest(monkeypatch, tmp_path):
     assert str(db.resolve()) in resolved.state_db_path
 
 
+def test_agent_only_state_db_is_empty_lineage_authority(monkeypatch, tmp_path):
+    """An Agent durable ledger must not block a first WebUI turn."""
+    from api import execution_lineage
+
+    db = tmp_path / "state.db"
+    import sqlite3
+
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE async_delegations "
+            "(delegation_id TEXT PRIMARY KEY)"
+        )
+    monkeypatch.setattr(execution_lineage, "get_hermes_home_for_profile", lambda _: tmp_path)
+
+    resolved = execution_lineage.resolve_execution_lineage(
+        "first-webui-session",
+        profile="default",
+    )
+
+    assert resolved.execution_root_session_id == "first-webui-session"
+    assert resolved.compression_member_ids == ("first-webui-session",)
+
+
 def test_invalid_profile_fails_closed(monkeypatch):
     from api import execution_lineage
 

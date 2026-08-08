@@ -5,6 +5,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="$ROOT/.venv"
 REQ_FILE="$ROOT/requirements-dev.txt"
 
+# Pytest's macOS multiprocessing tests use the ``spawn`` start method.  The
+# child interpreter does not reliably retain the repository working directory
+# on ``sys.path`` when the parent was launched through a virtualenv, so a
+# spawned worker cannot import the package-qualified ``tests.*`` helper module.
+# Keep the repo root on the inherited import path without disturbing any
+# caller-supplied entries (including the discovered Agent path).
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  export PYTHONPATH="$ROOT:$PYTHONPATH"
+else
+  export PYTHONPATH="$ROOT"
+fi
+
 resolve_venv_python() {
   local candidate
   for candidate in "$VENV_DIR/bin/python" "$VENV_DIR/Scripts/python.exe"; do

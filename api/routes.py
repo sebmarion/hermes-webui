@@ -3848,6 +3848,38 @@ def _truncate_journal_snapshot_value(value, *, limit: int = 256, key: str | None
     return value
 
 
+def _run_journal_envelope_run_id_result(event: dict) -> tuple[str | None, bool]:
+    raw_run_id = event.get("run_id")
+    if raw_run_id is None:
+        return None, False
+    if not isinstance(raw_run_id, str):
+        return None, True
+    run_id = raw_run_id.strip()
+    if not run_id:
+        return None, True
+    raw_event_id = event.get("event_id")
+    event_id = str(raw_event_id or "").strip()
+    if event_id:
+        event_run_id, event_seq = _shared_parse_run_journal_event_id(event_id)
+        if event_run_id and event_seq is not None and event_run_id != run_id:
+            return None, True
+    return run_id, False
+
+
+def _run_journal_snapshot_event_id_for_run(
+    event: dict,
+    run_id: str,
+    event_seq: int,
+) -> str | None:
+    raw_event_id = event.get("event_id")
+    event_id = str(raw_event_id or "").strip()
+    if event_id:
+        event_run_id, parsed_seq = _shared_parse_run_journal_event_id(event_id)
+        if event_run_id == run_id and parsed_seq is not None:
+            return event_id
+    return f"{run_id}:{event_seq}" if event_seq else None
+
+
 def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict | None:
     stream_id = str(stream_id or "").strip()
     if not stream_id:
@@ -3868,6 +3900,21 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
     events = [event for event in (journal.get("events") or []) if isinstance(event, dict)]
     if not events:
         return None
+    event_run_ids: set[str] = set()
+    malformed_envelope_run_id = False
+    for event in events:
+        event_run_id, event_run_id_malformed = _run_journal_envelope_run_id_result(event)
+        if event_run_id is not None:
+            event_run_ids.add(event_run_id)
+        if event_run_id_malformed:
+            malformed_envelope_run_id = True
+    # Durable event envelopes own the stable run identity. Fall back to the
+    # transport cursor only when the journal cannot provide one unambiguous id.
+    run_id = (
+        next(iter(event_run_ids))
+        if not malformed_envelope_run_id and len(event_run_ids) == 1
+        else str(summary.get("run_id") or stream_id).strip()
+    )
 
     assistant_text = ""
     reasoning_text = ""
@@ -4064,7 +4111,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "source_event_type": "token",
             "event_id": None,
             "local_id": local_id,
-            "run_id": stream_id,
+            "run_id": run_id,
             "stream_id": stream_id,
             "seq": None,
             "status": status,
@@ -4072,7 +4119,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "identity": {
                 "event_id": None,
                 "local_id": local_id,
-                "run_id": stream_id,
+                "run_id": run_id,
                 "stream_id": stream_id,
                 "seq": None,
             },
@@ -4107,7 +4154,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "source_event_type": "reasoning",
             "event_id": None,
             "local_id": local_id,
-            "run_id": stream_id,
+            "run_id": run_id,
             "stream_id": stream_id,
             "seq": None,
             "status": status,
@@ -4115,7 +4162,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "identity": {
                 "event_id": None,
                 "local_id": local_id,
-                "run_id": stream_id,
+                "run_id": run_id,
                 "stream_id": stream_id,
                 "seq": None,
             },
@@ -4184,7 +4231,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "source_event_type": "tool_complete" if call.get("done") else "tool",
             "event_id": None,
             "local_id": tool_id or row_id,
-            "run_id": stream_id,
+            "run_id": run_id,
             "stream_id": stream_id,
             "seq": None,
             "status": status,
@@ -4192,7 +4239,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "identity": {
                 "event_id": None,
                 "local_id": tool_id or row_id,
-                "run_id": stream_id,
+                "run_id": run_id,
                 "stream_id": stream_id,
                 "seq": None,
             },
@@ -4306,7 +4353,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
                 "source_event_type": "runtime_journal_snapshot",
                 "event_id": None,
                 "local_id": f"lifecycle:{stream_id}:running",
-                "run_id": stream_id,
+                "run_id": run_id,
                 "stream_id": stream_id,
                 "seq": None,
                 "status": "running",
@@ -4314,7 +4361,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
                 "identity": {
                     "event_id": None,
                     "local_id": f"lifecycle:{stream_id}:running",
-                    "run_id": stream_id,
+                    "run_id": run_id,
                     "stream_id": stream_id,
                     "seq": None,
                 },
@@ -4344,9 +4391,11 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
         event_last_seq = 0
     if event_last_seq >= summary_last_seq:
         last_seq = event_last_seq
-        last_event_id = events[-1].get("event_id") or (
-            f"{stream_id}:{event_last_seq}" if event_last_seq else summary.get("last_event_id")
-        )
+        last_event_id = _run_journal_snapshot_event_id_for_run(
+            events[-1],
+            run_id,
+            event_last_seq,
+        ) or summary.get("last_event_id")
     else:
         last_seq = summary_last_seq
         last_event_id = summary.get("last_event_id") or events[-1].get("event_id")
@@ -4374,7 +4423,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "identity": {
                 "session_id": session_id,
                 "stream_id": stream_id,
-                "run_id": stream_id,
+                "run_id": run_id,
                 "source_message_refs": [],
             },
             "lifecycle": {
@@ -8445,6 +8494,28 @@ def _rescale_threshold_tokens_for_context_window(
     return max(1, int(threshold * new_window / old_window))
 
 
+def _worktree_default_from_config(profile: str | None) -> bool:
+    """Return the strict boolean worktree default for a profile.
+
+    An absent request key inherits the agent config; malformed values and
+    config-read failures fail closed to a plain session. Explicit request
+    values are handled by the /api/session/new caller and always win.
+    """
+    try:
+        if profile:
+            from api.profiles import get_hermes_home_for_profile
+
+            cfg = get_config_for_profile_home(
+                get_hermes_home_for_profile(profile)
+            )
+        else:
+            cfg = get_config_for_profile_home(None)
+        return (cfg or {}).get("worktree", False) is True
+    except Exception:
+        logger.warning("failed to read worktree config default", exc_info=True)
+        return False
+
+
 def _session_model_state_from_request(
     model: str | None,
     requested_provider: str | None,
@@ -9496,6 +9567,23 @@ def _state_db_since_timestamp_for_limited_display(session, msg_limit, msg_before
         return None, sidecar_messages
 
     floor = min(sidecar_timestamps[-raw_budget:])
+    sidecar_before_count = sum(1 for ts in sidecar_timestamps if ts < floor)
+    prefix_summary = get_state_db_session_message_prefix_summary(
+        getattr(session, "session_id", None),
+        floor,
+        profile=getattr(session, "profile", None) or None,
+    )
+    if prefix_summary is None:
+        return None, sidecar_messages
+    try:
+        state_before_count = int(prefix_summary["count"])
+        null_timestamp_count = int(prefix_summary["null_timestamp_count"])
+    except (KeyError, TypeError, ValueError):
+        return None, sidecar_messages
+    if null_timestamp_count or state_before_count != sidecar_before_count:
+        return None, sidecar_messages
+    if sidecar_before_count == 0:
+        return floor, sidecar_messages
     sidecar_before_keys = [
         _session_message_visible_key(msg)
         for msg, ts in zip(sidecar_messages, sidecar_timestamps, strict=True)
@@ -9822,11 +9910,22 @@ def _cli_metadata_from_resolution(
 def _targeted_cli_metadata_for_resolution(
     resolution: SharedSessionResolution,
 ) -> dict:
-    """Read one external metadata row without the legacy collection fallback."""
+    """Read one external metadata row for a resolved session.
+
+    The targeted Agent API is the normal path. Keep the older lookup helper as
+    a bounded-miss fallback for legacy Agent adapters (and embedders that still
+    provide only the historical collection-backed seam); this is reached only
+    after the WebUI sidecar lookup already missed.
+    """
     try:
         targeted = get_cli_session_metadata(resolution.canonical_id) or {}
     except Exception:
         targeted = {}
+    if not targeted:
+        try:
+            targeted = _lookup_cli_session_metadata(resolution.canonical_id) or {}
+        except Exception:
+            targeted = {}
     return _cli_metadata_from_resolution(resolution, targeted)
 
 
@@ -10219,6 +10318,7 @@ from api.models import (
     get_cli_session_metadata,
     get_cli_session_messages,
     get_state_db_session_messages,
+    get_state_db_session_message_prefix_summary,
     get_state_db_session_message_keys_before_timestamp,
     get_state_db_session_summary,
     shared_interactive_sidebar_projection,
@@ -10500,6 +10600,7 @@ from api.gateway_chat import (
 )
 from api.run_journal import (
     _parse_run_journal_event_id as _shared_parse_run_journal_event_id,
+    SSE_RELAY_CLOSE_EVENTS,
     find_run_summary,
     read_run_events,
     read_session_run_events,
@@ -10588,6 +10689,7 @@ def _session_attention_summary(session_id: str) -> dict | None:
     """Return sidebar attention metadata for pending approval/clarify work."""
     approval_count = 0
     with _lock:
+        reconcile_gateway_pending_mirror_locked(session_id)
         queue_list = _pending.get(session_id)
         if isinstance(queue_list, list):
             approval_count = len(queue_list)
@@ -14643,6 +14745,17 @@ def handle_get(handler, parsed) -> bool:
                         sid,
                         **_state_db_reader_kwargs,
                     )
+                elif resolution.status != "found":
+                    # A sidecar-backed WebUI session can legitimately predate
+                    # its shared ``sessions`` row (or coexist with a partial
+                    # Agent-only state.db). The bounded lineage reader is only
+                    # authoritative after resolution succeeds; reading an
+                    # unresolved member from a valid-but-empty ``messages``
+                    # table would silently return [] and hide the sidecar.
+                    state_db_messages = get_state_db_session_messages(
+                        sid,
+                        profile=_session_profile,
+                    )
                 else:
                     try:
                         state_db_messages = read_resolved_session_history(
@@ -15224,7 +15337,12 @@ def handle_get(handler, parsed) -> bool:
             # the wire shape stays byte-equivalent to the previous inline
             # synthesis (the frontend has been reading these exact keys).
             all_msgs = list(synth.messages or [])
-            msgs = all_msgs if load_messages else []
+            # A profile-agnostic external session (Claude Code/Codex) has no
+            # WebUI sidecar to load lazily. Its transcript was already
+            # materialized by the synthesizer, so keep it in the detail
+            # response even for the metadata-only query used by sidebar
+            # navigation. State-backed WebUI rows still honor messages=0.
+            msgs = all_msgs if load_messages or _profile_agnostic else []
             sess = {
                 "session_id": synth.session_id,
                 "title": synth.title,
@@ -16555,10 +16673,16 @@ def handle_post(handler, parsed) -> bool:
         except (TypeError, ValueError) as e:
             return bad(handler, str(e))
         worktree_info = None
-        worktree_requested = (
-            body.get("worktree") is True
-            or str(body.get("worktree")).strip().lower() in {"1", "true", "yes", "on"}
-        )
+        worktree_skipped = None
+        raw_worktree = body.get("worktree")
+        worktree_explicit = "worktree" in body
+        if worktree_explicit:
+            worktree_requested = (
+                raw_worktree is True
+                or str(raw_worktree).strip().lower() in {"1", "true", "yes", "on"}
+            )
+        else:
+            worktree_requested = _worktree_default_from_config(body.get("profile") or None)
         if worktree_requested:
             try:
                 from api.worktrees import create_worktree_for_workspace
@@ -16568,7 +16692,10 @@ def handle_post(handler, parsed) -> bool:
                 worktree_info = create_worktree_for_workspace(base_workspace)
                 workspace = worktree_info["path"]
             except (TypeError, ValueError) as e:
-                return bad(handler, str(e), status=400)
+                if worktree_explicit:
+                    return bad(handler, str(e), status=400)
+                worktree_info = None
+                worktree_skipped = str(e)
             except Exception as e:
                 logger.exception("failed to create worktree-backed session")
                 return bad(handler, f"Failed to create worktree: {e}", status=500)
@@ -16651,7 +16778,10 @@ def handle_post(handler, parsed) -> bool:
                 profile=getattr(s, "profile", None),
                 session_id=getattr(s, "session_id", None),
             )
-        return j(handler, {"session": s.compact() | {"messages": s.messages}})
+        response_payload = {"session": s.compact() | {"messages": s.messages}}
+        if worktree_skipped:
+            response_payload["worktree_skipped"] = worktree_skipped
+        return j(handler, response_payload)
 
     if parsed.path == "/api/session/compression-recovery/start":
         return _handle_session_compression_recovery_start(handler, body)
@@ -17229,25 +17359,6 @@ def handle_post(handler, parsed) -> bool:
                 p.relative_to(SESSION_DIR.resolve())
             except Exception:
                 return bad(handler, "Invalid session_id", 400)
-            sidecar_deleted = False
-            try:
-                p.unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to unlink session file %s", p)
-            sidecar_deleted = not p.exists()
-            try:
-                prune_session_from_index(sid)
-            except Exception:
-                logger.debug("Failed to prune deleted session from index: %s", sid, exc_info=True)
-            try:
-                p.with_suffix('.json.bak').unlink(missing_ok=True)
-            except Exception:
-                logger.debug("Failed to unlink session backup file %s", p.with_suffix('.json.bak'))
-            if sidecar_deleted and not is_messaging_session:
-                try:
-                    _record_webui_deleted_session_tombstone(sid)
-                except Exception:
-                    logger.debug("Failed to tombstone deleted WebUI session %s", sid, exc_info=True)
         finally:
             session_lock.release()
         # Evict outside the mutation lock: lifecycle commit may perform provider
@@ -17327,6 +17438,9 @@ def handle_post(handler, parsed) -> bool:
                 logger.debug("Failed to delete CLI session %s", sid)
                 state_db_cleanup_failed = True
         _publish_session_list_changed("session_delete", profile=event_profile)
+        # Deletion must not briefly serve the stale sidebar snapshot: unlike
+        # rename/archive, a deleted id is invalid immediately.
+        _clear_session_list_cache(event_profile)
         return j(
             handler,
             {
@@ -20256,7 +20370,7 @@ def _stream_runner_run_events(
                     _runner_event_id(run_id, entry),
                 )
                 emitted = True
-                if event in ("stream_end", "error", "cancel"):
+                if event in SSE_RELAY_CLOSE_EVENTS:
                     terminal = True
             next_cursor = getattr(event_stream, "cursor", None)
             if next_cursor not in (None, ""):
@@ -20482,7 +20596,7 @@ def _handle_sse_stream(handler, parsed):
                         enabled=lazy_tail_stream,
                     ),
                 )
-            if event in ("stream_end", "error", "cancel"):
+            if event in SSE_RELAY_CLOSE_EVENTS:
                 break
     except _CLIENT_DISCONNECT_ERRORS:
         pass
@@ -20679,7 +20793,7 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
                     queued_event_id = STREAM_LAST_EVENT_ID.get(active_stream_id)
                 event_id = queued_event_id or STREAM_LAST_EVENT_ID.get(active_stream_id)
                 event_seq = _run_journal_same_run_seq(event_id, active_stream_id)
-                _is_terminal = event in ("stream_end", "error", "cancel")
+                _is_terminal = event in SSE_RELAY_CLOSE_EVENTS
                 _already_sent = (
                     (replay_cutoff_seq is not None and event_seq is not None and event_seq <= replay_cutoff_seq)
                     or (event_id and event_id in sent_event_ids)
@@ -20840,30 +20954,41 @@ def _handle_terminal_output(handler, parsed):
     term = get_terminal(sid)
     if term is None:
         return j(handler, {"error": "terminal not running"}, status=404)
-
-    handler.send_response(200)
-    handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
-    handler.send_header("Cache-Control", "no-cache")
-    handler.send_header("X-Accel-Buffering", "no")
-    handler.send_header("Connection", "close")
-    end_sse_headers(handler)
-    _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
+    raw_cursor = ""
     try:
+        raw_cursor = str((getattr(handler, "headers", {}) or {}).get("Last-Event-ID") or "").strip()
+    except Exception:
+        raw_cursor = ""
+    try:
+        after_seq = max(0, int(raw_cursor)) if raw_cursor else None
+    except (TypeError, ValueError):
+        after_seq = None
+    output = term.subscribe(after_seq=after_seq)
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        handler.send_header("Cache-Control", "no-cache")
+        handler.send_header("X-Accel-Buffering", "no")
+        handler.send_header("Connection", "close")
+        end_sse_headers(handler)
+        _sse_set_write_deadline(handler)  # Defect A: slow tab can't pin this thread
         while True:
             try:
-                event, data = term.output.get(timeout=_SSE_HEARTBEAT_INTERVAL_SECONDS)
+                seq, event, data = output.get(timeout=_SSE_HEARTBEAT_INTERVAL_SECONDS)
             except queue.Empty:
                 handler.wfile.write(b": terminal heartbeat\n\n")
                 handler.wfile.flush()
-                if term.closed.is_set() and term.output.empty():
+                if term.closed.is_set() and output.empty():
                     _sse(handler, "terminal_closed", {"exit_code": term.proc.poll()})
                     break
                 continue
-            _sse(handler, event, data)
+            _sse_with_id(handler, event, data, seq)
             if event in ("terminal_closed", "terminal_error"):
                 break
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
         pass
+    finally:
+        term.unsubscribe(output)
     return True
 
 
@@ -23753,7 +23878,12 @@ def _maintenance_fence_payload() -> dict:
     }
 
 
-def _bind_execution_lineage(session, admission_reservation_id):
+def _bind_execution_lineage(
+    session,
+    admission_reservation_id,
+    *,
+    state_db_path=None,
+):
     """Resolve and atomically bind the current turn's execution owner."""
     if not admission_reservation_id:
         raise RunAdmissionClosed("run admission reservation is missing")
@@ -23763,6 +23893,7 @@ def _bind_execution_lineage(session, admission_reservation_id):
         str(getattr(session, "session_id", "") or ""),
         session=session,
         profile=getattr(session, "profile", None),
+        state_db_path=state_db_path,
     )
     bind_run_admission(
         admission_reservation_id,
@@ -24392,6 +24523,7 @@ def _start_chat_stream_for_session(
     session_lock_held: bool = False,
     recovery_claim_token: str | None = None,
     recovery_fingerprint: str | None = None,
+    lineage_state_db_path=None,
     _admission_reservation_id=None,
     _admission_transfer_state=None,
     delegation_id: str = "",
@@ -24425,7 +24557,11 @@ def _start_chat_stream_for_session(
         if lineage_bound:
             return None
         try:
-            _bind_execution_lineage(s, _admission_reservation_id)
+            _bind_execution_lineage(
+                s,
+                _admission_reservation_id,
+                state_db_path=lineage_state_db_path,
+            )
         except RunAdmissionLineageBusy as exc:
             return _execution_lineage_error_payload(exc)
         except Exception as exc:
@@ -25084,6 +25220,7 @@ def _start_run(
     session_lock_held: bool = False,
     recovery_claim_token: str | None = None,
     recovery_fingerprint: str | None = None,
+    lineage_state_db_path=None,
     _admission_reservation_id=None,
     _admission_transfer_state=None,
     delegation_id: str = "",
@@ -25167,6 +25304,7 @@ def _start_run(
                 session_lock_held=session_lock_held,
                 recovery_claim_token=recovery_claim_token,
                 recovery_fingerprint=recovery_fingerprint,
+                lineage_state_db_path=lineage_state_db_path,
                 delegation_id=delegation_id,
                 delegation_turn_id=delegation_turn_id,
                 external_runtime_owned=gateway_chat_enabled,
@@ -25230,6 +25368,7 @@ def _start_run(
         session_lock_held=session_lock_held,
         recovery_claim_token=recovery_claim_token,
         recovery_fingerprint=recovery_fingerprint,
+        lineage_state_db_path=lineage_state_db_path,
         delegation_id=delegation_id,
         delegation_turn_id=delegation_turn_id,
         external_runtime_owned=gateway_chat_enabled,
@@ -27937,7 +28076,7 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: st
     # Collect keys from both _pending and _gateway_queues
     keys_from_pending = pending.get("pattern_keys") or [pending.get("pattern_key", "")] if pending else []
     all_keys = [k for k in keys_from_pending if k] + [k for k in gateway_keys if k]
-    if choice in ("once", "session"):
+    if choice == "session":
         for k in all_keys:
             approve_session(sid, k)
     elif choice == "always":
@@ -27945,6 +28084,8 @@ def _resolve_approval_legacy(sid: str, approval_id: str, choice: str, run_id: st
             approve_session(sid, k)
             approve_permanent(k)
         save_permanent_allowlist(_permanent_approved)
+    # ``once`` releases only the currently parked call below; it must not add
+    # the pattern to the session-wide allowlist that future calls consult.
     # Unblock the agent thread waiting in the gateway approval queue.
     # This is the primary signal when streaming is active — the agent
     # thread is parked in entry.event.wait() and needs to be woken up.

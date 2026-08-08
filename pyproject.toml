@@ -24,7 +24,18 @@ Issues = "https://github.com/nesquena/hermes-webui/issues"
 [tool.setuptools]
 include-package-data = true
 packages = ["api", "static"]
-py-modules = ["bootstrap", "server", "mcp_server"]
+py-modules = [
+    "bootstrap",
+    "server",
+    "server_runtime",
+    "mcp_server",
+    "deferred_release_manifest",
+    "deferred_startup_file_driver",
+    "deferred_startup_replay",
+    "managed_startup_coordinator",
+    "managed_startup_directories",
+    "managed_startup_provider_models",
+]
 
 [tool.setuptools.package-data]
 static = ["**/*"]

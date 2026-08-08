@@ -1936,6 +1936,7 @@ _LIST_PROFILES_CACHE_TTL = 4.0  # seconds. The perf(session-load-latency) pass b
 _LIST_PROFILES_CACHE_LOCK = threading.Lock()
 _LIST_PROFILES_REBUILDING = False
 _LIST_PROFILES_CACHE_GENERATION = 0
+_LIST_PROFILES_REBUILD_EVENT: threading.Event | None = None
 
 
 def _invalidate_list_profiles_cache() -> None:
@@ -2034,14 +2035,16 @@ def _build_profile_rows_minimal() -> list:
     return rows
 
 
-def _start_profile_rows_rebuild() -> None:
+def _start_profile_rows_rebuild() -> threading.Event | None:
     """Refresh detailed profile rows once, outside the HTTP request thread."""
-    global _LIST_PROFILES_REBUILDING
+    global _LIST_PROFILES_REBUILDING, _LIST_PROFILES_REBUILD_EVENT
     with _LIST_PROFILES_CACHE_LOCK:
         if _LIST_PROFILES_REBUILDING:
-            return
+            return _LIST_PROFILES_REBUILD_EVENT
         _LIST_PROFILES_REBUILDING = True
         generation = _LIST_PROFILES_CACHE_GENERATION
+        done = threading.Event()
+        _LIST_PROFILES_REBUILD_EVENT = done
 
     def rebuild() -> None:
         global _LIST_PROFILES_CACHE, _LIST_PROFILES_REBUILDING
@@ -2055,12 +2058,14 @@ def _start_profile_rows_rebuild() -> None:
         finally:
             with _LIST_PROFILES_CACHE_LOCK:
                 _LIST_PROFILES_REBUILDING = False
+            done.set()
 
     threading.Thread(
         target=rebuild,
         name="profile-rows-rebuild",
         daemon=True,
     ).start()
+    return done
 
 
 def _build_profile_rows_fast() -> list | None:
@@ -2211,12 +2216,23 @@ def list_profiles_api() -> list:
     # seconds merely to paint the picker.
     with _LIST_PROFILES_CACHE_LOCK:
         cached = _LIST_PROFILES_CACHE
-        if cached is not None and now - cached[1] < _LIST_PROFILES_CACHE_TTL:
+        cache_fresh = cached is not None and now - cached[1] < _LIST_PROFILES_CACHE_TTL
+        if cache_fresh:
             rows = cached[0]
         else:
             rows = cached[0] if cached is not None else None
 
-    _start_profile_rows_rebuild()
+    rebuild_event = _start_profile_rows_rebuild() if not cache_fresh else None
+    # Tiny profiles (notably the common one-profile case) can finish the
+    # detailed rebuild before this request returns. Give that fast path a
+    # bounded hand-off window so callers receive real skill counts without
+    # making a slow cold-start request wait for the full rebuild.
+    if rows is None and rebuild_event is not None:
+        rebuild_event.wait(0.05)
+        with _LIST_PROFILES_CACHE_LOCK:
+            cached_after_rebuild = _LIST_PROFILES_CACHE
+            if cached_after_rebuild is not None:
+                rows = cached_after_rebuild[0]
     if rows is None:
         rows = _build_profile_rows_minimal()
 

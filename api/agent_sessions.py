@@ -1714,13 +1714,6 @@ def read_importable_agent_session_rows(
         projected = [_with_normalized_source(row) for row in projected]
         projected = [row for row in projected if is_cli_session_row_visible(row)]
 
-        # For sessions with no title (LLM auto-title hasn't run or failed),
-        # fetch the first user message as a preview so the sidebar shows
-        # something identifiable instead of a synthetic "{Source} Session"
-        # label. Bounded to the visible page (≤ limit rows); a single batch
-        # query, not N+1.
-        _enrich_untitled_with_preview(projected, cur, message_cols)
-
         if limit is None:
             return projected
         projected = projected[:max(0, int(limit))]
@@ -1855,65 +1848,6 @@ def _lineage_report_row(row: dict, role: str) -> dict:
         'active': row.get('ended_at') is None,
         'archived': False,
     }
-
-
-def _enrich_untitled_with_preview(rows: list[dict], cur, message_cols: set[str]) -> None:
-    """Add a ``preview`` field (first user message) to untitled session rows.
-
-    Called after ``read_importable_agent_session_rows`` returns projected rows.
-    For sessions where ``title`` is NULL/empty, fetches the first ``role='user'``
-    message content from the ``messages`` table so the sidebar can display
-    something identifiable instead of a synthetic "{Source} Session" label.
-
-    Single batch query, bounded to the visible page (typically ≤ 20 rows).
-    Mutates rows in place — sets ``row['preview']`` only for untitled sessions.
-    """
-    if not rows:
-        return
-    if 'content' not in message_cols or 'session_id' not in message_cols:
-        return
-
-    # Collect session IDs that have no usable title.
-    untitled_ids = []
-    for row in rows:
-        title = (row.get("title") or "").strip()
-        if not title:
-            untitled_ids.append(row.get("id") or row.get("session_id"))
-    if not untitled_ids:
-        return
-
-    # SQLite LIMIT on IN clause varies; use a parameterized placeholder per id.
-    placeholders = ", ".join("?" for _ in untitled_ids)
-    has_role = 'role' in message_cols
-    role_filter = "AND LOWER(m.role) = 'user'" if has_role else ""
-    query = (
-        f"SELECT m.session_id, substr(m.content, 1, 160) "
-        f"FROM messages m "
-        f"WHERE m.session_id IN ({placeholders}) {role_filter} "
-        f"AND m.content IS NOT NULL AND TRIM(m.content) != '' "
-        f"ORDER BY m.session_id, m.timestamp ASC"
-    )
-    try:
-        cur.execute(query, untitled_ids)
-    except sqlite3.Error:
-        return
-
-    # First message per session wins (result is ordered by session_id, timestamp).
-    previews: dict[str, str] = {}
-    for row in cur.fetchall():
-        sid = row[0]
-        if sid not in previews:
-            previews[sid] = row[1]
-
-    if not previews:
-        return
-    for row in rows:
-        rid = row.get("id") or row.get("session_id")
-        if not (row.get("title") or "").strip():
-            preview = previews.get(rid, "")
-            if preview:
-                row["preview"] = preview
-
 
 def _empty_lineage_report(session_id: str, *, found: bool = False) -> dict:
     return {

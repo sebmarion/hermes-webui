@@ -380,6 +380,17 @@ def _check_agent_modules():
     """Verify hermes-agent Python modules are actually importable."""
     if not HERMES_AGENT:
         return False
+    # The WebUI test runner deliberately executes pytest from its own venv,
+    # while the Agent checkout is a separate source tree.  Discovery of the
+    # directory alone does not make top-level Agent packages (``cron``,
+    # ``tools``) importable during collection, so the availability probe would
+    # incorrectly mark a real checkout as missing and skip its tests.  Put the
+    # trusted, already-discovered source root on the test interpreter's import
+    # path before probing; the server subprocess receives the same path later
+    # through its explicit environment.
+    agent_path = str(HERMES_AGENT)
+    if agent_path not in sys.path:
+        sys.path.insert(0, agent_path)
     try:
         import importlib
         # These are the modules that cause 500 errors when missing
@@ -1192,6 +1203,26 @@ _AGENT_PATH_ENV_KEYS = ("HERMES_WEBUI_AGENT_DIR", "PYTHONPATH", "HERMES_WEBUI_PY
 _REAL_AGENT_ENV = {k: os.environ.get(k) for k in _AGENT_PATH_ENV_KEYS}
 _REAL_SYS_PATH = list(sys.path)
 
+# macOS uses ``spawn`` for multiprocessing.  Product profile activation may
+# temporarily rebuild PYTHONPATH, and the spawned interpreter then cannot
+# import the package-qualified test worker module (``tests.test_*``).  Keep the
+# repository import root present for every test process; the per-test guard
+# below restores the caller's other entries and never adds the Agent checkout
+# implicitly.
+_TEST_REPO_IMPORT_PATH = str(REPO_ROOT)
+
+
+def _ensure_test_spawn_import_path() -> None:
+    # The discovered Agent checkout also has a top-level ``tests`` package.
+    # Keep this WebUI checkout first so a spawned worker importing
+    # ``tests.test_*`` cannot resolve against the wrong repository.
+    while _TEST_REPO_IMPORT_PATH in sys.path:
+        sys.path.remove(_TEST_REPO_IMPORT_PATH)
+    sys.path.insert(0, _TEST_REPO_IMPORT_PATH)
+    current = [part for part in os.environ.get("PYTHONPATH", "").split(os.pathsep) if part]
+    if _TEST_REPO_IMPORT_PATH not in current:
+        os.environ["PYTHONPATH"] = os.pathsep.join([_TEST_REPO_IMPORT_PATH, *current])
+
 
 def _hermes_cli_is_healthy() -> bool:
     mod = sys.modules.get("hermes_cli")
@@ -1214,6 +1245,7 @@ def _restore_hermes_cli_module():
     hermes_cli.profiles`, `import hermes_state`, or spawn a server subprocess
     that can't import the agent at all.
     """
+    _ensure_test_spawn_import_path()
     yield
     if _REAL_HERMES_CLI is not None and not _hermes_cli_is_healthy():
         # Restore the genuine package object + its real __path__.

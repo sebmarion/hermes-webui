@@ -317,7 +317,11 @@ def test_active_cli_state_db_session_with_persisted_user_turn_is_visible_in_cli_
             "INSERT OR REPLACE INTO sessions "
             "(id, source, title, model, started_at, message_count, ended_at, end_reason) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (active_sid, 'cli', 'Untitled', 'openai/gpt-5', now + 20, 0, None, None),
+            # Agent's state.db enforces unique non-NULL titles.  The CLI's
+            # placeholder title is represented as NULL, so two independent
+            # default-title rows must not use INSERT OR REPLACE to evict one
+            # another when this fixture seeds the ended row below.
+            (active_sid, 'cli', None, 'openai/gpt-5', now + 20, 0, None, None),
         )
         conn.execute("DELETE FROM messages WHERE session_id = ?", (active_sid,))
         _insert_message(conn, active_sid, 'user', 'Active CLI session still running', now + 21)
@@ -335,7 +339,7 @@ def test_active_cli_state_db_session_with_persisted_user_turn_is_visible_in_cli_
             "INSERT OR REPLACE INTO sessions "
             "(id, source, title, model, started_at, message_count, ended_at, end_reason) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (ended_sid, 'cli', 'Untitled', 'openai/gpt-5', now + 10, 1, now + 11, 'cli-close'),
+            (ended_sid, 'cli', None, 'openai/gpt-5', now + 10, 1, now + 11, 'cli-close'),
         )
         conn.execute("DELETE FROM messages WHERE session_id = ?", (ended_sid,))
         _insert_message(conn, ended_sid, 'user', 'Ended CLI session', now + 11)
@@ -752,7 +756,10 @@ def test_default_title_cli_compression_chain_is_kept_by_lineage():
             conn,
             'cli_default_compress_tip_001',
             source='cli',
-            title='Cli Session',
+            # Compression continuations inherit the logical root title in
+            # projection; leave the physical tip title NULL so the Agent
+            # unique-title index does not replace the root row.
+            title=None,
             started_at=t0 + 101,
             parent_session_id='cli_default_compress_root_001',
             messages=1,

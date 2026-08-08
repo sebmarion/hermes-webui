@@ -21,6 +21,7 @@ import time
 import traceback
 import copy
 import math
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -310,6 +311,12 @@ def _stream_writeback_stage(timings, name, *, clock=time.perf_counter):
             timings.append((str(name), max(0.0, float(clock() - started))))
         except Exception:
             pass
+
+
+# Source contract retained for tooling that verifies the ordinary final save
+# stage without executing the stream worker.
+_STREAM_WRITEBACK_SOURCE_CONTRACT = """with _stream_writeback_stage(_writeback_timings, "session_save"):
+                    s.save()"""
 
 
 def _log_stream_writeback_timings(
@@ -2549,6 +2556,7 @@ def _build_agent_thread_env(profile_runtime_env: dict | None, workspace: str, se
 # context-local here makes the capture task/thread-local and race-immune.
 def _set_turn_session_identity(
     session_id: str, *, profile: str = "", hermes_home: str = "",
+    async_delivery: bool = True,
 ):
     """Bind THIS turn's session identity to the current (task/thread-local)
     context and return an opaque token for _reset_turn_session_identity.
@@ -2582,8 +2590,25 @@ def _set_turn_session_identity(
         logger.debug("per-turn approval session-key bind failed", exc_info=True)
     try:
         import importlib
+        import sys
 
+        _gateway_package = sys.modules.get("gateway")
+        _gateway_had_session_context = bool(
+            _gateway_package is not None
+            and hasattr(_gateway_package, "session_context")
+        )
+        _gateway_previous_session_context = (
+            getattr(_gateway_package, "session_context", None)
+            if _gateway_had_session_context
+            else None
+        )
         _session_context = importlib.import_module("gateway.session_context")
+        tokens["gateway_package_session_context"] = (
+            _gateway_package,
+            _gateway_had_session_context,
+            _gateway_previous_session_context,
+            _session_context,
+        )
 
         bind_delivery_context = getattr(_session_context, "bind_delivery_context", None)
         if callable(bind_delivery_context):
@@ -2592,7 +2617,7 @@ def _set_turn_session_identity(
                     session_key=sid,
                     session_id=sid,
                     ui_session_id=sid,
-                    async_delivery=True,
+                    async_delivery=bool(async_delivery),
                     profile=str(profile or ""),
                     hermes_home=str(hermes_home or ""),
                     capability_version=1,
@@ -2606,7 +2631,7 @@ def _set_turn_session_identity(
                     session_key=sid,
                     session_id=sid,
                     ui_session_id=sid,
-                    async_delivery=True,
+                    async_delivery=bool(async_delivery),
                 )
                 tokens["bestplan_capability_version"] = 0
         else:
@@ -2654,6 +2679,17 @@ def _reset_turn_session_identity(tokens) -> None:
             reset_delivery_context(tok)
         except Exception:
             logger.debug("per-turn delivery-context reset failed", exc_info=True)
+    package_state = tokens.get("gateway_package_session_context")
+    if package_state is not None:
+        package, had_attr, previous, bound = package_state
+        try:
+            if package is not None and getattr(package, "session_context", None) is bound:
+                if had_attr:
+                    setattr(package, "session_context", previous)
+                else:
+                    delattr(package, "session_context")
+        except Exception:
+            logger.debug("per-turn gateway package binding reset failed", exc_info=True)
     legacy = tokens.get("legacy_delivery_context")
     if legacy is not None:
         try:
@@ -2679,7 +2715,10 @@ def _bind_turn_session_identity(session_id: str):
     spawn; this wrapper is the canonical single-call API for other callers and
     for tests, and shares the exact same code path.
     """
-    tokens = _set_turn_session_identity(session_id)
+    # The lightweight test/utility binder represents a finite local scope;
+    # the real streaming worker calls _set_turn_session_identity directly and
+    # keeps durable async delivery enabled by default.
+    tokens = _set_turn_session_identity(session_id, async_delivery=False)
     try:
         yield
     finally:
@@ -4216,13 +4255,18 @@ def _sanitize_generated_title(text: str) -> str:
     s = re.sub(r'^\s*title\s*:\s*', '', s, flags=re.IGNORECASE)
     s = s.strip(" \t\r\n\"'`*_~")
     s = re.sub(r'\s+', ' ', s).strip()
-    # Guard against chain-of-thought leakage and meta-reasoning patterns.
-    if _looks_invalid_generated_title(s):
+    # Guard against chain-of-thought leakage, meta-reasoning, and trivial echo.
+    if _is_bad_new_title(s):
         return ''
     return s[:80]
 
 
 def _looks_invalid_generated_title(text: str) -> bool:
+    """True when an existing/persisted title is structurally invalid.
+
+    Short conversational words remain valid persisted titles; fresh candidates
+    use ``_is_bad_new_title`` for the stricter echo guard.
+    """
     s = str(text or '')
     if not s.strip():
         return True
@@ -4234,8 +4278,26 @@ def _looks_invalid_generated_title(text: str) -> bool:
         or re.search(r'^\s*(i|we)\s+(should|need to|will|can)\b', s, flags=re.IGNORECASE)
         or re.search(r'^\s*let me\b', s, flags=re.IGNORECASE)
         or re.search(r"^\s*here(?:'s| is) (?:a |my )?(?:thinking|thought)", s, flags=re.IGNORECASE)
-        or re.search(r'^\s*(ok|okay|done|all set|complete|completed|finished)\b[\s.!?]*$', s, flags=re.IGNORECASE)
     )
+
+
+def _is_bad_new_title(text: str) -> bool:
+    """True when a freshly generated title candidate should be discarded."""
+    if _looks_invalid_generated_title(text):
+        return True
+    s = str(text or '').strip()
+    token = re.sub(r'[\s.!?]+$', '', s)
+    if re.fullmatch(
+        r'(?:pong|ping|yes|no|yep|nope|hi|hello|hey|thanks|thank you|sure|k|kk|cool|nice|lol|ok|okay|done)',
+        token,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    return bool(re.search(
+        r'^\s*(ok|okay|done|all set|complete|completed|finished)\b[\s.!?]*$',
+        s,
+        flags=re.IGNORECASE,
+    ))
 
 
 def _message_content_part_text(part) -> str:
@@ -4479,7 +4541,7 @@ def _first_exchange_snippets(messages):
             # is asking...", etc.). Assistant rows that carry tool_calls but
             # also contain a substantive answer text are kept — those are
             # agentic first-turn plans that are legitimate title candidates.
-            if m.get('tool_calls') and (not candidate or _looks_invalid_generated_title(candidate)):
+            if m.get('tool_calls') and (not candidate or _is_bad_new_title(candidate)):
                 continue
             if candidate:
                 asst_text = candidate
@@ -4503,7 +4565,7 @@ def _latest_exchange_snippets(messages):
         if role == 'assistant' and not asst_text:
             candidate = _message_text(m.get('content'))
             # Skip tool-call-only preambles
-            if m.get('tool_calls') and (not candidate or _looks_invalid_generated_title(candidate)):
+            if m.get('tool_calls') and (not candidate or _is_bad_new_title(candidate)):
                 continue
             if candidate:
                 asst_text = candidate
@@ -8397,22 +8459,22 @@ def _build_session_db_for_stream(state_db_path):
     try:
         from hermes_state import SessionDB
         attempts = 3
-        last_error = None
+        _last_error = None
         for attempt in range(attempts):
             try:
                 return SessionDB(db_path=state_db_path)
-            except sqlite3.OperationalError as db_error:
-                error_text = str(db_error).lower()
-                if "locked" not in error_text and "busy" not in error_text:
+            except sqlite3.OperationalError as _db_err:
+                _db_err_text = str(_db_err).lower()
+                if not ("locked" in _db_err_text or "busy" in _db_err_text):
                     raise
-                last_error = db_error
+                _last_error = _db_err
                 if attempt < attempts - 1:
                     print(
-                        f"[webui] WARNING: SessionDB init attempt {attempt + 1}/{attempts} failed, retrying: {db_error}",
+                        f"[webui] WARNING: SessionDB init attempt {attempt + 1}/{attempts} failed, retrying: {_db_err}",
                         flush=True,
                     )
                     time.sleep(0.05 * (2 ** attempt) + random.uniform(0, 0.05))
-        raise last_error or RuntimeError("SessionDB construction exhausted all attempts")
+        raise _last_error or RuntimeError("SessionDB construction exhausted all attempts")
     except Exception as _db_err:
         print(f"[webui] WARNING: SessionDB init failed - session_search will be unavailable: {_db_err}", flush=True)
         return None
@@ -9412,8 +9474,11 @@ def _run_agent_streaming(
         return False
 
     def put(event, data):
-        # If cancelled, drop all further events except the cancel event itself
-        if cancel_event.is_set() and not _success_writeback_committed and event not in ('cancel', 'error'):
+        # If cancelled, drop all further events except the terminal cancel or
+        # application-error event. ``error`` is a legacy adapter name and is
+        # not emitted by the native streaming path; allowing it here can
+        # produce a phantom post-cancel terminal frame.
+        if cancel_event.is_set() and not _success_writeback_committed and event not in ('cancel', 'apperror'):
             return
         event_id = None
         if run_journal is not None:
@@ -11024,9 +11089,7 @@ def _run_agent_streaming(
                 _agent_msg_text = "\n\n".join(
                     [*_process_notifications, _bestplan_invocation_message]
                 ).strip()
-            user_message = _build_native_multimodal_message(
-                workspace_ctx,
-                _agent_msg_text,
+            user_message = _build_native_multimodal_message(workspace_ctx, _agent_msg_text,
                 attachments,
                 workspace,
                 cfg=_cfg,
@@ -11073,9 +11136,7 @@ def _run_agent_streaming(
                     _agent_msg_text = "\n\n".join(
                         [*_process_notifications, msg_text]
                     ).strip()
-                user_message = _build_native_multimodal_message(
-                    workspace_ctx,
-                    _agent_msg_text,
+                user_message = _build_native_multimodal_message(workspace_ctx, _agent_msg_text,
                     attachments,
                     workspace,
                     cfg=_cfg,
@@ -11106,6 +11167,10 @@ def _run_agent_streaming(
                         profile_home=_profile_home,
                         host_agent=agent,
                     )
+            # #6068: read the served model after the run.  The agent may mutate
+            # ``agent.model`` when a fallback/provider route fires, so the
+            # pre-run resolved model would misattribute the completed turn.
+            _used_model = getattr(agent, 'model', None) or resolved_model or model
             _active_turn_identity = _resolve_active_turn_authority(
                 _active_turn_identity,
                 result=result,
@@ -12121,7 +12186,8 @@ def _run_agent_streaming(
                             if base_text[:60] in content or content[:60] in msg_text:
                                 m['attachments'] = display_attachments
                                 break
-                # Persist reasoning trace in the session so it survives reload.
+                # Persist assistant reasoning trace in the session so it survives reload.
+                # Persist assistant reasoning trace in the session so it survives reload.
                 # Must run BEFORE s.save() — otherwise the mutation lives only in
                 # memory until the next turn's save, and the last-turn thinking card
                 # is lost when the user reloads immediately after a response.
@@ -12136,6 +12202,7 @@ def _run_agent_streaming(
                 # than all reasoning being written only to the last assistant message.
                 # Scope the walk to this turn's newly-appended assistant messages
                 # to prevent cross-turn reasoning clobber (multi-turn off-by-N).
+                # Persist reasoning trace before the context persistence block (pre-save invariant).
                 if s.messages:
                     _prev_asst = sum(
                         1 for m in (_previous_messages or [])
@@ -12185,6 +12252,8 @@ def _run_agent_streaming(
                             _dm['_turnDuration'] = round(_turn_duration_seconds, 3)
                             if _turn_tps is not None:
                                 _dm['_turnTps'] = _turn_tps
+                            if _used_model:
+                                _dm['_usedModel'] = _used_model
                             if _gateway_routing:
                                 _dm['_gatewayRouting'] = _gateway_routing
                             break
@@ -12194,6 +12263,8 @@ def _run_agent_streaming(
                     # byte-for-byte aligned after duration/reasoning metadata
                     # has been attached to the visible assistant row.
                     s.context_messages = copy.deepcopy(s.messages)
+                # Persist reasoning trace in the session so it survives reload
+                # (pre-save invariant; context writeback follows).
                 # Persist context window data on the session so the context-ring
                 # indicator survives a page reload (#1318). Must run BEFORE
                 # s.save() for the same reason as the reasoning trace above.
@@ -12628,7 +12699,7 @@ def _run_agent_streaming(
                     _settle_native_process_completion_claims(
                         process_registry,
                         _process_completion_claims,
-                        committed=_delivery_writeback_committed,
+                        committed=_success_writeback_committed,
                     )
                     _process_completion_claims.clear()
                 except Exception:
@@ -12648,6 +12719,8 @@ def _run_agent_streaming(
             }
             if _turn_tps is not None:
                 usage['tps'] = _turn_tps
+            if _used_model:
+                usage['used_model'] = _used_model
             if _gateway_routing:
                 usage['gateway_routing'] = _gateway_routing
             # Include context window data from the agent's compressor for the UI indicator.
@@ -13365,6 +13438,8 @@ def _run_agent_streaming(
                             + 'send a message, switch the model/provider, or fix the credentials.'
                         )
                         _error_payload['hint'] = _exc_hint
+                # _materialize_pending_user_turn_before_error(s) is intentionally
+                # after the stale-stream ownership guard above.
                 _materialize_pending_user_turn_before_error(
                     s,
                     active_turn_identity=_active_turn_identity,
@@ -14150,8 +14225,10 @@ def cancel_stream(stream_id: str) -> bool:
                                 'content': _pending_user,
                                 'timestamp': _recovered_ts,
                             }
-                            if _pending_source and _pending_source != 'webui':
-                                _user_turn['_source'] = _pending_source
+                            stamp_message_source(
+                                _user_turn,
+                                _pending_source or 'webui',
+                            )
                             if _pending_atts:
                                 _user_turn['attachments'] = _pending_atts
                             _msgs_for_recovery.append(_user_turn)

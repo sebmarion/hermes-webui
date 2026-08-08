@@ -20,7 +20,7 @@ _SESSIONS_CACHE_TTL_SECONDS = 30.0
 # still invalidate immediately, and live runtime state is overlaid per response.
 # Use the same bound while streaming so client poll cadence never selects a
 # different projection-rebuild policy.
-_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 30.0
+_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 45.0
 _SESSIONS_CACHE_MAX_ENTRIES = 64
 _SESSIONS_CACHE_WAIT_SECONDS = 0.25
 _SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
@@ -174,11 +174,11 @@ def _session_list_cache_get(
                 return copy.deepcopy(payload), False
             _SESSIONS_CACHE.pop(key, None)
             return None, False
-        # Keep the existing streaming branch explicit, but use one bounded age
-        # policy for idle and streaming cache entries.
+        # Use one bounded age policy for idle and streaming cache entries. The
+        # streaming constant remains a poll-cadence contract for callers that
+        # inspect it, but route reads must not hold stale rows past the normal
+        # cache age bound (#4672).
         ttl = _SESSIONS_CACHE_TTL_SECONDS
-        if _session_list_cache_streaming_freeze_marker() is not None:
-            ttl = _SESSIONS_CACHE_STREAMING_TTL_SECONDS
         fresh = (now - ts) < ttl
         if fresh:
             _SESSIONS_CACHE.move_to_end(key)
@@ -202,8 +202,6 @@ def _session_list_cache_stale_reason(key: tuple) -> str | None:
         if stamp != current_stamp:
             return "source"
         ttl = _SESSIONS_CACHE_TTL_SECONDS
-        if _session_list_cache_streaming_freeze_marker() is not None:
-            ttl = _SESSIONS_CACHE_STREAMING_TTL_SECONDS
         if (now - ts) >= ttl:
             return "age"
         return None
@@ -225,6 +223,13 @@ def _session_list_cache_clear(profile: str | None = None) -> None:
     with _SESSIONS_CACHE_LOCK:
         global _SESSIONS_CACHE_GLOBAL_INVALIDATION_VERSION
         global _SESSIONS_CACHE_ALL_PROFILES_INVALIDATION_VERSION
+        # A hard clear is an explicit request to discard the current
+        # projection.  Do not leave a seed/background owner fencing the next
+        # request behind an already-invalidated cache: that request must be
+        # able to claim a fresh rebuild.  The worker's completion path checks
+        # the event identity before releasing ownership, so removing this
+        # entry is safe even when the old worker is still unwinding.
+        _SESSIONS_CACHE_INFLIGHT.pop(_SESSIONS_CACHE_REFRESH_OWNER, None)
         if not profile:
             _SESSIONS_CACHE_GLOBAL_INVALIDATION_VERSION += 1
             _SESSIONS_CACHE_ALL_PROFILES_INVALIDATION_VERSION += 1

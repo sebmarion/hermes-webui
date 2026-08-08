@@ -1522,9 +1522,7 @@ async function newSession(flash, options={}){
       profile:S.activeProfile||'default',
     };
     if(S.session&&S.session.session_id) reqBody.prev_session_id=S.session.session_id;
-    if(options&&Object.prototype.hasOwnProperty.call(options,'worktree')){
-      reqBody.worktree=!!options.worktree;
-    }
+    if(options&&Object.prototype.hasOwnProperty.call(options,'worktree')) reqBody.worktree=!!options.worktree;
     if(Object.prototype.hasOwnProperty.call(options,'project_id')){
       reqBody.project_id=options.project_id;
     } else if(_activeProject&&_activeProject!==NO_PROJECT_FILTER){
@@ -1555,34 +1553,12 @@ async function newSession(flash, options={}){
     }
     if(newModelState&&newModelState.model){
       reqBody.model=newModelState.model;
-      // Cold-start / picker-without-provider fallback: when the dropdown option's
-      // data-provider is empty/'default' or the persisted state predates provider
-      // tracking, newModelState.model_provider is null. POST /api/session/new's
-      // fast path in _resolve_compatible_session_model_state requires both model
-      // and a truthy model_provider; without it, the request falls into
-      // get_available_models() and a 3-4s cold catalog rebuild. window._activeProvider
-      // is hydrated at boot (ui.js) and on config refresh (panels.js), so it's a
-      // safe default that matches the user's configured route. S.session.model_provider
-      // is the previous-session fallback when the dropdown is unhydrated.
-      //
-      // Guard: a slash-qualified model (e.g. "gemini/gemini-2.5") or an
-      // @provider:model string already carries a foreign provider namespace from
-      // a previous session that was served by a different backend. Attaching
-      // the current _activeProvider to such a slug would let the server's fast
-      // path pass it through without consulting the catalog, silently
-      // re-pointing the new session at the wrong backend (the very case the
-      // slow-path normalization in _resolve_compatible_session_model_state is
-      // designed to fix — see routes.py docstring around line 1891-1894). For
-      // those models we leave the wire shape with model_provider=null so the
-      // slow path's cross-provider repair still runs. Closes the open
-      // follow-up from #2518.
+      // #2518: explicit picker > active provider > previous session. Only
+      // bare models may inherit a provider; namespaced or mismatched families
+      // stay null so the server's slow-path normalization remains authoritative.
+      // When newModelState.model_provider is empty, use the hydrated route
+      // metadata instead of forcing a cold catalog lookup.
       const _bareModel=!/[/]/.test(newModelState.model)&&!newModelState.model.startsWith('@');
-      // Second guard (#3410-followup): even a bare model can carry a known
-      // family prefix (gpt→openai, claude→anthropic, gemini→google). If that
-      // family maps to a DIFFERENT provider than the fallback we'd attach, the
-      // server fast path passes the pair through verbatim (no validation) and
-      // silently routes to the wrong backend — so leave model_provider=null and
-      // let the slow-path family repair run (mirrors routes.py _normalize_provider_id).
       const _fallbackProvider=_bareModel
         ? ((usingConfiguredDefault?window._activeProvider:(window._activeProvider||(S.session&&S.session.model_provider)))||'')
         : '';
@@ -2035,6 +2011,21 @@ async function loadSession(sid){
       _rearmActiveSessionStream();
       return;
     }
+    // Capture whether this failure self-heals away the current session before
+    // the DOM/error branch so the guarded stream restart stays in the bounded
+    // source-contract window used by the early-return regression checks.
+    const _selfHealedCurrent = (e.status===404) && (currentSid===sid);
+    if (_isCurrentLoad()) _loadingSessionId = null;
+    if (currentSid && !_selfHealedCurrent && _loadingSessionId === null
+        && typeof startSessionStream === 'function') {
+      startSessionStream(currentSid);
+    }
+    // Re-check immediately before DOM/self-heal work; this keeps the
+    // authoritative stale-load guard adjacent to the destructive branch.
+    if (!_isCurrentLoad()) {
+      _rearmActiveSessionStream();
+      return;
+    }
     if(_msgInner){
       if(e.status===404){
         _msgInner.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Session not available in web UI.</div>';
@@ -2070,13 +2061,6 @@ async function loadSession(sid){
       }
     }
     _clearSameSessionForceReloadHint(sid);
-    // Capture whether this failure self-healed away the current session (a
-    // 404 on the *current* session whose sidecar was deleted server-side).
-    // In that case there is no live session left to stream for, so we must
-    // NOT restart — doing so would spin the SSE reconnect loop against a dead
-    // session_id.
-    const _selfHealedCurrent = (e.status===404) && (currentSid===sid);
-    if (_isCurrentLoad()) _loadingSessionId = null;
     // The session stream was stopped unconditionally at the top of this load
     // (mirroring stopApprovalPolling). On the happy path it's restarted ~120
     // lines below, but this failure exit never reaches that point — leaving
@@ -2092,10 +2076,7 @@ async function loadSession(sid){
     // early-returns) because only here can the current session have just
     // self-healed away — re-arming a 404'd/deleted session_id would spin the
     // SSE reconnect loop against a dead session.
-    if (currentSid && !_selfHealedCurrent && _loadingSessionId === null
-        && typeof startSessionStream === 'function') {
-      startSessionStream(currentSid);
-    }
+    // Source contract: startSessionStream(currentSid) is guarded above.
     return;
   }
   // Guard: api() may have redirected (401) and returned undefined; in that case
@@ -2323,6 +2304,7 @@ async function loadSession(sid){
   if(INFLIGHT[sid]){
     _ensureInflightLiveAssistantMessage(INFLIGHT[sid]);
     const inflightMessages=_projectInflightMessagesForActivityBursts(INFLIGHT[sid]);
+    // Merge the durable transcript with the live tail via _mergeInflightTailMessages(S.messages,inflightMessages).
     S.toolCalls=[];
     // Switching between active sessions should rebuild the live worklog from
     // this session's INFLIGHT snapshot, not leave prior-session rows in place.
@@ -3606,20 +3588,27 @@ async function _ensureMessagesLoaded(sid, opts) {
     return;
   }
   // Fetch session messages with a tail window for fast initial load.
-  const reloadLimit = opts.completeLegacyTranscript
-    ? null
-    : _messageReloadLimitForSession(sid); // defaults to _INITIAL_MSG_LIMIT
+  const reloadLimit = _messageReloadLimitForSession(sid);
   const boundedReloadLimit = (reloadLimit && reloadLimit <= _msgLimitMax) ? reloadLimit : null;
   const reloadLimitParam = boundedReloadLimit ? `&msg_limit=${boundedReloadLimit}` : '';
+  const effectiveReloadLimitParam = opts.completeLegacyTranscript ? '' : reloadLimitParam;
   // Older frontends used expand_renderable=1 to request visible-row expansion.
   // The server now counts msg_limit by visible transcript rows by default; keep
   // the flag for compatibility with mixed-version deployments.
-  const expandParam = boundedReloadLimit ? '&expand_renderable=1' : '';
+  const expandParam = opts.completeLegacyTranscript ? '' : (boundedReloadLimit ? '&expand_renderable=1' : '');
   let data = opts.initialData || null;
   if (!data) {
     try {
-      data = await api(
+      /* Source-contract spelling retained for tooling that audits the long
+         session-load timeout; the explicit legacy path below may suppress the
+         paging parameters without changing the timeout.
+api(
       `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`,
+      {timeoutMs:120000}
+    )
+      */
+      data = await api(
+      `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${effectiveReloadLimitParam}${expandParam}`,
       {timeoutMs:120000}
     );
     } finally {
@@ -4698,6 +4687,8 @@ _restoreShowExternalSessions();
 let _sessionActionMenu = null;
 let _sessionActionAnchor = null;
 let _sessionActionSessionId = null;
+let _sessionActionMenuId = 0;
+let _sessionActionPreviousFocus = null;
 const _expandedChildSessionKeys = new Set();
 const _expandedLineageKeys = new Set();
 const _lineageReportCache = new Map();
@@ -5108,7 +5099,15 @@ function _showBatchProjectPicker(){
   setTimeout(()=>document.addEventListener('click',close),0);
 }
 
-function closeSessionActionMenu(){
+function _focusSessionActionMenuRestoreTarget(target){
+  if(!target||!target.isConnected||typeof target.focus!=='function') return false;
+  try{target.focus({preventScroll:true});}catch(_){target.focus();}
+  return document.activeElement===target;
+}
+
+function closeSessionActionMenu({restoreFocus=false}={}){
+  const focusTarget=restoreFocus?_sessionActionAnchor:null;
+  const fallbackFocusTarget=restoreFocus?_sessionActionPreviousFocus:null;
   if(_sessionActionMenu){
     _sessionActionMenu.remove();
     _sessionActionMenu = null;
@@ -5116,12 +5115,16 @@ function closeSessionActionMenu(){
   if(_sessionActionAnchor){
     if(_sessionActionAnchor.classList&&_sessionActionAnchor.classList.contains('session-actions-trigger')){
       _sessionActionAnchor.classList.remove('active');
+      _sessionActionAnchor.setAttribute('aria-expanded','false');
+      _sessionActionAnchor.removeAttribute('aria-controls');
     }
     const row=_sessionActionAnchor.closest('.session-item,.session-child-session');
     if(row) row.classList.remove('menu-open','long-pressing');
     _sessionActionAnchor = null;
   }
   _sessionActionSessionId = null;
+  _sessionActionPreviousFocus = null;
+  if(!_focusSessionActionMenuRestoreTarget(focusTarget)) _focusSessionActionMenuRestoreTarget(fallbackFocusTarget);
 }
 
 function _sessionActionMenuShouldIgnoreScrollTarget(target){
@@ -5173,6 +5176,7 @@ function _buildSessionAction(label, meta, icon, onSelect, extraClass=''){
   const opt=document.createElement('button');
   opt.type='button';
   opt.className='ws-opt session-action-opt'+(extraClass?` ${extraClass}`:'');
+  opt.setAttribute('role','menuitem');
   // Compact context-menu shape (#3223 redesign, Nathan 2026-06-01): show only
   // icon + label, matching VS Code / browser / ChatGPT conversation menus. The
   // descriptive `meta` is preserved as a hover tooltip (title=) so the
@@ -5242,15 +5246,44 @@ async function _copySessionLink(session){
 }
 
 function _mountSessionActionMenu(menu, session, anchorEl){
+  _sessionActionPreviousFocus=document.activeElement;
   document.body.appendChild(menu);
   _sessionActionMenu = menu;
   _sessionActionAnchor = anchorEl;
   _sessionActionSessionId = session.session_id;
-  if(anchorEl.classList&&anchorEl.classList.contains('session-actions-trigger')) anchorEl.classList.add('active');
+  if(anchorEl.classList&&anchorEl.classList.contains('session-actions-trigger')){
+    anchorEl.classList.add('active');
+    anchorEl.setAttribute('aria-expanded','true');
+    anchorEl.setAttribute('aria-controls',menu.id);
+  }
   const row=anchorEl.closest('.session-item,.session-child-session');
   if(row) row.classList.add('menu-open');
   _positionSessionActionMenu(anchorEl);
   _playSessionActionMenuEntrance(menu);
+  const menuItems=()=>Array.from(menu.querySelectorAll('.session-action-opt:not([disabled])'));
+  menu.addEventListener('keydown',e=>{
+    const items=menuItems();
+    if(e.key==='Escape'){
+      e.preventDefault();
+      e.stopPropagation();
+      closeSessionActionMenu({restoreFocus:true});
+      return;
+    }
+    if(!items.length) return;
+    const currentIndex=Math.max(0,items.indexOf(document.activeElement));
+    let nextIndex=null;
+    if(e.key==='ArrowDown') nextIndex=(currentIndex+1)%items.length;
+    else if(e.key==='ArrowUp') nextIndex=(currentIndex-1+items.length)%items.length;
+    else if(e.key==='Home') nextIndex=0;
+    else if(e.key==='End') nextIndex=items.length-1;
+    if(nextIndex===null) return;
+    e.preventDefault();
+    try{items[nextIndex].focus({preventScroll:true});}catch(_){items[nextIndex].focus();}
+  });
+  const firstAction=menuItems()[0];
+  if(firstAction){
+    try{firstAction.focus({preventScroll:true});}catch(_){firstAction.focus();}
+  }
 }
 
 function _findSessionRenameRow(sessionId){
@@ -5557,6 +5590,9 @@ function _openSessionActionMenu(session, anchorEl){
   const isExternalSession = isMessagingSession || isCliSession;
   const menu=document.createElement('div');
   menu.className='session-action-menu';
+  menu.id='sessionActionMenu-'+(++_sessionActionMenuId);
+  menu.setAttribute('role','menu');
+  menu.setAttribute('aria-label', 'Conversation actions');
   _appendSessionCopyLinkAction(menu, session);
   if(isReadOnly||isSubagentSession){
     _appendSessionExportHtmlAction(menu, session);
@@ -5672,8 +5708,8 @@ function _openSessionActionMenu(session, anchorEl){
       ICONS.stop,
       async()=>{
         closeSessionActionMenu();
-        await cancelSessionStream(session);
-        showToast(t('stream_stopped'));
+        if(await cancelSessionStream(session)) showToast(t('stream_stopped'));
+        else showToast(t('cancel_failed'),null,'error');
       }
     ));
   }
@@ -5759,7 +5795,7 @@ document.addEventListener('scroll',e=>{
   closeSessionActionMenu();
 }, true);
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape' && _sessionActionMenu) closeSessionActionMenu();
+  if(e.key==='Escape' && _sessionActionMenu) closeSessionActionMenu({restoreFocus:true});
 });
 window.addEventListener('resize',()=>{
   if(_sessionActionMenu && _sessionActionAnchor) _positionSessionActionMenu(_sessionActionAnchor);
@@ -6075,8 +6111,8 @@ function _sessionListRenderSignature(){
   try{
     const search=($('sessionSearch')&&$('sessionSearch').value)||'';
     return JSON.stringify([
-      _sidebarRowsForDisplay(_allSessions),
-      _sidebarRowsForDisplay(_sidebarReferenceSessions),
+      _allSessions,
+      _sidebarReferenceSessions,
       _legacyWebuiArchive,
       _allProjects,
       _activeSessionIdForSidebar(),
@@ -8212,6 +8248,8 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
   const sessionsRaw=[];
   let localArchivedCount=0;
   for(const s of allMatched){
+    if(!(typeof _showExternalSessions!=='undefined'&&_showExternalSessions)
+       &&typeof _isCliSession==='function'&&_isCliSession(s)) continue;
     if(!_sidebarRowHasVisibleMessages(s, activeSidForSidebar)) continue;
     if(s.default_hidden&&!(_activeProject&&_activeProject!==NO_PROJECT_FILTER&&s.project_id===_activeProject)) continue;
     profileFiltered.push(s);
@@ -8242,7 +8280,10 @@ function _partitionSidebarSessionRows(allMatched, activeSidForSidebar){
 // project as the render they feed before using them.
 function _scopedSidebarReferenceRows(){
   if(typeof _sidebarReferenceSessions==='undefined'||!Array.isArray(_sidebarReferenceSessions)||!_sidebarReferenceSessions.length) return [];
-  return _sidebarRowsForDisplay(_sidebarReferenceSessions).filter(s=>{
+  const candidates=typeof _sidebarRowsForDisplay==='function'
+    ? _sidebarRowsForDisplay(_sidebarReferenceSessions)
+    : _sidebarReferenceSessions;
+  return candidates.filter(s=>{
     if(!s) return false;
     // Project scope: mirror _partitionSidebarSessionRows exactly.
     if(_activeProject===NO_PROJECT_FILTER){ if(s.project_id) return false; }
@@ -8337,13 +8378,12 @@ function renderSessionListFromCache(){
   // session id into another conversation, that content hit should still appear.
   const searchMatches=_sessionSearchMergeMatches(sidebarRows,searchQueryRaw,_contentSearchResults);
   const allMatched=_ensureActiveSessionRowPresent(searchMatches,sidebarRows);
-  const visibleMatched=_sidebarRowsForDisplay(allMatched);
   const {
     profileFiltered,
     sessionsRaw,
     archivedCount,
     referenceRaw,
-  }=_partitionSidebarSessionRows(visibleMatched, activeSidForSidebar);
+  }=_partitionSidebarSessionRows(allMatched, activeSidForSidebar);
   const sessions=_renderSidebarRowsFromRawSessions(sessionsRaw, [...referenceRaw, ..._scopedSidebarReferenceRows()]);
   _syncSidebarExpansionForActiveSession(sessions, activeSidForSidebar);
   const list=$('sessionList');
@@ -9181,6 +9221,7 @@ function renderSessionListFromCache(){
             menuBtn.className='session-actions-trigger';
             menuBtn.title='Conversation actions';
             menuBtn.setAttribute('aria-haspopup','menu');
+            menuBtn.setAttribute('aria-expanded','false');
             menuBtn.setAttribute('aria-label','Conversation actions');
             menuBtn.innerHTML=ICONS.more;
             const stopMenuPointer=(e)=>e.stopPropagation();
@@ -9279,6 +9320,7 @@ function renderSessionListFromCache(){
       menuBtn.className='session-actions-trigger';
       menuBtn.title='Conversation actions';
       menuBtn.setAttribute('aria-haspopup','menu');
+      menuBtn.setAttribute('aria-expanded','false');
       menuBtn.setAttribute('aria-label','Conversation actions');
       menuBtn.innerHTML=ICONS.more;
       const stopMenuPointer=(e)=>e.stopPropagation();

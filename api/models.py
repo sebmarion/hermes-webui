@@ -62,7 +62,7 @@ _CLI_SESSIONS_CACHE_TTL_SECONDS = 5.0
 # polls /api/sessions every ~5s during a stream; without a wider window the
 # CLI cache key advances on every streamed message row (see below) and the
 # expensive state.db CLI/cron projection is re-run on every poll. (#4842)
-_CLI_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 30.0
+_CLI_SESSIONS_CACHE_STREAMING_TTL_SECONDS = 45.0
 _CLI_SESSIONS_CACHE_LOCK = threading.Lock()
 _CLI_SESSIONS_CACHE_INFLIGHT: "dict[tuple, threading.Event]" = {}
 _CLI_SESSIONS_REFRESH_OWNER = ("__global_agent_session_projection_refresh__",)
@@ -1091,7 +1091,8 @@ def _append_recovered_pending_turn(session, *, timestamp: int | None = None) -> 
     }
     pending_source = getattr(session, 'pending_user_source', None)
     if pending_source and pending_source != 'webui':
-        recovered['_source'] = pending_source
+        from api.process_event_utils import stamp_message_source
+        stamp_message_source(recovered, pending_source)
     if session.pending_attachments:
         recovered['attachments'] = list(session.pending_attachments)
     session.messages.append(recovered)
@@ -3681,27 +3682,47 @@ def _apply_core_sync_or_error_marker(
     # clearing runtime stream state.
     if len(session.messages) != 0:
         _pending_text = " ".join(str(session.pending_user_message or "").split())
-        _already_checkpointed = False
-        if _pending_text and session.messages:
-            for _last_msg in reversed(session.messages):
-                if isinstance(_last_msg, dict) and _last_msg.get('role') == 'user':
-                    _last_text = " ".join(str(_last_msg.get('content') or "").split())
-                    _already_checkpointed = _last_text == _pending_text
-                    break
         _recovered_ts = int(time.time())
         if isinstance(session.pending_started_at, (int, float)) and session.pending_started_at > 0:
             _recovered_ts = int(session.pending_started_at)
-        _already_checkpointed = _message_matches_pending_checkpoint(
-            session.messages[-1],
-            session.pending_user_message,
-            _recovered_ts,
-            session.pending_user_source,
-            session.pending_attachments,
+        # A pending timestamp/attachment/source is a durable checkpoint
+        # identity.  Once one is present, matching text alone is not enough:
+        # an earlier identical prompt must not suppress the current turn.
+        _has_checkpoint_identity = bool(
+            (isinstance(session.pending_started_at, (int, float))
+             and session.pending_started_at > 0)
+            or session.pending_attachments
+            or session.pending_user_source
         )
-        _tail_user_already_checkpointed = _already_checkpointed or _message_matches_pending_text(
-            session.messages[-1],
-            session.pending_user_message,
+        _already_checkpointed = False
+        _latest_user = next(
+            (
+                message for message in reversed(session.messages)
+                if isinstance(message, dict) and message.get('role') == 'user'
+            ),
+            None,
         )
+        _candidate_has_identity = bool(
+            isinstance(_latest_user, dict)
+            and (
+                'timestamp' in _latest_user
+                or _latest_user.get('attachments')
+                or _latest_user.get('_source')
+            )
+        )
+        if _has_checkpoint_identity and _candidate_has_identity:
+            _already_checkpointed = _message_matches_pending_checkpoint(
+                _latest_user,
+                session.pending_user_message,
+                _recovered_ts,
+                session.pending_user_source,
+                session.pending_attachments,
+            )
+        elif _pending_text and _latest_user is not None:
+            _already_checkpointed = _latest_user_matches_pending_text(
+                [_latest_user],
+                session.pending_user_message,
+            )
         _pending_started_at = session.pending_started_at
         if _run_journal_terminal_state(session, _stream_id) == 'completed':
             if not _already_checkpointed:
@@ -5804,20 +5825,9 @@ def persist_recovered_workspace_binding(
                     "Failed to persist recovered workspace: session workspace changed"
                 )
             payload["workspace"] = resolved
-            tmp = path.with_suffix(
-                f".tmp.{os.getpid()}.{threading.current_thread().ident}"
-            )
             try:
-                with open(tmp, "w", encoding="utf-8") as handle:
-                    json.dump(payload, handle, ensure_ascii=False, indent=2)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                _safe_replace(tmp, path)
+                _write_session_sidecar_payload(path, payload)
             except Exception as exc:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except Exception:
-                    pass
                 raise WorkspaceBindingPersistenceError(
                     "Failed to persist recovered workspace"
                 ) from exc
@@ -6123,14 +6133,17 @@ def _read_state_db_sidebar_overrides(
             has_messages_table = cur.fetchone() is not None
             messages_has_session_id = False
             messages_has_timestamp = False
+            messages_has_title_fields = False
             if has_messages_table:
                 cur.execute("PRAGMA table_info(messages)")
                 message_cols = {str(row[1]) for row in cur.fetchall()}
                 messages_has_session_id = 'session_id' in message_cols
                 messages_has_timestamp = 'timestamp' in message_cols
+                messages_has_title_fields = {'session_id', 'role', 'content', 'timestamp'}.issubset(message_cols)
 
             overrides: dict[str, dict] = {}
             messaging_ids: set[str] = set()
+            delegated_title_ids: set[str] = set()
             ids = list(wanted)
             chunk_size = 500
             for i in range(0, len(ids), chunk_size):
@@ -6152,6 +6165,12 @@ def _read_state_db_sidebar_overrides(
                     if state_title:
                         entry['_state_db_title'] = state_title
                     state_source = str(row['source'] or '').strip().lower()
+                    if (
+                        state_source == 'subagent'
+                        and sid in count_wanted
+                        and ' '.join(state_title.split()) == 'Subagent Session'
+                    ):
+                        delegated_title_ids.add(sid)
                     if state_source:
                         entry['_state_db_source'] = state_source
                         source_meta = normalize_agent_session_source(state_source)
@@ -6222,6 +6241,30 @@ def _read_state_db_sidebar_overrides(
                                 entry['_state_db_last_message_at'] = float(row['last_message_at'] or 0)
                             except (TypeError, ValueError):
                                 pass
+            if messages_has_title_fields and delegated_title_ids:
+                seen_user_messages: set[str] = set()
+                delegated_ids = list(delegated_title_ids)
+                for i in range(0, len(delegated_ids), chunk_size):
+                    chunk = delegated_ids[i:i + chunk_size]
+                    placeholders = ','.join('?' * len(chunk))
+                    cur.execute(
+                        f"""
+                        SELECT session_id, role, content, timestamp
+                        FROM messages
+                        WHERE session_id IN ({placeholders}) AND role = 'user'
+                        ORDER BY session_id, timestamp ASC
+                        """,
+                        chunk,
+                    )
+                    for row in cur.fetchall():
+                        sid = str(row['session_id'])
+                        if sid in seen_user_messages:
+                            continue
+                        display_title = title_from([dict(row)], fallback='')
+                        if display_title:
+                            seen_user_messages.add(sid)
+                            overrides.setdefault(sid, {})['_state_db_display_title'] = display_title
+
             cur.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_completion_events'"
             )
@@ -6396,6 +6439,7 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
         state_db_source_label = entry.pop('_state_db_source_label', None)
         state_db_message_count = entry.pop('_state_db_message_count', None)
         state_db_last_message_at = entry.pop('_state_db_last_message_at', None)
+        state_db_display_title = entry.pop('_state_db_display_title', None)
         state_db_archived = entry.pop('_state_db_archived', missing)
         state_db_pinned = entry.pop('_state_db_pinned', missing)
         completion_generation = entry.pop('_state_db_completion_generation', missing)
@@ -6490,6 +6534,12 @@ def _apply_sidebar_state_db_override_metadata(sessions: list[dict], metadata: di
         ):
             session['_state_db_title'] = state_db_title
             session['display_title'] = state_db_title
+        if (
+            state_db_display_title
+            and state_db_source == 'subagent'
+            and ' '.join(str(title or '').split()) == 'Subagent Session'
+        ):
+            session['display_title'] = state_db_display_title
 
 
 def _enrich_sidebar_lineage_metadata(
@@ -6890,6 +6940,8 @@ def title_from(messages, fallback: str='Untitled'):
     for m in messages:
         if m.get('role') == 'user':
             c = m.get('content', '')
+            if c is None:
+                continue
             if isinstance(c, list):
                 c = ' '.join(p.get('text', '') for p in c if isinstance(p, dict) and p.get('type') == 'text')
             text = _strip_attached_files_marker(str(c))
@@ -9351,6 +9403,61 @@ def get_state_db_session_message_keys_before_timestamp(
         return None
 
 
+def get_state_db_session_message_prefix_summary(
+    sid,
+    before_timestamp,
+    *,
+    profile=None,
+) -> dict[str, int] | None:
+    """Summarize a visible state.db message prefix through a read-only handle."""
+    try:
+        import sqlite3
+    except ImportError:
+        return None
+    try:
+        before_ts = float(before_timestamp)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(profile, str) and profile:
+        db_path = _get_profile_home(profile) / "state.db"
+        if not db_path.exists():
+            db_path = _active_state_db_path()
+    else:
+        db_path = _active_state_db_path()
+    if not sid or not db_path.exists():
+        return {"count": 0, "null_timestamp_count": 0}
+    try:
+        with closing(open_state_db_readonly(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(messages)")
+            available = {str(row["name"]) for row in cur.fetchall()}
+            if not {"session_id", "timestamp"}.issubset(available):
+                return None
+            active_clause = ""
+            if "active" in available:
+                active_clause = " AND (active IS NULL OR active != 0)"
+            cur.execute(
+                f"""
+                SELECT SUM(CASE WHEN timestamp IS NOT NULL THEN 1 ELSE 0 END) AS count,
+                       SUM(CASE WHEN timestamp IS NULL THEN 1 ELSE 0 END)
+                           AS null_timestamp_count
+                FROM messages
+                WHERE session_id = ?
+                  AND (timestamp IS NULL OR timestamp < ?)
+                  {active_clause}
+                """,
+                (str(sid), before_ts),
+            )
+            row = cur.fetchone()
+            return {
+                "count": int(row["count"] or 0),
+                "null_timestamp_count": int(row["null_timestamp_count"] or 0),
+            }
+    except Exception:
+        return None
+
+
 def get_state_db_session_summary(sid, *, profile=None) -> dict:
     """Return a cheap message count/timestamp summary for one state.db session."""
     try:
@@ -9464,6 +9571,7 @@ _SESSION_MESSAGE_DISPLAY_METADATA_KEYS = (
     "_turnTps",
     "_turnUsage",
     "_firstTokenMs",
+    "_usedModel",
     "_gatewayRouting",
     "_statusCard",
     "_anchor_stream_id",
@@ -9941,6 +10049,64 @@ def merge_session_messages_append_only(
     """
     sidecar_messages = list(sidecar_messages or [])
     state_messages = list(state_messages or [])
+    # Cache all canonical message keys for this merge.  Legacy content can be
+    # an expensive list/object whose stringification is observable in tests;
+    # one prepared copy per message keeps the merge/dedup/content/visible
+    # helpers consistent without changing the returned message identities.
+    _MESSAGE_CACHE_MISSING = object()
+    _cached_msg_prepared: dict[int, dict[str, object]] = {}
+    _cached_msg_keys: dict[tuple[int, str], object] = {}
+    _message_key_helpers = {
+        "merge": _session_message_merge_key,
+        "dedup": _session_message_dedup_key,
+        "content": _session_message_content_key,
+        "visible": _session_message_visible_key,
+    }
+
+    def _cached_message_key(msg, kind):
+        if not isinstance(msg, dict):
+            return _message_key_helpers[kind](msg)
+        cache_key = (id(msg), kind)
+        value = _cached_msg_keys.get(cache_key, _MESSAGE_CACHE_MISSING)
+        if value is not _MESSAGE_CACHE_MISSING:
+            return value
+        helper = _message_key_helpers[kind]
+        msg_cache_key = id(msg)
+        prepared_msg = _cached_msg_prepared.get(msg_cache_key)
+        if kind in {"merge", "dedup"}:
+            if prepared_msg is None:
+                value = helper(msg)
+                if (
+                    isinstance(value, tuple)
+                    and value
+                    and value[0] == "legacy"
+                ):
+                    prepared_msg = dict(msg)
+                    prepared_msg["content"] = value[2]
+                    _cached_msg_prepared[msg_cache_key] = prepared_msg
+            else:
+                value = helper(prepared_msg)
+            _cached_msg_keys[cache_key] = value
+            return value
+        if prepared_msg is None:
+            merge_key = _cached_message_key(msg, "merge")
+            prepared_msg = _cached_msg_prepared.get(msg_cache_key)
+            if prepared_msg is None:
+                prepared_msg = dict(msg)
+                prepared_msg["content"] = (
+                    merge_key[2]
+                    if (
+                        isinstance(merge_key, tuple)
+                        and len(merge_key) > 2
+                        and merge_key[0] == "legacy"
+                    )
+                    else str(msg.get("content") or "")
+                )
+                _cached_msg_prepared[msg_cache_key] = prepared_msg
+        value = helper(prepared_msg)
+        _cached_msg_keys[cache_key] = value
+        return value
+
     watermark_timestamp = _message_timestamp_as_float({"timestamp": truncation_watermark})
     if not state_messages:
         return sidecar_messages
@@ -10001,7 +10167,7 @@ def merge_session_messages_append_only(
         seen_messages = {}
         deduped = []
         for msg in filtered:
-            key = _session_message_dedup_key(msg)
+            key = _cached_message_key(msg, "dedup")
             if key not in seen:
                 seen.add(key)
                 seen_messages[key] = msg
@@ -10027,19 +10193,19 @@ def merge_session_messages_append_only(
     def _remember_merged_message(message):
         if not isinstance(message, dict):
             return
-        merged_by_message_key.setdefault(_session_message_merge_key(message), message)
-        merged_by_dedup_key.setdefault(_session_message_dedup_key(message), message)
-        merged_by_visible_key.setdefault(_session_message_visible_key(message), message)
+        merged_by_message_key.setdefault(_cached_message_key(message, "merge"), message)
+        merged_by_dedup_key.setdefault(_cached_message_key(message, "dedup"), message)
+        merged_by_visible_key.setdefault(_cached_message_key(message, "visible"), message)
 
     for msg in sidecar_messages:
         timestamp = _message_timestamp_as_float(msg)
         if timestamp is not None:
             max_sidecar_timestamp = timestamp if max_sidecar_timestamp is None else max(max_sidecar_timestamp, timestamp)
-        key = _session_message_merge_key(msg)
+        key = _cached_message_key(msg, "merge")
         seen_message_keys.add(key)
-        seen_dedup_keys.add(_session_message_dedup_key(msg))
-        seen_content_keys.add(_session_message_content_key(msg))
-        visible_key = _session_message_visible_key(msg)
+        seen_dedup_keys.add(_cached_message_key(msg, "dedup"))
+        seen_content_keys.add(_cached_message_key(msg, "content"))
+        visible_key = _cached_message_key(msg, "visible")
         seen_visible_keys.add(visible_key)
         sidecar_visible_keys.add(visible_key)
         sidecar_visible_counts[visible_key] = sidecar_visible_counts.get(visible_key, 0) + 1
@@ -10066,8 +10232,10 @@ def merge_session_messages_append_only(
     )
     for msg in state_messages:
         timestamp = _message_timestamp_as_float(msg)
-        key = _session_message_merge_key(msg)
-        visible_key = _session_message_visible_key(msg)
+        key = _cached_message_key(msg, "merge")
+        dedup_key = _cached_message_key(msg, "dedup")
+        visible_key = _cached_message_key(msg, "visible")
+        content_key = _cached_message_key(msg, "content")
         replays_sidecar_prefix = False
         replay_target = None
         if state_replay_idx < len(sidecar_visible_sequence):
@@ -10091,7 +10259,7 @@ def merge_session_messages_append_only(
                 )
             # Record dedup key so later duplicates of this replayed message
             # are caught by the dedup guard (#3346).
-            seen_dedup_keys.add(_session_message_dedup_key(msg))
+            seen_dedup_keys.add(dedup_key)
             continue
         # Skip rows ABOVE the watermark only while the sidecar has NOT advanced
         # past the watermark. Because Session.save() no longer auto-clears the
@@ -10150,7 +10318,7 @@ def merge_session_messages_append_only(
             and timestamp is not None
             and timestamp < watermark_timestamp
             and key not in seen_message_keys
-            and _session_message_content_key(msg) not in seen_content_keys
+            and content_key not in seen_content_keys
         ):
             continue
         # Same-second edit: if timestamp equals the watermark and the message
@@ -10168,7 +10336,7 @@ def merge_session_messages_append_only(
             and timestamp is not None
             and timestamp == watermark_timestamp
             and key not in seen_message_keys
-            and _session_message_content_key(msg) not in seen_content_keys
+            and content_key not in seen_content_keys
             and str(msg.get("role", "")).lower() == "user"
         ):
             continue
@@ -10177,7 +10345,6 @@ def merge_session_messages_append_only(
         # sub-second messages with the same second-level merge key are not
         # collapsed.  The merge key truncates to seconds; the dedup key does
         # not.
-        dedup_key = _session_message_dedup_key(msg)
         if dedup_key in seen_dedup_keys:
             _merge_session_display_metadata(merged_by_dedup_key.get(dedup_key), msg)
             continue
@@ -10245,7 +10412,7 @@ def merge_session_messages_append_only(
                 and timestamp == watermark_timestamp
                 and checkpoint_consumed
                 and str(msg.get("role", "")).lower() != "user"
-                and _session_message_content_key(msg) not in seen_content_keys
+                and content_key not in seen_content_keys
             ):
                 pass  # fall through to append below
             else:
@@ -10256,7 +10423,7 @@ def merge_session_messages_append_only(
                 # differ), preserve it — distinct tool_calls must not be collapsed.
                 _tc = msg.get("tool_calls")
                 if _tc:
-                    _ck = _session_message_content_key(msg)
+                    _ck = content_key
                     if _ck in seen_content_keys and dedup_key not in seen_dedup_keys:
                         # Different tool_calls from sidecar — preserve, but keep
                         # the row in timestamp order. Falling through to the
@@ -10265,7 +10432,7 @@ def merge_session_messages_append_only(
                         if _insert_state_message_chronologically(merged_messages, msg):
                             seen_message_keys.add(key)
                             seen_dedup_keys.add(dedup_key)
-                            seen_content_keys.add(_session_message_content_key(msg))
+                            seen_content_keys.add(content_key)
                             seen_visible_keys.add(visible_key)
                             _remember_merged_message(msg)
                         continue
@@ -10273,11 +10440,11 @@ def merge_session_messages_append_only(
                         _merge_session_display_metadata(merged_by_message_key.get(key), msg)
                         continue
                 else:
-                    if msg.get("role") == "user" and _session_message_content_key(msg) not in seen_content_keys:
+                    if msg.get("role") == "user" and content_key not in seen_content_keys:
                         if _insert_state_message_chronologically(merged_messages, msg):
                             seen_message_keys.add(key)
                             seen_dedup_keys.add(dedup_key)
-                            seen_content_keys.add(_session_message_content_key(msg))
+                            seen_content_keys.add(content_key)
                             seen_visible_keys.add(visible_key)
                             _remember_merged_message(msg)
                         continue
@@ -10285,7 +10452,7 @@ def merge_session_messages_append_only(
                     continue
         seen_message_keys.add(key)
         seen_dedup_keys.add(dedup_key)
-        seen_content_keys.add(_session_message_content_key(msg))
+        seen_content_keys.add(content_key)
         seen_visible_keys.add(visible_key)
         merged_messages.append(msg)
         _remember_merged_message(msg)

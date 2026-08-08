@@ -695,4 +695,5 @@ def start_atomic_webui_recovery(body: dict) -> dict:
             session_lock_held=True,
             recovery_claim_token=claim_token,
             recovery_fingerprint=fingerprint,
+            lineage_state_db_path=_state_db_path(profile),
         )

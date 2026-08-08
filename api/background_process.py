@@ -42,6 +42,7 @@ this module routes them to the same listener so the frontend's single
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import os
 import queue
@@ -910,6 +911,58 @@ def claim_staged_process_completion_events(session_id: str) -> list[dict]:
         return _STAGED_PROCESS_COMPLETION_EVENTS.pop(owner, [])
 
 
+def _peek_staged_process_completion_event(
+    session_id: str,
+    event_id: str,
+) -> dict | None:
+    """Return a staged completion without transferring ownership.
+
+    Durable async-delegation rows retain a JSON copy for restart recovery, but
+    the in-process handoff must keep the original event object until
+    ``start_session_turn`` claims it.  This lets the route and its worker share
+    one exact receipt object while still falling back to the durable JSON row
+    after a process restart.
+    """
+    owner = str(session_id or "").strip()
+    wanted = str(event_id or "").strip()
+    if not owner or not wanted:
+        return None
+    with _STAGED_PROCESS_COMPLETION_EVENTS_LOCK:
+        for item in _STAGED_PROCESS_COMPLETION_EVENTS.get(owner) or []:
+            current = str(
+                item.get("event_id") or item.get("delegation_id") or ""
+            ).strip()
+            if current == wanted:
+                return item
+    return None
+
+
+def _discard_deferred_wakeup(
+    session_id: str,
+    process_id: str,
+) -> bool:
+    """Remove one compatibility deferred entry after durable acceptance."""
+    from api import config as _cfg
+
+    owner = str(session_id or "").strip()
+    wanted = str(process_id or "").strip()
+    if not owner or not wanted:
+        return False
+    with _cfg.DEFERRED_PROCESS_WAKEUPS_LOCK:
+        entries = _cfg.DEFERRED_PROCESS_WAKEUPS.get(owner) or []
+        retained = [
+            entry for entry in entries
+            if str(entry.get("process_id") or "") != wanted
+        ]
+        if len(retained) == len(entries):
+            return False
+        if retained:
+            _cfg.DEFERRED_PROCESS_WAKEUPS[owner] = retained
+        else:
+            _cfg.DEFERRED_PROCESS_WAKEUPS.pop(owner, None)
+        return True
+
+
 def has_staged_process_completion_events(session_id: str) -> bool:
     owner = str(session_id or "").strip()
     if not owner:
@@ -964,7 +1017,20 @@ def _unstage_process_completion_event(session_id: str, event: dict) -> bool:
 # registry, pre-Option-1 spawns) it is a PURE PASS-THROUGH — it never
 # suppresses a legitimate Option Z wakeup on uncertainty (Option Z must keep
 # working).
-_ENV_IMMUNE_OWNER_ATTRS = ("spawn_session_id", "owner_session_id", "turn_session_id")
+_ENV_IMMUNE_OWNER_ATTRS = (
+    "origin_ui_session_id",
+    "spawn_session_id",
+    "owner_session_id",
+    "turn_session_id",
+)
+
+
+def _resolve_completion_target(
+    *, session_key_resolved_sid: str, origin_ui_session_id: str = "",
+) -> str:
+    """Prefer the exact UI session stamped at spawn time when available."""
+    origin = str(origin_ui_session_id or "").strip()
+    return origin or str(session_key_resolved_sid or "")
 
 
 def _env_immune_spawn_owner(proc_session) -> str:
@@ -1332,6 +1398,7 @@ def _retry_unmapped_async_delegation_event(process_registry, evt: dict) -> None:
 
 def _record_async_delegation_accepted(evt: dict, *, session_id: str, claim) -> None:
     complete_async_delegation_delivery(evt, claim)
+    _discard_deferred_wakeup(session_id, completion_delivery_id(evt))
     try:
         _emit_bg_task_complete_events_coalesced(session_id, _build_payload(evt, session_id))
     except Exception:
@@ -1340,23 +1407,55 @@ def _record_async_delegation_accepted(evt: dict, *, session_id: str, claim) -> N
 
 def _start_async_delegation_wakeup_turn(session_id: str, wakeup_prompt: str, *, delegation_id: str, evt: dict, claim, process_registry) -> None:
     def _runner() -> None:
+        completion_staged = bool(stage_process_completion_event(session_id, evt))
+
+        def _defer() -> None:
+            if completion_staged:
+                _unstage_process_completion_event(session_id, evt)
+            record_deferred_wakeup(
+                session_id,
+                delegation_id,
+                wakeup_prompt,
+                async_delegation_id=delegation_id,
+                completion_event=evt,
+            )
+
         try:
             from api.routes import start_session_turn
-            resp = start_session_turn(
-                session_id,
-                wakeup_prompt,
-                source="process_wakeup",
-                delegation_id=delegation_id,
-            )
+            try:
+                resp = start_session_turn(
+                    session_id,
+                    wakeup_prompt,
+                    source="process_wakeup",
+                    delegation_id=delegation_id,
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument 'delegation_id'" not in str(exc):
+                    raise
+                resp = start_session_turn(
+                    session_id,
+                    wakeup_prompt,
+                    source="process_wakeup",
+                )
             raw_status = (resp or {}).get("_status")
             status = (200 if (resp or {}).get("stream_id") else 500) if raw_status is None else int(raw_status)
             if 200 <= status < 300:
+                # Real route admission claims this receipt while holding the
+                # session lock. Compatibility adapters may not expose that
+                # process-local handoff, but a successful durable admission is
+                # still the ACK boundary; discard any unused staging copy.
+                if completion_staged and _peek_staged_process_completion_event(
+                    session_id, delegation_id,
+                ) is not None:
+                    _unstage_process_completion_event(session_id, evt)
                 _record_async_delegation_accepted(evt, session_id=session_id, claim=claim)
             else:
                 release_async_delegation_delivery(evt, claim)
+                _defer()
                 _requeue_async_delegation_event(process_registry, evt, claim=claim)
         except Exception:
             release_async_delegation_delivery(evt, claim)
+            _defer()
             _requeue_async_delegation_event(process_registry, evt, claim=claim)
             logger.warning("async delegation wakeup turn failed", exc_info=True)
     threading.Thread(target=_runner, name=f"hermes-webui-delegation-wakeup-{str(session_id)[:8]}", daemon=True).start()
@@ -1535,12 +1634,28 @@ def _process_async_delegation_event(evt: dict) -> None:
     if row.get("state") == "delivered":
         return
 
+    # Keep the legacy in-memory defer receipt in sync with the durable row.
+    # The durable SQLite row is authoritative, but the in-process queue is
+    # still consumed by older teardown/next-turn paths and by Agent builds
+    # that predate the store. It must carry the exact event object while this
+    # process is alive.
+    if _session_has_active_turn(session_id):
+        stage_process_completion_event(session_id, evt)
+        record_deferred_wakeup(
+            session_id,
+            delegation_id,
+            wakeup_prompt,
+            async_delegation_id=delegation_id,
+            completion_event=evt,
+        )
+
     # Live-view is observational only and happens after durable acceptance.
     if outcome.status == "inserted":
         _emit_bg_task_complete_events_coalesced(session_id, _build_payload(evt, session_id))
         cfg.PENDING_BG_TASK_COMPLETIONS.add(session_id)
 
     if not _session_has_active_turn(session_id):
+        stage_process_completion_event(session_id, evt)
         dispatch_pending_delegation_wakeups_for_session(session_id)
 
 
@@ -1978,15 +2093,55 @@ def _run_claimed_delegation_wakeup(row: dict) -> None:
     store = _delegation_wakeup_store()
     delegation_id = str(row.get("delegation_id") or "")
     claim_token = str(row.get("claim_token") or "")
+    _session_id = str(row.get("session_id") or "")
+    _wakeup_prompt = str(row.get("wakeup_prompt") or "")
+    completion_event = _peek_staged_process_completion_event(
+        _session_id, delegation_id,
+    )
+    if completion_event is None:
+        try:
+            candidate = json.loads(str(row.get("event_json") or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            candidate = None
+        if isinstance(candidate, dict):
+            completion_event = candidate
+    completion_staged = bool(
+        completion_event
+        and stage_process_completion_event(_session_id, completion_event)
+    )
+
+    def _defer() -> None:
+        if completion_staged and completion_event:
+            _unstage_process_completion_event(_session_id, completion_event)
+        record_deferred_wakeup(
+            _session_id,
+            delegation_id,
+            _wakeup_prompt,
+            async_delegation_id=delegation_id,
+            completion_event=completion_event,
+        )
+
     try:
         from api.routes import start_session_turn
 
-        response = start_session_turn(
-            str(row.get("session_id") or ""),
-            str(row.get("wakeup_prompt") or ""),
-            source="process_wakeup",
-            delegation_id=delegation_id,
-        )
+        try:
+            response = start_session_turn(
+                _session_id,
+                _wakeup_prompt,
+                source="process_wakeup",
+                delegation_id=delegation_id,
+            )
+        except TypeError as exc:
+            # Older test doubles/Agent builds predate the delegation_id
+            # keyword. Retry only for that signature mismatch; a TypeError
+            # raised by the implementation itself must still fail the wakeup.
+            if "unexpected keyword argument 'delegation_id'" not in str(exc):
+                raise
+            response = start_session_turn(
+                _session_id,
+                _wakeup_prompt,
+                source="process_wakeup",
+            )
         status = int((response or {}).get("_status", 200) or 200)
         if status >= 400:
             store.release_claim(
@@ -1994,11 +2149,19 @@ def _run_claimed_delegation_wakeup(row: dict) -> None:
                 claim_token,
                 str((response or {}).get("error") or f"status={status}"),
             )
+            _defer()
             return
+        if completion_staged and _peek_staged_process_completion_event(
+            _session_id, delegation_id,
+        ) is not None:
+            _unstage_process_completion_event(_session_id, completion_event)
         if not store.mark_delivered(delegation_id, claim_token):
             logger.error("async_delegation delivered transition lost for %s", delegation_id)
+        else:
+            _discard_deferred_wakeup(_session_id, delegation_id)
     except Exception as exc:
         store.release_claim(delegation_id, claim_token, str(exc))
+        _defer()
         logger.warning("async_delegation wakeup start failed for %s", delegation_id, exc_info=True)
     finally:
         current = threading.current_thread()

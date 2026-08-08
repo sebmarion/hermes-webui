@@ -940,11 +940,15 @@ from tools.process_registry import process_registry
 peu.ASYNC_DELIVERY_CLAIM_RETRY_SECONDS = 0.05
 first_notes = streaming._drain_webui_process_notifications("webui-session-1")
 first_timers = peu.async_delivery_retry_timer_count()
-with ad._DB_LOCK, ad._connect() as conn:
-    conn.execute(
-        "UPDATE async_delegations SET delivery_claimed_at=? WHERE delegation_id=?",
-        (time.time() - 301, {delegation_id!r}),
-    )
+# Current Agent durability is the JSON tracker.  Age the claim in that
+# authoritative store to model a consumer that crashed after claiming; do not
+# reach into the retired SQLite compatibility ledger.
+with ad._persist_lock:
+    tracker = ad._read_persisted_unlocked()
+    entry = (tracker.get("records") or {{}}).get({delegation_id!r})
+    assert isinstance(entry, dict)
+    entry["delivery_claimed_at"] = time.time() - 301
+    ad._write_persisted_unlocked(tracker)
 deadline = time.time() + 3
 while process_registry.completion_queue.empty() and time.time() < deadline:
     time.sleep(.01)
@@ -1112,4 +1116,3 @@ def test_next_turn_drain_respects_origin_over_session_key_index(monkeypatch):
     assert [consumer for _evt, consumer in delivery["claim"]] == ["webui-next-turn"]
     assert len(delivery["complete"]) == 1
     assert delivery["release"] == []
-

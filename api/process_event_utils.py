@@ -279,7 +279,10 @@ def schedule_async_delegation_claim_retry(
             exc_info=True,
         )
         return False
-    if not isinstance(durable, dict) or durable.get("delivery_state") != "pending":
+    # Current Agent JSON checkpoints mark an enqueued completion as ``queued``;
+    # the legacy SQLite ledger called the same undelivered state ``pending``.
+    # Both are retryable until an explicit terminal acknowledgement.
+    if not isinstance(durable, dict) or durable.get("delivery_state") in {"delivered", "dropped"}:
         return False
 
     retry_delay = (

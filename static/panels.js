@@ -8825,6 +8825,10 @@ async function _autosavePreferencesSettings(payload){
       window._hideEmptyStatePanel=!!(saved&&saved.hide_empty_state_panel);
       if(typeof applyEmptyStatePanelPref==='function') applyEmptyStatePanelPref();
     }
+    if(payload&&payload.hide_empty_state_panel!==undefined){
+      window._hideEmptyStatePanel=!!(saved&&saved.hide_empty_state_panel);
+      if(typeof applyEmptyStatePanelPref==='function') applyEmptyStatePanelPref();
+    }
     if(payload&&payload.show_conversation_outline!==undefined){
       window._showConversationOutline=!!(saved&&saved.show_conversation_outline);
       document.documentElement.dataset.conversationOutline=window._showConversationOutline?'enabled':'disabled';

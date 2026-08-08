@@ -3243,6 +3243,8 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     applyEmptyStateSuggestionPref();
     window._hideEmptyStatePanel=s.hide_empty_state_panel===true;
     applyEmptyStatePanelPref();
+    window._hideEmptyStatePanel=s.hide_empty_state_panel===true;
+    applyEmptyStatePanelPref();
     // Long transcripts default to a bounded render window. Users can opt out
     // explicitly in Preferences when browser Find/full-history rendering is
     // more important than DOM cost.
@@ -3398,6 +3400,8 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     if(typeof applyConversationOutlinePreference==='function') applyConversationOutlinePreference();
     window._hideEmptyStateSuggestions=false;
     applyEmptyStateSuggestionPref();
+    window._hideEmptyStatePanel=false;
+    applyEmptyStatePanelPref();
     window._hideEmptyStatePanel=false;
     applyEmptyStatePanelPref();
     window._virtualizeTranscript=true;  // settings-load failed: keep the transcript DOM bounded

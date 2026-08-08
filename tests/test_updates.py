@@ -423,9 +423,13 @@ def test_force_update_cleans_dirty_stable_checkout_without_changing_head(tmp_pat
     assert (
         result == {
             'ok': True,
-            'message': 'webui force-updated to HEAD',
+            'message': (
+                'webui force-updated to HEAD. '
+                'Restart requires fresh approval in chat.'
+            ),
             'target': 'webui',
             'restart_scheduled': True,
+            'restart_required': True,
         }
         and tracked.read_text(encoding='utf-8') == 'experimental content\n'
         and status_ok and status == ''
@@ -696,9 +700,13 @@ def test_force_update_clean_failure_preserves_reset_boundary(tmp_path, monkeypat
     if reset_ok:
         assert result == {
             'ok': True,
-            'message': 'webui force-updated to origin/main',
+            'message': (
+                'webui force-updated to origin/main. '
+                'Restart requires fresh approval in chat.'
+            ),
             'target': 'webui',
             'restart_scheduled': True,
+            'restart_required': True,
         }
         restart.assert_called_once_with()
     else:
@@ -1824,4 +1832,3 @@ def test_apply_update_pull_lock_no_stash_when_clean(tmp_path, monkeypatch):
     assert result.get('lock_conflict') is True
     # No stash pop on a clean pull-lock path.
     assert not any(c[0] == 'stash' for c in git_calls)
-
