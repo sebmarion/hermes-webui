@@ -85,6 +85,48 @@ _ACCOUNT_USAGE_CACHE_MAX_ENTRIES = 64
 _ACCOUNT_USAGE_WORKER_IDLE_SECONDS = 5 * 60
 _ACCOUNT_USAGE_PROVIDERS = frozenset({"openai-codex", "anthropic"})
 
+# Account-usage probes must not clone the live process environment: per-profile
+# streaming/background scopes can temporarily expose another profile's values
+# there. Capture only the operator/runtime fields a Python child may need, and
+# overlay the target profile through the same gateway-parity filter used by
+# normal profile execution. Credential-looking or arbitrary variables are
+# intentionally absent unless they belong to the target profile itself.
+_ACCOUNT_USAGE_BASE_ENV_NAMES = frozenset({
+    "ALL_PROXY",
+    "COMSPEC",
+    "CURL_CA_BUNDLE",
+    "DYLD_LIBRARY_PATH",
+    "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "LANG",
+    "LANGUAGE",
+    "LD_LIBRARY_PATH",
+    "LOGNAME",
+    "NO_PROXY",
+    "PATH",
+    "PATHEXT",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "REQUESTS_CA_BUNDLE",
+    "SHELL",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+    "USER",
+    "VIRTUAL_ENV",
+    "WINDIR",
+})
+_ACCOUNT_USAGE_PROCESS_ENV_BASELINE = {
+    key: value
+    for key, value in os.environ.items()
+    if key in _ACCOUNT_USAGE_BASE_ENV_NAMES or key.startswith("LC_")
+}
+
 # Upper bound on simultaneous profile-isolated quota probe subprocesses.
 # Each probe runs a Python child for up to 35 s; capping concurrency prevents
 # resource exhaustion when the UI polls all providers rapidly. The limit is
@@ -1579,34 +1621,17 @@ def _agent_fetch_account_usage(provider: str, *, base_url: str | None = None, ap
 
 
 def _account_usage_subprocess_env(home: Path, provider: str, api_key: str | None) -> dict[str, str]:
-    env = dict(os.environ)
-    try:
-        from api.config import _thread_ctx
-    except Exception:
-        _thread_ctx = None
-    if bool(getattr(_thread_ctx, "block_process_env_fallback", False)):
-        # Rely on the centralized profile scrub set (api.profiles), which unions
-        # the WebUI provider env vars + the agent auth registry + the non-registry
-        # agent credential fallback (CUSTOM_API_KEY, AWS/Bedrock family). Falling
-        # back to the WebUI-only set keeps the probe fail-closed if that import
-        # fails. (#3961 — don't leave a partial local AWS set here.)
-        _strip = set(_PROVIDER_CREDENTIAL_ENV_VARS)
-        try:
-            from api.profiles import _profile_secret_env_names, get_active_hermes_home
-            _strip.update(_profile_secret_env_names(get_active_hermes_home()))
-        except Exception:
-            _strip.update({"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"})
-        for env_name in _strip:
-            env.pop(env_name, None)
-    env["HERMES_HOME"] = str(Path(home))
+    from api.profiles import (
+        filter_runtime_env_for_gateway_parity,
+        get_profile_runtime_env,
+    )
 
-    # Profile .env values should affect only the child quota probe, not the
-    # WebUI process-global environment. This is especially important for
-    # Anthropic account usage, where the agent resolver reads OAuth/API tokens
-    # from environment variables.
-    for key, value in _load_env_file(Path(home) / ".env").items():
-        if value:
-            env[key] = value
+    env = dict(_ACCOUNT_USAGE_PROCESS_ENV_BASELINE)
+    target_env = filter_runtime_env_for_gateway_parity(
+        get_profile_runtime_env(Path(home))
+    )
+    env.update({key: value for key, value in target_env.items() if value})
+    env["HERMES_HOME"] = str(Path(home))
 
     env_var = _provider_env_var_for((provider or "").strip().lower())
     if env_var and api_key:
@@ -1619,7 +1644,7 @@ def _account_usage_subprocess_env(home: Path, provider: str, api_key: str | None
     pythonpath_parts: list[str] = []
     if _AGENT_DIR:
         pythonpath_parts.append(str(_AGENT_DIR))
-    existing_pythonpath = env.get("PYTHONPATH", "")
+    existing_pythonpath = _ACCOUNT_USAGE_PROCESS_ENV_BASELINE.get("PYTHONPATH", "")
     if existing_pythonpath:
         pythonpath_parts.append(existing_pythonpath)
     if pythonpath_parts:
@@ -2973,17 +2998,11 @@ def _clean_provider_key_from_config(provider_id: str) -> None:
     except Exception:
         return
 
-    if not config_path.exists():
-        return
-
     try:
-        import yaml as _yaml
-
         changed = False
 
         with _cfg_lock:
-            raw = config_path.read_text(encoding="utf-8")
-            cfg = _yaml.safe_load(raw)
+            cfg = _config._load_yaml_config_file(config_path)
             if not isinstance(cfg, dict):
                 return
 

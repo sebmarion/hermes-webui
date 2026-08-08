@@ -1,10 +1,58 @@
 """Regression coverage for #5220 config reload stampede collapse."""
 
+import copy
 import sys
 import threading
 import time
 import types
 from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_config_globals():
+    """Do not leak a temporary config identity into later test modules."""
+    import api.config as config
+
+    with config._cfg_lock:
+        saved_cache = copy.deepcopy(config._cfg_cache)
+        saved_cfg_ref = config.cfg
+        saved_cfg_value = (
+            copy.deepcopy(saved_cfg_ref)
+            if isinstance(saved_cfg_ref, dict) and saved_cfg_ref is not config._cfg_cache
+            else None
+        )
+        saved_scalars = {
+            "path": config._cfg_path,
+            "mtime": config._cfg_mtime,
+            "signature": config._cfg_signature,
+            "fingerprint": config._cfg_fingerprint,
+        }
+    with config._yaml_file_cache_lock:
+        saved_yaml_cache = copy.deepcopy(config._yaml_file_cache)
+
+    try:
+        yield
+    finally:
+        with config._cfg_lock:
+            config._cfg_cache.clear()
+            config._cfg_cache.update(saved_cache)
+            if saved_cfg_ref is config._cfg_cache:
+                config.cfg = config._cfg_cache
+            else:
+                if isinstance(saved_cfg_ref, dict) and saved_cfg_value is not None:
+                    saved_cfg_ref.clear()
+                    saved_cfg_ref.update(saved_cfg_value)
+                config.cfg = saved_cfg_ref
+            config._cfg_path = saved_scalars["path"]
+            config._cfg_mtime = saved_scalars["mtime"]
+            config._cfg_signature = saved_scalars["signature"]
+            config._cfg_fingerprint = saved_scalars["fingerprint"]
+        with config._yaml_file_cache_lock:
+            config._yaml_file_cache.clear()
+            config._yaml_file_cache.update(saved_yaml_cache)
+        config.invalidate_models_cache()
 
 
 def test_stale_readers_collapse_to_single_reload_when_config_is_hot_reload(tmp_path, monkeypatch):
@@ -74,10 +122,10 @@ def test_explicit_reload_config_forces_disk_refresh(tmp_path, monkeypatch):
     calls_lock = threading.Lock()
     real_load = config._load_yaml_config_file_raw
 
-    def _counted_load(path):
+    def _counted_load(path, *args, **kwargs):
         with calls_lock:
             calls["n"] += 1
-        return real_load(path)
+        return real_load(path, *args, **kwargs)
 
     monkeypatch.setattr(config, "_load_yaml_config_file_raw", _counted_load)
     config_path.write_text("marker: hot\n", encoding="utf-8")

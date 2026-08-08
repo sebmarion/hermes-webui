@@ -13,7 +13,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 
+from tests.conftest import HERMES_AGENT
+
+
+@pytest.mark.requires_agent
 def test_profiles_first_then_config_still_initializes_active_profile(tmp_path):
     home = tmp_path / "home"
     base = home / ".hermes"
@@ -27,7 +32,8 @@ def test_profiles_first_then_config_still_initializes_active_profile(tmp_path):
     env.pop("HERMES_BASE_HOME", None)
     env.pop("HERMES_WEBUI_STATE_DIR", None)
     env["HOME"] = str(home)
-    env["PYTHONPATH"] = str(repo_root)
+    env["HERMES_WEBUI_AGENT_DIR"] = str(HERMES_AGENT)
+    env["PYTHONPATH"] = os.pathsep.join((str(repo_root), str(HERMES_AGENT)))
 
     code = """
 import os

@@ -324,7 +324,7 @@ def test_credits_command_fail_opens_on_runtime_error(monkeypatch):
     assert output == "Couldn't fetch credits right now."
 
 
-def test_codex_runtime_command_uses_shared_switch_and_persists(monkeypatch, tmp_path):
+def test_codex_runtime_command_uses_shared_switch_and_persists(monkeypatch):
     """`/codex-runtime` executes through the same shared switch as CLI/gateway."""
     calls = _install_fake_codex_runtime_switch(monkeypatch)
     saved = []
@@ -333,14 +333,15 @@ def test_codex_runtime_command_uses_shared_switch_and_persists(monkeypatch, tmp_
     from api.commands import execute_agent_command
 
     config_data = {"model": {"openai_runtime": "auto"}}
-    monkeypatch.setattr(webui_config, "get_config", lambda: config_data)
-    monkeypatch.setattr(webui_config, "_get_config_path", lambda: tmp_path / "config.yaml")
-    monkeypatch.setattr(
-        webui_config,
-        "_save_yaml_config_file",
-        lambda path, data: saved.append((path, data.copy())),
-    )
-    monkeypatch.setattr(webui_config, "reload_config", lambda: saved.append(("reload", None)))
+
+    def _update(operation):
+        def _persist(candidate):
+            assert candidate is config_data
+            saved.append(candidate.copy())
+
+        return operation(config_data, _persist)
+
+    monkeypatch.setattr(webui_config, "_with_active_config_update", _update)
 
     output = execute_agent_command('/codex-runtime on')
 
@@ -350,9 +351,7 @@ def test_codex_runtime_command_uses_shared_switch_and_persists(monkeypatch, tmp_
         ("parse_args", "on"),
         ("apply", "codex_app_server", "auto"),
     ]
-    assert saved[0][0] == tmp_path / "config.yaml"
-    assert saved[0][1] == {"model": {"openai_runtime": "codex_app_server"}}
-    assert saved[1] == ("reload", None)
+    assert saved == [{"model": {"openai_runtime": "codex_app_server"}}]
 
 
 def test_codex_runtime_command_accepts_underscore_alias(monkeypatch):
@@ -362,9 +361,12 @@ def test_codex_runtime_command_accepts_underscore_alias(monkeypatch):
     from api import config as webui_config
     from api.commands import execute_agent_command
 
-    monkeypatch.setattr(webui_config, "get_config", lambda: {"model": {"openai_runtime": "auto"}})
-    monkeypatch.setattr(webui_config, "_save_yaml_config_file", lambda path, data: None)
-    monkeypatch.setattr(webui_config, "reload_config", lambda: None)
+    config_data = {"model": {"openai_runtime": "auto"}}
+
+    def _update(operation):
+        return operation(config_data, lambda candidate: None)
+
+    monkeypatch.setattr(webui_config, "_with_active_config_update", _update)
 
     output = execute_agent_command('/codex_runtime codex_app_server')
 

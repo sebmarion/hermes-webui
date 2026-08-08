@@ -498,6 +498,81 @@ class TestRemoveProviderKey:
         assert "api_key" not in active["providers"]["openai"]
         assert active["model"] == {"provider": "openai"}
 
+    def test_clean_provider_key_projects_sparse_named_profile_override(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        """Named-profile cleanup must mask the inherited key without copying root."""
+        import yaml
+
+        import api.config as cfg_mod
+        import api.providers as providers
+
+        root = tmp_path / "hermes-root"
+        profile = root / "profiles" / "work"
+        profile.mkdir(parents=True)
+        root_config = root / "config.yaml"
+        child_config = profile / "config.yaml"
+        root_config.write_text(
+            yaml.safe_dump(
+                {
+                    "providers": {
+                        "novita": {
+                            "api_key": "synthetic-root-key",
+                            "base_url": "https://api.novita.example/v1",
+                            "models": ["zai-org/glm-test"],
+                        }
+                    },
+                    "model": {
+                        "provider": "novita",
+                        "default": "zai-org/glm-test",
+                    },
+                    "terminal": {"cwd": "/root-workspace"},
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        child_config.write_text(
+            yaml.safe_dump(
+                {
+                    "_profile": {"inherits": "default", "version": 1},
+                    "providers": {
+                        "novita": {"api_key": "synthetic-child-key"}
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+        root_before = root_config.read_bytes()
+
+        monkeypatch.setattr(cfg_mod, "_get_config_path", lambda: child_config)
+        monkeypatch.setattr(providers, "reload_config", lambda: None)
+        monkeypatch.setattr(providers, "invalidate_providers_cache", lambda: None)
+
+        providers._clean_provider_key_from_config("novita")
+
+        assert root_config.read_bytes() == root_before
+        assert yaml.safe_load(child_config.read_text(encoding="utf-8")) == {
+            "_profile": {
+                "inherits": "default",
+                "version": 1,
+                "masks": [["providers", "novita", "api_key"]],
+            }
+        }
+        effective = cfg_mod._load_yaml_config_file(child_config)
+        assert effective["providers"]["novita"] == {
+            "base_url": "https://api.novita.example/v1",
+            "models": ["zai-org/glm-test"],
+        }
+        assert effective["model"] == {
+            "provider": "novita",
+            "default": "zai-org/glm-test",
+        }
+        assert effective["terminal"] == {"cwd": "/root-workspace"}
+
     def test_clean_custom_provider_key_matches_safe_name_slug(self, monkeypatch, tmp_path):
         """Custom-provider key removal must match the canonical safe name slug."""
         import yaml

@@ -74,16 +74,13 @@ class TestNoSkillToolImportsInsideEnvLock:
     """AST-level: no ``import tools.skills_tool`` or ``import tools.skill_manager_tool``
     inside any ``with _ENV_LOCK:`` block."""
 
-    def test_no_skill_imports_in_env_lock(self):
+    def test_streaming_has_no_process_env_lock_fallback(self):
         source = _read_streaming()
         bodies = _find_env_lock_with_bodies(source)
-        assert bodies, "Expected at least one `with _ENV_LOCK:` block in streaming.py"
-        for body in bodies:
-            found = _imports_in_body(body, _TARGET_MODULES)
-            assert found == [], (
-                f"Found import(s) of {found} inside an `_ENV_LOCK` with-block. "
-                "Move them to _prewarm_skill_tool_modules() outside the lock (#2024)."
-            )
+        assert bodies == [], (
+            "Foreground streaming must use task-local Agent scopes, not a "
+            "process-global environment lock"
+        )
 
 
 class TestPrewarmHelperExists:
@@ -114,62 +111,36 @@ class TestPrewarmHelperExists:
             "streaming.py must reference 'tools.skill_manager_tool'"
         )
 
-    def test_prewarm_called_before_env_lock(self):
-        """_prewarm_skill_tool_modules() must be called before the first
-        ``with _ENV_LOCK:`` in _run_agent_streaming."""
+    def test_prewarm_called_before_dynamic_profile_home_probe(self):
         source = _read_streaming()
         lines = source.splitlines()
         prewarm_line = None
-        first_env_lock_line = None
+        probe_line = None
         for i, line in enumerate(lines, 1):
             if "_prewarm_skill_tool_modules()" in line and prewarm_line is None:
                 prewarm_line = i
-            if "with _ENV_LOCK:" in line and first_env_lock_line is None:
-                first_env_lock_line = i
+            if "_skill_modules_support_profile_home(" in line and probe_line is None:
+                probe_line = i
         assert prewarm_line is not None, "_prewarm_skill_tool_modules() call not found"
-        assert first_env_lock_line is not None, "with _ENV_LOCK: not found"
-        assert prewarm_line < first_env_lock_line, (
+        assert probe_line is not None, "dynamic skill-home probe not found"
+        assert prewarm_line < probe_line, (
             f"_prewarm_skill_tool_modules() (line {prewarm_line}) must appear "
-            f"before the first `with _ENV_LOCK:` (line {first_env_lock_line})"
+            f"before the dynamic profile-home probe (line {probe_line})"
         )
 
 
 class TestSysModulesLookupInEnvLock:
     """Inside the lock, streaming must use the shared cache patch helper."""
 
-    def test_shared_skill_home_patch_helper_used_in_env_lock(self):
+    def test_foreground_does_not_patch_process_global_skill_home(self):
         source = _read_streaming()
-        bodies = _find_env_lock_with_bodies(source)
-        assert bodies, "Expected at least one `with _ENV_LOCK:` block"
-
-        lines = source.splitlines()
-        in_lock = False
-        lock_lines: list[str] = []
-        depth = 0
-        for line in lines:
-            stripped = line.strip()
-            if stripped.startswith("with _ENV_LOCK:"):
-                in_lock = True
-                depth = 0
-                continue
-            if in_lock:
-                # Track indentation depth to know when we exit the with-block
-                if stripped:
-                    # Count leading spaces
-                    indent = len(line) - len(line.lstrip())
-                    if depth == 0:
-                        depth = indent
-                    elif indent < depth and stripped:
-                        in_lock = False
-                        continue
-                lock_lines.append(line)
-
-        lock_source = "\n".join(lock_lines)
-        assert "patch_skill_home_modules" in lock_source, (
-            "Inside `_ENV_LOCK`, streaming must use the shared skill module "
-            "cache patch helper instead of duplicating module-specific logic "
-            "(#2023/#2024)"
+        tree = ast.parse(source)
+        run_fn = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_run_agent_streaming"
         )
+        run_source = ast.get_source_segment(source, run_fn) or ""
+        assert "patch_skill_home_modules" not in run_source
 
     def test_shared_helper_uses_sys_modules_get_for_both_skill_modules(self):
         source = PROFILES_PY.read_text(encoding="utf-8")

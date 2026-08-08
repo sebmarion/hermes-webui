@@ -833,8 +833,6 @@ def _get_disabled_skill_names_for_profile() -> set:
     ``skills.disabled``.
     """
     config_path = _active_profile_config_path()
-    if not config_path.exists():
-        return set()
     try:
         cfg = _load_yaml_config_file(config_path)
     except Exception:
@@ -7571,8 +7569,9 @@ def _read_profile_model_config(
 
     Returns (profile_provider, profile_default_model, profile_config_dict).
     The first two are None when the session has no profile or the profile config
-    is unreadable; profile_config_dict is None in the same cases so callers only
-    pay for one YAML parse.
+    is unreadable. The full dict is None for no profile or a failed read; a
+    readable empty user config remains a dict and may contain hydrated WebUI
+    defaults.
 
     When the session already has an explicit ``requested_provider``, the profile
     ``model.provider`` is not returned (first tuple element is None) so profile
@@ -7580,14 +7579,9 @@ def _read_profile_model_config(
     returned for suffix repair (#5127) only when the profile's configured
     provider matches ``requested_provider`` after normalization.
 
-    perf(webui/session-load-latency) tier2a: the parse is wrapped in a
-    per-process LRU keyed by (profile_name, config_mtime, size). The
-    function fires on every chat-open for sessions under a named
-    profile (resolve_model=1 path), and the YAML parse alone is
-    hundreds of µs to single-digit ms on the Chromebook. Cache TTL
-    60s is a backstop in case mtime resolution is poor on a given
-    filesystem; under normal edits the mtime changes and invalidates
-    immediately.
+    The shared ``api.config`` loader owns parsing and stable composition. Its
+    dependency identity covers both the root config and sparse child override,
+    so an edit to either physical layer invalidates the effective read.
     """
     if not getattr(session, "profile", None):
         return None, None, None
@@ -7598,8 +7592,6 @@ def _read_profile_model_config(
         _profile_name = str(session.profile or "")
         _profile_home = get_hermes_home_for_profile(_profile_name)
         _profile_cfg_path = os.path.join(str(_profile_home), "config.yaml")
-        if not os.path.isfile(_profile_cfg_path):
-            return None, None, None
         _pcfg = _read_profile_config_cached(_profile_name, _profile_cfg_path)
         if _pcfg is None:
             return None, None, None
@@ -7625,87 +7617,19 @@ def _read_profile_model_config(
     return _provider, _default, _pcfg
 
 
-# perf(webui/session-load-latency) tier2a: process-wide cache for parsed
-# profile config.yaml. Key = (profile_name, inode, mtime, size); value = parsed
-# dict. inode tracks atomic-rename edits (most editors replace files, giving a
-# new inode on Linux). mtime+size auto-invalidates on in-place edits; a 60s TTL
-# is the backstop in case of coarse mtime resolution (some network filesystems
-# round mtime to whole seconds — the size guard catches a write of equal-length
-# bytes within the same second). On cache hit, a full-content comparison catches
-# any in-place rewrite that inode+mtime+size missed (Greptile P1, PR#5803
-# discussion_r3548477915). Reading and comparing the full file content (~1-10KB)
-# is much cheaper than yaml.safe_load(). Reads are guarded by a single Lock to
-# keep the hot path simple; the underlying yaml.safe_load is the slow step, not
-# the lock, so contention is bounded.
-_PROFILE_CONFIG_CACHE: "dict[tuple, tuple[float, str, dict]]" = {}
-_PROFILE_CONFIG_CACHE_TTL_SECONDS = 60.0
-_PROFILE_CONFIG_CACHE_LOCK = threading.Lock()
-
-
 def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None:
-    """Return parsed profile config, caching by (inode, mtime, size) with
-    TTL backstop and full-content verification.
+    """Return the effective root-backed config for one named profile.
 
-    The full-content comparison reads the current file and compares it to a
-    copy stored in the cache entry. This catches any in-place rewrite where
-    inode+mtime+size are identical, regardless of where in the file the change
-    occurs — unlike a fixed-length prefix comparison, edits to fields after the
-    first N characters are always detected. Reading and comparing the full file
-    content (~1-10KB for a typical config.yaml) is much cheaper than
-    yaml.safe_load().
-
-    NOTE: The cache key uses inode+mtime+size to handle the common cases
-    (atomic-rename editors -> new inode; in-place editors -> mtime/size
-    change). The full-content comparison is a backstop for the rare case where
-    all three collide (e.g., sed -i on a filesystem with coarse mtime
-    resolution, writing the same byte count).
+    ``api.config`` owns the physical-file parse cache and includes both the
+    root and sparse override in its dependency signature. Keeping a second
+    child-only cache here would serve stale provider/model routes after a root
+    edit, so this hot path delegates to that shared boundary.
     """
     try:
-        st = os.stat(cfg_path)
-    except OSError:
-        return None
-    mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
-    size = int(getattr(st, "st_size", 0) or 0)
-    inode = int(getattr(st, "st_ino", 0) or 0)
-    key = (str(profile_name or ""), inode, mtime, size)
-    now = time.monotonic()
-    with _PROFILE_CONFIG_CACHE_LOCK:
-        cached = _PROFILE_CONFIG_CACHE.get(key)
-        if cached is not None:
-            cached_at, cached_content, cached_dict = cached
-            if (now - cached_at) <= _PROFILE_CONFIG_CACHE_TTL_SECONDS:
-                # Full content comparison catches any in-place rewrite where
-                # inode+mtime+size are identical but the file content changed.
-                # Reading and comparing the full file (~1-10KB) is cheaper than
-                # yaml.safe_load(). Unlike a fixed-length prefix, this detects
-                # edits anywhere in the file. Greptile P1 (PR#5803).
-                _current_content = None
-                try:
-                    with open(cfg_path, "r", encoding="utf-8") as _f:
-                        _current_content = _f.read()
-                except Exception:
-                    pass
-                if _current_content == cached_content:
-                    return cached_dict
-                # Content changed while key collided — fall through to re-parse
-    import yaml
-    try:
-        with open(cfg_path, encoding="utf-8") as _f:
-            content = _f.read()
-            parsed = yaml.safe_load(content) or {}
+        parsed = get_config_for_profile_home(Path(cfg_path).parent)
     except Exception:
         return None
-    if not isinstance(parsed, dict):
-        return None
-    with _PROFILE_CONFIG_CACHE_LOCK:
-        _PROFILE_CONFIG_CACHE[key] = (now, content, parsed)
-        # Cap the cache at 32 entries; profiles are bounded in practice
-        # and unbounded growth would be a leak.
-        if len(_PROFILE_CONFIG_CACHE) > 32:
-            # Drop the oldest entry by insertion order (dict is ordered).
-            for old_key in list(_PROFILE_CONFIG_CACHE.keys())[:max(0, len(_PROFILE_CONFIG_CACHE) - 32)]:
-                _PROFILE_CONFIG_CACHE.pop(old_key, None)
-    return parsed
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _load_profile_config_dict(session) -> dict | None:
@@ -7715,16 +7639,8 @@ def _load_profile_config_dict(session) -> dict | None:
     try:
         from api.profiles import get_hermes_home_for_profile
 
-        _profile_cfg_path = os.path.join(
-            str(get_hermes_home_for_profile(session.profile)),
-            "config.yaml",
-        )
-        if not os.path.isfile(_profile_cfg_path):
-            return None
-        import yaml
-
-        with open(_profile_cfg_path, encoding="utf-8") as _f:
-            _pcfg = yaml.safe_load(_f) or {}
+        _profile_home = get_hermes_home_for_profile(session.profile)
+        _pcfg = get_config_for_profile_home(_profile_home)
         return _pcfg if isinstance(_pcfg, dict) else None
     except Exception:
         logger.warning(
@@ -30817,7 +30733,7 @@ def _handle_session_import(handler, body):
 
 
 # ── MCP Server helpers ──
-from api.config import get_config, _save_yaml_config_file, _get_config_path, reload_config
+from api.config import get_config, _with_active_config_update
 
 def _mask_secrets(obj):
     """Mask sensitive values in env vars and headers."""
@@ -31612,17 +31528,18 @@ def _handle_mcp_server_delete(handler, name):
     name = unquote(name)
     if not name:
         return bad(handler, "name is required")
-    cfg = get_config()
-    servers = cfg.get("mcp_servers", {})
-    if not isinstance(servers, dict):
-        servers = {}
-    if name not in servers:
-        return bad(handler, f"MCP server '{name}' not found", 404)
-    del servers[name]
-    cfg["mcp_servers"] = servers
-    _save_yaml_config_file(_get_config_path(), cfg)
-    reload_config()
-    return j(handler, {"ok": True, "deleted": name})
+    def _delete(cfg, persist):
+        servers = cfg.get("mcp_servers", {})
+        if not isinstance(servers, dict):
+            servers = {}
+        if name not in servers:
+            return bad(handler, f"MCP server '{name}' not found", 404)
+        del servers[name]
+        cfg["mcp_servers"] = servers
+        persist(cfg)
+        return j(handler, {"ok": True, "deleted": name})
+
+    return _with_active_config_update(_delete)
 
 
 def _handle_mcp_server_toggle(handler, name, body):
@@ -31634,19 +31551,20 @@ def _handle_mcp_server_toggle(handler, name, body):
     if "enabled" not in body:
         return bad(handler, "enabled field is required")
     enabled = bool(body["enabled"])
-    cfg = get_config()
-    servers = cfg.get("mcp_servers", {})
-    if not isinstance(servers, dict):
-        servers = {}
-    if name not in servers:
-        return bad(handler, f"MCP server '{name}' not found", 404)
-    if not isinstance(servers[name], dict):
-        return bad(handler, f"MCP server '{name}' has invalid config", 400)
-    servers[name]["enabled"] = enabled
-    cfg["mcp_servers"] = servers
-    _save_yaml_config_file(_get_config_path(), cfg)
-    reload_config()
-    return j(handler, {"ok": True, "name": name, "enabled": enabled})
+    def _toggle(cfg, persist):
+        servers = cfg.get("mcp_servers", {})
+        if not isinstance(servers, dict):
+            servers = {}
+        if name not in servers:
+            return bad(handler, f"MCP server '{name}' not found", 404)
+        if not isinstance(servers[name], dict):
+            return bad(handler, f"MCP server '{name}' has invalid config", 400)
+        servers[name]["enabled"] = enabled
+        cfg["mcp_servers"] = servers
+        persist(cfg)
+        return j(handler, {"ok": True, "name": name, "enabled": enabled})
+
+    return _with_active_config_update(_toggle)
 
 
 _MASKED_PLACEHOLDER = "••••••"
@@ -31676,31 +31594,42 @@ def _handle_mcp_server_update(handler, name, body):
     if not name:
         return bad(handler, "name is required")
     # Validate: must have url (http) or command (stdio)
-    server_cfg = {}
-    cfg = get_config()
-    servers = cfg.get("mcp_servers", {})
-    if not isinstance(servers, dict):
-        servers = {}
-    existing_cfg = servers.get(name, {})
-    if body.get("url"):
-        server_cfg["url"] = body["url"].strip()
-        if body.get("headers"):
-            server_cfg["headers"] = _strip_masked_values(body["headers"], existing_cfg.get("headers", {}))
-    elif body.get("command"):
-        server_cfg["command"] = body["command"].strip()
-        if body.get("args"):
-            server_cfg["args"] = body["args"] if isinstance(body["args"], list) else [body["args"]]
-        if body.get("env"):
-            server_cfg["env"] = _strip_masked_values(body["env"], existing_cfg.get("env", {}))
-    else:
-        return bad(handler, "url or command is required")
-    if body.get("timeout") is not None:
-        try:
-            server_cfg["timeout"] = int(body["timeout"])
-        except (ValueError, TypeError):
-            pass
-    servers[name] = server_cfg
-    cfg["mcp_servers"] = servers
-    _save_yaml_config_file(_get_config_path(), cfg)
-    reload_config()
-    return j(handler, {"ok": True, "server": _server_summary(name, server_cfg)})
+    def _update(cfg, persist):
+        server_cfg = {}
+        servers = cfg.get("mcp_servers", {})
+        if not isinstance(servers, dict):
+            servers = {}
+        existing_cfg = servers.get(name, {})
+        if body.get("url"):
+            server_cfg["url"] = body["url"].strip()
+            if body.get("headers"):
+                server_cfg["headers"] = _strip_masked_values(
+                    body["headers"],
+                    existing_cfg.get("headers", {}),
+                )
+        elif body.get("command"):
+            server_cfg["command"] = body["command"].strip()
+            if body.get("args"):
+                server_cfg["args"] = (
+                    body["args"]
+                    if isinstance(body["args"], list)
+                    else [body["args"]]
+                )
+            if body.get("env"):
+                server_cfg["env"] = _strip_masked_values(
+                    body["env"],
+                    existing_cfg.get("env", {}),
+                )
+        else:
+            return bad(handler, "url or command is required")
+        if body.get("timeout") is not None:
+            try:
+                server_cfg["timeout"] = int(body["timeout"])
+            except (ValueError, TypeError):
+                pass
+        servers[name] = server_cfg
+        cfg["mcp_servers"] = servers
+        persist(cfg)
+        return j(handler, {"ok": True, "server": _server_summary(name, server_cfg)})
+
+    return _with_active_config_update(_update)

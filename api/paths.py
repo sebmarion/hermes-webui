@@ -83,7 +83,12 @@ def _has_extended_attributes(path: Path) -> bool:
         raise
 
 
-def _require_writable_target(write_path: Path) -> os.stat_result | None:
+def _require_writable_target(
+    write_path: Path,
+    *,
+    reject_aliases: bool = False,
+    expected_identity: tuple[int, int] | None = None,
+) -> os.stat_result | None:
     """Reject writes to a read-only target before any replacement work.
 
     ``os.replace`` happily swaps a fresh inode over a ``0444`` file when the
@@ -96,16 +101,45 @@ def _require_writable_target(write_path: Path) -> os.stat_result | None:
     ``None`` if the target vanished concurrently.
     """
     try:
-        probe_fd = os.open(write_path, os.O_WRONLY)
+        flags = os.O_WRONLY
+        if reject_aliases:
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+        probe_fd = os.open(write_path, flags)
     except FileNotFoundError:
         return None
+    except OSError as exc:
+        if reject_aliases:
+            raise RuntimeError(
+                f"Refusing linked config target at write boundary: {write_path}"
+            ) from exc
+        raise
     try:
-        return os.fstat(probe_fd)
+        opened_stat = os.fstat(probe_fd)
+        if reject_aliases:
+            opened_identity = (opened_stat.st_dev, opened_stat.st_ino)
+            if (
+                not stat.S_ISREG(opened_stat.st_mode)
+                or opened_stat.st_nlink > 1
+                or (
+                    expected_identity is not None
+                    and opened_identity != expected_identity
+                )
+            ):
+                raise RuntimeError(
+                    f"Refusing aliased config target at write boundary: {write_path}"
+                )
+        return opened_stat
     finally:
         os.close(probe_fd)
 
 
-def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+def _atomic_write_text(
+    path: Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+    reject_aliases: bool = False,
+) -> None:
     """Atomically replace *path* with *text*.
 
     Writes to a temp file in the same directory, flushes + ``os.fsync``, then
@@ -152,12 +186,35 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
     The caller is responsible for ensuring ``path.parent`` exists.
     """
     path = Path(path)
-    symlink_target = path.resolve(strict=False) if path.is_symlink() else None
+    guarded_stat = None
+    guarded_identity = None
+    if reject_aliases:
+        try:
+            guarded_stat = path.lstat()
+        except FileNotFoundError:
+            guarded_stat = None
+        if guarded_stat is not None:
+            if (
+                not stat.S_ISREG(guarded_stat.st_mode)
+                or guarded_stat.st_nlink > 1
+            ):
+                raise RuntimeError(
+                    f"Refusing linked or aliased config target at write boundary: {path}"
+                )
+            guarded_identity = (guarded_stat.st_dev, guarded_stat.st_ino)
+    symlink_target = (
+        path.resolve(strict=False)
+        if not reject_aliases and path.is_symlink()
+        else None
+    )
     write_path = symlink_target or path
-    try:
-        existing_stat = os.stat(write_path)
-    except FileNotFoundError:
-        existing_stat = None
+    if reject_aliases:
+        existing_stat = guarded_stat
+    else:
+        try:
+            existing_stat = os.stat(write_path)
+        except FileNotFoundError:
+            existing_stat = None
     mode = stat.S_IMODE(existing_stat.st_mode) if existing_stat else None
 
     def _verify_symlink_target() -> None:
@@ -165,6 +222,10 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
             raise RuntimeError("config symlink target changed during atomic write")
 
     def _write_in_place() -> None:
+        if reject_aliases:
+            raise RuntimeError(
+                f"Refusing non-atomic or aliased config write: {write_path}"
+            )
         with _IN_PLACE_WRITE_LOCK:
             if existing_stat is None or not stat.S_ISREG(existing_stat.st_mode):
                 raise PermissionError(f"Cannot replace config path: {write_path}")
@@ -191,15 +252,24 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
                     os.close(fallback_fd)
 
     if existing_stat is not None and stat.S_ISREG(existing_stat.st_mode):
-        probed_stat = _require_writable_target(write_path)
+        probed_stat = _require_writable_target(
+            write_path,
+            reject_aliases=reject_aliases,
+            expected_identity=guarded_identity,
+        )
         if probed_stat is not None and stat.S_ISREG(probed_stat.st_mode):
             existing_stat = probed_stat
             mode = stat.S_IMODE(existing_stat.st_mode)
         else:
             existing_stat = probed_stat
             mode = None
+        has_extended_attributes = _has_extended_attributes(write_path)
+        if reject_aliases and has_extended_attributes:
+            raise RuntimeError(
+                f"Refusing to replace config with extended attributes in no-alias mode: {write_path}"
+            )
         if existing_stat is not None and (
-            existing_stat.st_nlink > 1 or _has_extended_attributes(write_path)
+            existing_stat.st_nlink > 1 or has_extended_attributes
         ):
             _write_in_place()
             return
@@ -207,6 +277,8 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
     try:
         fd, tmp = _create_atomic_temp_file(write_path, existing=existing_stat is not None)
     except PermissionError:
+        if reject_aliases:
+            raise
         _write_in_place()
         return
     owns_fd = True
@@ -245,6 +317,25 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
             elif mode is not None:
                 os.chmod(tmp, mode)
             os.fsync(f.fileno())
+        if reject_aliases:
+            try:
+                current_stat = path.lstat()
+            except FileNotFoundError:
+                current_stat = None
+            if guarded_identity is None:
+                if current_stat is not None:
+                    raise RuntimeError(
+                        f"Config target appeared during guarded write: {path}"
+                    )
+            elif (
+                current_stat is None
+                or not stat.S_ISREG(current_stat.st_mode)
+                or current_stat.st_nlink > 1
+                or (current_stat.st_dev, current_stat.st_ino) != guarded_identity
+            ):
+                raise RuntimeError(
+                    f"Config target became linked or changed during guarded write: {path}"
+                )
         _verify_symlink_target()
         os.replace(tmp, write_path)
         _fsync_directory(write_path.parent)

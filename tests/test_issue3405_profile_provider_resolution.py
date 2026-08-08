@@ -292,24 +292,15 @@ class TestReadProfileModelConfig:
         result = _read_profile_model_config(FakeSession(), None)
         assert result == (None, None, None)
 
-    def test_returns_none_when_explicit_provider(self):
-        """Explicit requested_provider skips profile config read."""
-        from api.routes import _read_profile_model_config
-
-        class FakeSession:
-            profile = "work"
-
-        result = _read_profile_model_config(FakeSession(), "openai-codex")
-        assert result == (None, None, None)
-
-    def test_reads_profile_config(self, tmp_path):
-        """Reads model.provider and model.default from profile config.yaml."""
+    def test_explicit_provider_does_not_inject_mismatched_profile_provider(self, tmp_path):
+        """An explicit request wins without hiding the readable profile config."""
         from api.routes import _read_profile_model_config
         import yaml
 
-        config_path = tmp_path / "config.yaml"
-        config_path.write_text(
-            yaml.dump({"model": {"provider": "anthropic", "default": "claude-sonnet-4.6"}}),
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"model": {"provider": "anthropic", "default": "claude-sonnet-4.6"}}
+            ),
             encoding="utf-8",
         )
 
@@ -317,13 +308,43 @@ class TestReadProfileModelConfig:
             profile = "work"
 
         with patch("api.profiles.get_hermes_home_for_profile", return_value=tmp_path):
+            result = _read_profile_model_config(FakeSession(), "openai-codex")
+
+        assert result[:2] == (None, None)
+        assert result[2]["model"] == {
+            "provider": "anthropic",
+            "default": "claude-sonnet-4.6",
+        }
+
+    def test_reads_profile_config(self, tmp_path):
+        """Reads inherited model.provider and model.default for a sparse profile."""
+        from api.routes import _read_profile_model_config
+        import yaml
+
+        root = tmp_path / "hermes-root"
+        profile_home = root / "profiles" / "work"
+        profile_home.mkdir(parents=True)
+        (root / "config.yaml").write_text(
+            yaml.safe_dump(
+                {"model": {"provider": "anthropic", "default": "claude-sonnet-4.6"}}
+            ),
+            encoding="utf-8",
+        )
+
+        class FakeSession:
+            profile = "work"
+
+        with patch("api.profiles.get_hermes_home_for_profile", return_value=profile_home):
             result = _read_profile_model_config(FakeSession(), None)
 
         assert result[:2] == ("anthropic", "claude-sonnet-4.6")
-        assert result[2] == {"model": {"provider": "anthropic", "default": "claude-sonnet-4.6"}}
+        assert result[2]["model"] == {
+            "provider": "anthropic",
+            "default": "claude-sonnet-4.6",
+        }
 
-    def test_missing_config_returns_none(self):
-        """Missing config.yaml returns (None, None, None)."""
+    def test_missing_config_has_no_model_injection(self):
+        """A standalone home without config has no model-specific values."""
         from api.routes import _read_profile_model_config
         import tempfile
 
@@ -334,7 +355,9 @@ class TestReadProfileModelConfig:
             with patch("api.profiles.get_hermes_home_for_profile", return_value=Path(td)):
                 result = _read_profile_model_config(FakeSession(), None)
 
-        assert result == (None, None, None)
+        assert result[:2] == (None, None)
+        assert isinstance(result[2], dict)
+        assert "model" not in result[2]
 
     def test_empty_provider_returns_none(self, tmp_path):
         """Empty model.provider in config returns (None, default, config)."""
@@ -353,7 +376,11 @@ class TestReadProfileModelConfig:
         with patch("api.profiles.get_hermes_home_for_profile", return_value=tmp_path):
             result = _read_profile_model_config(FakeSession(), None)
 
-        assert result == (None, "claude-sonnet-4.6", {"model": {"provider": "", "default": "claude-sonnet-4.6"}})
+        assert result[:2] == (None, "claude-sonnet-4.6")
+        assert result[2]["model"] == {
+            "provider": "",
+            "default": "claude-sonnet-4.6",
+        }
 
 
 class TestStreamingWorkerEnrichment:

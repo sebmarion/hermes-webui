@@ -28,6 +28,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 import api.config as config
 import api.profiles as profiles
 
@@ -286,8 +288,8 @@ def test_active_request_scope_restores_state_when_home_reset_fails(monkeypatch, 
         profiles.clear_request_profile()
 
 
-def test_active_request_legacy_scope_still_mirrors_process_env(monkeypatch, tmp_path):
-    """Live-model request scope still mirrors env for agent-side readers."""
+def test_active_request_scope_keeps_process_env_and_uses_thread_scope(monkeypatch, tmp_path):
+    """Named-profile reads use context-local env without mutating the process."""
     base = tmp_path / ".hermes"
     (base / "profiles" / "work").mkdir(parents=True)
     (base / "profiles" / "work" / ".env").write_text(
@@ -299,7 +301,8 @@ def test_active_request_legacy_scope_still_mirrors_process_env(monkeypatch, tmp_
     profiles.set_request_profile("work")
     try:
         with profiles.profile_env_for_active_request("test"):
-            assert os.environ.get("ISSUE_3957_PROBE") == "from-work-profile"
+            assert os.environ.get("ISSUE_3957_PROBE") == "from-process-env"
+            assert config._thread_local_env_value("ISSUE_3957_PROBE") == "from-work-profile"
         assert os.environ.get("ISSUE_3957_PROBE") == "from-process-env"
     finally:
         profiles.clear_request_profile()
@@ -383,8 +386,8 @@ def test_providers_and_models_routes_wrap_in_profile_env():
     assert "_get_models_cache_path" in config_src
 
 
-def test_models_sync_rebuild_uses_legacy_mirrored_env(monkeypatch, tmp_path):
-    """The budget<=0 sync rebuild still mirrors profile env into os.environ."""
+def test_models_sync_rebuild_uses_profile_thread_env_without_process_mutation(monkeypatch, tmp_path):
+    """The budget<=0 sync rebuild keeps profile env context-local."""
     base = tmp_path / ".hermes"
     (base / "profiles" / "work").mkdir(parents=True)
     (base / "profiles" / "work" / ".env").write_text(
@@ -415,7 +418,7 @@ def test_models_sync_rebuild_uses_legacy_mirrored_env(monkeypatch, tmp_path):
     finally:
         profiles.clear_request_profile()
 
-    assert seen["process_env"] == "from-work-profile"
+    assert seen["process_env"] == "from-process-env"
     assert seen["thread_env"] == "from-work-profile"
     assert os.environ.get("ISSUE_3957_PROBE") == "from-process-env"
     assert result["groups"] == []
@@ -479,6 +482,9 @@ def test_detached_worker_scope_binds_profile_on_new_thread(monkeypatch, tmp_path
         with profiles.profile_scope_for_detached_worker("work", "test-worker"):
             out["inside_name"] = config._get_models_cache_path().name
             out["inside_env"] = os.environ.get("ISSUE_3957_WPROBE")
+            out["inside_thread_env"] = config._thread_local_env_value(
+                "ISSUE_3957_WPROBE"
+            )
         out["after_name"] = config._get_models_cache_path().name
         out["after_env"] = os.environ.get("ISSUE_3957_WPROBE")
 
@@ -489,7 +495,8 @@ def test_detached_worker_scope_binds_profile_on_new_thread(monkeypatch, tmp_path
     assert out["before_name"] == "models_cache.json"  # default (no scope)
     assert out["before_env"] is None
     assert out["inside_name"] == "models_cache.work.json"  # profile-scoped
-    assert out["inside_env"] == "worker-env"
+    assert out["inside_env"] is None
+    assert out["inside_thread_env"] == "worker-env"
     assert out["after_name"] == "models_cache.json"  # restored
     assert out["after_env"] is None
 
@@ -536,7 +543,7 @@ def test_detached_worker_scope_blocks_pool_env_seed(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENROUTER_API_KEY", "from-process-env")
 
     with profiles.profile_scope_for_detached_worker("work", "test-worker"):
-        assert os.environ.get("OPENROUTER_API_KEY") is None
+        assert os.environ.get("OPENROUTER_API_KEY") == "from-process-env"
         assert config._has_explicit_pool_credentials("openrouter") is False
         assert getattr(config._thread_ctx, "block_process_env_fallback", False) is True
 
@@ -561,7 +568,7 @@ def test_detached_worker_scope_scrubs_absent_custom_provider_key_env(monkeypatch
     monkeypatch.setenv("ISSUE_3957_CUSTOM_KEY", "from-process-env")
 
     with profiles.profile_scope_for_detached_worker("work", "test-worker"):
-        assert os.environ.get("ISSUE_3957_CUSTOM_KEY") is None
+        assert os.environ.get("ISSUE_3957_CUSTOM_KEY") == "from-process-env"
         assert config._thread_local_env_value("ISSUE_3957_CUSTOM_KEY") == ""
 
     assert os.environ.get("ISSUE_3957_CUSTOM_KEY") == "from-process-env"
@@ -586,6 +593,41 @@ def test_account_usage_subprocess_env_blocks_process_default_key(monkeypatch, tm
 
     assert env["HERMES_HOME"] == str(work_home)
     assert "OPENAI_API_KEY" not in env
+
+
+def test_account_usage_subprocess_env_uses_filtered_target_profile_baseline(
+    monkeypatch,
+    tmp_path,
+):
+    """Quota probes cannot clone another profile's ambient process state."""
+    from api.providers import _account_usage_subprocess_env
+
+    base = tmp_path / ".hermes"
+    work_home = base / "profiles" / "work"
+    work_home.mkdir(parents=True)
+    (work_home / ".env").write_text(
+        "B_ONLY_SETTING=child-value\n"
+        "PATH=poisoned-child-path\n"
+        "HOME=poisoned-child-home\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+    monkeypatch.setenv("A_ONLY_PRIVATE_KEY", "other-profile-secret")
+    operator_path = os.environ["PATH"]
+    operator_home = os.environ["HOME"]
+
+    profiles.set_request_profile("work")
+    try:
+        with profiles.profile_env_for_active_request_readonly("quota probe"):
+            env = _account_usage_subprocess_env(work_home, "openai", None)
+    finally:
+        profiles.clear_request_profile()
+
+    assert "A_ONLY_PRIVATE_KEY" not in env
+    assert env["B_ONLY_SETTING"] == "child-value"
+    assert env["HERMES_HOME"] == str(work_home)
+    assert env["PATH"] == operator_path
+    assert env["HOME"] == operator_home
 
 
 def test_active_request_scope_installs_secret_scope(monkeypatch, tmp_path):
@@ -632,9 +674,10 @@ def test_active_request_scope_installs_secret_scope(monkeypatch, tmp_path):
             sys.modules.pop("agent", None)
         profiles._secret_scope_available = None
 
-    # Verify the scope was set with profile env only
+    # The target profile explicitly masks known credentials that it does not
+    # own, so Agent's non-multiplex overlay cannot fall through to process env.
     assert "set_scope" in call_log
-    assert "OPENROUTER_API_KEY" not in call_log["set_scope"]
+    assert call_log["set_scope"]["OPENROUTER_API_KEY"] == ""
     assert "HERMES_HOME" in call_log["set_scope"]
     # Verify reset was called
     assert call_log.get("reset_called") is True
@@ -694,12 +737,182 @@ def test_detached_worker_scope_installs_secret_scope(monkeypatch, tmp_path):
             sys.modules.pop("agent", None)
         profiles._secret_scope_available = None
 
-    # Verify the scope was set with profile env only
+    # The detached scope uses the same fail-closed credential mask.
     assert "set_scope" in call_log
-    assert "OPENROUTER_API_KEY" not in call_log["set_scope"]
+    assert call_log["set_scope"]["OPENROUTER_API_KEY"] == ""
     assert "HERMES_HOME" in call_log["set_scope"]
     # Verify reset was called
     assert call_log.get("reset_called") is True
+
+
+@pytest.mark.parametrize("scope_kind", ["background", "readonly"])
+def test_named_profile_scope_fails_closed_without_agent_secret_scope(
+    monkeypatch,
+    tmp_path,
+    scope_kind,
+):
+    base = tmp_path / ".hermes"
+    work_home = base / "profiles" / "work"
+    work_home.mkdir(parents=True)
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+    monkeypatch.setattr(profiles, "_resolve_secret_scope_module", lambda: None)
+
+    if scope_kind == "background":
+        scope = profiles.profile_env_for_background_worker(
+            "work",
+            patch_skill_modules=False,
+        )
+    else:
+        profiles.set_request_profile("work")
+        scope = profiles.profile_env_for_active_request_readonly("test")
+
+    try:
+        with pytest.raises(RuntimeError, match="secret-scope"):
+            with scope:
+                raise AssertionError("named profile body must not run unscoped")
+    finally:
+        if scope_kind == "readonly":
+            profiles.clear_request_profile()
+
+
+@pytest.mark.parametrize("scope_kind", ["background", "readonly"])
+def test_named_profile_scope_fails_closed_when_secret_scope_setter_raises(
+    monkeypatch,
+    tmp_path,
+    scope_kind,
+):
+    base = tmp_path / ".hermes"
+    work_home = base / "profiles" / "work"
+    work_home.mkdir(parents=True)
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+
+    class _BrokenSecretScope:
+        @staticmethod
+        def set_secret_scope(_mapping):
+            raise RuntimeError("synthetic secret-scope failure")
+
+        @staticmethod
+        def reset_secret_scope(_token):
+            raise AssertionError("no token was installed")
+
+    monkeypatch.setattr(
+        profiles,
+        "_resolve_secret_scope_module",
+        lambda: _BrokenSecretScope,
+    )
+
+    if scope_kind == "background":
+        scope = profiles.profile_env_for_background_worker(
+            "work",
+            patch_skill_modules=False,
+        )
+    else:
+        profiles.set_request_profile("work")
+        scope = profiles.profile_env_for_active_request_readonly("test")
+
+    try:
+        with pytest.raises(RuntimeError, match="secret-scope"):
+            with scope:
+                raise AssertionError("named profile body must not run unscoped")
+    finally:
+        if scope_kind == "readonly":
+            profiles.clear_request_profile()
+
+
+def test_named_readonly_scope_fails_closed_without_home_override(monkeypatch, tmp_path):
+    base = tmp_path / ".hermes"
+    (base / "profiles" / "work").mkdir(parents=True)
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+    monkeypatch.setattr(profiles, "_resolve_hermes_home_override", lambda: None)
+
+    profiles.set_request_profile("work")
+    try:
+        with pytest.raises(RuntimeError, match="HERMES_HOME"):
+            with profiles.profile_env_for_active_request_readonly("test"):
+                raise AssertionError("named request must not run without home scope")
+    finally:
+        profiles.clear_request_profile()
+
+
+def test_named_background_scope_fails_closed_when_home_override_setter_raises(
+    monkeypatch,
+    tmp_path,
+):
+    from api import config as config_api
+
+    base = tmp_path / ".hermes"
+    (base / "profiles" / "work").mkdir(parents=True)
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+
+    scope_calls = []
+
+    class _TrackingSecretScope:
+        @staticmethod
+        def set_secret_scope(_mapping):
+            scope_calls.append("set")
+            return "scope-token"
+
+        @staticmethod
+        def reset_secret_scope(token):
+            scope_calls.append(("reset", token))
+
+    class _BrokenHomeOverride:
+        @staticmethod
+        def set_hermes_home_override(_home):
+            raise RuntimeError("synthetic home override failure")
+
+        @staticmethod
+        def reset_hermes_home_override(_token):
+            raise AssertionError("no home token was installed")
+
+    monkeypatch.setattr(
+        profiles,
+        "_resolve_secret_scope_module",
+        lambda: _TrackingSecretScope,
+    )
+    monkeypatch.setattr(
+        profiles,
+        "_resolve_hermes_home_override",
+        lambda: _BrokenHomeOverride,
+    )
+    before_env = dict(getattr(config_api._thread_ctx, "env", {}))
+    before_block = bool(
+        getattr(config_api._thread_ctx, "block_process_env_fallback", False)
+    )
+    body_ran = False
+
+    with pytest.raises(RuntimeError, match="HERMES_HOME"):
+        with profiles.profile_env_for_background_worker(
+            "work",
+            patch_skill_modules=False,
+        ):
+            body_ran = True
+
+    assert body_ran is False
+    assert scope_calls == ["set", ("reset", "scope-token")]
+    assert dict(getattr(config_api._thread_ctx, "env", {})) == before_env
+    assert bool(
+        getattr(config_api._thread_ctx, "block_process_env_fallback", False)
+    ) is before_block
+
+
+def test_renamed_root_alias_background_scope_keeps_root_process_credentials(
+    monkeypatch,
+):
+    from agent import secret_scope
+
+    monkeypatch.setattr(
+        profiles,
+        "_is_root_profile",
+        lambda name: name in {"default", "kinni"},
+    )
+    monkeypatch.setenv("ROOT_ALIAS_PLUGIN_TOKEN", "root-alias-secret")
+
+    with profiles.profile_env_for_background_worker(
+        "kinni",
+        patch_skill_modules=False,
+    ):
+        assert secret_scope.get_secret("ROOT_ALIAS_PLUGIN_TOKEN") == "root-alias-secret"
 
 
 def test_account_usage_subprocess_env_strips_bedrock_keys(monkeypatch, tmp_path):
@@ -798,8 +1011,8 @@ def test_detached_worker_scope_scrubs_anthropic_token_aliases(monkeypatch, tmp_p
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "process-default-oauth-token")
 
     with profiles.profile_scope_for_detached_worker("work", "test-worker"):
-        assert os.environ.get("ANTHROPIC_TOKEN") is None
-        assert os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") is None
+        assert os.environ.get("ANTHROPIC_TOKEN") == "process-default-anthropic-token"
+        assert os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") == "process-default-oauth-token"
         assert config._thread_local_env_value("ANTHROPIC_TOKEN") == ""
         assert config._thread_local_env_value("CLAUDE_CODE_OAUTH_TOKEN") == ""
 
@@ -856,13 +1069,13 @@ def test_detached_worker_scope_scrubs_non_registry_agent_creds(monkeypatch, tmp_
     monkeypatch.setenv("MSI_ENDPOINT", "http://169.254.169.254/msi")
 
     with profiles.profile_scope_for_detached_worker("work", "test-worker"):
-        assert os.environ.get("CUSTOM_API_KEY") is None
-        assert os.environ.get("AWS_PROFILE") is None
-        assert os.environ.get("AWS_SECRET_ACCESS_KEY") is None
-        assert os.environ.get("AZURE_CLIENT_SECRET") is None
-        assert os.environ.get("AZURE_FOUNDRY_API_KEY") is None
-        assert os.environ.get("IDENTITY_ENDPOINT") is None
-        assert os.environ.get("MSI_ENDPOINT") is None
+        assert os.environ.get("CUSTOM_API_KEY") == "process-default-custom-key"
+        assert os.environ.get("AWS_PROFILE") == "process-default-aws-profile"
+        assert os.environ.get("AWS_SECRET_ACCESS_KEY") == "process-default-aws-secret"
+        assert os.environ.get("AZURE_CLIENT_SECRET") == "process-default-azure-secret"
+        assert os.environ.get("AZURE_FOUNDRY_API_KEY") == "process-default-foundry-key"
+        assert os.environ.get("IDENTITY_ENDPOINT") == "http://169.254.169.254/msi"
+        assert os.environ.get("MSI_ENDPOINT") == "http://169.254.169.254/msi"
         assert config._thread_local_env_value("CUSTOM_API_KEY") == ""
 
     assert os.environ.get("CUSTOM_API_KEY") == "process-default-custom-key"
@@ -912,4 +1125,3 @@ def test_expand_env_vars_does_not_leak_process_env_under_block_scope(monkeypatch
             config._thread_ctx.env = {}
         else:
             config._thread_ctx.env = prev_env
-

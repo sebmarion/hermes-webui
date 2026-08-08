@@ -45,7 +45,7 @@ def _catalog_with_cfg(monkeypatch, tmp_path, cfg):
 def _menu_cfg():
     return {
         "openai-codex",
-        "custom:deepseek-novita",
+        "novita",
         "zeus",
     }
 
@@ -63,12 +63,12 @@ def test_configured_provider_menu_keeps_only_codex_novita_and_zeus(monkeypatch, 
                 "openai-codex": {
                     "models": ["gpt-5.6-sol", "gpt-5.6-sol-pro"],
                 },
+                "novita": {"models": ["zai-org/glm-5.2"]},
                 "openrouter": {"models": ["openai/gpt-5.6-sol"]},
                 "zai": {"models": ["glm-5.2"]},
                 "zeus": {"models": ["escha-qwen36-35b-a3b-w2"]},
             },
             "custom_providers": [
-                {"name": "Deepseek Novita", "model": "deepseek/deepseek-v4-flash"},
                 {"name": "Zeus RTX 5080", "model": "escha-qwen36-35b-a3b-w2"},
             ],
         },
@@ -141,7 +141,7 @@ def test_provider_cards_use_the_same_configured_menu_allowlist(monkeypatch):
     config.cfg.update({"webui": {"provider_menu": {"allowed_providers": sorted(_menu_cfg())}}})
     records = [
         {"id": "openai-codex", "display_name": "OpenAI Codex", "models": []},
-        {"id": "custom:deepseek-novita", "display_name": "Deepseek Novita", "models": []},
+        {"id": "novita", "display_name": "Novita", "models": []},
         {"id": "zeus", "display_name": "Zeus", "models": []},
         {"id": "openrouter", "display_name": "OpenRouter", "models": []},
         {"id": "custom:zeus-rtx-5080", "display_name": "Zeus RTX 5080", "models": []},
@@ -154,7 +154,7 @@ def test_provider_cards_use_the_same_configured_menu_allowlist(monkeypatch):
 
     assert [provider["id"] for provider in filtered] == [
         "openai-codex",
-        "custom:deepseek-novita",
+        "novita",
         "zeus",
     ]
 

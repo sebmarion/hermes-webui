@@ -13,6 +13,7 @@ truly isolated import and can't pollute the test process.
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import subprocess
 import sys
@@ -27,6 +28,15 @@ def _state_dir_for_env(platform_home: Path, **env_overrides) -> Path:
     """Import api.config in a fresh subprocess under the given env and return
     the resolved STATE_DIR it computes. None-valued overrides unset the var."""
     env = dict(os.environ)
+    agent_spec = importlib.util.find_spec("hermes_cli")
+    assert agent_spec is not None and agent_spec.origin
+    agent_root = Path(agent_spec.origin).resolve().parent.parent
+    inherited_pythonpath = str(env.get("PYTHONPATH") or "").strip()
+    env["PYTHONPATH"] = os.pathsep.join(
+        part
+        for part in (str(agent_root), inherited_pythonpath)
+        if part
+    )
     # Keep every probe inside fixture-owned platform paths. Inheriting the real
     # user home lets an import-only probe reconcile pytest workspace defaults
     # into the user's settings.json before it prints STATE_DIR.

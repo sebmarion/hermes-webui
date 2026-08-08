@@ -1,16 +1,13 @@
 """Regression test for #5567 — cross-profile HERMES_HOME race at the config reader.
 
-Root cause: `profile_env_for_background_worker` mirrors the profile's HERMES_HOME
-into the process-global `os.environ`, and the worker body runs outside the setup
-lock. A concurrent cross-profile worker can clobber `os.environ["HERMES_HOME"]`
-mid-body, so the agent config reader (`hermes_cli.config.get_config_path` /
-`load_config`, which read `get_hermes_home()`) resolves the WRONG profile's
-config — intermittent turn-init failures referencing another profile's provider.
+Root cause: older profile workers mirrored the profile's HERMES_HOME into the
+process-global `os.environ`. Concurrent cross-profile workers could therefore
+clobber one another and make an agent config reader resolve the wrong profile.
 
-Fix (#5567): when hermes-agent >= v0.18.0 exposes the context-local home
-override (`hermes_constants.set_hermes_home_override`), the worker scope installs
-it so `get_hermes_home()` resolves THIS task's profile home from task-local state,
-immune to the process-global clobber — without serializing workers.
+Fix (#5567): workers keep profile values task-local. When hermes-agent exposes
+the context-local home override (`hermes_constants.set_hermes_home_override`),
+the worker installs it so `get_hermes_home()` resolves this task's profile home
+without mutating process-global environment state or serializing workers.
 
 Per #2321's acceptance criteria, this exercises the REAL
 `hermes_cli.config.load_config()` against a non-default profile with an
@@ -41,6 +38,7 @@ HAS_OVERRIDE = hasattr(hermes_constants, "set_hermes_home_override") and hasattr
 )
 
 from api import profiles as profiles_api  # noqa: E402
+from api import config as webui_config  # noqa: E402
 
 
 def _seed_profile_home(base: Path, name: str, provider: str, model: str) -> Path:
@@ -61,7 +59,7 @@ def _seed_profile_home(base: Path, name: str, provider: str, model: str) -> Path
 
 @pytest.mark.skipif(
     not HAS_OVERRIDE,
-    reason="hermes-agent < v0.18.0: no set_hermes_home_override; WebUI degrades to the os.environ mirror",
+    reason="hermes-agent lacks the task-local profile-home boundary",
 )
 def test_load_config_resolves_worker_profile_despite_env_clobber(tmp_path, monkeypatch):
     """The crux (#2321 criterion): inside profile_env_for_background_worker(A),
@@ -123,17 +121,17 @@ def test_override_is_cleared_after_worker_exits(tmp_path, monkeypatch):
 
 def test_graceful_degradation_resolver_is_optional():
     """On an agent WITHOUT the override, the resolver returns None and the CM
-    falls back to the pre-existing os.environ mirror — never raises. We assert
-    the resolver is import-safe and boolean-clean regardless of agent version."""
+    remains import-safe.  Legacy skill modules are patched separately; profile
+    credentials and home values are never mirrored into process-global env."""
     mod = profiles_api._resolve_hermes_home_override()
     if HAS_OVERRIDE:
         assert mod is not None and hasattr(mod, "set_hermes_home_override")
     else:
-        assert mod is None  # older agent: graceful no-op, os.environ mirror stays
+        assert mod is None  # named background workers fail closed on this runtime
 
 
 def test_profile_env_for_background_worker_uses_legacy_skill_module_patching(monkeypatch, tmp_path):
-    """When override support is unavailable for this run, fallback still patches skill modules."""
+    """Dynamic home support can coexist with legacy module-level skill paths."""
     profile_home = tmp_path / "legacy-profile-home"
     profile_home.mkdir(parents=True, exist_ok=True)
 
@@ -149,7 +147,28 @@ def test_profile_env_for_background_worker_uses_legacy_skill_module_patching(mon
     monkeypatch.setenv("HERMES_HOME", "default-home")
     monkeypatch.delenv("HERMES_TEST_PROFILE_ENV", raising=False)
 
-    monkeypatch.setattr(profiles_api, "_hermes_home_override_available", False)
+    home_override_calls = []
+
+    class _HomeOverride:
+        @staticmethod
+        def set_hermes_home_override(value):
+            home_override_calls.append(("set", value))
+            return "home-token"
+
+        @staticmethod
+        def reset_hermes_home_override(token):
+            home_override_calls.append(("reset", token))
+
+    monkeypatch.setattr(
+        profiles_api,
+        "_resolve_hermes_home_override",
+        lambda: _HomeOverride,
+    )
+    monkeypatch.setattr(
+        profiles_api,
+        "_skill_modules_support_profile_home",
+        lambda _home: False,
+    )
     monkeypatch.setattr(profiles_api, "get_hermes_home_for_profile", lambda profile: profile_home)
     monkeypatch.setattr(
         profiles_api,
@@ -163,8 +182,13 @@ def test_profile_env_for_background_worker_uses_legacy_skill_module_patching(mon
     )
 
     with profiles_api.profile_env_for_background_worker("legacy", "legacy worker"):
-        assert os.environ.get("HERMES_HOME") == str(profile_home)
-        assert os.environ.get("HERMES_TEST_PROFILE_ENV") == "legacy-runtime"
+        assert os.environ.get("HERMES_HOME") == "default-home"
+        assert os.environ.get("HERMES_TEST_PROFILE_ENV") is None
+        assert webui_config._thread_local_env_value("HERMES_HOME") == str(profile_home)
+        assert (
+            webui_config._thread_local_env_value("HERMES_TEST_PROFILE_ENV")
+            == "legacy-runtime"
+        )
         assert fake_skill_module.HERMES_HOME == profile_home
         assert fake_skill_module.SKILLS_DIR == profile_home / "skills"
 
@@ -172,6 +196,30 @@ def test_profile_env_for_background_worker_uses_legacy_skill_module_patching(mon
     assert fake_skill_module.SKILLS_DIR == "default-home/skills"
     assert os.environ.get("HERMES_HOME") == "default-home"
     assert os.environ.get("HERMES_TEST_PROFILE_ENV") is None
+    assert home_override_calls == [
+        ("set", str(profile_home)),
+        ("reset", "home-token"),
+    ]
+
+
+def test_named_background_worker_fails_closed_without_home_override(monkeypatch, tmp_path):
+    profile_home = tmp_path / "unsupported-profile-home"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", "operator-home")
+    monkeypatch.setattr(profiles_api, "_resolve_hermes_home_override", lambda: None)
+    monkeypatch.setattr(
+        profiles_api,
+        "get_hermes_home_for_profile",
+        lambda _profile: profile_home,
+    )
+    monkeypatch.setattr(profiles_api, "get_profile_runtime_env", lambda _home: {})
+
+    with pytest.raises(RuntimeError, match="task-local HERMES_HOME"):
+        with profiles_api.profile_env_for_background_worker("unsupported"):
+            raise AssertionError("worker body must not run unscoped")
+
+    assert os.environ.get("HERMES_HOME") == "operator-home"
+    assert getattr(webui_config._thread_ctx, "block_process_env_fallback", False) is False
 
 
 def test_run_agent_streaming_installs_and_resets_profile_home_override(tmp_path, monkeypatch):
@@ -323,11 +371,11 @@ def test_run_agent_streaming_installs_and_resets_profile_home_override(tmp_path,
     assert _stream_id not in _streaming.STREAMS
 
 
-def test_run_agent_streaming_falls_back_to_skill_module_patch_for_static_modules(
+def test_run_agent_streaming_fails_closed_for_static_skill_modules(
     tmp_path,
     monkeypatch,
 ):
-    """Streaming should use snapshot/patch/restore when skill modules are static."""
+    """A named turn must not patch process-global skill paths for its lifetime."""
 
     import api.streaming as _streaming
 
@@ -507,12 +555,7 @@ def test_run_agent_streaming_falls_back_to_skill_module_patch_for_static_modules
 
     assert _events.get("set_override_home") == str(_home)
     assert _events.get("reset_override") == ("sentinel-module", None, True)
-    assert _events.get("run_conversation") is True
-    # Two call paths can reach the legacy skill-module helpers now:
-    # 1) upstream runtime-refresh model-resolution scope, and
-    # 2) the PR-owned streaming fallback branch at _run_agent_streaming.
-    # Assert that the streaming-owned fallback still executes once and fully
-    # restores the snapshot it captured.
+    assert _events.get("run_conversation") is None
     _streaming_patch_calls = [
         entry["source"]
         for entry in _events.get("patch_skill_home_modules", [])
@@ -528,9 +571,9 @@ def test_run_agent_streaming_falls_back_to_skill_module_patch_for_static_modules
         for entry in _events.get("restore_skill_home_modules", [])
         if entry["source"][0] == "streaming.py"
     ]
-    assert len(_streaming_patch_calls) == 1
-    assert len(_streaming_snapshot_calls) == 1
-    assert _streaming_restore_calls == [{"snapshot": True}]
+    assert _streaming_patch_calls == []
+    assert _streaming_snapshot_calls == []
+    assert _streaming_restore_calls == []
     assert _stream_id not in _streaming.STREAMS
 
 

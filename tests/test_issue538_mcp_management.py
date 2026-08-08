@@ -1,4 +1,5 @@
 """Tests for issue #538 — MCP server management API."""
+import copy
 import json, pytest
 from unittest.mock import patch, MagicMock, call
 import yaml
@@ -24,6 +25,22 @@ def _make_handler():
 def _json_payload(handler):
     body = handler.wfile.write.call_args[0][0]
     return json.loads(body.decode('utf-8'))
+
+
+def _capturing_update_runner(initial_config):
+    """Return the request-owned update seam test double and committed docs."""
+    committed = []
+
+    def _run(operation):
+        config_data = copy.deepcopy(initial_config)
+
+        def _persist(candidate):
+            assert candidate is config_data
+            committed.append(copy.deepcopy(candidate))
+
+        return operation(config_data, _persist)
+
+    return _run, committed
 
 
 SAMPLE_MCP = {
@@ -181,58 +198,50 @@ class TestMcpList:
 class TestMcpSave:
     """PUT /api/mcp/servers/<name> — add or update."""
 
-    @patch('api.routes.reload_config')
-    @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes.get_config')
-    def test_add_new_stdio_server(self, mock_cfg, mock_path, mock_save, mock_reload):
-        mock_cfg.return_value = {}
+    def test_add_new_stdio_server(self):
+        update, committed = _capturing_update_runner({})
         h = _make_handler()
         h.command = 'PUT'
         body = {"command": "test-cmd", "timeout": 30}
-        _handle_mcp_server_update(h, 'test-server', body)
-        assert mock_save.called
-        saved = mock_save.call_args[0][1]
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_update(h, 'test-server', body)
+        assert committed
+        saved = committed[-1]
         assert 'test-server' in saved['mcp_servers']
         assert saved['mcp_servers']['test-server']['command'] == 'test-cmd'
 
-    @patch('api.routes.reload_config')
-    @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes.get_config')
-    def test_add_new_http_server(self, mock_cfg, mock_path, mock_save, mock_reload):
-        mock_cfg.return_value = {}
+    def test_add_new_http_server(self):
+        update, committed = _capturing_update_runner({})
         h = _make_handler()
         h.command = 'PUT'
         body = {"url": "http://localhost:4000", "timeout": 60}
-        _handle_mcp_server_update(h, 'http-srv', body)
-        saved = mock_save.call_args[0][1]
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_update(h, 'http-srv', body)
+        saved = committed[-1]
         assert saved['mcp_servers']['http-srv']['url'] == 'http://localhost:4000'
 
-    @patch('api.routes.reload_config')
-    @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes.get_config')
-    def test_update_existing(self, mock_cfg, mock_path, mock_save, mock_reload):
-        mock_cfg.return_value = {'mcp_servers': {'existing': {'command': 'old'}}}
+    def test_update_existing(self):
+        update, committed = _capturing_update_runner(
+            {'mcp_servers': {'existing': {'command': 'old'}}}
+        )
         h = _make_handler()
         h.command = 'PUT'
         body = {"command": "new-cmd"}
-        _handle_mcp_server_update(h, 'existing', body)
-        saved = mock_save.call_args[0][1]
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_update(h, 'existing', body)
+        saved = committed[-1]
         assert saved['mcp_servers']['existing']['command'] == 'new-cmd'
 
-    @patch('api.routes.reload_config')
-    @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes.get_config')
-    def test_preserves_other_servers(self, mock_cfg, mock_path, mock_save, mock_reload):
-        mock_cfg.return_value = {'mcp_servers': {'keep': {'command': 'stay'}}}
+    def test_preserves_other_servers(self):
+        update, committed = _capturing_update_runner(
+            {'mcp_servers': {'keep': {'command': 'stay'}}}
+        )
         h = _make_handler()
         h.command = 'PUT'
         body = {"command": "new"}
-        _handle_mcp_server_update(h, 'add-me', body)
-        saved = mock_save.call_args[0][1]
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_update(h, 'add-me', body)
+        saved = committed[-1]
         assert 'keep' in saved['mcp_servers']
         assert 'add-me' in saved['mcp_servers']
 
@@ -256,38 +265,37 @@ class TestMcpSave:
 class TestMcpDelete:
     """DELETE /api/mcp/servers/<name>."""
 
-    @patch('api.routes.reload_config')
-    @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes.get_config')
-    def test_delete_existing(self, mock_cfg, mock_path, mock_save, mock_reload):
-        mock_cfg.return_value = {'mcp_servers': {'target': {'command': 'rm'}}}
+    def test_delete_existing(self):
+        update, committed = _capturing_update_runner(
+            {'mcp_servers': {'target': {'command': 'rm'}}}
+        )
         h = _make_handler()
         h.command = 'DELETE'
-        _handle_mcp_server_delete(h, 'target')
-        assert mock_save.called
-        saved = mock_save.call_args[0][1]
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_delete(h, 'target')
+        assert committed
+        saved = committed[-1]
         assert 'target' not in saved.get('mcp_servers', {})
 
-    @patch('api.routes.get_config')
-    def test_delete_nonexistent(self, mock_cfg):
-        mock_cfg.return_value = {'mcp_servers': {}}
+    def test_delete_nonexistent(self):
+        update, committed = _capturing_update_runner({'mcp_servers': {}})
         h = _make_handler()
         h.command = 'DELETE'
-        _handle_mcp_server_delete(h, 'ghost')
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_delete(h, 'ghost')
         status = h.send_response.call_args[0][0]
         assert status == 404
+        assert committed == []
 
-    @patch('api.routes.reload_config')
-    @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes.get_config')
-    def test_preserves_others(self, mock_cfg, mock_path, mock_save, mock_reload):
-        mock_cfg.return_value = {'mcp_servers': {'a': {'c': '1'}, 'b': {'c': '2'}}}
+    def test_preserves_others(self):
+        update, committed = _capturing_update_runner(
+            {'mcp_servers': {'a': {'c': '1'}, 'b': {'c': '2'}}}
+        )
         h = _make_handler()
         h.command = 'DELETE'
-        _handle_mcp_server_delete(h, 'a')
-        saved = mock_save.call_args[0][1]
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_delete(h, 'a')
+        saved = committed[-1]
         assert 'a' not in saved['mcp_servers']
         assert 'b' in saved['mcp_servers']
 
@@ -367,40 +375,38 @@ class TestStripMaskedValues:
 class TestMcpToggle:
     """PATCH /api/mcp/servers/<name> — enable/disable."""
 
-    @patch('api.routes.reload_config')
-    @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes.get_config')
-    def test_disable_server(self, mock_cfg, mock_path, mock_save, mock_reload):
-        mock_cfg.return_value = {'mcp_servers': {'myserver': {'command': 'run'}}}
+    def test_disable_server(self):
+        update, committed = _capturing_update_runner(
+            {'mcp_servers': {'myserver': {'command': 'run'}}}
+        )
         h = _make_handler()
         h.command = 'PATCH'
-        _handle_mcp_server_toggle(h, 'myserver', {'enabled': False})
-        assert mock_save.called
-        saved = mock_save.call_args[0][1]
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_toggle(h, 'myserver', {'enabled': False})
+        assert committed
+        saved = committed[-1]
         assert saved['mcp_servers']['myserver']['enabled'] is False
-        assert mock_reload.called
 
-    @patch('api.routes.reload_config')
-    @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes.get_config')
-    def test_enable_server(self, mock_cfg, mock_path, mock_save, mock_reload):
-        mock_cfg.return_value = {'mcp_servers': {'myserver': {'command': 'run', 'enabled': False}}}
+    def test_enable_server(self):
+        update, committed = _capturing_update_runner(
+            {'mcp_servers': {'myserver': {'command': 'run', 'enabled': False}}}
+        )
         h = _make_handler()
         h.command = 'PATCH'
-        _handle_mcp_server_toggle(h, 'myserver', {'enabled': True})
-        saved = mock_save.call_args[0][1]
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_toggle(h, 'myserver', {'enabled': True})
+        saved = committed[-1]
         assert saved['mcp_servers']['myserver']['enabled'] is True
 
-    @patch('api.routes.get_config')
-    def test_nonexistent_server_returns_404(self, mock_cfg):
-        mock_cfg.return_value = {'mcp_servers': {}}
+    def test_nonexistent_server_returns_404(self):
+        update, committed = _capturing_update_runner({'mcp_servers': {}})
         h = _make_handler()
         h.command = 'PATCH'
-        _handle_mcp_server_toggle(h, 'ghost', {'enabled': True})
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_toggle(h, 'ghost', {'enabled': True})
         status = h.send_response.call_args[0][0]
         assert status == 404
+        assert committed == []
 
     def test_empty_name_rejected(self):
         h = _make_handler()
@@ -416,29 +422,27 @@ class TestMcpToggle:
         status = h.send_response.call_args[0][0]
         assert status == 400
 
-    @patch('api.routes.reload_config')
-    @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes.get_config')
-    def test_response_payload(self, mock_cfg, mock_path, mock_save, mock_reload):
-        mock_cfg.return_value = {'mcp_servers': {'srv': {'url': 'http://localhost'}}}
+    def test_response_payload(self):
+        update, _committed = _capturing_update_runner(
+            {'mcp_servers': {'srv': {'url': 'http://localhost'}}}
+        )
         h = _make_handler()
         h.command = 'PATCH'
-        _handle_mcp_server_toggle(h, 'srv', {'enabled': False})
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_toggle(h, 'srv', {'enabled': False})
         body = h.wfile.write.call_args[0][0]
         payload = json.loads(body.decode('utf-8'))
         assert payload == {'ok': True, 'name': 'srv', 'enabled': False}
 
-    @patch('api.routes.reload_config')
-    @patch('api.routes._save_yaml_config_file')
-    @patch('api.routes._get_config_path', return_value='/tmp/test.yaml')
-    @patch('api.routes.get_config')
-    def test_url_encoded_name(self, mock_cfg, mock_path, mock_save, mock_reload):
+    def test_url_encoded_name(self):
         """Names with special characters must be URL-decoded."""
-        mock_cfg.return_value = {'mcp_servers': {'my server': {'command': 'x'}}}
+        update, committed = _capturing_update_runner(
+            {'mcp_servers': {'my server': {'command': 'x'}}}
+        )
         h = _make_handler()
         h.command = 'PATCH'
-        _handle_mcp_server_toggle(h, 'my%20server', {'enabled': False})
-        saved = mock_save.call_args[0][1]
+        with patch('api.routes._with_active_config_update', side_effect=update):
+            _handle_mcp_server_toggle(h, 'my%20server', {'enabled': False})
+        saved = committed[-1]
         assert 'my server' in saved['mcp_servers']
         assert saved['mcp_servers']['my server']['enabled'] is False

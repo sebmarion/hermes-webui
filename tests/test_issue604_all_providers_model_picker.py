@@ -62,10 +62,10 @@ class TestConfigProvidersDetection:
     """Providers listed in config.yaml providers section should be detected."""
 
     def test_cfg_providers_detection_exists(self):
-        """_build_available_models must scan cfg['providers'] for known providers."""
+        """The catalog builder must scan the request-owned effective config."""
         src = _src()
-        assert "cfg.get(\"providers\", {})" in src, \
-            "Must read cfg['providers']"
+        assert "_get_providers_cfg(catalog_config)" in src, \
+            "Must read providers from the request-owned effective catalog config"
         assert "_cfg_providers" in src, \
             "Must use _cfg_providers variable"
 

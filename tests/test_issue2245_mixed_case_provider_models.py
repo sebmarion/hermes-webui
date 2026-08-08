@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import sys
 import types
+import copy
 
 import pytest
+import yaml
 
 import api.config as config
 
@@ -28,11 +30,53 @@ import api.config as config
 
 @pytest.fixture(autouse=True)
 def _isolate_models_cache(tmp_path, monkeypatch):
-    """Invalidate the models TTL cache before and after every test."""
+    """Own a real config path and restore every process-global cache afterward."""
+    with config._cfg_lock:
+        saved_cache = copy.deepcopy(config._cfg_cache)
+        saved_cfg_ref = config.cfg
+        saved_cfg_value = (
+            copy.deepcopy(saved_cfg_ref)
+            if isinstance(saved_cfg_ref, dict) and saved_cfg_ref is not config._cfg_cache
+            else None
+        )
+        saved_scalars = {
+            "path": config._cfg_path,
+            "mtime": config._cfg_mtime,
+            "signature": config._cfg_signature,
+            "fingerprint": config._cfg_fingerprint,
+        }
+    with config._yaml_file_cache_lock:
+        saved_yaml_cache = copy.deepcopy(config._yaml_file_cache)
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(config, "_get_config_path", lambda: config_path)
     monkeypatch.setattr(config, "_models_cache_path", tmp_path / "models_cache.json")
+    with config._yaml_file_cache_lock:
+        config._yaml_file_cache.clear()
+    config.reload_config()
     config.invalidate_models_cache()
-    yield
-    config.invalidate_models_cache()
+    try:
+        yield
+    finally:
+        config.invalidate_models_cache()
+        with config._cfg_lock:
+            config._cfg_cache.clear()
+            config._cfg_cache.update(saved_cache)
+            if saved_cfg_ref is config._cfg_cache:
+                config.cfg = config._cfg_cache
+            else:
+                if isinstance(saved_cfg_ref, dict) and saved_cfg_value is not None:
+                    saved_cfg_ref.clear()
+                    saved_cfg_ref.update(saved_cfg_value)
+                config.cfg = saved_cfg_ref
+            config._cfg_path = saved_scalars["path"]
+            config._cfg_mtime = saved_scalars["mtime"]
+            config._cfg_signature = saved_scalars["signature"]
+            config._cfg_fingerprint = saved_scalars["fingerprint"]
+        with config._yaml_file_cache_lock:
+            config._yaml_file_cache.clear()
+            config._yaml_file_cache.update(saved_yaml_cache)
 
 
 def _stub_hermes_cli(monkeypatch):
@@ -52,20 +96,14 @@ def _stub_hermes_cli(monkeypatch):
 
 
 def _with_config(cfg_dict: dict):
-    """Replace ``config.cfg`` with *cfg_dict* and return a restore callable."""
-    old_cfg = dict(config.cfg)
-    old_mtime = config._cfg_mtime
-    config.cfg.clear()
-    config.cfg.update(cfg_dict)
-    try:
-        config._cfg_mtime = config.Path(config._get_config_path()).stat().st_mtime
-    except Exception:
-        config._cfg_mtime = 0.0
+    """Publish *cfg_dict* through the same disk-backed loader as production."""
+    config_path = config.Path(config._get_config_path())
+    config_path.write_text(yaml.safe_dump(cfg_dict, sort_keys=False), encoding="utf-8")
+    with config._yaml_file_cache_lock:
+        config._yaml_file_cache.clear()
+    config.reload_config()
 
     def restore():
-        config.cfg.clear()
-        config.cfg.update(old_cfg)
-        config._cfg_mtime = old_mtime
         config.invalidate_models_cache()
 
     return restore

@@ -17,6 +17,7 @@ from api.config import (
     DEFAULT_WORKSPACE,
     _FALLBACK_MODELS,
     _HERMES_FOUND,
+    _config_dependency_signature,
     invalidate_models_cache,
     _PROVIDER_DISPLAY,
     _PROVIDER_MODELS,
@@ -28,11 +29,22 @@ from api.config import (
     save_settings,
     verify_hermes_imports,
 )
-from api.paths import _atomic_write_text
 from api.providers import _write_env_file  # shared impl with _ENV_LOCK (#1164)
 from api.workspace import get_last_workspace, load_workspaces
 
 logger = logging.getLogger(__name__)
+
+
+def _effective_config_exists(config_path: Path | None = None) -> bool:
+    """True when any layer backing the selected config exists on disk."""
+    selected_path = Path(config_path or _get_config_path())
+    if selected_path.exists():
+        return True
+    return any(
+        isinstance(mtime_ns, int) and mtime_ns >= 0
+        for _path, mtime_ns, _size, _ctime_ns, _inode, _digest in
+        _config_dependency_signature(selected_path)
+    )
 
 
 _SUPPORTED_PROVIDER_SETUPS = {
@@ -232,31 +244,17 @@ def _load_env_file(env_path: Path) -> dict[str, str]:
 
 def _load_yaml_config(config_path: Path) -> dict:
     try:
-        import yaml as _yaml
-    except ImportError:
-        return {}
+        from api.config import _load_yaml_config_file
 
-    if not config_path.exists():
-        return {}
-    try:
-        loaded = _yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        return loaded if isinstance(loaded, dict) else {}
+        return _load_yaml_config_file(config_path)
     except Exception:
         return {}
 
 
 def _save_yaml_config(config_path: Path, config: dict) -> None:
-    try:
-        import yaml as _yaml
-    except ImportError as exc:
-        raise RuntimeError("PyYAML is required to write Hermes config.yaml") from exc
+    from api.config import _save_yaml_config_file
 
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(
-        config_path,
-        _yaml.safe_dump(config, sort_keys=False, allow_unicode=True),
-        encoding="utf-8",
-    )
+    _save_yaml_config_file(config_path, config)
 
 
 def _normalize_model_for_provider(provider: str, model: str) -> str:
@@ -891,7 +889,7 @@ def get_onboarding_status() -> dict:
     # through the wizard just because their provider doesn't have a detectable API key
     # — the wizard cannot represent their provider and would overwrite their config
     # with whichever wizard-supported provider they accidentally select.
-    config_exists = Path(_get_config_path()).exists()
+    config_exists = _effective_config_exists()
 
     # For providers not in the wizard's quick-setup list (e.g. ollama-cloud, deepseek,
     # xai, kimi-k2.6), the wizard can never help — it only knows how to configure
@@ -945,7 +943,7 @@ def get_onboarding_status() -> dict:
             "missing_modules": missing,
             "import_errors": errors,
             "config_path": str(_get_config_path()),
-            "config_exists": Path(_get_config_path()).exists(),
+            "config_exists": config_exists,
             **runtime,
         },
         "setup": _build_setup_catalog(cfg),
@@ -994,7 +992,7 @@ def apply_onboarding_setup(body: dict) -> dict:
     # Guard: if config.yaml already exists and the caller did not explicitly
     # acknowledge the overwrite, refuse to proceed.  The frontend must pass
     # confirm_overwrite=True after showing the user a confirmation step.
-    if Path(config_path).exists() and not body.get("confirm_overwrite"):
+    if _effective_config_exists(config_path) and not body.get("confirm_overwrite"):
         return {
             "error": "config_exists",
             "message": (

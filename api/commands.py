@@ -282,16 +282,14 @@ def _run_codex_runtime_command(arg_string: str) -> str:
         try:
             from api import config as webui_config
 
-            active_config = webui_config.get_config()
-
-            def _persist_config(config_data: dict) -> None:
-                webui_config._save_yaml_config_file(
-                    webui_config._get_config_path(),
-                    config_data,
+            def _apply_update(active_config: dict, persist) -> object:
+                return apply(
+                    active_config,
+                    new_value,
+                    persist_callback=persist,
                 )
-                webui_config.reload_config()
 
-            status = apply(active_config, new_value, persist_callback=_persist_config)
+            status = webui_config._with_active_config_update(_apply_update)
         except Exception as exc:
             logger.warning("Failed to execute /codex-runtime", exc_info=True)
             raise RuntimeError("Failed to update Codex runtime") from exc

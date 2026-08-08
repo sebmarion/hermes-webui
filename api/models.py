@@ -2401,6 +2401,37 @@ def process_wakeup_credential_state_fingerprint(session) -> str:
         if name == 'auth.json':
             files.append((name, _process_wakeup_auth_store_fingerprint(path)))
             continue
+        if name == 'config.yaml':
+            try:
+                dependencies = _cfg._config_dependency_signature(path)
+            except Exception as exc:
+                files.append((name, 'error', exc.__class__.__name__))
+            else:
+                for index, (
+                    dep_path,
+                    mtime_ns,
+                    size,
+                    ctime_ns,
+                    inode,
+                    content_digest,
+                ) in enumerate(dependencies):
+                    label = 'root_config.yaml' if len(dependencies) > 1 and index == 0 else name
+                    if mtime_ns is None:
+                        files.append((label, str(dep_path), 'missing'))
+                    elif mtime_ns == -1:
+                        files.append((label, str(dep_path), 'error', size))
+                    else:
+                        files.append((
+                            label,
+                            str(dep_path),
+                            'file',
+                            int(mtime_ns),
+                            int(size),
+                            int(ctime_ns),
+                            int(inode),
+                            str(content_digest),
+                        ))
+            continue
         try:
             stat = path.stat()
         except FileNotFoundError:
@@ -5153,12 +5184,14 @@ def _profile_default_model_state(profile=None):
     """Return the default model/provider configured for *profile*."""
     default_model = ""
     default_provider = None
-    try:
-        from api.profiles import get_hermes_home_for_profile
-        config_path = Path(get_hermes_home_for_profile(profile)) / "config.yaml"
-        config_data = _cfg._load_yaml_config_file(config_path)
-    except Exception:
-        config_data = {}
+    # Missing config remains an empty effective user layer, but malformed or
+    # unreadable inheritance must fail closed. Falling back to the ambient
+    # process model here would create a named-profile session on another
+    # profile's provider/credentials.
+    from api.profiles import get_hermes_home_for_profile
+
+    profile_home = Path(get_hermes_home_for_profile(profile))
+    config_data = _cfg.get_config_for_profile_home(profile_home)
 
     model_cfg = config_data.get("model", {}) if isinstance(config_data, dict) else {}
     if isinstance(model_cfg, str):

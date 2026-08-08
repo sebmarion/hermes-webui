@@ -145,6 +145,8 @@ def test_generic_provider_keeps_static_catalog_as_cli_failure_fallback(monkeypat
     group = _provider_group(result, "anthropic")
 
     assert calls == ["anthropic"]
+    assert "claude-fable-5" in _ids(group)
+    assert "claude-opus-5" in _ids(group)
     assert "claude-opus-4.7" in _ids(group)
     assert "claude-sonnet-4.6" in _ids(group)
 
