@@ -250,7 +250,7 @@ def test_post_unregister_successor_recovery_order_is_shared(
     clean_admission_state, monkeypatch
 ):
     from api import background_process as bp
-    from api import execution_lineage
+    from api import compression_recovery_receipts, execution_lineage
     from api import goal_continuation, tool_limit_continuation
 
     events = []
@@ -261,6 +261,17 @@ def test_post_unregister_successor_recovery_order_is_shared(
             execution_root_session_id="root",
             profile="profile-a",
         ),
+    )
+    monkeypatch.setattr(
+        compression_recovery_receipts,
+        "settle_compression_recovery",
+        lambda sid, parent: events.append(("compression", {"session_id": sid, "parent": parent}))
+        or {"state": "started", "started_now": True},
+    )
+    monkeypatch.setattr(
+        compression_recovery_receipts,
+        "recover_pending_compression_recoveries",
+        lambda **kwargs: events.append(("compression_pending", kwargs)) or 0,
     )
     monkeypatch.setattr(
         tool_limit_continuation,
@@ -280,13 +291,56 @@ def test_post_unregister_successor_recovery_order_is_shared(
 
     result = bp.recover_successors_after_unregister(
         "ancestor",
+        parent_run_id="parent-run",
         session=SimpleNamespace(session_id="tip", profile="profile-a"),
     )
 
-    assert [item[0] for item in events] == ["tool", "goal", "deferred"]
-    assert events[0][1] == {"root_session_id": "root", "profile": "profile-a"}
-    assert events[1][1] == {"session_id": "tip"}
-    assert result == {"tool_limit": 1, "goal": 2, "deferred": 3}
+    assert [item[0] for item in events] == ["compression", "tool", "goal", "deferred"]
+    assert events[0][1] == {"session_id": "tip", "parent": "parent-run"}
+    assert events[1][1] == {"root_session_id": "root", "profile": "profile-a"}
+    assert events[2][1] == {"session_id": "tip"}
+    assert result == {"compression": 1, "tool_limit": 1, "goal": 2, "deferred": 3}
+
+
+def test_post_unregister_retries_older_claim_when_exact_parent_has_none(
+    clean_admission_state,
+    monkeypatch,
+):
+    from api import background_process as bp
+    from api import compression_recovery_receipts, execution_lineage
+    from api import goal_continuation, tool_limit_continuation
+
+    events = []
+    monkeypatch.setattr(
+        execution_lineage,
+        "resolve_execution_lineage",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            execution_root_session_id="root",
+            profile="profile-a",
+        ),
+    )
+    monkeypatch.setattr(
+        compression_recovery_receipts,
+        "settle_compression_recovery",
+        lambda *_args, **_kwargs: events.append("exact") or None,
+    )
+    monkeypatch.setattr(
+        compression_recovery_receipts,
+        "recover_pending_compression_recoveries",
+        lambda **kwargs: events.append(("pending", kwargs)) or 1,
+    )
+    monkeypatch.setattr(tool_limit_continuation, "recover_pending_continuations", lambda **_kwargs: 0)
+    monkeypatch.setattr(goal_continuation, "recover_pending_goal_continuations", lambda **_kwargs: 0)
+    monkeypatch.setattr(bp, "drain_deferred_wakeups_for_session", lambda _sid: 0)
+
+    result = bp.recover_successors_after_unregister(
+        "tip",
+        parent_run_id="different-parent",
+        session=SimpleNamespace(session_id="tip", profile="profile-a"),
+    )
+
+    assert events == ["exact", ("pending", {"session_id": "tip"})]
+    assert result["compression"] == 1
 
 
 def test_lifecycle_health_redacts_lineage_ownership(clean_admission_state):

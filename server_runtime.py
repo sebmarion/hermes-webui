@@ -1029,6 +1029,15 @@ def _recover_tool_limit_continuations_for_startup() -> dict:
     )
 
 
+def _recover_compression_recoveries_for_startup() -> dict:
+    from api.routes import _recover_compression_recoveries_on_startup
+
+    return _require_terminal_recovery_receipt(
+        "compression recovery",
+        _recover_compression_recoveries_on_startup(strict=True),
+    )
+
+
 def _recover_goal_continuations_for_startup() -> dict:
     from api.routes import _recover_goal_continuations_on_startup
 
@@ -1137,6 +1146,9 @@ def _deferred_startup_steps():
         ),
         "server._recover_async_delegation_notifications": (
             _recover_async_delegation_notifications
+        ),
+        "server._recover_compression_recoveries_for_startup": (
+            _recover_compression_recoveries_for_startup
         ),
         "server._recover_tool_limit_continuations_for_startup": (
             _recover_tool_limit_continuations_for_startup

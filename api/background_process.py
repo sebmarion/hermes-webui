@@ -2007,21 +2007,23 @@ def drain_deferred_wakeups_for_session(
 def recover_successors_after_unregister(
     session_id: str,
     *,
+    parent_run_id: str | None = None,
     session=None,
     profile: str | None = None,
 ) -> dict[str, int]:
     """Run post-turn successor recovery in one backend-independent order.
 
     The parent active-run row must already be removed before this helper is
-    called. Tool-limit receipts have priority, then goal continuations, then
-    the generic lineage-owned process wakeup bucket. Each subsystem keeps its
-    existing durable/retry semantics; this function only fixes their ordering.
+    called. Exact compression recovery has priority, then tool-limit receipts,
+    goal continuations, and the generic lineage-owned process wakeup bucket.
+    Each subsystem keeps its existing durable/retry semantics; this function
+    only fixes their ordering.
     """
     target_session_id = str(
         getattr(session, "session_id", None) or session_id or ""
     ).strip()
     if not target_session_id:
-        return {"tool_limit": 0, "goal": 0, "deferred": 0}
+        return {"compression": 0, "tool_limit": 0, "goal": 0, "deferred": 0}
     target_profile = str(
         profile or getattr(session, "profile", None) or ""
     ).strip()
@@ -2047,6 +2049,48 @@ def recover_successors_after_unregister(
             target_session_id,
             exc_info=True,
         )
+
+    compression_started = 0
+    exact_parent_run_id = str(parent_run_id or "").strip()
+    if exact_parent_run_id:
+        try:
+            from api.compression_recovery_receipts import (
+                settle_compression_recovery,
+            )
+
+            compression_result = settle_compression_recovery(
+                target_session_id,
+                exact_parent_run_id,
+            )
+            compression_started = int(
+                bool(
+                    compression_result
+                    and compression_result.get("started_now") is True
+                )
+            )
+        except Exception:
+            logger.exception(
+                "compression successor recovery failed for %s run %s",
+                target_session_id,
+                exact_parent_run_id,
+            )
+    if not compression_started:
+        try:
+            from api.compression_recovery_receipts import (
+                recover_pending_compression_recoveries,
+            )
+
+            compression_started = int(
+                recover_pending_compression_recoveries(
+                    session_id=target_session_id,
+                )
+                or 0
+            )
+        except Exception:
+            logger.exception(
+                "pending compression successor recovery failed for %s",
+                target_session_id,
+            )
 
     tool_started = 0
     if lineage_resolved:
@@ -2083,6 +2127,7 @@ def recover_successors_after_unregister(
         drain_deferred_wakeups_for_session(target_session_id) or 0
     )
     return {
+        "compression": compression_started,
         "tool_limit": tool_started,
         "goal": goal_started,
         "deferred": deferred_started,

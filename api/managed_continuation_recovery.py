@@ -583,6 +583,7 @@ def recover_exact(
     manifest_sha256: str,
     max_receipts: int,
     process_token_lookup,
+    reconcile_stale_starting: bool = False,
 ) -> ManagedContinuationRecoveryReceipt:
     """Enumerate, classify, and recover one continuation receipt authority."""
     before_identity = None
@@ -628,13 +629,18 @@ def recover_exact(
                         raise ValueError(
                             f"{key}: starting owner PID identity mismatch"
                         )
-                    elif phase == "launching":
+                    elif phase == "launching" and not reconcile_stale_starting:
                         raise ValueError(
                             f"{key}: launch-before-started-write is ambiguous"
                         )
                     else:
                         row_classifications.append(
-                            (key, "dead_owner_starting_retryable")
+                            (
+                                key,
+                                "dead_owner_starting_reconcile"
+                                if phase == "launching"
+                                else "dead_owner_starting_retryable",
+                            )
                         )
                         row_retryable.append(key)
                         row_eligible.append(key)

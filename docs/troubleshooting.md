@@ -124,45 +124,65 @@ The on-disk locations below assume the default `~/.hermes/webui` state directory
 ## "Context compression exhausted" after a long-running turn
 
 **Symptom.** A long-running session, often with many tool calls or a small
-context-window model, ends with a `Context compression exhausted` error instead
-of a final answer. The message includes a recovery action labeled `Start focused
-continuation`.
+context-window model, briefly shows `Recovering context...` after the current
+worker runs out of safe context. Hermes then continues the unfinished request in
+the same conversation. If the server cannot prove that an automatic retry is
+safe, the transcript instead shows one `Context recovery blocked` diagnostic;
+the composer remains enabled.
 
-**Why.** Automatic compression could not shrink the current conversation enough
-to continue safely in the same model-facing context. The exhausted session is
-terminal: sending a bare "continue", "go on", or "继续" would usually replay the
-same oversized state and fail again, so the WebUI points the user to a focused
-linked continuation instead.
+**Why.** Automatic compression could not shrink the model-facing conversation
+enough to finish the turn. WebUI preserves the visible transcript, builds a
+bounded recovery context from the exact failed request, safe attachment
+metadata, and the newest trustworthy summary or assistant checkpoint, then
+durably claims one hidden successor against the same session. That successor is
+started only after the failed worker releases stream and run ownership. This
+fallback is server-owned for both native and Gateway-backed chat; an open
+browser is not required.
 
 **Diagnostic.**
 
 1. Open the session JSON under your WebUI state directory, for example:
    ```bash
-   jq '.recommended_recovery_action, .compression_recovery' \
+   jq '.compression_recovery, .recommended_recovery_action' \
      ~/.hermes/webui/sessions/<session_id>.json
    ```
-2. A recoverable exhausted turn should report:
-   - `recommended_recovery_action: "start_focused_continuation"`
-   - `compression_recovery.terminal_state: "compression_exhausted"`
-   - the final assistant error message carrying `_compressionRecovery`
+2. A safely accepted recovery has `terminal_state: "compression_exhausted"`,
+   `same_session: true`, and a phase such as `claimed`, `starting`, or
+   `running`. `recommended_recovery_action` is null; there is no recovery button
+   or focused-child navigation.
+3. If the phase is `blocked`, inspect its bounded `reason`. Common safety stops
+   are a missing trustworthy seed, an attachment that no longer resolves, an
+   unreadable receipt store, or ambiguous evidence that a successor may already
+   have launched. Do not edit the receipt store by hand.
+4. For process-restart diagnosis, inspect
+   `~/.hermes/webui/sessions/_compression_recoveries.json`. A receipt is keyed by
+   the same session and parent run and moves through `claimed`, `starting`, then
+   `started` or `discarded`. Startup reconciles pending receipts before lower-
+   priority continuation work; ambiguous post-launch evidence is discarded and
+   disclosed instead of being replayed. Settled rows are content-free
+   fingerprint tombstones; deleting a conversation purges its rows.
 
-**Fix.** Use the `Start focused continuation` action in the exhausted message.
-The exhausted session is terminal and read-only: any attempted send opens the
-focused continuation instead of retrying the oversized parent context. The new
-linked session preserves the workspace, model, profile, project, toolset, and
-worktree lane, but never copies the source transcript or tool rows. It carries
-at most the newest secret-redacted compaction summary (bounded to 8,000
-characters) as hidden reference context and restores the latest substantive
-user request as an editable composer draft. Generic `continue` / `handoff`
-turns are skipped when selecting that draft. Nothing is submitted automatically;
-review or edit the draft, then press Send. Use **Open source history** in the
-focused continuation to return to the read-only transcript.
+**Fix.** Normally, wait for the same conversation to continue. If the browser
+was closed or refreshed, reopen that conversation; the server continues the
+claimed work and the tab attaches to the same task when it returns. If recovery
+is blocked, clarify or resend from the still-enabled composer in that same
+conversation. A human message supersedes a not-yet-started automatic claim and
+uses its safe recovery context, so no stale hidden retry can run later. It also
+reclaims a stale `starting`/`started` residue when no stream or active-run owner
+is live; only a demonstrably live recovery may return a temporary conflict.
 
-**When to file a bug.** File a bug if the exhausted message has no recovery
-action, the action copies the old transcript/tool rows, the focused child loses
-its draft on reload, any recovery action submits work automatically, or either
-`/api/chat/start` or the synchronous `/api/chat` path accepts another turn in
-the exhausted parent instead of returning recovery guidance.
+After upgrading from a build that showed `Start focused continuation`, restart
+WebUI and fully open the affected conversation. The first full message load can
+adopt one safe legacy marker in place; sidebar metadata polling and startup alone
+do not perform that adoption. WebUI will not auto-adopt a legacy source when a
+focused child already contains substantive work, because replay could duplicate
+effects.
+
+**When to file a bug.** File a bug if recovery creates or navigates to another
+conversation, changes the title or URL, adds a sidebar row, makes the composer
+read-only, displays duplicate failed user rows, starts more than one successor,
+or leaves a safely claimed receipt pending after restart. Also report a blocked
+state that gives no truthful reason, or a native/Gateway behavior mismatch.
 
 ---
 

@@ -839,7 +839,10 @@ def _settle_gateway_terminal_error(
     cancel_event=None,
 ):
     from api.streaming import (
+        _active_turn_authority,
+        _blocked_compression_recovery_payload,
         _classify_provider_error,
+        _claim_same_session_compression_recovery,
         _materialize_pending_user_turn_before_error,
         _provider_error_payload,
         _session_payload_with_full_messages,
@@ -855,6 +858,11 @@ def _settle_gateway_terminal_error(
         session = get_session(session_id)
         if not _stream_writeback_is_current(session, stream_id):
             return None
+        active_turn_identity = _active_turn_authority(
+            session,
+            stream_id,
+            str(getattr(session, "pending_user_message", None) or ""),
+        )
         if cancel_event is not None and cancel_event.is_set():
             return None
         terminal_state_before = (
@@ -892,7 +900,10 @@ def _settle_gateway_terminal_error(
                     f"{error_payload.get('hint', '').rstrip()} {pause_hint}"
                 ).strip()
         turn_duration = _terminal_turn_duration(session)
-        _materialize_pending_user_turn_before_error(session)
+        _materialize_pending_user_turn_before_error(
+            session,
+            active_turn_identity=active_turn_identity,
+        )
         session.active_stream_id = None
         session.pending_user_message = None
         session.pending_attachments = None
@@ -914,11 +925,38 @@ def _settle_gateway_terminal_error(
         }
         if turn_duration is not None:
             error_message["_turnDuration"] = turn_duration
+        compression_recovery_accepted = False
+        if error_classification.get("type") == "compression_exhausted":
+            if process_completion_claims:
+                recovery = _blocked_compression_recovery_payload(
+                    session,
+                    stream_id,
+                    reason="process_completion_delivery_requires_terminal_receipt",
+                )
+            else:
+                compression_recovery_accepted, recovery = (
+                    _claim_same_session_compression_recovery(
+                        session,
+                        stream_id,
+                        failed_user_text=str(active_turn_identity.get("text") or ""),
+                        attachments=active_turn_identity.get("attachments") or [],
+                        source=str(active_turn_identity.get("source") or "webui"),
+                    )
+                )
+            error_payload["compression_recovery"] = recovery
+            error_payload["terminal_state"] = "compression_exhausted"
+            error_payload["automatic_recovery"] = bool(
+                compression_recovery_accepted
+            )
+            error_payload["phase"] = recovery.get("phase")
+            if not compression_recovery_accepted:
+                error_message["_compressionRecovery"] = recovery
         if error_payload.get("details"):
             error_message["provider_details"] = error_payload["details"]
         if not isinstance(session.messages, list):
             session.messages = []
-        session.messages.append(error_message)
+        if not compression_recovery_accepted:
+            session.messages.append(error_message)
         session.workspace = str(workspace)
         session.model = model
         session.model_provider = model_provider
@@ -963,6 +1001,40 @@ def _settle_gateway_terminal_error(
                 else:
                     terminal_session_persisted = process_completion_delivery_committed
             logger.debug("Failed to persist gateway terminal error settlement", exc_info=True)
+        recovery_terminal_journal_persisted = False
+        if (
+            active_turn_identity.get("source") == "compression_recovery"
+            and terminal_session_persisted
+        ):
+            try:
+                from api.turn_journal import append_turn_journal_event_for_stream
+
+                append_turn_journal_event_for_stream(
+                    session.session_id,
+                    stream_id,
+                    {
+                        "event": "interrupted",
+                        "created_at": time.time(),
+                        "reason": error_classification.get("type") or "gateway_error",
+                        "recovery_terminal_persisted": True,
+                        "recovery_presentation_session_id": str(session.session_id),
+                    },
+                )
+                recovery_terminal_journal_persisted = True
+            except Exception:
+                logger.debug(
+                    "Failed to persist gateway recovery terminal turn journal",
+                    exc_info=True,
+                )
+        if recovery_terminal_journal_persisted:
+            from api.compression_recovery_receipts import (
+                settle_recovery_after_durable_terminal,
+            )
+
+            settle_recovery_after_durable_terminal(
+                session,
+                child_stream_id=stream_id,
+            )
         if process_completion_receipt_status in {"invalid", "unavailable", "absent"}:
             error_payload.pop("session", None)
         else:
@@ -1630,6 +1702,10 @@ def _run_gateway_chat_streaming(
                     "goal_continuation",
                     "_goal_continuation_control",
                 ),
+                "compression_recovery": (
+                    "compression_recovery",
+                    "_compression_recovery_control",
+                ),
             }.get(pending_source)
             if _internal_control:
                 _control_attr, _control_key = _internal_control
@@ -1784,6 +1860,45 @@ def _run_gateway_chat_streaming(
                     return
             else:
                 s.save()
+            recovery_terminal_journal_persisted = False
+            if pending_source == "compression_recovery":
+                try:
+                    from api.turn_journal import append_turn_journal_event_for_stream
+
+                    append_turn_journal_event_for_stream(
+                        s.session_id,
+                        stream_id,
+                        {
+                            "event": "completed",
+                            "created_at": time.time(),
+                            "assistant_message_index": next(
+                                (
+                                    idx
+                                    for idx in range(len(s.messages) - 1, -1, -1)
+                                    if isinstance(s.messages[idx], dict)
+                                    and s.messages[idx].get("role") == "assistant"
+                                ),
+                                None,
+                            ),
+                            "recovery_terminal_persisted": True,
+                            "recovery_presentation_session_id": str(s.session_id),
+                        },
+                    )
+                    recovery_terminal_journal_persisted = True
+                except Exception:
+                    logger.debug(
+                        "Failed to persist gateway recovery terminal turn journal",
+                        exc_info=True,
+                    )
+            if recovery_terminal_journal_persisted:
+                from api.compression_recovery_receipts import (
+                    settle_recovery_after_durable_terminal,
+                )
+
+                settle_recovery_after_durable_terminal(
+                    s,
+                    child_stream_id=stream_id,
+                )
             if cancel_event.is_set():
                 if delivery_writeback_committed:
                     success_writeback_committed = True
@@ -2039,6 +2154,7 @@ def _run_gateway_chat_streaming(
 
                 recover_successors_after_unregister(
                     session_id,
+                    parent_run_id=stream_id,
                     session=s,
                     profile=getattr(s, "profile", None) or profile,
                 )

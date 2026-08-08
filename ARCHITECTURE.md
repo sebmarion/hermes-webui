@@ -76,6 +76,8 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       routes.py            All GET + POST route handlers (if/elif dispatch, no decorators)
       startup.py           Startup helpers: auto_install_agent_deps()
       state_sync.py        Shared state.db bridge — metadata, counts, and lineage
+      compression_recovery.py Bounded/redacted same-session recovery seed policy
+      compression_recovery_receipts.py Durable at-most-once recovery ownership + restart reconciliation
       streaming.py         SSE engine, run_agent, cancel, compression, HERMES_HOME save/restore
       updates.py           Self-update check and release notes
       upload.py            Multipart parser, file upload handler
@@ -464,6 +466,74 @@ Stream cleanup: _run_agent_streaming() pops its stream_id from STREAMS in a fina
 block. If the browser disconnects mid-stream, the daemon thread runs to completion and
 then cleans up. The queue fills and the put_nowait() calls fail silently (queue.Full
 is caught).
+
+Compression-exhaustion recovery is server-owned and stays inside the current
+session. When native streaming or Gateway-backed execution returns structured
+`compression_exhausted`, `api/compression_recovery.py` builds one bounded,
+redacted seed from the exact failed request, safe attachment descriptors, and
+the newest trustworthy compressed summary or assistant checkpoint. The visible
+`messages` array is not replaced or truncated; only the next turn's
+`context_messages` are seeded. Tool results/arguments, reasoning, synthetic
+controls, terminal errors, and unbounded transcript history cannot enter the
+seed. Missing or conflicting attachments and insufficient context fail closed.
+
+`api/compression_recovery_receipts.py` durably claims that work by
+`(session_id, parent_run_id)` before the parent terminal frame reports automatic
+recovery. Its private bounded store, `_compression_recoveries.json`, moves one
+claim through `claimed`, `starting`, `started`, or `discarded`. The failed turn's
+text/source/time/attachments remain owned by the active-turn identity and exact
+submitted journal row; the receipt does not store a separate failed `turn_id`.
+The hidden successor's submitted `stream_id`/`turn_id` are written by the turn
+journal and reconciled into started ownership only from exact claim token and
+seed-fingerprint evidence.
+Once a non-blocking terminal state is durable, the seed is removed and only a
+compact fingerprint tombstone remains for duplicate suppression. Session
+deletion is fenced while a recovery-owned worker can still write the task, then
+purges its rows entirely once no live owner remains. At the store bounds, only
+the oldest non-blocking tombstones are prunable; pending and ambiguity-blocking
+authority is never evicted. Unmanaged publication fsyncs both the replacement file and
+its parent directory.
+
+After the parent removes `STREAMS`, `ACTIVE_RUNS`, and execution-lineage
+ownership, `api/background_process.py` gives the exact compression claim first
+opportunity at the shared successor boundary. It calls
+`start_session_turn(..., source="compression_recovery")` for the same session,
+profile, workspace, model/provider routing, attachments, and lineage. The
+control prompt is model-context-only and excluded from visible history, pending
+composer state, and title generation. Native and Gateway backends settle the
+same presentation contract: `Recovering context...` is transient, the successor
+answer appends normally to the same visible conversation, and success clears the
+recovery phase. If Agent compression rotates the backing session during that
+successor, the source receipt durably records the canonical presentation session
+at the rotation boundary. Terminal-journal reconciliation repeats that identity,
+so a crash or write failure repairs or blocks the canonical task instead of
+leaving it stuck in `running`.
+
+The receipt reservation closes duplicate terminal callbacks, multiple tabs,
+and restart races. Startup processes compression receipts before tool-limit,
+goal, and deferred successors. A dead owner with no submitted successor, or an
+exact completed `launch_failed`, is reclaimable. Exact live or terminal journal
+evidence reconciles to `started`; malformed, conflicting, or ambiguous
+post-submission evidence becomes a durable in-place blocker rather than a
+second launch. Managed startup performs the same scan inside the signed
+continuation-receipt boundary and verifies the exact store afterward.
+
+A human WebUI start serializes at the same session/lineage admission boundary.
+When it wins against one `claimed` receipt, a fenced multi-step handoff reserves
+the claim, installs its seed, merges and revalidates recovery plus human
+attachments, durably submits the human turn, and only then marks the automatic
+control `superseded_by_user`. A demonstrably live `starting` or `started`
+successor retains ownership and returns an ordinary conflict. If neither live
+stream registry owns a stale reservation after a terminal save/journal failure,
+the human turn reclaims the exact seed and proceeds in place rather than
+returning a permanent 503.
+Blocked recovery leaves the composer enabled and renders one truthful
+diagnostic; a recovery successor that itself exhausts context is blocked and
+cannot recurse. The retired manual recovery endpoint returns typed `409
+reload_required` and never creates a child session. Safe legacy focused-recovery
+markers are evaluated on the first full session load (not metadata polling or
+startup); adoption is refused when an existing focused child contains
+substantive work.
 
 Standing-goal continuation is server-owned. After a goal-related turn is judged
 `continue`, `api/goal_continuation.py` atomically records a receipt keyed by

@@ -7,7 +7,9 @@ import sys
 import types
 from pathlib import Path
 
-from api import models, streaming
+import pytest
+
+from api import compression_recovery_receipts, config, models, streaming
 from api.models import Session
 from api.streaming import (
     _agent_result_terminal_failure,
@@ -19,6 +21,100 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _read(relpath: str) -> str:
     return (ROOT / relpath).read_text(encoding="utf-8")
+
+
+def _started_native_recovery(tmp_path, monkeypatch, *, stream_id):
+    from api.compression_recovery import _recovery_fingerprint
+    from api.turn_journal import append_turn_journal_event
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(config, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(streaming, "SESSION_DIR", session_dir)
+    models.SESSIONS.clear()
+    streaming.SESSIONS.clear()
+    config.STREAMS.clear()
+    config.ACTIVE_RUNS.clear()
+    config.CANCEL_FLAGS.clear()
+    config.AGENT_INSTANCES.clear()
+    config.SESSION_AGENT_LOCKS.clear()
+
+    request = "Finish the exact native recovery work from the trusted checkpoint."
+    context_messages = [
+        {"role": "assistant", "content": "Trusted completed checkpoint."},
+        {"role": "user", "content": request},
+    ]
+    session = Session(
+        session_id=f"native-recovery-{stream_id}",
+        title="Native recovery",
+        workspace=str(tmp_path),
+        model="test-model",
+        messages=[{"role": "assistant", "content": "Trusted completed checkpoint."}],
+    )
+    session.save()
+    models.SESSIONS[session.session_id] = session
+    streaming.SESSIONS[session.session_id] = session
+    seed = {
+        "session_id": session.session_id,
+        "parent_run_id": "native-parent",
+        "context_messages": context_messages,
+        "attachments": [],
+        "trust_source": "assistant_checkpoint",
+        "fingerprint": "",
+    }
+    seed["fingerprint"] = _recovery_fingerprint(
+        session_id=session.session_id,
+        parent_run_id="native-parent",
+        context_messages=context_messages,
+        attachments=[],
+    )
+    claimed = compression_recovery_receipts.claim_compression_recovery(
+        session,
+        "native-parent",
+        seed,
+    )
+
+    def start_recovery(sid, prompt, **kwargs):
+        submitted = append_turn_journal_event(
+            sid,
+            {
+                "event": "submitted",
+                "stream_id": stream_id,
+                "role": "user",
+                "content": prompt,
+                "attachments": kwargs["attachments"],
+                "source": compression_recovery_receipts.SOURCE,
+                "profile": "default",
+                "recovery_claim_token": kwargs["recovery_claim_token"],
+                "recovery_fingerprint": kwargs["recovery_fingerprint"],
+            },
+        )
+        return {
+            "session_id": sid,
+            "stream_id": stream_id,
+            "turn_id": submitted["turn_id"],
+        }
+
+    started = compression_recovery_receipts.settle_compression_recovery(
+        session.session_id,
+        "native-parent",
+        start=start_recovery,
+    )
+    session.active_stream_id = stream_id
+    session.pending_user_message = compression_recovery_receipts.RECOVERY_CONTROL_PROMPT
+    session.pending_attachments = []
+    session.pending_started_at = 1.0
+    session.pending_user_source = compression_recovery_receipts.SOURCE
+    session.context_messages = context_messages
+    session.compression_recovery = compression_recovery_receipts._session_phase_payload(
+        started,
+        "running",
+    )
+    session.save(touch_updated_at=False)
+    config.STREAMS[stream_id] = queue.Queue()
+    return session, claimed
 
 
 def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_errors_on_continuation(
@@ -139,9 +235,10 @@ def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_err
     assert payload["session"]["session_id"] == new_sid
     assert payload["old_session_id"] == old_sid
     assert payload["new_session_id"] == new_sid
-    assert payload["recommended_recovery_action"] == "start_focused_continuation"
     assert payload["compression_recovery"]["terminal_state"] == "compression_exhausted"
     assert payload["compression_recovery"]["source_session_id"] == new_sid
+    assert payload["compression_recovery"]["phase"] == "blocked"
+    assert payload["automatic_recovery"] is False
 
     old_payload = json.loads((session_dir / f"{old_sid}.json").read_text(encoding="utf-8"))
     new_payload = json.loads((session_dir / f"{new_sid}.json").read_text(encoding="utf-8"))
@@ -151,10 +248,10 @@ def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_err
     assert new_payload["session_id"] == new_sid
     assert new_payload["parent_session_id"] == old_sid
     assert new_payload["pre_compression_snapshot"] is False
-    assert new_payload["recommended_recovery_action"] == "start_focused_continuation"
-    assert new_payload["compression_recovery"]["recommended_action"] == "start_focused_continuation"
+    assert new_payload["recommended_recovery_action"] is None
+    assert new_payload["compression_recovery"]["phase"] == "blocked"
     assert new_payload["messages"][-1]["_error"] is True
-    assert new_payload["messages"][-1]["_compressionRecovery"]["recommended_action"] == "start_focused_continuation"
+    assert new_payload["messages"][-1]["_compressionRecovery"]["phase"] == "blocked"
     assert "Context compression exhausted" in new_payload["messages"][-1]["content"]
     assert not any(
         "Context budget rejected locally: compaction_made_no_progress." in str(message.get("content") or "")
@@ -168,6 +265,319 @@ def test_compression_exhausted_after_session_rotation_preserves_snapshot_and_err
     )
     assert old_sid not in streaming.SESSIONS
     assert streaming.SESSIONS[new_sid].session_id == new_sid
+
+
+@pytest.mark.parametrize("agent_outcome", ["success", "error"])
+@pytest.mark.parametrize("failure_mode", [None, "terminal_save", "terminal_journal"])
+def test_native_recovery_settles_only_after_durable_terminal(
+    tmp_path,
+    monkeypatch,
+    agent_outcome,
+    failure_mode,
+):
+    stream_id = f"native-{agent_outcome}-{failure_mode or 'durable'}"
+    session, claimed = _started_native_recovery(
+        tmp_path,
+        monkeypatch,
+        stream_id=stream_id,
+    )
+    failure_seen = []
+
+    class FakeAgent:
+        def __init__(self, stream_delta_callback=None, session_id=None, **_kwargs):
+            self.session_id = session_id
+            self.stream_delta_callback = stream_delta_callback
+            self.context_compressor = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.reasoning_config = None
+            self.ephemeral_system_prompt = None
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            if agent_outcome == "error":
+                raise RuntimeError("synthetic recovery provider failure")
+            history = list(kwargs.get("conversation_history") or [])
+            return {
+                "completed": True,
+                "final_response": "Recovered answer",
+                "messages": history
+                + [
+                    {"role": "user", "content": kwargs["persist_user_message"]},
+                    {"role": "assistant", "content": "Recovered answer"},
+                ],
+            }
+
+        def interrupt(self, _message):
+            return None
+
+    if failure_mode == "terminal_save":
+        original_save = models.Session.save
+
+        def fail_terminal_save(current, *args, **kwargs):
+            if (
+                current.session_id == session.session_id
+                and current.active_stream_id is None
+            ):
+                failure_seen.append("terminal_save")
+                raise OSError("synthetic native terminal save failure")
+            return original_save(current, *args, **kwargs)
+
+        monkeypatch.setattr(models.Session, "save", fail_terminal_save)
+    elif failure_mode == "terminal_journal":
+        original_append = streaming.append_turn_journal_event_for_stream
+
+        def fail_terminal_journal(session_id, current_stream_id, event, **kwargs):
+            if event.get("recovery_terminal_persisted") is True:
+                failure_seen.append("terminal_journal")
+                raise OSError("synthetic native terminal journal failure")
+            return original_append(session_id, current_stream_id, event, **kwargs)
+
+        monkeypatch.setattr(
+            streaming,
+            "append_turn_journal_event_for_stream",
+            fail_terminal_journal,
+        )
+
+    fake_hermes_state = types.ModuleType("hermes_state")
+    fake_hermes_state.SessionDB = lambda *_args, **_kwargs: object()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(streaming, "get_session", lambda _sid: session)
+        scoped.setattr(streaming, "_get_ai_agent", lambda: FakeAgent)
+        scoped.setattr(
+            streaming,
+            "resolve_model_provider",
+            lambda *_args, **_kwargs: ("test-model", "openai", None),
+        )
+        scoped.setattr("api.config.get_config", lambda *_args, **_kwargs: {})
+        scoped.setattr("api.config._resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+        scoped.setitem(sys.modules, "hermes_state", fake_hermes_state)
+        streaming._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text=compression_recovery_receipts.RECOVERY_CONTROL_PROMPT,
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id=stream_id,
+            attachments=[],
+        )
+
+    receipt = compression_recovery_receipts.load_receipts()["receipts"][
+        claimed["claim_key"]
+    ]
+    if failure_mode is None:
+        assert receipt["state"] == "discarded"
+        assert receipt["discarded_reason"] == "successor_settled"
+        assert Session.load(session.session_id).compression_recovery == {}
+    else:
+        assert failure_seen
+        assert not (
+            receipt["state"] == "discarded"
+            and receipt.get("discarded_reason") == "successor_settled"
+        )
+
+
+def test_native_rotated_recovery_settles_source_receipt_and_canonical_presentation(
+    tmp_path,
+    monkeypatch,
+):
+    from api.turn_journal import read_turn_journal
+
+    stream_id = "native-rotated-recovery"
+    source, claimed = _started_native_recovery(
+        tmp_path,
+        monkeypatch,
+        stream_id=stream_id,
+    )
+    source_sid = source.session_id
+    canonical_sid = f"{source_sid}-canonical"
+
+    class RotatingAgent:
+        def __init__(self, stream_delta_callback=None, session_id=None, **_kwargs):
+            self.session_id = session_id
+            self.stream_delta_callback = stream_delta_callback
+            self.context_compressor = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.reasoning_config = None
+            self.ephemeral_system_prompt = None
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            self.session_id = canonical_sid
+            history = list(kwargs.get("conversation_history") or [])
+            return {
+                "completed": True,
+                "final_response": "Recovered after rotation",
+                "messages": history
+                + [
+                    {"role": "user", "content": kwargs["persist_user_message"]},
+                    {"role": "assistant", "content": "Recovered after rotation"},
+                ],
+            }
+
+        def interrupt(self, _message):
+            return None
+
+    fake_hermes_state = types.ModuleType("hermes_state")
+    fake_hermes_state.SessionDB = lambda *_args, **_kwargs: object()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(streaming, "get_session", lambda _sid: source)
+        scoped.setattr(streaming, "_get_ai_agent", lambda: RotatingAgent)
+        scoped.setattr(
+            streaming,
+            "resolve_model_provider",
+            lambda *_args, **_kwargs: ("test-model", "openai", None),
+        )
+        scoped.setattr("api.config.get_config", lambda *_args, **_kwargs: {})
+        scoped.setattr("api.config._resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+        scoped.setitem(sys.modules, "hermes_state", fake_hermes_state)
+        streaming._run_agent_streaming(
+            session_id=source_sid,
+            msg_text=compression_recovery_receipts.RECOVERY_CONTROL_PROMPT,
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id=stream_id,
+            attachments=[],
+        )
+
+    terminal_events = [
+        event
+        for event in read_turn_journal(source_sid)["events"]
+        if event.get("stream_id") == stream_id
+        and event.get("event") in {"completed", "interrupted"}
+    ]
+    assert terminal_events[-1]["recovery_terminal_persisted"] is True
+    receipt = compression_recovery_receipts.load_receipts()["receipts"][
+        claimed["claim_key"]
+    ]
+    canonical = Session.load(canonical_sid)
+
+    assert receipt["session_id"] == source_sid
+    assert receipt["state"] == "discarded"
+    assert receipt["discarded_reason"] == "successor_settled"
+    assert canonical.parent_session_id == source_sid
+    assert canonical.compression_recovery == {}
+
+
+def test_native_rotated_terminal_journal_failure_repairs_canonical_blocker_on_restart(
+    tmp_path,
+    monkeypatch,
+):
+    stream_id = "native-rotated-terminal-journal-failure"
+    source, claimed = _started_native_recovery(
+        tmp_path,
+        monkeypatch,
+        stream_id=stream_id,
+    )
+    source_sid = source.session_id
+    canonical_sid = f"{source_sid}-canonical"
+    source_path = Path(models.SESSION_DIR) / f"{source_sid}.json"
+    journal_failures = []
+
+    class RotatingAgent:
+        def __init__(self, stream_delta_callback=None, session_id=None, **_kwargs):
+            self.session_id = session_id
+            self.stream_delta_callback = stream_delta_callback
+            self.context_compressor = None
+            self.session_prompt_tokens = 0
+            self.session_completion_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.reasoning_config = None
+            self.ephemeral_system_prompt = None
+            self._last_error = None
+
+        def run_conversation(self, **kwargs):
+            self.session_id = canonical_sid
+            history = list(kwargs.get("conversation_history") or [])
+            return {
+                "completed": True,
+                "final_response": "Recovered before terminal journal failure",
+                "messages": history
+                + [
+                    {"role": "user", "content": kwargs["persist_user_message"]},
+                    {
+                        "role": "assistant",
+                        "content": "Recovered before terminal journal failure",
+                    },
+                ],
+            }
+
+        def interrupt(self, _message):
+            return None
+
+    original_append = streaming.append_turn_journal_event_for_stream
+
+    def fail_recovery_terminal(session_id, current_stream_id, event, **kwargs):
+        if event.get("recovery_terminal_persisted") is True:
+            journal_failures.append((session_id, current_stream_id))
+            raise OSError("synthetic rotated terminal journal failure")
+        return original_append(session_id, current_stream_id, event, **kwargs)
+
+    fake_hermes_state = types.ModuleType("hermes_state")
+    fake_hermes_state.SessionDB = lambda *_args, **_kwargs: object()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(streaming, "get_session", lambda _sid: source)
+        scoped.setattr(streaming, "_get_ai_agent", lambda: RotatingAgent)
+        scoped.setattr(
+            streaming,
+            "resolve_model_provider",
+            lambda *_args, **_kwargs: ("test-model", "openai", None),
+        )
+        scoped.setattr(
+            streaming,
+            "append_turn_journal_event_for_stream",
+            fail_recovery_terminal,
+        )
+        scoped.setattr("api.config.get_config", lambda *_args, **_kwargs: {})
+        scoped.setattr("api.config._resolve_cli_toolsets", lambda *_args, **_kwargs: [])
+        scoped.setitem(sys.modules, "hermes_state", fake_hermes_state)
+        streaming._run_agent_streaming(
+            session_id=source_sid,
+            msg_text=compression_recovery_receipts.RECOVERY_CONTROL_PROMPT,
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id=stream_id,
+            attachments=[],
+        )
+
+    before_restart = compression_recovery_receipts.load_receipts()["receipts"][
+        claimed["claim_key"]
+    ]
+    canonical_before_restart = Session.load(canonical_sid)
+    source_before_restart_repair = source_path.read_bytes()
+    assert journal_failures == [(source_sid, stream_id)]
+    assert before_restart["state"] == "started"
+    assert before_restart["presentation_session_id"] == canonical_sid
+    assert canonical_before_restart.compression_recovery["phase"] == "running"
+
+    models.SESSIONS.clear()
+    streaming.SESSIONS.clear()
+    config.STREAMS.clear()
+    config.ACTIVE_RUNS.clear()
+    recovered = compression_recovery_receipts.recover_pending_compression_recoveries()
+
+    repaired_receipt = compression_recovery_receipts.load_receipts()["receipts"][
+        claimed["claim_key"]
+    ]
+    repaired_canonical = Session.load(canonical_sid)
+    assert recovered == 0
+    assert repaired_receipt["state"] == "discarded"
+    assert repaired_receipt["discarded_reason"] == "ambiguous_started_successor"
+    assert repaired_receipt["presentation_session_id"] == canonical_sid
+    assert repaired_canonical.compression_recovery["phase"] == "blocked"
+    assert (
+        repaired_canonical.compression_recovery["reason"]
+        == "ambiguous_started_successor"
+    )
+    assert source_path.read_bytes() == source_before_restart_repair
 
 
 def test_compression_exhausted_result_is_terminal_failure_even_after_streamed_text():
@@ -449,8 +859,8 @@ def test_apperror_payload_enriched_before_enqueue(tmp_path, monkeypatch):
     assert payload_after["session_id"] == new_sid
     assert payload_after["old_session_id"] == old_sid
     assert payload_after["new_session_id"] == new_sid
-    assert payload_after["recommended_recovery_action"] == "start_focused_continuation"
-    assert payload_after["compression_recovery"]["recommended_action"] == "start_focused_continuation"
+    assert payload_after["automatic_recovery"] is False
+    assert payload_after["compression_recovery"]["phase"] == "blocked"
 
 
 def test_exception_apperror_payload_includes_session_id_before_enqueue():

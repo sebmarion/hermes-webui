@@ -106,6 +106,12 @@ EXPECTED_DEFERRED_RELEASE_DESCRIPTORS = [
         "condition": "always",
     },
     {
+        "name": "compression_recovery",
+        "owner": "webui_server",
+        "operation": "server._recover_compression_recoveries_for_startup",
+        "condition": "startup_run_admission_closed",
+    },
+    {
         "name": "tool_limit_continuation_recovery",
         "owner": "webui_server",
         "operation": "server._recover_tool_limit_continuations_for_startup",
@@ -153,7 +159,7 @@ EXPECTED_DEFERRED_RELEASE_MANIFEST = {
     "descriptors": EXPECTED_DEFERRED_RELEASE_DESCRIPTORS,
 }
 EXPECTED_DEFERRED_RELEASE_MANIFEST_SHA256 = (
-    "040d95fe27e21611ec01c5d63da7a8767bc120e1d771593df17446be0943a38b"
+    "a6eccf4a27e35ebac257266d0604656c43340440ce3aff2b266ac4132aa0f1b9"
 )
 
 
@@ -2984,6 +2990,7 @@ def test_managed_deferred_start_includes_detached_continuation_recovery(
     assert "startup_configuration" in names
     assert "process_completion_recovery" in names
     assert "async_delegation_recovery" in names
+    assert "compression_recovery" in names
     assert "tool_limit_continuation_recovery" in names
     assert "goal_continuation_recovery" in names
     assert names.index("state_directories") < names.index("startup_profile_state")
@@ -2995,6 +3002,9 @@ def test_managed_deferred_start_includes_detached_continuation_recovery(
         "async_delegation_recovery"
     )
     assert names.index("async_delegation_recovery") < names.index(
+        "compression_recovery"
+    )
+    assert names.index("compression_recovery") < names.index(
         "tool_limit_continuation_recovery"
     )
     assert names.index("goal_continuation_recovery") < names.index(
@@ -3136,6 +3146,54 @@ def test_async_delegation_recovery_runs_once_inside_signed_accept(
     assert accepted["state"] == "open"
     assert repeated["state"] == "open"
     assert calls == ["recover"]
+
+
+def test_compression_recovery_runs_once_inside_signed_accept(
+    monkeypatch,
+    isolated_startup_admission,
+):
+    import server
+    from api import routes
+
+    calls = []
+    monkeypatch.setattr(
+        routes,
+        "_recover_compression_recoveries_on_startup",
+        lambda *, strict=False: (
+            calls.append(strict)
+            or {"status": "complete", "recovered": 2}
+        ),
+    )
+    monkeypatch.setattr(server, "_DEFERRED_STARTUP_COMPLETED", set())
+    monkeypatch.setattr(
+        server,
+        "_deferred_startup_steps",
+        lambda: (
+            (
+                "compression_recovery",
+                server._recover_compression_recoveries_for_startup,
+            ),
+        ),
+    )
+    _configure_test_managed_replay(monkeypatch, server)
+    _select_managed_candidate(monkeypatch)
+    assert server._prepare_startup_mutators() == "deferred"
+    fenced = _claim_startup_fence()
+
+    accepted = config.accept_startup_run_admission(
+        fenced["token"],
+        expected_identity=IDENTITY,
+        transaction_id=TRANSACTION_ID,
+    )
+    repeated = config.accept_startup_run_admission(
+        fenced["token"],
+        expected_identity=IDENTITY,
+        transaction_id=TRANSACTION_ID,
+    )
+
+    assert accepted["state"] == "open"
+    assert repeated["state"] == "open"
+    assert calls == [True]
 
 
 def test_managed_accept_waits_for_one_shot_recovery_terminal_success(
@@ -3691,6 +3749,7 @@ def test_fresh_managed_import_and_prepare_do_not_mutate_state_before_accept(
     before = _tree_bytes_and_mtimes(isolated_root)
 
     env = os.environ.copy()
+    assert config._AGENT_DIR is not None
     env.update(
         {
             "HOME": str(home),
@@ -3699,7 +3758,7 @@ def test_fresh_managed_import_and_prepare_do_not_mutate_state_before_accept(
             "HERMES_WEBUI_STATE_DIR": str(state_dir),
             "HERMES_WEBUI_TEST_STATE_DIR": str(state_dir),
             "HERMES_WEBUI_DEFAULT_WORKSPACE": str(workspace),
-            "HERMES_WEBUI_AGENT_DIR": os.path.join(os.path.dirname(repo_root), "agent"),
+            "HERMES_WEBUI_AGENT_DIR": str(config._AGENT_DIR),
             "HERMES_WEBUI_RELEASE_PATH": repo_root,
             "HERMES_WEBUI_LAUNCH_MODE": "selector",
             "HERMES_WEBUI_MANIFEST_SHA256": "a" * 64,

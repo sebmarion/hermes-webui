@@ -46,6 +46,7 @@ _SAFE_PARTIAL_STEPS = frozenset(
         "state_directories",
         "startup_configuration",
         "async_delegation_recovery",
+        "compression_recovery",
         "tool_limit_continuation_recovery",
         "goal_continuation_recovery",
         "background_services",
@@ -61,6 +62,7 @@ _RERUN_IF_ABSENT_STEPS = frozenset(
         "plugins",
         "process_completion_recovery",
         "async_delegation_recovery",
+        "compression_recovery",
         "tool_limit_continuation_recovery",
         "goal_continuation_recovery",
         "background_services",
@@ -1202,6 +1204,17 @@ def _background_verification(drain, reaper, receipt):
     return _Verification(outcome, combined)
 
 
+def _start_compression_recovery_turn(
+    routes,
+    session_id: str,
+    prompt: str,
+    **kwargs,
+):
+    """Forward the exact durable recovery binding to the shared route seam."""
+
+    return routes.start_session_turn(session_id, prompt, **kwargs)
+
+
 def build_production_managed_startup_coordinator(
     *,
     environment: Mapping[str, str] | None = None,
@@ -1222,6 +1235,7 @@ def build_production_managed_startup_coordinator(
         auth,
         background_process,
         config,
+        compression_recovery_receipts,
         goal_continuation,
         managed_startup_configuration,
         managed_continuation_recovery,
@@ -1273,6 +1287,11 @@ def build_production_managed_startup_coordinator(
         async_delegation,
         "verify_managed_async_delegations_exact",
         capability="async delegation recovery",
+    )
+    verify_compression = _required_callable(
+        compression_recovery_receipts,
+        "verify_managed_compression_recoveries_exact",
+        capability="compression recovery",
     )
     verify_tool = _required_callable(
         tool_limit_continuation,
@@ -1446,6 +1465,15 @@ def build_production_managed_startup_coordinator(
             ),
         )
 
+    def compression_mutator():
+        return compression_recovery_receipts.recover_managed_compression_recoveries_exact(
+            transaction_id=transaction_id,
+            manifest_sha256=manifest_sha,
+            start=lambda session_id, prompt, **kwargs: _start_compression_recovery_turn(
+                routes, session_id, prompt, **kwargs
+            ),
+        )
+
     def goal_mutator():
         return goal_continuation.recover_managed_goal_continuations_exact(
             transaction_id=transaction_id,
@@ -1512,6 +1540,17 @@ def build_production_managed_startup_coordinator(
             ),
         ),
         "async_delegation_recovery": (async_mutator, async_verifier),
+        "compression_recovery": (
+            compression_mutator,
+            lambda receipt: _Verification(
+                verify_compression(
+                    receipt,
+                    transaction_id=transaction_id,
+                    manifest_sha256=manifest_sha,
+                ).outcome,
+                receipt,
+            ),
+        ),
         "tool_limit_continuation_recovery": (
             tool_mutator,
             lambda receipt: _Verification(
@@ -1563,6 +1602,7 @@ def build_production_managed_startup_coordinator(
                 "plugins": "webui.plugins-receipt.v1",
                 "process_completion_recovery": "agent.process-recovery-receipt.v1",
                 "async_delegation_recovery": "agent.async-recovery-receipt.v1",
+                "compression_recovery": "webui.continuation-receipt.v1",
                 "tool_limit_continuation_recovery": "webui.continuation-receipt.v1",
                 "goal_continuation_recovery": "webui.continuation-receipt.v1",
                 "background_services": "webui.background-receipt.v1",

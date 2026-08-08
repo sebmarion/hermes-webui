@@ -74,7 +74,6 @@ from api.session_message_paging import (
 from api.compression_anchor import visible_messages_for_anchor
 from api.compression_recovery import (
     COMPRESSION_RECOVERY_ACTION_START_FOCUSED,
-    build_focused_continuation_seed,
     compression_recovery_payload_for_session,
 )
 from api.session_events import (
@@ -14553,6 +14552,8 @@ def handle_get(handler, parsed) -> bool:
                     )
             original_stream_id = getattr(s, "active_stream_id", None)
             _clear_stale_stream_state(s)
+            if load_messages and not getattr(s, "_loaded_metadata_only", False):
+                _maybe_adopt_legacy_compression_recovery_on_session_load(s)
             if _session_requires_cli_metadata_lookup(s):
                 cli_meta = _targeted_cli_metadata_for_resolution(resolution)
             else:
@@ -17258,21 +17259,38 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         except PermissionError:
             return bad(handler, "Read-only imported sessions cannot be updated from WebUI", 403)
-        old_ws = getattr(s, "workspace", "")
-        old_model = getattr(s, "model", None)
-        old_provider = getattr(s, "model_provider", None)
         try:
             new_ws = str(resolve_trusted_workspace(body.get("workspace", s.workspace)))
         except ValueError as e:
             return bad(handler, str(e))
         with _get_session_agent_lock(body["session_id"]):
-            s.workspace = new_ws
+            old_ws = getattr(s, "workspace", "")
+            old_model = getattr(s, "model", None)
+            old_provider = getattr(s, "model_provider", None)
+            model = old_model
+            provider = old_provider
             if "model" in body or "model_provider" in body:
                 model, provider = _session_model_state_from_request(
                     body.get("model", s.model),
                     body.get("model_provider") if "model_provider" in body else None,
                     getattr(s, "model_provider", None),
                 )
+            route_changed = (
+                str(old_ws or "") != str(new_ws or "")
+                or str(old_model or "") != str(model or "")
+                or str(old_provider or "") != str(provider or "")
+            )
+            if route_changed:
+                from api.compression_recovery_receipts import (
+                    retire_session_compression_recoveries,
+                )
+
+                retire_session_compression_recoveries(
+                    s,
+                    reason="superseded_by_user",
+                )
+            s.workspace = new_ws
+            if "model" in body or "model_provider" in body:
                 if model is not None:
                     s.model = model
                 s.model_provider = provider
@@ -17339,8 +17357,10 @@ def handle_post(handler, parsed) -> bool:
         is_messaging_session = _is_messaging_session_id(sid)
         worktree_retained = _worktree_retained_payload_for_session_id(sid)
         state_db_cleanup_failed = False
+        session_for_delete = None
         try:
-            event_profile = getattr(get_session(sid, metadata_only=True), "profile", None)
+            session_for_delete = get_session(sid, metadata_only=True)
+            event_profile = getattr(session_for_delete, "profile", None)
         except KeyError:
             event_profile = None
         except Exception:
@@ -17352,6 +17372,27 @@ def handle_post(handler, parsed) -> bool:
         if not session_lock.acquire(timeout=5):
             return bad(handler, "Session busy, try again", 503)
         try:
+            from api.compression_recovery_receipts import (
+                retire_session_compression_recoveries,
+                session_has_live_compression_recovery,
+            )
+
+            if session_has_live_compression_recovery(session_for_delete or sid):
+                return j(
+                    handler,
+                    {
+                        "error": (
+                            "Context recovery is still running in this conversation"
+                        ),
+                        "type": "compression_recovery_in_progress",
+                        "session_id": sid,
+                    },
+                    status=409,
+                )
+            retire_session_compression_recoveries(
+                session_for_delete or sid,
+                reason="session_deleted",
+            )
             with LOCK:
                 SESSIONS.pop(sid, None)
             try:
@@ -17465,6 +17506,14 @@ def handle_post(handler, parsed) -> bool:
         canonical_title_cleared = True
         canonical_title_clear_failed = False
         with _get_session_agent_lock(sid):
+            from api.compression_recovery_receipts import (
+                retire_session_compression_recoveries,
+            )
+
+            retire_session_compression_recoveries(
+                s,
+                reason="superseded_by_user",
+            )
             had_sidecar_messages = bool(s.messages or [])
             # Clear is a full truncate-to-empty: route through the SAME helper the
             # /api/session/truncate handler uses (single source of truth) so the
@@ -17620,7 +17669,14 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "keep_count must be non-negative")
         with _get_session_agent_lock(body["session_id"]):
             from api.session_ops import truncate_session_at_keep
+            from api.compression_recovery_receipts import (
+                retire_session_compression_recoveries,
+            )
 
+            retire_session_compression_recoveries(
+                s,
+                reason="superseded_by_user",
+            )
             old_msg_count, old_ctx_count = truncate_session_at_keep(s, keep)
             s.save()
             logger.info(
@@ -24318,7 +24374,11 @@ def _prepare_chat_start_session_for_stream(
     s.model_provider = model_provider
     s.active_stream_id = stream_id
     s.post_compression_context_tokens_estimate = None
-    _hidden_internal_control = source in ("tool_limit_continuation", "goal_continuation")
+    _hidden_internal_control = source in (
+        "tool_limit_continuation",
+        "goal_continuation",
+        "compression_recovery",
+    )
     # Continuation prompts are control-plane input. The structured copy is
     # already durable in context_messages; never expose it as composer/pending
     # state, eagerly checkpoint it into the visible transcript, or derive a
@@ -24393,6 +24453,7 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
     if getattr(session, "pending_user_source", None) in (
         "tool_limit_continuation",
         "goal_continuation",
+        "compression_recovery",
     ):
         return (
             str(getattr(session, "pending_server_instance_id", None) or "")
@@ -24523,6 +24584,7 @@ def _start_chat_stream_for_session(
     session_lock_held: bool = False,
     recovery_claim_token: str | None = None,
     recovery_fingerprint: str | None = None,
+    recovery_context_messages: list[dict] | None = None,
     lineage_state_db_path=None,
     _admission_reservation_id=None,
     _admission_transfer_state=None,
@@ -24543,6 +24605,8 @@ def _start_chat_stream_for_session(
     attachments = attachments or []
     process_completion_events: list[dict] = []
     lineage_bound = False
+    human_supersession_claim_key: str | None = None
+    human_supersession_start_token: str | None = None
 
     def _bind_lineage_before_turn_mutation() -> dict | None:
         """Bind admission only after this session's lock is authoritative.
@@ -24582,6 +24646,173 @@ def _start_chat_stream_for_session(
         process_completion_events = claim_staged_process_completion_events(
             s.session_id
         )
+
+    def _apply_compression_recovery_context_under_lock() -> dict | None:
+        """Install or supersede a receipt only at the stream admission boundary."""
+
+        nonlocal recovery_claim_token
+        nonlocal recovery_fingerprint
+        nonlocal human_supersession_claim_key
+        nonlocal human_supersession_start_token
+
+        from api.compression_recovery_receipts import (
+            SOURCE as COMPRESSION_RECOVERY_SOURCE,
+            CompressionRecoveryAdmissionBlocked,
+            CompressionRecoveryInProgress,
+            CompressionRecoverySupersessionConflict,
+            _session_phase_payload,
+            retire_session_compression_recoveries,
+            reserve_human_compression_supersession,
+            reserved_recovery_seed,
+        )
+
+        if source == COMPRESSION_RECOVERY_SOURCE:
+            if not (
+                recovery_claim_token
+                and recovery_fingerprint
+                and isinstance(recovery_context_messages, list)
+            ):
+                return {
+                    "error": "Compression recovery reservation is incomplete",
+                    "type": "compression_recovery_reservation_invalid",
+                    "_status": 409,
+                }
+            try:
+                seed = reserved_recovery_seed(
+                    s,
+                    claim_token=recovery_claim_token,
+                    fingerprint=recovery_fingerprint,
+                    context_messages=recovery_context_messages,
+                    attachments=attachments,
+                )
+            except CompressionRecoveryAdmissionBlocked as exc:
+                s.compression_recovery = _session_phase_payload(
+                    exc.receipt,
+                    "blocked",
+                    reason=exc.reason,
+                )
+                s.recommended_recovery_action = None
+                try:
+                    s.save(touch_updated_at=False)
+                except Exception:
+                    logger.exception(
+                        "compression recovery admission blocker could not be projected for %s",
+                        s.session_id,
+                    )
+                return {
+                    "error": "Compression recovery cannot safely use its reserved context",
+                    "type": "compression_recovery_admission_blocked",
+                    "reason": exc.reason,
+                    "_status": 409,
+                }
+            except Exception:
+                logger.exception(
+                    "compression recovery reservation validation failed for %s",
+                    s.session_id,
+                )
+                return {
+                    "error": "Compression recovery reservation could not be validated",
+                    "type": "compression_recovery_reservation_invalid",
+                    "_status": 409,
+                }
+            s.context_messages = copy.deepcopy(seed["context_messages"])
+            recovery = dict(getattr(s, "compression_recovery", None) or {})
+            recovery.update(
+                {
+                    "phase": "starting",
+                    "automatic_recovery": True,
+                    "same_session": True,
+                    "fingerprint": recovery_fingerprint,
+                }
+            )
+            s.compression_recovery = recovery
+            s.recommended_recovery_action = None
+            return None
+
+        if source == "webui":
+            try:
+                superseded = reserve_human_compression_supersession(
+                    s,
+                    attachments=attachments,
+                )
+            except CompressionRecoverySupersessionConflict:
+                return {
+                    "error": "Pending context recovery attachment conflicts with the new turn",
+                    "type": "compression_recovery_supersession_failed",
+                    "_status": 409,
+                }
+            except CompressionRecoveryInProgress:
+                return {
+                    "error": "Context recovery is still running in this conversation",
+                    "type": "compression_recovery_in_progress",
+                    "_status": 409,
+                }
+            except Exception:
+                logger.exception(
+                    "human compression recovery supersession failed for %s",
+                    s.session_id,
+                )
+                return {
+                    "error": "Pending context recovery could not be superseded safely",
+                    "type": "compression_recovery_supersession_failed",
+                    "_status": 503,
+                }
+            if superseded is not None:
+                attachments[:] = copy.deepcopy(
+                    superseded["merged_attachments"]
+                )
+                human_supersession_claim_key = str(
+                    superseded.get("claim_key") or ""
+                )
+                human_supersession_start_token = str(
+                    superseded.get("start_token") or ""
+                )
+                recovery_claim_token = human_supersession_start_token
+                recovery_fingerprint = str(
+                    superseded.get("fingerprint") or ""
+                )
+            elif (
+                dict(getattr(s, "compression_recovery", None) or {}).get("phase")
+                == "blocked"
+            ):
+                try:
+                    retire_session_compression_recoveries(
+                        s,
+                        reason="superseded_by_user",
+                    )
+                except Exception:
+                    logger.exception(
+                        "blocked compression recovery could not be retired for %s",
+                        s.session_id,
+                    )
+                    return {
+                        "error": "Blocked context recovery could not be retired safely",
+                        "type": "compression_recovery_supersession_failed",
+                        "_status": 503,
+                    }
+        return None
+
+    def _block_human_supersession(reason: str) -> None:
+        if not human_supersession_claim_key or not human_supersession_start_token:
+            return
+        from api.compression_recovery_receipts import (
+            _session_phase_payload,
+            finish_human_compression_supersession,
+        )
+
+        blocked_receipt = finish_human_compression_supersession(
+            human_supersession_claim_key,
+            human_supersession_start_token,
+            reason=reason,
+            project=False,
+        )
+        s.compression_recovery = _session_phase_payload(
+            blocked_receipt,
+            "blocked",
+            reason=reason,
+        )
+        s.recommended_recovery_action = None
+        s.save(touch_updated_at=False)
 
     def _process_completion_claim_identity(event: object, index: int) -> str:
         event_type = (
@@ -24780,6 +25011,9 @@ def _start_chat_stream_for_session(
             _goal_guard_error = _claim_goal_continuation_guard()
             if _goal_guard_error:
                 return _goal_guard_error
+            _compression_recovery_error = _apply_compression_recovery_context_under_lock()
+            if _compression_recovery_error:
+                return _compression_recovery_error
             _claim_process_completion_events_for_worker()
             _completion_settlement = _settle_replayed_process_completion()
             if _completion_settlement is not None:
@@ -24824,6 +25058,9 @@ def _start_chat_stream_for_session(
                 _goal_guard_error = _claim_goal_continuation_guard()
                 if _goal_guard_error:
                     return _goal_guard_error
+                _compression_recovery_error = _apply_compression_recovery_context_under_lock()
+                if _compression_recovery_error:
+                    return _compression_recovery_error
                 _claim_process_completion_events_for_worker()
                 _completion_settlement = _settle_replayed_process_completion()
                 if _completion_settlement is not None:
@@ -24908,11 +25145,41 @@ def _start_chat_stream_for_session(
             }
         if recovery_claim_token or recovery_fingerprint:
             # Recovery requires a durable reservation before any worker starts.
-            # Keep the persisted active/pending owner fail-closed and return an
-            # uncertain server error; the watchdog retains its global slot.
+            # No stream or worker owns this id yet. Release the provisional
+            # sidecar owner so the exact receipt can reconcile back to claimed
+            # instead of leaving a same-process phantom stream forever.
+            def _release_unjournaled_recovery_owner():
+                if getattr(s, "active_stream_id", None) != stream_id:
+                    return
+                s.active_stream_id = None
+                s.pending_user_message = None
+                s.pending_attachments = []
+                s.pending_started_at = None
+                s.pending_user_source = None
+                s.pending_server_instance_id = None
+                s.save(touch_updated_at=False)
+
+            try:
+                if session_lock_held:
+                    _release_unjournaled_recovery_owner()
+                else:
+                    with session_lock:
+                        _release_unjournaled_recovery_owner()
+            except Exception:
+                logger.exception(
+                    "Failed to release unjournaled compression recovery owner"
+                )
+            if human_supersession_claim_key and human_supersession_start_token:
+                try:
+                    _block_human_supersession(
+                        "ambiguous_human_supersession"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to block unjournaled human recovery supersession"
+                    )
             return {
                 "error": "Atomic recovery reservation could not be journaled",
-                "active_stream_id": stream_id,
                 "_status": 500,
             }
     thr = None
@@ -25041,6 +25308,19 @@ def _start_chat_stream_for_session(
                 except Exception:
                     logger.debug("Failed to record gateway run-start failure for stream %s", stream_id, exc_info=True)
             raise
+        if human_supersession_claim_key and human_supersession_start_token:
+            from api.compression_recovery_receipts import (
+                finish_human_compression_supersession,
+            )
+
+            if not _thread_start_was_observed(thr):
+                raise RuntimeError(
+                    "human compression supersession worker start was not observed"
+                )
+            finish_human_compression_supersession(
+                human_supersession_claim_key,
+                human_supersession_start_token,
+            )
         if delegation_id:
             if not worker_ready.wait(
                 timeout=_DELEGATION_WORKER_ACCEPT_TIMEOUT_SECONDS
@@ -25125,11 +25405,27 @@ def _start_chat_stream_for_session(
             )
         except Exception:
             logger.exception("Atomic recovery launch failure could not be journaled for stream %s", stream_id)
+            if human_supersession_claim_key and human_supersession_start_token:
+                try:
+                    _block_human_supersession(
+                        "ambiguous_human_supersession"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to block unjournaled human recovery launch failure"
+                    )
             return {
                 "error": "Atomic recovery worker launch failure could not be journaled",
                 "active_stream_id": stream_id,
                 "_status": 500,
             }
+        if human_supersession_claim_key and human_supersession_start_token:
+            try:
+                _block_human_supersession("ambiguous_human_supersession")
+            except Exception:
+                logger.exception(
+                    "Failed to block unstarted human recovery supersession"
+                )
         return {
             "error": "Atomic recovery worker failed before launch",
             "recovery_launch_failed": True,
@@ -25220,6 +25516,7 @@ def _start_run(
     session_lock_held: bool = False,
     recovery_claim_token: str | None = None,
     recovery_fingerprint: str | None = None,
+    recovery_context_messages: list[dict] | None = None,
     lineage_state_db_path=None,
     _admission_reservation_id=None,
     _admission_transfer_state=None,
@@ -25257,11 +25554,47 @@ def _start_run(
         runtime_adapter_runner_enabled,
     )
 
-    if session_lock_held and runtime_adapter_runner_enabled():
+    if (
+        runtime_adapter_runner_enabled()
+        and (session_lock_held or recovery_claim_token or recovery_fingerprint)
+    ):
         return {
-            "error": "Atomic recovery is unavailable when an external runner owns reservation",
+            "error": "Atomic recovery is unavailable when an external runner owns execution",
             "_status": 501,
         }
+
+    if runtime_adapter_runner_enabled() and source == "webui":
+        try:
+            from api.compression_recovery_receipts import (
+                session_has_pending_compression_recovery,
+            )
+
+            pending_compression_recovery = session_has_pending_compression_recovery(
+                s.session_id,
+                claim_key=str(
+                    dict(getattr(s, "compression_recovery", None) or {}).get(
+                        "claim_key"
+                    )
+                    or ""
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to prove compression recovery ownership before runner dispatch"
+            )
+            return {
+                "error": "Compression recovery ownership is unavailable",
+                "code": "compression_recovery_owner_unavailable",
+                "_status": 503,
+            }
+        if pending_compression_recovery:
+            return {
+                "error": (
+                    "Pending compression recovery requires a local writeback worker"
+                ),
+                "code": "compression_recovery_runner_supersession_unsupported",
+                "_status": 409,
+            }
 
     if runtime_adapter_enabled() or runtime_adapter_runner_enabled():
         if source == "process_wakeup" and runtime_adapter_runner_enabled():
@@ -25304,6 +25637,7 @@ def _start_run(
                 session_lock_held=session_lock_held,
                 recovery_claim_token=recovery_claim_token,
                 recovery_fingerprint=recovery_fingerprint,
+                recovery_context_messages=recovery_context_messages,
                 lineage_state_db_path=lineage_state_db_path,
                 delegation_id=delegation_id,
                 delegation_turn_id=delegation_turn_id,
@@ -25368,6 +25702,7 @@ def _start_run(
         session_lock_held=session_lock_held,
         recovery_claim_token=recovery_claim_token,
         recovery_fingerprint=recovery_fingerprint,
+        recovery_context_messages=recovery_context_messages,
         lineage_state_db_path=lineage_state_db_path,
         delegation_id=delegation_id,
         delegation_turn_id=delegation_turn_id,
@@ -25436,6 +25771,10 @@ def start_session_turn(
     _admission_reservation_id=None,
     _admission_transfer_state=None,
     delegation_id: str = "",
+    attachments: list[dict] | None = None,
+    recovery_claim_token: str | None = None,
+    recovery_fingerprint: str | None = None,
+    recovery_context_messages: list[dict] | None = None,
 ):
     """Start a server-side agent turn for ``session_id`` with ``message``.
 
@@ -25671,7 +26010,7 @@ def start_session_turn(
         resp = _start_run(
             s,
             msg=msg,
-            attachments=[],
+            attachments=list(attachments or []),
             workspace=workspace,
             model=model,
             model_provider=model_provider,
@@ -25680,6 +26019,9 @@ def start_session_turn(
             route="start_session_turn",
             delegation_id=str(delegation_id or ""),
             delegation_turn_id=delegation_turn_id,
+            recovery_claim_token=recovery_claim_token,
+            recovery_fingerprint=recovery_fingerprint,
+            recovery_context_messages=recovery_context_messages,
         )
     except Exception:
         if delegation_id:
@@ -25732,7 +26074,7 @@ def start_session_turn(
                         "session_id": str(session_id),
                         "stream_id": str(stream_id),
                         "pending_started_at": (resp or {}).get("pending_started_at"),
-                        "source": source,
+                        "source": turn_source,
                     },
                 )
     except Exception:
@@ -25740,6 +26082,214 @@ def start_session_turn(
             "server_turn_started fan-out failed for session %s", session_id, exc_info=True
         )
     return resp
+
+
+_LEGACY_COMPRESSION_RECOVERY_ADOPTION_LOCK = threading.RLock()
+
+
+def _legacy_compression_recovery_block(session, *, parent_run_id: str, reason: str) -> dict:
+    payload = {
+        "terminal_state": "compression_exhausted",
+        "phase": "blocked",
+        "automatic_recovery": False,
+        "same_session": True,
+        "source_session_id": session.session_id,
+        "parent_run_id": parent_run_id,
+        "created_at": time.time(),
+        "title": "Context recovery stopped",
+        "summary": (
+            "Hermes could not safely adopt the earlier recovery marker. "
+            "You can keep working in this conversation."
+        ),
+        "reason": str(reason)[:200],
+    }
+    session.compression_recovery = payload
+    session.recommended_recovery_action = None
+    session.save(touch_updated_at=False)
+    return payload
+
+
+def _maybe_adopt_legacy_compression_recovery_on_session_load(session) -> bool:
+    """Turn one safe read-only legacy marker into a durable in-place claim."""
+
+    recovery = compression_recovery_payload_for_session(session)
+    if not recovery:
+        return False
+    sid = str(getattr(session, "session_id", "") or "")
+    marker_identity = json.dumps(
+        {
+            "session_id": sid,
+            "created_at": recovery.get("created_at"),
+            "terminal_state": recovery.get("terminal_state"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    parent_run_id = str(recovery.get("parent_run_id") or "").strip() or (
+        "legacy-" + hashlib.sha256(marker_identity.encode("utf-8")).hexdigest()[:24]
+    )
+    with _LEGACY_COMPRESSION_RECOVERY_ADOPTION_LOCK:
+        try:
+            from api.compression_recovery_receipts import load_receipts
+
+            existing = [
+                row
+                for row in load_receipts().get("receipts", {}).values()
+                if row.get("session_id") == sid
+                and row.get("state") in {"claimed", "starting", "started"}
+            ]
+        except Exception:
+            logger.exception("legacy compression recovery receipt lookup failed for %s", sid)
+            _legacy_compression_recovery_block(
+                session,
+                parent_run_id=parent_run_id,
+                reason="durable_claim_unavailable",
+            )
+            return False
+        if existing:
+            session.recommended_recovery_action = None
+            return False
+
+        child = find_compression_recovery_session(
+            sid,
+            COMPRESSION_RECOVERY_ACTION_START_FOCUSED,
+            source_profile=getattr(session, "profile", None),
+        )
+        if child is not None and (
+            list(getattr(child, "messages", None) or [])
+            or any(
+                isinstance(row, dict)
+                and row.get("role") == "assistant"
+                and str(row.get("content") or "").strip()
+                for row in list(getattr(child, "context_messages", None) or [])
+            )
+        ):
+            _legacy_compression_recovery_block(
+                session,
+                parent_run_id=parent_run_id,
+                reason="legacy_focused_continuation_has_work",
+            )
+            return False
+
+        failed_row = next(
+            (
+                row
+                for row in reversed(list(getattr(session, "messages", None) or []))
+                if isinstance(row, dict)
+                and row.get("role") == "user"
+                and str(row.get("content") or "")
+            ),
+            None,
+        )
+        if failed_row is None:
+            _legacy_compression_recovery_block(
+                session,
+                parent_run_id=parent_run_id,
+                reason="missing_terminal_request",
+            )
+            return False
+        try:
+            from api.compression_recovery import build_same_session_recovery_seed
+            from api.compression_recovery_receipts import claim_compression_recovery
+
+            seed = build_same_session_recovery_seed(
+                session,
+                parent_run_id=parent_run_id,
+                failed_user_text=str(failed_row.get("content") or ""),
+                attachments=copy.deepcopy(list(failed_row.get("attachments") or [])),
+            )
+            claim_compression_recovery(session, parent_run_id, seed)
+        except Exception as exc:
+            reason = getattr(exc, "reason", "legacy_seed_unavailable")
+            logger.info(
+                "legacy compression recovery adoption blocked for %s: %s",
+                sid,
+                reason,
+            )
+            _legacy_compression_recovery_block(
+                session,
+                parent_run_id=parent_run_id,
+                reason=str(reason),
+            )
+            return False
+
+    def _recover_adopted_claim():
+        from api.compression_recovery_receipts import (
+            settle_compression_recovery,
+        )
+
+        settle_compression_recovery(sid, parent_run_id)
+
+    try:
+        start_admitted_auxiliary_thread(
+            kind="compression_recovery",
+            target=_recover_adopted_claim,
+            name=f"compression-recovery-{sid[:12]}",
+            daemon=True,
+            registration_timeout=1.0,
+        )
+    except Exception:
+        logger.exception(
+            "legacy compression recovery launch scheduling failed for %s",
+            sid,
+        )
+    return True
+
+
+def _recover_compression_recoveries_on_startup(
+    *,
+    strict: bool = False,
+    transaction_id: str | None = None,
+    manifest_sha256: str | None = None,
+) -> dict:
+    """Recover durable same-session claims before lower-priority successors."""
+
+    try:
+        from api.compression_recovery_receipts import (
+            recover_managed_compression_recoveries_exact,
+            recover_pending_compression_recoveries,
+        )
+
+        if strict:
+            receipt = recover_managed_compression_recoveries_exact(
+                transaction_id=transaction_id,
+                manifest_sha256=manifest_sha256,
+                start=lambda sid, prompt, **kwargs: start_session_turn(
+                    sid, prompt, **kwargs
+                ),
+            )
+            if receipt.outcome.value not in {"ABSENT", "COMPLETE"}:
+                raise RuntimeError(
+                    "managed compression recovery was not terminal: "
+                    f"{receipt.outcome.value}"
+                )
+            return receipt.to_dict()
+        recovered = recover_pending_compression_recoveries()
+    except Exception as exc:
+        logger.exception("compression recovery startup recovery failed")
+        if strict:
+            raise
+        return {"status": "failed", "error": type(exc).__name__}
+    return {"status": "complete", "recovered": int(recovered or 0)}
+
+
+# Avoid scheduling an import-time worker merely to prove an empty receipt store.
+# Besides creating needless startup work, that worker can race isolated-state
+# initialization in import-heavy test/embedded processes. Legacy markers are
+# intentionally adopted on first full session load; only a durable receipt
+# requires this unmanaged startup scan.
+def _schedule_unmanaged_compression_recovery() -> None:
+    if (Path(SESSION_DIR) / "_compression_recoveries.json").is_file():
+        start_admitted_auxiliary_thread(
+            kind="compression_recovery",
+            target=_recover_compression_recoveries_on_startup,
+            name="compression-recovery",
+            daemon=True,
+            registration_timeout=1.0,
+        )
+
+
+_schedule_unmanaged_compression_recovery()
 
 
 def _recover_tool_limit_continuations_on_startup(
@@ -25910,92 +26460,15 @@ def _handle_session_compression_recovery_start(handler, body):
         return bad(handler, "Session not found", 404)
     if not _session_visible_to_active_profile(getattr(source, "profile", None), handler):
         return bad(handler, "Session not found", 404)
-    recovery = compression_recovery_payload_for_session(source)
-    if not recovery:
-        return bad(handler, "Session does not have a compression recovery action.", 409)
-    action = str(recovery.get("recommended_action") or "")
-    if action != COMPRESSION_RECOVERY_ACTION_START_FOCUSED:
-        return bad(handler, "Unsupported compression recovery action.", 409)
-
-    created = False
-    with _COMPRESSION_RECOVERY_START_LOCK:
-        source_profile = getattr(source, "profile", None)
-        copied_session = find_compression_recovery_session(
-            sid, action, source_profile=source_profile
-        )
-        if copied_session is None:
-            recovery_context, recovery_draft = build_focused_continuation_seed(source)
-            title = str(getattr(source, "title", None) or "Untitled").strip() or "Untitled"
-            if not title.endswith(" (focused continuation)"):
-                title = f"{title} (focused continuation)"
-            copied_session = Session(
-                session_id=uuid.uuid4().hex[:12],
-                title=title,
-                workspace=getattr(source, "workspace", get_last_workspace()),
-                model=getattr(source, "model", None),
-                model_provider=getattr(source, "model_provider", None),
-                messages=[],
-                tool_calls=[],
-                pinned=False,
-                archived=False,
-                project_id=getattr(source, "project_id", None),
-                profile=getattr(source, "profile", None),
-                session_source="fork",
-                personality=getattr(source, "personality", None),
-                enabled_toolsets=copy.deepcopy(getattr(source, "enabled_toolsets", None)),
-                context_length=getattr(source, "context_length", None),
-                threshold_tokens=getattr(source, "threshold_tokens", None),
-                gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),
-                gateway_routing_history=copy.deepcopy(
-                    getattr(source, "gateway_routing_history", None) or []
-                ),
-                parent_session_id=getattr(source, "session_id", sid),
-                worktree_path=getattr(source, "worktree_path", None),
-                worktree_branch=getattr(source, "worktree_branch", None),
-                worktree_repo_root=getattr(source, "worktree_repo_root", None),
-                worktree_created_at=getattr(source, "worktree_created_at", None),
-                compression_recovery_source_session_id=sid,
-                compression_recovery_action=action,
-                context_messages=recovery_context,
-                composer_draft=recovery_draft,
-            )
-            try:
-                copied_session.save()
-            except Exception as e:
-                logger.exception("failed to persist compression recovery session for %s", sid)
-                return bad(
-                    handler,
-                    f"Failed to start compression recovery: {_sanitize_error(e)}",
-                    500,
-                )
-
-            with LOCK:
-                SESSIONS[copied_session.session_id] = copied_session
-                SESSIONS.move_to_end(copied_session.session_id)
-                _evict_sessions_over_cap()
-            created = True
-    if created:
-        publish_session_list_changed(
-            "session_compression_recovery",
-            profile=getattr(copied_session, "profile", None),
-            session_id=getattr(copied_session, "session_id", None),
-        )
-    session_payload = redact_session_data(
-        copied_session.compact() | {"messages": copied_session.messages}
-    )
     return j(
         handler,
         {
-            "ok": True,
-            "session": session_payload,
-            "source_session_id": sid,
-            "recommended_recovery_action": action,
-            "message": (
-                "Started a focused continuation with a recovered task draft."
-                if created
-                else "Opened the existing focused continuation for this exhausted session."
-            ),
+            "error": "Compression recovery is automatic in this conversation. Reload to attach.",
+            "type": "reload_required",
+            "reload_required": True,
+            "session_id": sid,
         },
+        status=409,
     )
 
 
@@ -26315,13 +26788,6 @@ def _handle_chat_start(handler, body, diag=None):
             return bad(handler, "message is required")
         diag.stage("normalize_attachments") if diag else None
         attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
-        recovery_required = _compression_recovery_required_payload(s)
-        if recovery_required:
-            return j(
-                handler,
-                recovery_required,
-                status=409,
-            )
         diag.stage("resolve_workspace") if diag else None
         try:
             workspace = _resolve_chat_workspace_with_recovery(s, body.get("workspace"))
@@ -26515,14 +26981,39 @@ def _handle_chat_sync(handler, body):
     msg = str(body.get("message", "")).strip()
     if not msg:
         return j(handler, {"error": "empty message"}, status=400)
-    recovery_required = _compression_recovery_required_payload(s)
-    if recovery_required:
-        return j(handler, recovery_required, status=409)
     try:
         workspace = str(resolve_trusted_workspace(body.get("workspace") or s.workspace))
     except ValueError as e:
         return bad(handler, str(e))
     with _get_session_agent_lock(s.session_id):
+        try:
+            from api.compression_recovery_receipts import (
+                CompressionRecoverySupersessionConflict,
+                retire_session_compression_recoveries,
+                supersede_pending_compression_recovery,
+            )
+
+            superseded_recovery = supersede_pending_compression_recovery(
+                s,
+                attachments_supported=False,
+            )
+            if (
+                superseded_recovery is None
+                and dict(getattr(s, "compression_recovery", None) or {}).get("phase")
+                == "blocked"
+            ):
+                retire_session_compression_recoveries(
+                    s,
+                    reason="superseded_by_user",
+                )
+        except CompressionRecoverySupersessionConflict as exc:
+            return bad(handler, _sanitize_error(exc), 409)
+        except Exception as exc:
+            logger.exception(
+                "synchronous compression recovery supersession failed for %s",
+                s.session_id,
+            )
+            return bad(handler, f"Pending context recovery is unavailable: {_sanitize_error(exc)}", 503)
         s.workspace = workspace
         _sync_requested_provider = (
             body.get("model_provider") if "model_provider" in body else getattr(s, "model_provider", None)
@@ -28978,6 +29469,14 @@ def _handle_session_compress(
 
             from api.session_ops import _truncation_watermark_for
             from api.streaming import _stamp_missing_message_timestamps
+            from api.compression_recovery_receipts import (
+                retire_session_compression_recoveries,
+            )
+
+            retire_session_compression_recoveries(
+                s,
+                reason="superseded_by_user",
+            )
 
             compressed_copy = copy.deepcopy(compressed)
             _stamp_missing_message_timestamps(compressed_copy)

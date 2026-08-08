@@ -88,6 +88,24 @@ dot, or standalone running badge. In settled final history, remove live-only
 automatic compression rows unless they explain a visible recovery or error
 state.
 
+When automatic compression cannot finish the active turn, recovery stays in
+that same visual and conversational lane. A durably accepted same-session
+successor renders only the transient divider text `Recovering context...`; it
+must not create a recovery card, button, focused child, URL/title/sidebar
+change, synthetic user row, or red terminal row. The successor's ordinary
+stream and final answer continue in the selected conversation, and settled
+history removes the transient recovery divider.
+
+If the server cannot prove recovery is safe, show one concise, text-only
+`Context recovery blocked` diagnostic with the truthful reason. Keep the
+composer enabled so the user can clarify or resend in place. Do not offer a
+manual fork or make the conversation read-only. A newer human send may
+supersede a not-yet-started automatic claim; the UI remains an observer of this
+server-owned arbitration and must not submit the hidden control itself. A
+demonstrably live successor may briefly reject a competing send with an
+ordinary ownership conflict; stale post-writeback ownership must be reclaimed
+by that send without requiring a restart or a new conversation.
+
 The existing two-stage proposal in `docs/ui-ux/two-stage-proposal.html` records a
 compatible direction for long turns: live work can be grouped as a worklog, then
 settled history can collapse while the final answer reads as the calm

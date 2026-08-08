@@ -441,6 +441,42 @@ def test_runner_owned_start_run_does_not_enter_local_stream_barrier(monkeypatch)
     assert len(calls) == 1
 
 
+def test_runner_owned_human_send_fails_closed_with_pending_compression_recovery(
+    monkeypatch,
+):
+    from api import compression_recovery_receipts, routes
+
+    class RunnerClient:
+        def start_run(self, _request):
+            raise AssertionError("pending recovery escaped to the external runner")
+
+    session = types.SimpleNamespace(session_id="session-recovery", profile=None)
+    monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "runner-local")
+    monkeypatch.setattr("api.runtime_adapter.runtime_adapter_enabled", lambda: False)
+    monkeypatch.setattr("api.runtime_adapter.runtime_adapter_runner_enabled", lambda: True)
+    monkeypatch.setattr(routes, "_runtime_runner_client_factory", lambda: RunnerClient())
+    monkeypatch.setattr(
+        compression_recovery_receipts,
+        "session_has_pending_compression_recovery",
+        lambda _sid, **_kwargs: True,
+    )
+
+    response = routes._start_run(
+        session,
+        msg="new human instruction",
+        attachments=[],
+        workspace="/tmp/workspace",
+        model="test-model",
+        model_provider="test-provider",
+        normalized_model=False,
+        source="webui",
+        route="/api/chat/start",
+    )
+
+    assert response["_status"] == 409
+    assert response["code"] == "compression_recovery_runner_supersession_unsupported"
+
+
 @pytest.mark.parametrize("gateway_owned", [False, True])
 def test_stream_admission_uses_one_gateway_ownership_snapshot(monkeypatch, gateway_owned):
     """The barrier and worker must share one immutable backend decision."""

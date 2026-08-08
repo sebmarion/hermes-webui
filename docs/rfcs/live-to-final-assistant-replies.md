@@ -3,7 +3,7 @@
 - **Status:** Accepted (parent contract; implementation tracked in [#3400](https://github.com/nesquena/hermes-webui/issues/3400))
 - **Author:** @franksong2702
 - **Created:** 2026-06-03
-- **Updated:** 2026-07-16
+- **Updated:** 2026-08-08
 - **Tracking issue:** [#3400](https://github.com/nesquena/hermes-webui/issues/3400)
 
 ## Background: Long-Running Sessions Are The Anchor
@@ -92,7 +92,7 @@ not current open/merged/superseded state: for live status, the tracking issue
 | --- | --- | --- |
 | Live work vs final answer boundary | [#536](https://github.com/nesquena/hermes-webui/issues/536), [#3400](https://github.com/nesquena/hermes-webui/issues/3400), [#3464](https://github.com/nesquena/hermes-webui/pull/3464) | Main product scope. #3464 landed the first RFC; this document is the parent contract for follow-up slices. |
 | First live-to-final reply implementation | [#3401](https://github.com/nesquena/hermes-webui/pull/3401), [#3014](https://github.com/nesquena/hermes-webui/issues/3014), [#3015](https://github.com/nesquena/hermes-webui/pull/3015) | First implementation slice. It should keep using `Refs #3400`; it does not close the umbrella. |
-| Auto Compression visibility and context pressure | [#469](https://github.com/nesquena/hermes-webui/issues/469), [#2973](https://github.com/nesquena/hermes-webui/issues/2973), [#3079](https://github.com/nesquena/hermes-webui/issues/3079), [#3315](https://github.com/nesquena/hermes-webui/issues/3315), [#3316](https://github.com/nesquena/hermes-webui/pull/3316) | Supporting edge case. Running compression is live lifecycle status; compression-exhausted/no-final finalization is a terminal-state follow-up. |
+| Auto Compression visibility and context pressure | [#469](https://github.com/nesquena/hermes-webui/issues/469), [#2973](https://github.com/nesquena/hermes-webui/issues/2973), [#3079](https://github.com/nesquena/hermes-webui/issues/3079), [#3315](https://github.com/nesquena/hermes-webui/issues/3315), [#3316](https://github.com/nesquena/hermes-webui/pull/3316) | Supporting edge case. Running compression is live lifecycle status; structured exhaustion now uses one durable same-session successor or an in-place safety blocker. |
 | Replay, reconnect, session switch, and reattach | [#2283](https://github.com/nesquena/hermes-webui/pull/2283), [#2924](https://github.com/nesquena/hermes-webui/issues/2924), [#3391](https://github.com/nesquena/hermes-webui/pull/3391) | Supporting recovery infrastructure. The product requirement is same lifecycle after replay, or an explicit degraded/restoring state. |
 | Tool, activity, thinking, and visible progress | [#1298](https://github.com/nesquena/hermes-webui/issues/1298), [#3014](https://github.com/nesquena/hermes-webui/issues/3014), [#3015](https://github.com/nesquena/hermes-webui/pull/3015) | Main reply-rendering concern. Process prose stays primary; tool/reasoning/debug detail stays supporting. |
 | No-final and terminal failure outcomes | [#3315](https://github.com/nesquena/hermes-webui/issues/3315), [#3316](https://github.com/nesquena/hermes-webui/pull/3316) | Confirmed follow-up / active PR scope. A tool-tail or compression-exhausted run must not settle as normal completion without a real final answer. |
@@ -137,7 +137,7 @@ flowchart TD
     L -- no --> N{Specific terminal outcome}
     N -- cancelled --> O["cancelled<br/>user stopped the turn"]
     N -- interrupted --> P["interrupted<br/>continuity lost before final answer"]
-    N -- compression_exhausted --> Q["compression_exhausted<br/>compression could not continue safely"]
+    N -- compression_exhausted --> Q{"Durable same-session<br/>recovery safely claimed?"}
     N -- tool_limit_reached --> R["tool_limit_reached<br/>tool / retry / iteration ceiling hit"]
     N -- no_response --> S["no_response<br/>no usable assistant final content"]
     N -- other failure --> T["error<br/>fallback for other terminal failures"]
@@ -145,7 +145,10 @@ flowchart TD
     M --> U["Settled reply visible<br/>supporting activity collapsed;<br/>artifacts and workspace outputs findable"]
     O --> U
     P --> U
-    Q --> U
+    Q -- yes --> V["Recovering context...<br/>same task; server-owned successor"]
+    V --> C
+    Q -- no / ambiguous --> W["Context recovery blocked<br/>composer remains enabled"]
+    W --> U
     R --> U
     S --> U
     T --> U
@@ -273,7 +276,7 @@ Required product states:
 | `completed` | The assistant produced a final answer and the turn settled normally. |
 | `cancelled` | The user stopped the turn. |
 | `interrupted` | Browser, stream, worker, runtime, or network continuity was lost before a final answer was produced. |
-| `compression_exhausted` | Context compression could not create enough room to continue safely. |
+| `compression_exhausted` | Context compression could not create enough room for the current worker; one durable same-session recovery may continue the reply, otherwise an in-place blocker remains. |
 | `tool_limit_reached` | The run hit a tool-call, retry, or iteration ceiling before a final answer was produced. |
 | `no_response` | The provider or runtime returned no usable assistant final content. |
 | `error` | Fallback for failures that do not fit the above states. |
@@ -306,7 +309,27 @@ Expected behavior:
 - Do not keep compression status text in the settled transcript unless it
   explains an error or recovery state.
 - If compression fails to create enough room, surface `compression_exhausted`
-  or another specific terminal outcome instead of normal completion.
+  or another specific terminal outcome instead of normal completion. A durably
+  accepted exhaustion is presented as transient `Recovering context...` while
+  one hidden successor continues in the same visible conversation.
+- The successor is server-owned and starts only after the failed worker releases
+  stream/run ownership. It must not require an open tab, create a child task,
+  change URL/title/sidebar identity, duplicate the failed user row, or make the
+  composer read-only.
+- Preserve the visible transcript; replace only model-facing context with one
+  bounded, redacted seed containing the exact failed request, safe attachments,
+  and at most one trustworthy summary/checkpoint reference.
+- Persist an at-most-once receipt before presenting recovery as accepted.
+  Restart may reclaim only a proven-not-launched successor; ambiguous launch
+  evidence becomes one truthful in-place blocker rather than a repeated action.
+- A newer human turn may supersede a still-claimed automatic control and consume
+  its safe seed. A demonstrably live successor keeps ownership; a stale
+  `starting`/`started` residue with no live registry owner is reclaimed by the
+  human send after a terminal persistence failure.
+- A recovery successor that also exhausts context is blocked in place and must
+  not create an automatic recovery loop.
+- Native and Gateway-backed turns share the same claim, start-admission, and
+  presentation semantics.
 - Compression success in the UI does not by itself prove model-facing context
   was pruned; that remains a runtime/context invariant covered by the run-state
   consistency contract.
@@ -315,9 +338,9 @@ Confirmed follow-up scope:
 
 - Add or standardize an explicit per-pass compression completion event if the
   UI otherwise has to infer completion from later stream events.
-- Keep compression-exhausted/no-final handling aligned with
-  [#3315](https://github.com/nesquena/hermes-webui/issues/3315) and
-  [#3316](https://github.com/nesquena/hermes-webui/pull/3316).
+- Keep no-final classification aligned with [#3315](https://github.com/nesquena/hermes-webui/issues/3315)
+  and [#3316](https://github.com/nesquena/hermes-webui/pull/3316) without
+  reintroducing their historical manual focused-continuation UX.
 
 ### Tool-call, retry, and iteration ceilings
 
@@ -514,6 +537,7 @@ for current open/merged/superseded status.
 | First reply lifecycle implementation | Live process prose, quiet tool activity, settled activity summary above final answer, replay/reattach consistency, live-only compression status, supporting stream ownership fixes. | [#3401](https://github.com/nesquena/hermes-webui/pull/3401), absorbed through [#3741](https://github.com/nesquena/hermes-webui/pull/3741). |
 | Activity display projections | Compact Worklog by default, opt-in Transparent Stream, and opt-in Final answer only over the same assistant-turn data. | [#3820](https://github.com/nesquena/hermes-webui/issues/3820), [`transparent-stream-activity-mode.md`](transparent-stream-activity-mode.md), tracking issue [#3400](https://github.com/nesquena/hermes-webui/issues/3400). |
 | Assistant-turn presentation ownership | Normalize live, settled, replayed, and recovered activity into one Anchor / `activity_scene_v1`, with legacy rendering limited to historical or non-anchor compatibility. | [#3926](https://github.com/nesquena/hermes-webui/issues/3926), [`stable-assistant-turn-anchors.md`](stable-assistant-turn-anchors.md); core implementation shipped through the #4411/#4564 and #5242/#5243 capstones. |
+| Same-conversation compression recovery | One durable at-most-once successor after structured exhaustion, same visible task, restart reconciliation, human supersession, and an in-place ambiguity blocker. | Implemented contract in [`2026-08-08-transparent-same-conversation-compression-recovery-design.md`](../superpowers/specs/2026-08-08-transparent-same-conversation-compression-recovery-design.md). |
 | Terminal/no-final stabilization | Compression exhausted, tool-tail/no-final transcript shape, context-compaction marker suppression, terminal error routing. | [#3315](https://github.com/nesquena/hermes-webui/issues/3315), [#3316](https://github.com/nesquena/hermes-webui/pull/3316). |
 | Cancel ownership hardening | Frontend cancel should close its own SSE source and clear only its own busy state. | [#3344](https://github.com/nesquena/hermes-webui/issues/3344), [#3345](https://github.com/nesquena/hermes-webui/pull/3345). |
 | Early-cancel startup race | Backend cancel should still interrupt the worker when the SSE registry detached before startup fully settled. | [#3475](https://github.com/nesquena/hermes-webui/issues/3475), [#3476](https://github.com/nesquena/hermes-webui/pull/3476). |

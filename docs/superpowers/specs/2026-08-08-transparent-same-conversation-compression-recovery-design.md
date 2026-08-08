@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-08
 
-**Status:** Approved direction; implementation pending
+**Status:** Implemented
 
 **Contract family:** runtime, streaming, recovery, transcript, and session identity
 
@@ -42,20 +42,35 @@ conversation; the UI never instructs the user to open a new task.
 
 ## Incident and root cause
 
-The current implementation converts `compression_exhausted` into a terminal
-read-only state with a recommended `start_focused_continuation` action. The
-action constructs a new `Session`, clears its visible messages, gives it a
-`(focused continuation)` title, and waits for the browser to navigate to it.
-Its model seed contains only the newest compressed summary when one exists; a
-generic authorization such as "do it" can therefore lose the assistant's
-immediately preceding plan when no summary was persisted.
+The screenshot incident crossed two layers. Hermes Agent normally compresses
+and retries inside the active turn, but Agent commit `ee509c7a0` made a
+dispatch-prune persistence miss terminal even when no role-sequence repair was
+required. The captured session reached that path on 2026-08-06 at 23:20 local
+time. Agent commit `fe1777ff1` changed that exact prune-only miss back to a
+non-terminal warning on 2026-08-07 at 01:07. WebUI nevertheless retained the
+already-written terminal marker indefinitely and never re-evaluated it.
+
+That core regression explains why ordinary automatic compression stopped in
+the captured turn. It is distinct from the WebUI recovery contract below:
+even a genuine terminal `compression_exhausted` still needs a transparent,
+durable same-conversation fallback. Recovery must not mask a non-terminal
+Agent compression defect or become the normal path for prune-only persistence
+misses.
+
+The superseded implementation converted `compression_exhausted` into a
+terminal read-only state with a recommended `start_focused_continuation`
+action. That action constructed a new `Session`, cleared its visible messages,
+gave it a `(focused continuation)` title, and waited for the browser to
+navigate to it. Its model seed contained only the newest compressed summary
+when one existed; a generic authorization such as "do it" could therefore lose
+the assistant's immediately preceding plan when no summary was persisted.
 
 This protects the exhausted session from an oversized replay, but exposes an
 internal context-management boundary as a broken conversation boundary. The
 manual browser step is also the wrong durability owner: a closed or refreshed
 tab cannot complete it.
 
-The repository already has the pieces needed for a smaller repair:
+The implementation composes the following existing pieces:
 
 - separate visible `messages` and model-facing `context_messages`;
 - turn-journal rows that durably identify the submitted user turn;
@@ -197,10 +212,26 @@ The claim key is a digest of `(session_id, parent_run_id)`. A receipt contains:
 
 - claim key, session ID, parent run ID, normalized profile, and source;
 - a bounded recovery seed and safe attachment descriptors;
-- the exact submitted turn ID and a transcript/seed fingerprint;
+- a transcript/seed fingerprint, but no separately persisted failed `turn_id`;
 - state `claimed`, `starting`, `started`, or `discarded`;
-- process/start ownership fields used by the existing receipt pattern; and
+- process/start ownership fields used by the existing receipt pattern;
+- the hidden child's stream/turn identity after exact start or journal
+  reconciliation; and
 - a discard or blocker reason when recovery cannot proceed.
+
+The bounded seed exists only while launch or ambiguity ownership needs it. A
+non-blocking terminal receipt is compacted to an idempotency tombstone containing
+claim identity and fingerprint but no conversation context or attachment paths.
+Session deletion purges its receipt rows. When a bound is reached, admission may
+prune only the oldest non-blocking tombstones; live, pending, and blocking rows
+remain fail-closed authority.
+
+The failed request's authoritative text, source, timestamp, and attachments are
+captured from the active-turn identity and its submitted journal evidence before
+pending state is cleared. They are not re-identified by a receipt-level failed
+`turn_id`. The hidden child's separate submitted `turn_id` is written by the
+turn journal and may then be copied into the `started` receipt for
+reconciliation.
 
 The terminal handler builds and saves the seed after materializing the exact
 user turn and partial assistant output, but before clearing runtime ownership.
@@ -258,7 +289,8 @@ conversation if ambiguity is disclosed.
 A human `/api/chat/start` and an automatic recovery start serialize on the same
 session and lineage locks.
 
-If a human start wins while a claim is still `claimed`, the server atomically:
+If a human start wins while a claim is still `claimed`, the server performs a
+fenced handoff that:
 
 1. verifies the claim still matches the current transcript boundary;
 2. installs the recovery seed as `context_messages`;
@@ -268,6 +300,10 @@ If a human start wins while a claim is still `claimed`, the server atomically:
 The new human message is the current intent. The old automatic control is never
 launched afterward. If the automatic recovery stream already owns the session,
 the existing active-stream behavior applies; the claim is not duplicated.
+A `starting` or `started` receipt alone is not live-worker proof. While holding
+the session admission lock, the server preserves demonstrably live ownership,
+but reclaims the exact seed when neither the stream registry nor active-run
+registry owns the stale successor after a terminal transcript/journal failure.
 
 The terminal `compression_exhausted` marker therefore no longer blocks either
 generic or substantive human messages. A human message is also the recovery
@@ -348,22 +384,25 @@ create a session.
 
 ## Existing-state adoption
 
-On startup and on the first post-deploy session load, an existing terminal
-session with `recommended_action=start_focused_continuation` may be adopted into
-same-session recovery only when:
+On the first full post-deploy session load, an existing terminal session with
+`recommended_action=start_focused_continuation` may be adopted into same-session
+recovery only when:
 
 - no focused-continuation child contains substantive work;
 - the terminal user turn and session/profile identity can be validated; and
 - a trustworthy seed can be built under the new rules.
 
-Adoption changes the marker to the new pending claim and starts through the
-same server-owned path. If a focused child already contains work, the source is
-left untouched and disclosed as legacy state; the change does not merge or
-repeat that work. Empty legacy child cleanup is outside scope.
+Sidebar metadata-only polling and startup do not adopt legacy markers. Startup
+does recover receipts that were already durably claimed under the new contract.
+Full-load adoption changes the marker to the new pending claim and starts
+through the same server-owned path. If a focused child already contains work,
+the source is left untouched and disclosed as legacy state; the change does not
+merge or repeat that work. Empty legacy child cleanup is outside scope.
 
 ## Testing strategy
 
-Tests are written first and must fail against the current focused-fork behavior.
+Characterization tests pin the superseded focused-fork behavior, then the
+implemented contract proves the following state space.
 
 ### Seed policy
 
@@ -408,6 +447,9 @@ Tests are written first and must fail against the current focused-fork behavior.
 
 ### Backend siblings and regression
 
+- a prune-only Agent persistence miss that requires no role-sequence repair
+  remains ordinary automatic compression and never creates a WebUI recovery
+  claim;
 - structured result and exception paths share the same claim helper;
 - native and Gateway-backed shared start routing receive the same source,
   context, and attachments;
@@ -443,9 +485,8 @@ command, and live health verification pass.
 
 ## Implementation ownership
 
-After implementation planning is approved, local Ornith receives one bounded
-mechanical slice at a time, beginning with characterization tests and the
-smallest shared backend seam. Ornith may edit only the paths named in that
-slice. Codex retains scope control, reviews every diff, resolves contract-level
-judgment, runs final acceptance, commits on the existing `main`, and pushes
-`main` only after verification succeeds.
+Implementation used local Escha for bounded mechanical slices, beginning with
+characterization tests and the smallest shared backend seam. Escha edited only
+the paths named in each slice. Codex retained scope control, reviewed every
+diff, resolved contract-level judgment, and owns final acceptance, commit, and
+push on the existing `main`.

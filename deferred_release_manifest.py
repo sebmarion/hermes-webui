@@ -103,6 +103,12 @@ _MANIFEST = DeferredReleaseManifest(
             ALWAYS,
         ),
         DeferredReleaseDescriptor(
+            "compression_recovery",
+            "webui_server",
+            "server._recover_compression_recoveries_for_startup",
+            STARTUP_RUN_ADMISSION_CLOSED,
+        ),
+        DeferredReleaseDescriptor(
             "tool_limit_continuation_recovery",
             "webui_server",
             "server._recover_tool_limit_continuations_for_startup",

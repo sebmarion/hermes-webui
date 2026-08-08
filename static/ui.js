@@ -465,20 +465,29 @@ function _assistantTurnDurationLabel(message, durationText){
 function _compressionRecoveryHtml(recovery, sessionId){
   if(!recovery||typeof recovery!=='object') return '';
   if(String(recovery.terminal_state||'')!=='compression_exhausted') return '';
-  const action=String(recovery.recommended_action||'');
-  if(action!=='start_focused_continuation') return '';
-  const sid=String(recovery.source_session_id||sessionId||'');
-  const title=String(recovery.title||'Context compression exhausted');
-  const summary=String(recovery.summary||'Open a focused continuation with a recovered task draft.');
-  const actionLabel=String(recovery.action_label||'Start focused continuation');
-  const icon=(typeof li==='function')?li('git-branch',14):'';
-  return `<div class="compression-recovery-card" data-compression-recovery-card="1">
+  if(String(recovery.phase||'')!=='blocked') return '';
+  const title=String(recovery.title||'Context recovery stopped');
+  const summary=String(recovery.summary||'Hermes could not safely reconstruct enough context to continue automatically. You can keep working in this conversation.');
+  return `<div class="compression-recovery-card" data-compression-recovery-blocked="1" role="status">
     <div class="compression-recovery-copy">
       <div class="compression-recovery-title">${esc(title)}</div>
       <div class="compression-recovery-summary">${esc(summary)}</div>
     </div>
-    <button class="compression-recovery-action" type="button" data-recovery-session-id="${esc(sid)}" onclick="startCompressionRecovery(this);event.stopPropagation()">${icon}<span>${esc(actionLabel)}</span></button>
   </div>`;
+}
+
+function _automaticCompressionRecoveryState(session){
+  const recovery=session&&session.compression_recovery;
+  if(!recovery||typeof recovery!=='object') return null;
+  if(String(recovery.terminal_state||'')!=='compression_exhausted') return null;
+  if(recovery.automatic_recovery!==true) return null;
+  if(!['claimed','starting','running'].includes(String(recovery.phase||''))) return null;
+  return {
+    phase:'running',
+    automatic:true,
+    recovery:true,
+    message:String(recovery.message||'Recovering context...'),
+  };
 }
 
 function _compressionRecoverySourceHtml(session){
@@ -490,7 +499,7 @@ function _compressionRecoverySourceHtml(session){
   return `<div class="compression-recovery-card" data-compression-recovery-source="1">
     <div class="compression-recovery-copy">
       <div class="compression-recovery-title">Focused continuation</div>
-      <div class="compression-recovery-summary">This fresh chat uses at most one bounded summary. The original transcript remains read-only.</div>
+      <div class="compression-recovery-summary">This historical continuation used one bounded summary from its source conversation.</div>
     </div>
     <button class="compression-recovery-action" type="button" data-recovery-source-session-id="${esc(sourceSid)}" onclick="openCompressionRecoverySource(this);event.stopPropagation()">${icon}<span>Open source history</span></button>
   </div>`;
@@ -528,63 +537,10 @@ function _activeCompressionRecoveryPayload(){
   return null;
 }
 
-function shouldInterceptCompressionRecoveryContinuation(_text, _files){
+function _blockedCompressionRecoveryPayload(){
   const recovery=_activeCompressionRecoveryPayload();
-  return !!(recovery&&String(recovery.recommended_action||'')==='start_focused_continuation');
-}
-
-function showCompressionRecoveryContinuationHint(){
-  const card=document.querySelector('[data-compression-recovery-card="1"]');
-  if(card&&typeof card.scrollIntoView==='function'){
-    try{card.scrollIntoView({block:'center',behavior:'smooth'});}catch(_){card.scrollIntoView();}
-    const btn=card.querySelector('.compression-recovery-action');
-    if(btn&&typeof btn.focus==='function') setTimeout(()=>btn.focus(),120);
-  }
-  if(typeof showToast==='function') showToast('This session exhausted context compression and is read-only. Open its focused continuation to continue.',4500,'warning');
-}
-
-async function redirectCompressionRecoverySend(){
-  if(typeof showCompressionRecoveryContinuationHint==='function'){
-    showCompressionRecoveryContinuationHint();
-    return true;
-  }
-  return false;
-}
-
-async function startCompressionRecovery(btn){
-  const sourceSid=String((btn&&btn.dataset&&btn.dataset.recoverySessionId)||(S.session&&S.session.session_id)||'').trim();
-  if(!sourceSid) return;
-  let retiredRecoveryCard=false;
-  if(btn){btn.disabled=true;btn.classList.add('loading');}
-  try{
-    const data=await api('/api/session/compression-recovery/start',{method:'POST',body:JSON.stringify({session_id:sourceSid})});
-    const sid=data&&data.session&&data.session.session_id;
-    if(!sid) throw new Error('Compression recovery did not return a session.');
-    try{localStorage.setItem('hermes-webui-session',sid);}catch(_){ }
-    if(typeof loadSession==='function') await loadSession(sid,{preserveActiveInput:false});
-    else if(data.session){S.session=data.session;S.messages=data.session.messages||[];syncTopbar();renderMessages();}
-    if(typeof renderSessionList==='function') await renderSessionList();
-    if(typeof _setActiveSessionUrl==='function') _setActiveSessionUrl(sid);
-    if(typeof showToast==='function') showToast((data&&data.message)||'Started focused continuation.',3000,'success');
-    const composer=$('msg');
-    if(composer&&typeof composer.focus==='function') composer.focus();
-  }catch(e){
-    if(e&&e.status===409){
-      const staleCard=(btn&&btn.closest&&btn.closest('.compression-recovery-card'))
-        ||document.querySelector('[data-compression-recovery-card="1"]');
-      if(staleCard){
-        staleCard.setAttribute('data-compression-recovery-consumed','1');
-        const staleBtn=staleCard.querySelector('.compression-recovery-action');
-        if(staleBtn){staleBtn.disabled=true;staleBtn.classList.remove('loading');}
-        retiredRecoveryCard=true;
-      }
-      if(typeof showToast==='function') showToast('This conversation already moved on — the focused-continuation action is no longer available.',4000,'info');
-      return;
-    }
-    if(typeof showToast==='function') showToast('Compression recovery failed: '+(e&&e.message||e),5000,'error');
-  }finally{
-    if(btn){if(!retiredRecoveryCard) btn.disabled=false;btn.classList.remove('loading');}
-  }
+  if(!recovery||String(recovery.phase||'')!=='blocked') return null;
+  return recovery;
 }
 
 const MESSAGE_RENDER_WINDOW_DEFAULT=50;
@@ -14265,12 +14221,16 @@ function _compressionCardsHtml(state){
     ${referenceHtml}`;
 }
 function _autoCompressionBaseDetail(state){
+  const message=String(state&&state.message||'').trim();
+  if(message)return message;
   const running=state&&state.phase==='running';
   if(running)return 'Compressing context';
   if(state&&state.phase==='done')return 'Context auto-compressed';
   return '';
 }
 function _autoCompressionPreviewText(state){
+  const message=String(state&&state.message||'').trim();
+  if(message)return message;
   const running=state&&state.phase==='running';
   if(running)return 'Compressing context';
   if(state&&state.phase==='done')return 'Context auto-compressed';
@@ -15913,6 +15873,11 @@ function renderMessages(options){
     _hydrateIdLinkedHistoricalToolScenes(S.messages,{sessionId:sid,mode:activityMode});
   }
   const recoverySourceHtml=_compressionRecoverySourceHtml(S.session);
+  const recoveryPendingState=_automaticCompressionRecoveryState(S.session);
+  const recoveryBlockedPayload=_blockedCompressionRecoveryPayload();
+  const recoveryBlockedHtml=recoveryBlockedPayload
+    ? _compressionRecoveryHtml(recoveryBlockedPayload, sid)
+    : '';
   const msgCount=S.messages.length;
   // During session switch, S.messages is intentionally cleared while the full
   // message fetch is still in flight. Other async updates can still call
@@ -15922,13 +15887,15 @@ function renderMessages(options){
   let cachedRenderSignature=null;
   const hasTransientTranscriptUi=!!(
     recoverySourceHtml ||
+    recoveryPendingState ||
+    recoveryBlockedHtml ||
     (window._compressionUi&&(!window._compressionUi.sessionId||window._compressionUi.sessionId===sid)) ||
     (window._handoffUi&&(!window._handoffUi.sessionId||window._handoffUi.sessionId===sid))
   );
 
   const preservedCompressionTaskMessages=_latestPreservedCompressionTaskListMessages(S.messages);
   const visWithIdx=_getVisibleMessagesWithIdx();
-  $('emptyState').style.display=(recoverySourceHtml||visWithIdx.length||preservedCompressionTaskMessages.length)?'none':'';
+  $('emptyState').style.display=(recoverySourceHtml||recoveryPendingState||recoveryBlockedHtml||visWithIdx.length||preservedCompressionTaskMessages.length)?'none':'';
   const virtualWindow=virtualFallback
     ? {virtualized:false,start:0,end:visWithIdx.length,topPad:0,bottomPad:0,total:visWithIdx.length,tailStart:visWithIdx.length}
     : _currentMessageVirtualWindow(visWithIdx,_messageVirtualKeepTailCount());
@@ -16011,8 +15978,8 @@ function renderMessages(options){
     }
   }
   const compressionState=(()=>{
-    let compressionState=_compressionStateForCurrentSession();
-    if(!S.busy && compressionState && compressionState.automatic){
+    let compressionState=_compressionStateForCurrentSession()||recoveryPendingState;
+    if(!S.busy && compressionState && compressionState.automatic && !compressionState.recovery){
       window._compressionUi=null;
       _clearCompressionElapsedTimer();
       _setCompressionSessionLock(null);
@@ -16083,6 +16050,14 @@ function renderMessages(options){
     if(recoverySourceNode) inner.appendChild(recoverySourceNode);
   }
   const compressionNode=compressionState?_compressionCardsNode(compressionState):null;
+  const recoveryBlockedNode=recoveryBlockedHtml
+    ? (()=>{
+        const row=document.createElement('div');
+        row.className='compression-turn compression-recovery-turn';
+        row.innerHTML=`<div class="compression-turn-blocks">${recoveryBlockedHtml}</div>`;
+        return row;
+      })()
+    : null;
   const {message:referenceMessage, rawIdx:referenceMessageRawIdx}=_latestCompressionReferenceMessage(
     S.messages,
     sessionCompressionSummary
@@ -16365,11 +16340,6 @@ function renderMessages(options){
       const summary=m.provider_details_label||'Provider details';
       bodyHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
     }
-    const recoveryPayload=(!isUser&&m._compressionRecovery)
-      ? m._compressionRecovery
-      : (!isUser&&isLastAssistant&&isTurnFinalAssistant&&typeof _activeCompressionRecoveryPayload==='function' ? _activeCompressionRecoveryPayload() : null);
-    const recoveryHtml=recoveryPayload ? _compressionRecoveryHtml(recoveryPayload, (S.session&&S.session.session_id)||'') : '';
-    if(recoveryHtml) bodyHtml += recoveryHtml;
     const messageStatusCard=!isUser
       ? (
         typeof _assistantMessageStatusCard==='function'
@@ -16643,7 +16613,7 @@ function renderMessages(options){
       if((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs)) assistantThinking.set(rawIdx, thinkingText);
       else if(window._showThinking!==false) seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
     }
-    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||recoveryHtml);
+    const hasVisibleBody=!!(String(content||'').trim()||filesHtml);
     if(statusHtml){
       seg.insertAdjacentHTML('beforeend', statusHtml);
       if(hasVisibleBody) seg.insertAdjacentHTML('beforeend', `${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`);
@@ -16736,6 +16706,10 @@ function renderMessages(options){
     if(entry.rawIdx<firstRenderedRawIdx) continue;
     _insertCompressionLikeNodeByRawIdx(_handoffCardsNode(entry.state), entry.rawIdx);
   }
+  // A blocked recovery is session state, not assistant content. Keep its one
+  // diagnostic at the transcript tail so it can never replace a valid answer
+  // and still renders when the failed turn has no assistant row at all.
+  _insertCompressionLikeNode(recoveryBlockedNode, null);
   renderCompressionUi();
   const anchorOwnedAssistantRawIdxs=new Set();
   for(const [rawIdx,seg] of assistantSegments){

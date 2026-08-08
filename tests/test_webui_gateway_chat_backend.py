@@ -9,6 +9,10 @@ import time
 import types
 import urllib.error
 
+import pytest
+
+import api.compression_recovery_receipts as compression_recovery_receipts
+import api.config as config
 import api.gateway_chat as gateway_chat
 import api.models as models
 import api.streaming as streaming
@@ -55,6 +59,119 @@ def _gateway_completion_event(session_id, suffix="gateway"):
         "output": f"output-{suffix}",
         "created_at": 1.0,
     }
+
+
+class _GatewaySseResponse:
+    def __init__(self, *rows):
+        self._rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+def _isolate_gateway_recovery_state(tmp_path, monkeypatch):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(config, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
+    monkeypatch.setattr(
+        gateway_chat,
+        "_gateway_use_runs_api_enabled",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        gateway_chat,
+        "gateway_approval_unavailable_reason",
+        lambda *_args, **_kwargs: None,
+    )
+    return session_dir
+
+
+def _started_gateway_recovery(tmp_path, monkeypatch, *, child_stream_id):
+    _isolate_gateway_recovery_state(tmp_path, monkeypatch)
+    request = "Finish the exact requested work from the trusted checkpoint."
+    session = models.Session(
+        session_id=f"gateway-recovery-{child_stream_id}",
+        title="Gateway recovery",
+        workspace=str(tmp_path),
+        messages=[{"role": "assistant", "content": "Trusted completed checkpoint."}],
+    )
+    session.save()
+    context_messages = [
+        {"role": "assistant", "content": "Trusted completed checkpoint."},
+        {"role": "user", "content": request},
+    ]
+    seed = {
+        "session_id": session.session_id,
+        "parent_run_id": "gateway-parent",
+        "context_messages": context_messages,
+        "attachments": [],
+        "trust_source": "assistant_checkpoint",
+        "fingerprint": "",
+    }
+    from api.compression_recovery import _recovery_fingerprint
+
+    seed["fingerprint"] = _recovery_fingerprint(
+        session_id=session.session_id,
+        parent_run_id="gateway-parent",
+        context_messages=context_messages,
+        attachments=[],
+    )
+    claimed = compression_recovery_receipts.claim_compression_recovery(
+        session,
+        "gateway-parent",
+        seed,
+    )
+    def start_recovery(sid, prompt, **kwargs):
+        from api.turn_journal import append_turn_journal_event
+
+        submitted = append_turn_journal_event(
+            sid,
+            {
+                "event": "submitted",
+                "stream_id": child_stream_id,
+                "role": "user",
+                "content": prompt,
+                "attachments": kwargs["attachments"],
+                "source": compression_recovery_receipts.SOURCE,
+                "profile": "default",
+                "recovery_claim_token": kwargs["recovery_claim_token"],
+                "recovery_fingerprint": kwargs["recovery_fingerprint"],
+            },
+        )
+        return {
+            "session_id": sid,
+            "stream_id": child_stream_id,
+            "turn_id": submitted["turn_id"],
+        }
+
+    started = compression_recovery_receipts.settle_compression_recovery(
+        session.session_id,
+        "gateway-parent",
+        start=start_recovery,
+    )
+    assert started["state"] == "started"
+    session.active_stream_id = child_stream_id
+    session.pending_user_message = compression_recovery_receipts.RECOVERY_CONTROL_PROMPT
+    session.pending_attachments = []
+    session.pending_started_at = time.time()
+    session.pending_user_source = compression_recovery_receipts.SOURCE
+    session.compression_recovery = compression_recovery_receipts._session_phase_payload(
+        started,
+        "running",
+    )
+    session.save(touch_updated_at=False)
+    STREAMS[child_stream_id] = create_stream_channel()
+    return session, claimed
 
 
 def test_gateway_chat_backend_is_default_off_for_truthy_values():
@@ -454,6 +571,232 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
         "tid": "call-1",
     }) in event_pairs
     assert all(len(item) == 3 and item[2] for item in events)
+
+
+def test_gateway_compression_exhaustion_claims_same_session_recovery_after_parent_unregister(
+    tmp_path,
+    monkeypatch,
+):
+    _isolate_gateway_recovery_state(tmp_path, monkeypatch)
+    request = "Audit the exact recovery seam and finish the requested implementation."
+    session = models.Session(
+        session_id="gateway-compression-parent",
+        title="Gateway compression",
+        workspace=str(tmp_path),
+        messages=[{"role": "assistant", "content": "Trusted completed checkpoint."}],
+    )
+    stream_id = "gateway-compression-parent-stream"
+    session.active_stream_id = stream_id
+    session.pending_user_message = request
+    session.pending_attachments = []
+    session.pending_started_at = time.time()
+    session.pending_user_source = "webui"
+    session.save()
+    channel = create_stream_channel()
+    subscriber = channel.subscribe()
+    STREAMS[stream_id] = channel
+    monkeypatch.setattr(
+        gateway_chat.urllib.request,
+        "urlopen",
+        lambda _req, timeout=0: _GatewaySseResponse(
+            b"event: response.failed\n",
+            b'data: {"message":"compression_exhausted"}\n\n',
+            b"data: [DONE]\n\n",
+        ),
+    )
+
+    lifecycle = []
+    original_unregister = gateway_chat.unregister_active_run
+
+    def tracked_unregister(parent_stream_id, **kwargs):
+        result = original_unregister(parent_stream_id, **kwargs)
+        lifecycle.append(("unregistered", parent_stream_id))
+        return result
+
+    def tracked_recover(session_id, *, parent_run_id, session, profile):
+        assert parent_run_id not in config.ACTIVE_RUNS
+        lifecycle.append(("recovered", session_id, parent_run_id))
+        return True
+
+    monkeypatch.setattr(gateway_chat, "unregister_active_run", tracked_unregister)
+    monkeypatch.setattr(
+        "api.background_process.recover_successors_after_unregister",
+        tracked_recover,
+    )
+
+    gateway_chat._run_gateway_chat_streaming(
+        session.session_id,
+        request,
+        "test-model",
+        str(tmp_path),
+        stream_id,
+        [],
+    )
+
+    saved = models.Session.load(session.session_id)
+    events = []
+    while not subscriber.empty():
+        events.append(subscriber.get_nowait())
+    error = next(item[1] for item in events if item[0] == "apperror")
+    assert error["type"] == "compression_exhausted"
+    assert error["automatic_recovery"] is True
+    assert not any(message.get("_error") for message in saved.messages)
+    receipts = compression_recovery_receipts.load_receipts()["receipts"]
+    assert list(receipts.values())[0]["session_id"] == session.session_id
+    assert list(receipts.values())[0]["state"] == "claimed"
+    assert lifecycle == [
+        ("unregistered", stream_id),
+        ("recovered", session.session_id, stream_id),
+    ]
+
+
+def test_gateway_recovery_success_settles_exact_receipt_only_after_durable_success(
+    tmp_path,
+    monkeypatch,
+):
+    stream_id = "gateway-recovery-success-stream"
+    session, claimed = _started_gateway_recovery(
+        tmp_path,
+        monkeypatch,
+        child_stream_id=stream_id,
+    )
+    monkeypatch.setattr(
+        gateway_chat.urllib.request,
+        "urlopen",
+        lambda _req, timeout=0: _GatewaySseResponse(
+            b'data: {"choices":[{"delta":{"content":"recovered answer"}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ),
+    )
+    lifecycle = []
+    original_save = models.Session.save
+    original_clear = compression_recovery_receipts.clear_recovery_presentation
+
+    def tracked_save(current, *args, **kwargs):
+        result = original_save(current, *args, **kwargs)
+        if (
+            current.session_id == session.session_id
+            and current.active_stream_id is None
+            and any(
+                message.get("role") == "assistant"
+                and message.get("content") == "recovered answer"
+                for message in current.messages
+            )
+        ):
+            lifecycle.append("durable_success")
+        return result
+
+    def tracked_clear(current, *, child_stream_id=None, **kwargs):
+        result = original_clear(
+            current,
+            child_stream_id=child_stream_id,
+            **kwargs,
+        )
+        lifecycle.append(("receipt_settled", child_stream_id))
+        return result
+
+    monkeypatch.setattr(models.Session, "save", tracked_save)
+    monkeypatch.setattr(
+        compression_recovery_receipts,
+        "clear_recovery_presentation",
+        tracked_clear,
+    )
+
+    gateway_chat._run_gateway_chat_streaming(
+        session.session_id,
+        compression_recovery_receipts.RECOVERY_CONTROL_PROMPT,
+        "test-model",
+        str(tmp_path),
+        stream_id,
+        [],
+    )
+
+    receipt = compression_recovery_receipts.load_receipts()["receipts"][
+        claimed["claim_key"]
+    ]
+    assert receipt["state"] == "discarded"
+    assert receipt["discarded_reason"] == "successor_settled"
+    assert lifecycle.index("durable_success") < lifecycle.index(
+        ("receipt_settled", stream_id)
+    )
+
+
+@pytest.mark.parametrize("failure_mode", ["terminal_save", "terminal_journal"])
+def test_gateway_recovery_terminal_failure_never_settles_receipt(
+    tmp_path,
+    monkeypatch,
+    failure_mode,
+):
+    stream_id = f"gateway-recovery-{failure_mode}-stream"
+    session, claimed = _started_gateway_recovery(
+        tmp_path,
+        monkeypatch,
+        child_stream_id=stream_id,
+    )
+    monkeypatch.setattr(
+        gateway_chat.urllib.request,
+        "urlopen",
+        lambda _req, timeout=0: _GatewaySseResponse(
+            b'data: {"choices":[{"delta":{"content":"recovered answer"}}]}\n\n',
+            b"data: [DONE]\n\n",
+        ),
+    )
+    failure_seen = []
+
+    if failure_mode == "terminal_save":
+        original_save = models.Session.save
+
+        def fail_terminal_save(current, *args, **kwargs):
+            if (
+                current.session_id == session.session_id
+                and current.active_stream_id is None
+                and any(
+                    message.get("role") == "assistant"
+                    and message.get("content") == "recovered answer"
+                    for message in current.messages
+                )
+            ):
+                failure_seen.append("terminal_save")
+                raise OSError("synthetic terminal save failure")
+            return original_save(current, *args, **kwargs)
+
+        monkeypatch.setattr(models.Session, "save", fail_terminal_save)
+    else:
+        import api.turn_journal as turn_journal
+
+        original_append = turn_journal.append_turn_journal_event_for_stream
+
+        def fail_recovery_terminal(session_id, current_stream_id, event, **kwargs):
+            if event.get("recovery_terminal_persisted") is True:
+                failure_seen.append("terminal_journal")
+                raise OSError("synthetic terminal journal failure")
+            return original_append(session_id, current_stream_id, event, **kwargs)
+
+        monkeypatch.setattr(
+            turn_journal,
+            "append_turn_journal_event_for_stream",
+            fail_recovery_terminal,
+        )
+
+    gateway_chat._run_gateway_chat_streaming(
+        session.session_id,
+        compression_recovery_receipts.RECOVERY_CONTROL_PROMPT,
+        "test-model",
+        str(tmp_path),
+        stream_id,
+        [],
+    )
+
+    assert failure_seen
+    receipt = compression_recovery_receipts.load_receipts()["receipts"][
+        claimed["claim_key"]
+    ]
+    assert not (
+        receipt["state"] == "discarded"
+        and receipt.get("discarded_reason") == "successor_settled"
+    )
+    saved = models.Session.load(session.session_id)
+    assert saved.compression_recovery.get("phase") in {"running", "blocked"}
 
 
 def test_gateway_chat_worker_commits_process_completion_receipt_on_success(tmp_path, monkeypatch):

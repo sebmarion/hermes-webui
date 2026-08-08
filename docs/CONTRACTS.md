@@ -32,6 +32,10 @@ contributor guidance; it does not change runtime behavior or CI gates.
   accepted product model for long-running assistant replies, live process text,
   tool activity, recovery, terminal outcomes, and final-answer boundaries. Start
   here for UI/UX changes to running-session assistant reply rendering.
+- [`docs/superpowers/specs/2026-08-08-transparent-same-conversation-compression-recovery-design.md`](superpowers/specs/2026-08-08-transparent-same-conversation-compression-recovery-design.md):
+  implemented bounded-seed, durable-receipt, same-session successor, human
+  supersession, restart reconciliation, and in-place blocker contract for
+  structured compression exhaustion.
 - [`docs/rfcs/stable-assistant-turn-anchors.md`](rfcs/stable-assistant-turn-anchors.md):
   implemented presentation/reconciliation model that attaches live, settled,
   replayed, and recovered activity to one assistant-turn owner and projects one
@@ -84,6 +88,43 @@ reconstruction, cancellation, approval/clarify, session metadata, or run state,
 read the relevant RFC before editing. In the PR description, name the state layer
 or event/control surface affected and include a regression test or manual
 verification for the relevant invariant.
+
+Current compression-exhaustion recovery contract: a structured
+`compression_exhausted` result may claim one durable, server-owned successor in
+the same session. The visible transcript, title, URL, project, and sidebar
+identity do not change; only `context_messages` are replaced by a bounded seed
+containing the exact failed request, safe attachment descriptors, and at most one
+trusted summary/checkpoint reference. The receipt store is keyed by
+`(session_id, parent_run_id)` and owns `claimed`/`starting`/`started`/`discarded`
+launch state. The failed turn identity remains authoritative in the active-turn
+and turn-journal layers; the receipt does not invent or persist a separate
+failed `turn_id`. The successor's submitted stream/turn identity is reconciled
+from exact journal evidence. The successor starts only after parent stream,
+active-run, and lineage ownership are released, through the shared native or
+Gateway start path with source `compression_recovery`.
+Non-blocking terminal receipts retain only a compact fingerprint tombstone;
+their context and attachment paths are removed. Session deletion returns a
+typed conflict while a recovery-owned worker is demonstrably live; once it is
+not live, deletion purges all of that session's receipt rows. Capacity pruning
+may remove only the oldest non-blocking tombstones, never pending or ambiguity-
+blocking ownership.
+
+Pending receipts recover during managed startup. A dead reservation is reclaimed
+only when exact evidence proves no launch or a complete `launch_failed`; an
+ambiguous post-submission window is discarded and shown as one in-place blocker
+instead of risking duplicate tool effects. A human WebUI turn may supersede one
+still-claimed recovery and consume its safe context/attachments. A live
+`starting`/`started` successor keeps ownership; a stale successor with no live
+stream evidence after a terminal persistence failure is reclaimed by the same
+human send rather than trapping the task behind a 503. The composer stays enabled
+for blocked recovery, and successful settlement clears transient recovery
+presentation. Safe legacy focused-continuation markers are adopted only on the
+first full session load, never from sidebar metadata polling; a legacy child with
+substantive work is not replayed. Changes to this path must prove seed bounds and
+redaction, same-session identity, native/Gateway parity, exact-once admission,
+attachment preservation/conflict handling, human supersession, startup
+reconciliation, ambiguity blocking, no recursive recovery, and absence of a
+manual fork/read-only UI.
 
 Current standing-goal continuation contract: a `continue` verdict is durably
 claimed before its live-view event, started by the server only after the parent

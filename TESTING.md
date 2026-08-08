@@ -104,6 +104,76 @@ real model. A full chat golden-path E2E (send → stream → render → switch �
 reload) lives in the maintainer's private QA harness, which has the agent + a
 mock LLM provider available.
 
+### Transparent same-conversation compression recovery gate
+
+Run the seed, durable ownership, backend admission, legacy adoption, terminal,
+UI, and managed-startup contracts with:
+
+```bash
+./scripts/test.sh \
+  tests/test_transparent_compression_recovery.py \
+  tests/test_compression_recovery_receipts.py \
+  tests/test_transparent_compression_recovery_ui.py \
+  tests/test_compression_recovery_action.py \
+  tests/test_auto_compression_terminal_failure.py \
+  tests/test_webui_gateway_chat_backend.py \
+  tests/test_execution_lineage_admission.py \
+  tests/test_managed_startup_coordinator.py \
+  tests/test_startup_release_fence.py
+```
+
+The automated gate must prove that one structured `compression_exhausted`
+terminal callback durably claims, then admits, at most one hidden successor
+after parent ownership is released. The start must reuse the same session,
+profile, workspace, model/provider route, lineage, exact failed request, and
+safe attachments; visible history must retain one failed user row and zero
+control-prompt rows. Seed tests cover summary/checkpoint priority, generic
+request blocking, bounded redaction, unsafe-row exclusion, missing/conflicting
+attachments, and preservation of the visible transcript. Run both native and
+Gateway neighboring suites when changing either settlement path; they must
+produce the same claim/blocker state and route the successor through the same
+`start_session_turn()` admission seam.
+
+Crash tests must cover duplicate claim/settle, a live reservation, dead owner
+before submission, exact `launch_failed`, exact live/completed successor, corrupt
+store, and malformed/conflicting/ambiguous journal evidence. The last three
+fail closed with one blocker and never repeat possible effects. Verify that the
+failed turn identity comes from active-turn and submitted-journal authority;
+the recovery receipt has no synthetic failed `turn_id`, while the child
+submitted `turn_id` is reconciled from its exact journal event. Managed startup
+must recover and verify compression receipts before tool-limit, goal, and
+deferred successor work.
+
+For the browser/live gate, use isolated state and force one exhaustion after a
+substantive request. The visible/logical task identity, URL, title, project,
+sidebar row, and visible transcript must remain unchanged while `Recovering
+context...` appears transiently and the successor answer streams. Agent
+compression may rotate an internal backing session ID; that canonicalization
+must rebind the live session channel without visible navigation or a new task.
+Confirm there is no focused-child card, action button, permanent recovery row,
+red terminal row, or read-only composer at wide, laptop, and mobile widths.
+Close the tab while the receipt is `claimed`, restart WebUI, and verify
+server-side recovery completes without a browser submission. Then test a newer
+human send against a `claimed` receipt: the human message must consume the safe
+seed, merge attachments, discard the automatic control as
+`superseded_by_user`, and leave no stale retry. A conflict must abort atomically
+without discarding the claim. Inject terminal transcript-save and terminal-
+journal failures after a recovery reaches `started`: with no live stream owner,
+the next human send must proceed in place; with exact live ownership, it must
+return 409 and preserve the receipt. Rotate a recovery successor's internal
+session ID and prove its source receipt settles while the canonical session's
+presentation clears; repeat with terminal-journal failure and restart to prove
+the canonical presentation is repaired or blocked in place. Deleting a session
+must return a typed conflict while the hidden worker is live, then remove its
+recovery seed and attachment paths once no live owner remains. Store-bound tests
+may prune only the oldest non-blocking terminal tombstone and must preserve
+claimed, starting, started, and ambiguity-blocking rows.
+
+Finally, load one safe legacy `start_focused_continuation` marker through a full
+session request and verify it adopts once in place. Metadata-only sidebar
+polling and startup must not trigger legacy adoption, and a focused child with
+substantive work must block adoption instead of repeating that work.
+
 ### Standing-goal continuation recovery gate
 
 Run the focused automated contract with:

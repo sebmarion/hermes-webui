@@ -459,6 +459,14 @@ def retry_last(session_id: str) -> dict[str, Any]:
             if last_user_idx is None:
                 raise ValueError('No previous message to retry.')
 
+            from api.compression_recovery_receipts import (
+                retire_session_compression_recoveries,
+            )
+
+            retire_session_compression_recoveries(
+                s,
+                reason='superseded_by_user',
+            )
             last_user_text = _extract_text(history[last_user_idx].get('content', ''))
             removed_count = len(history) - last_user_idx
             s.messages = history[:last_user_idx]
@@ -502,6 +510,14 @@ def undo_last(session_id: str) -> dict[str, Any]:
             if last_user_idx is None:
                 raise ValueError('Nothing to undo.')
 
+            from api.compression_recovery_receipts import (
+                retire_session_compression_recoveries,
+            )
+
+            retire_session_compression_recoveries(
+                s,
+                reason='superseded_by_user',
+            )
             removed_text = _extract_text(history[last_user_idx].get('content', ''))
             removed_count = len(history) - last_user_idx
             s.messages = history[:last_user_idx]

@@ -15,12 +15,18 @@ def test_startup_continuation_recovery_is_admission_tracked():
     source = (Path(__file__).parents[1] / "api" / "routes.py").read_text(
         encoding="utf-8"
     )
+    compression_start = source.index(
+        "def _recover_compression_recoveries_on_startup"
+    )
     tool_start = source.index("def _recover_tool_limit_continuations_on_startup")
     goal_start = source.index("def _recover_goal_continuations_on_startup")
     ack_start = source.index("def _handle_bg_task_complete_ack")
 
+    compression_block = source[compression_start:tool_start]
     tool_block = source[tool_start:goal_start]
     goal_block = source[goal_start:ack_start]
+    assert "start_admitted_auxiliary_thread(" in compression_block
+    assert 'kind="compression_recovery"' in compression_block
     assert "start_admitted_auxiliary_thread(" in tool_block
     assert 'kind="tool_limit_continuation_recovery"' in tool_block
     assert "start_admitted_auxiliary_thread(" in goal_block

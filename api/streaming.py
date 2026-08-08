@@ -58,7 +58,10 @@ from api.config import (
 )
 from api.helpers import redact_session_data, _redact_text
 from api.compression_anchor import is_context_compression_marker, visible_messages_for_anchor
-from api.compression_recovery import stamp_compression_exhausted_recovery
+from api.compression_recovery import (
+    CompressionRecoveryBlocked,
+    build_same_session_recovery_seed,
+)
 from api.metering import meter
 from api.run_journal import RunJournalWriter
 from api.todo_state import attach_todo_state, emit_todo_state
@@ -7253,6 +7256,7 @@ def _merge_display_messages_after_agent_result(
     internal_control_source = source in (
         'tool_limit_continuation',
         'goal_continuation',
+        'compression_recovery',
     )
     previous_display = [
         m for m in list(previous_display or [])
@@ -7823,7 +7827,7 @@ def _merged_transcript_lacks_final_assistant_answer(
     active_turn_identity=None,
 ) -> bool:
     """Return True when the current turn still lacks a final assistant answer."""
-    if source in ('tool_limit_continuation', 'goal_continuation'):
+    if source in ('tool_limit_continuation', 'goal_continuation', 'compression_recovery'):
         # Internal continuation prompts intentionally have no visible user row.
         # Running the display-boundary classifier below would append that hidden
         # prompt *after* the valid assistant delta and falsely report a terminal
@@ -7885,6 +7889,146 @@ def _compression_exhausted_context_messages(result_messages, previous_context, m
     # WebUI snapshot is the only safe model-context source. Never replay an
     # untrusted failed-turn payload into the next provider request.
     return list(previous_context or [])
+
+
+def _latest_recovery_partial_text(session, failed_user_text: str) -> str:
+    """Return only assistant partial work belonging to the failed visible turn."""
+
+    messages = list(getattr(session, "messages", None) or [])
+    boundary = -1
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and _normalize_user_text(message.get("content"))
+            == _normalize_user_text(failed_user_text)
+        ):
+            boundary = index
+            break
+    for message in reversed(messages[boundary + 1 :]):
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and message.get("_partial")
+        ):
+            return str(message.get("content") or "")
+    return ""
+
+
+def _blocked_compression_recovery_payload(
+    session,
+    parent_run_id: str,
+    *,
+    reason: str,
+) -> dict:
+    """Persist one truthful same-conversation blocker with no action button."""
+
+    reason = str(reason or "recovery_unavailable")[:200]
+    payload = {
+        "terminal_state": "compression_exhausted",
+        "phase": "blocked",
+        "automatic_recovery": False,
+        "same_session": True,
+        "source_session_id": str(getattr(session, "session_id", "") or ""),
+        "parent_run_id": str(parent_run_id or ""),
+        "created_at": time.time(),
+        "title": "Context recovery stopped",
+        "summary": (
+            "Hermes could not safely reconstruct enough context to continue "
+            "automatically. You can keep working in this conversation."
+        ),
+        "reason": reason,
+    }
+    session.compression_recovery = payload
+    session.recommended_recovery_action = None
+    return payload
+
+
+def _claim_same_session_compression_recovery(
+    session,
+    parent_run_id: str,
+    *,
+    failed_user_text: str,
+    attachments: list[dict] | None,
+    source: str,
+) -> tuple[bool, dict]:
+    """Build and durably claim one in-place successor, or return a blocker."""
+
+    from api.compression_recovery_receipts import (
+        SOURCE as COMPRESSION_RECOVERY_SOURCE,
+        claim_compression_recovery,
+        clear_recovery_presentation,
+    )
+
+    if source == COMPRESSION_RECOVERY_SOURCE:
+        clear_recovery_presentation(
+            session,
+            child_stream_id=str(parent_run_id),
+            reason="recovery_successor_exhausted",
+            blocked=True,
+        )
+        return False, _blocked_compression_recovery_payload(
+            session,
+            parent_run_id,
+            reason="recovery_successor_exhausted",
+        )
+    try:
+        seed = build_same_session_recovery_seed(
+            session,
+            parent_run_id=str(parent_run_id),
+            failed_user_text=str(failed_user_text or ""),
+            attachments=copy.deepcopy(list(attachments or [])),
+            partial_assistant_text=_latest_recovery_partial_text(
+                session,
+                str(failed_user_text or ""),
+            ),
+        )
+        receipt = claim_compression_recovery(session, str(parent_run_id), seed)
+    except CompressionRecoveryBlocked as exc:
+        return False, _blocked_compression_recovery_payload(
+            session,
+            parent_run_id,
+            reason=exc.reason,
+        )
+    except Exception:
+        logger.exception(
+            "durable compression recovery claim failed for session %s run %s",
+            getattr(session, "session_id", ""),
+            parent_run_id,
+        )
+        return False, _blocked_compression_recovery_payload(
+            session,
+            parent_run_id,
+            reason="durable_claim_unavailable",
+        )
+    disposition = str(receipt.pop("claim_disposition", "pending") or "pending")
+    if disposition == "blocked":
+        return False, dict(getattr(session, "compression_recovery", None) or {})
+    if disposition == "settled":
+        return True, {
+            "terminal_state": "compression_exhausted",
+            "phase": "settled",
+            "automatic_recovery": True,
+            "same_session": True,
+            "source_session_id": str(getattr(session, "session_id", "") or ""),
+            "claim_key": receipt.get("claim_key"),
+            "fingerprint": receipt.get("fingerprint"),
+        }
+    payload = dict(getattr(session, "compression_recovery", None) or {})
+    payload.update(
+        {
+            "phase": "running" if disposition == "running" else "claimed",
+            "automatic_recovery": True,
+            "same_session": True,
+            "claim_key": receipt.get("claim_key"),
+            "fingerprint": receipt.get("fingerprint"),
+            "message": "Recovering context...",
+        }
+    )
+    session.compression_recovery = payload
+    session.recommended_recovery_action = None
+    return True, payload
 
 
 def _drop_synthetic_compression_exhaustion_response(result_messages, result):
@@ -8234,16 +8378,32 @@ def _materialize_pending_user_turn_before_error(session, *, active_turn_identity
     bubble disappear on reload/reconcile. Return True when a recovered user turn
     was appended.
     """
-    pending_text = str(getattr(session, 'pending_user_message', None) or '')
+    authority = active_turn_identity if isinstance(active_turn_identity, dict) else {}
+    pending_text = str(
+        authority.get('text')
+        if authority.get('text') is not None
+        else (getattr(session, 'pending_user_message', None) or '')
+    )
     if not pending_text:
         return False
-    normalized_pending = " ".join(pending_text.split())
     recovered_ts = int(time.time())
-    pending_started_at = getattr(session, 'pending_started_at', None)
+    pending_started_at = (
+        authority.get('timestamp')
+        if authority.get('timestamp') is not None
+        else getattr(session, 'pending_started_at', None)
+    )
     if isinstance(pending_started_at, (int, float)) and pending_started_at > 0:
         recovered_ts = int(pending_started_at)
-    pending_source = getattr(session, 'pending_user_source', None) or 'webui'
-    pending_attachments = list(getattr(session, 'pending_attachments', None) or [])
+    pending_source = (
+        authority.get('source')
+        or getattr(session, 'pending_user_source', None)
+        or 'webui'
+    )
+    pending_attachments = list(
+        authority.get('attachments')
+        if isinstance(authority.get('attachments'), list)
+        else (getattr(session, 'pending_attachments', None) or [])
+    )
 
     def is_exact_checkpoint(messages):
         if not isinstance(messages, list) or not messages:
@@ -11012,6 +11172,9 @@ def _run_agent_streaming(
                 'goal_continuation': (
                     'goal_continuation', '_goal_continuation_control'
                 ),
+                'compression_recovery': (
+                    'compression_recovery', '_compression_recovery_control'
+                ),
             }.get(_turn_pending_source)
             if _turn_internal_control:
                 # The child snapshot contains a durable seed row so a crash
@@ -11523,6 +11686,16 @@ def _run_agent_streaming(
                     _compression_origin_session_id = old_sid
                     _compression_continuation_session_id = new_sid
                     s.session_id = new_sid
+                    if _turn_pending_source == 'compression_recovery':
+                        from api.compression_recovery_receipts import (
+                            bind_recovery_presentation_session,
+                        )
+
+                        bind_recovery_presentation_session(
+                            s,
+                            source_session_id=old_sid,
+                            child_stream_id=stream_id,
+                        )
                     # Carry profile identity across the compression boundary.
                     # Without this, s.profile stays None on the continuation
                     # session. On the next request, _run_agent_streaming calls
@@ -11962,15 +12135,44 @@ def _run_agent_streaming(
                         }
                         if _terminal_error_turn_duration is not None:
                             _error_message['_turnDuration'] = _terminal_error_turn_duration
+                        _compression_recovery_accepted = False
                         if _err_type == 'compression_exhausted':
-                            _recovery = stamp_compression_exhausted_recovery(
-                                s,
-                                message=_error_payload.get('message') or _err_label,
-                                details=_error_payload.get('details') or '',
-                            )
-                            _error_message['_compressionRecovery'] = _recovery
+                            if _process_completion_claims:
+                                _recovery = _blocked_compression_recovery_payload(
+                                    s,
+                                    stream_id,
+                                    reason="process_completion_delivery_requires_terminal_receipt",
+                                )
+                            else:
+                                _compression_recovery_accepted, _recovery = (
+                                    _claim_same_session_compression_recovery(
+                                        s,
+                                        stream_id,
+                                        failed_user_text=str(
+                                            _active_turn_identity.get('text')
+                                            if isinstance(_active_turn_identity, dict)
+                                            else msg_text
+                                        ),
+                                        attachments=(
+                                            _active_turn_identity.get('attachments')
+                                            if isinstance(_active_turn_identity, dict)
+                                            else []
+                                        ),
+                                        source=str(
+                                            _active_turn_identity.get('source')
+                                            if isinstance(_active_turn_identity, dict)
+                                            else _turn_pending_source
+                                        ),
+                                    )
+                                )
                             _error_payload['compression_recovery'] = _recovery
-                            _error_payload['recommended_recovery_action'] = _recovery.get('recommended_action')
+                            _error_payload['terminal_state'] = 'compression_exhausted'
+                            _error_payload['automatic_recovery'] = bool(
+                                _compression_recovery_accepted
+                            )
+                            _error_payload['phase'] = _recovery.get('phase')
+                            if not _compression_recovery_accepted:
+                                _error_message['_compressionRecovery'] = _recovery
                         if _error_payload.get('details'):
                             _error_message['provider_details'] = _error_payload['details']
                         if _err_type == 'cancelled':
@@ -11979,18 +12181,66 @@ def _run_agent_streaming(
                             _error_message['provider_details_label'] = 'Interruption details'
                         elif _err_type == 'tool_limit_reached':
                             _error_message['provider_details_label'] = 'Terminal state details'
-                        s.messages.append(_error_message)
+                        if not _compression_recovery_accepted:
+                            s.messages.append(_error_message)
+                        _terminal_session_persisted = False
                         if _process_completion_claims:
-                            _commit_exact_process_completion_terminal(
+                            _terminal_session_persisted = bool(
+                                _commit_exact_process_completion_terminal(
                                 s,
                                 _error_message,
                                 _native_terminal_state_before,
+                                )
                             )
                         else:
                             try:
                                 s.save()
+                                _terminal_session_persisted = True
                             except Exception:
                                 pass
+                        if _err_type == 'tool_limit_reached':
+                            _error_payload['terminal_state'] = 'tool_limit_reached'
+                            _error_payload['terminal_reason'] = 'max_iterations'
+                        _terminal_journal_persisted = False
+                        if not ephemeral:
+                            try:
+                                _terminal_event = {
+                                    "event": "interrupted",
+                                    "created_at": time.time(),
+                                    "reason": _err_type,
+                                }
+                                if (
+                                    _turn_pending_source == 'compression_recovery'
+                                    and _terminal_session_persisted
+                                ):
+                                    _terminal_event["recovery_terminal_persisted"] = True
+                                    _terminal_event["recovery_presentation_session_id"] = (
+                                        str(getattr(s, "session_id", session_id) or session_id)
+                                    )
+                                append_turn_journal_event_for_stream(
+                                    session_id,
+                                    stream_id,
+                                    _terminal_event,
+                                )
+                                _terminal_journal_persisted = True
+                            except Exception:
+                                logger.debug(
+                                    "Failed to append terminal-result turn journal event",
+                                    exc_info=True,
+                                )
+                        if (
+                            _turn_pending_source == 'compression_recovery'
+                            and _terminal_session_persisted
+                            and _terminal_journal_persisted
+                        ):
+                            from api.compression_recovery_receipts import (
+                                settle_recovery_after_durable_terminal,
+                            )
+
+                            settle_recovery_after_durable_terminal(
+                                s,
+                                child_stream_id=stream_id,
+                            )
                         _error_payload['session'] = redact_session_data(
                             _session_payload_with_full_messages(s, tool_calls=s.tool_calls)
                         )
@@ -11999,25 +12249,6 @@ def _run_agent_streaming(
                         if _compression_continuation_session_id is not None:
                             _error_payload['new_session_id'] = _compression_continuation_session_id
                             _error_payload['continuation_session_id'] = _compression_continuation_session_id
-                        if _err_type == 'tool_limit_reached':
-                            _error_payload['terminal_state'] = 'tool_limit_reached'
-                            _error_payload['terminal_reason'] = 'max_iterations'
-                        if not ephemeral:
-                            try:
-                                append_turn_journal_event_for_stream(
-                                    session_id,
-                                    stream_id,
-                                    {
-                                        "event": "interrupted",
-                                        "created_at": time.time(),
-                                        "reason": _err_type,
-                                    },
-                                )
-                            except Exception:
-                                logger.debug(
-                                    "Failed to append terminal-result turn journal event",
-                                    exc_info=True,
-                                )
                         put('apperror', _error_payload)
                         # Legacy #373 source tests and clients look for the
                         # no_response type; #1765 keeps that type but improves
@@ -12113,7 +12344,7 @@ def _run_agent_streaming(
                 _stamp_missing_message_timestamps(s.messages)
                 # Only auto-generate title when still default; preserves user renames.
                 # Internal continuation control must never become a visible title.
-                if (_turn_pending_source not in ('tool_limit_continuation', 'goal_continuation')
+                if (_turn_pending_source not in ('tool_limit_continuation', 'goal_continuation', 'compression_recovery')
                         and (s.title == 'Untitled' or s.title == 'New Chat' or not s.title)):
                     s.title = title_from(s.messages, s.title)
                 _looks_default = (s.title == 'Untitled' or s.title == 'New Chat' or not s.title)
@@ -12501,23 +12732,43 @@ def _run_agent_streaming(
                         logger.debug("Failed to append cancelled turn journal event", exc_info=True)
                     put('cancel', _cancel_event_payload('Cancelled by user'))
                     return
+                _terminal_journal_persisted = False
                 if not ephemeral:
                     try:
+                        _terminal_event = {
+                            "event": "completed",
+                            "created_at": time.time(),
+                            "assistant_message_index": next(
+                                (idx for idx in range(len(s.messages) - 1, -1, -1)
+                                 if isinstance(s.messages[idx], dict) and s.messages[idx].get('role') == 'assistant'),
+                                None,
+                            ),
+                        }
+                        if _turn_pending_source == 'compression_recovery':
+                            _terminal_event["recovery_terminal_persisted"] = True
+                            _terminal_event["recovery_presentation_session_id"] = (
+                                str(getattr(s, "session_id", session_id) or session_id)
+                            )
                         append_turn_journal_event_for_stream(
                             session_id,
                             stream_id,
-                            {
-                                "event": "completed",
-                                "created_at": time.time(),
-                                "assistant_message_index": next(
-                                    (idx for idx in range(len(s.messages) - 1, -1, -1)
-                                     if isinstance(s.messages[idx], dict) and s.messages[idx].get('role') == 'assistant'),
-                                    None,
-                                ),
-                            },
+                            _terminal_event,
                         )
+                        _terminal_journal_persisted = True
                     except Exception:
                         logger.debug("Failed to append completed turn journal event", exc_info=True)
+                if (
+                    _turn_pending_source == 'compression_recovery'
+                    and _terminal_journal_persisted
+                ):
+                    from api.compression_recovery_receipts import (
+                        settle_recovery_after_durable_terminal,
+                    )
+
+                    settle_recovery_after_durable_terminal(
+                        s,
+                        child_stream_id=stream_id,
+                    )
                 if not ephemeral:
                     # ── Memory-provider lifecycle: mark turn completed (CLI parity) ──
                     # Completed, non-ephemeral turns are marked dirty/uncommitted so
@@ -13463,46 +13714,104 @@ def _run_agent_streaming(
                 }
                 if _terminal_error_turn_duration is not None:
                     _error_message['_turnDuration'] = _terminal_error_turn_duration
+                _compression_recovery_accepted = False
                 if _exc_type == 'compression_exhausted':
-                    _recovery = stamp_compression_exhausted_recovery(
-                        s,
-                        message=_error_payload.get('message') or err_str,
-                        details=_error_payload.get('details') or '',
-                    )
-                    _error_message['_compressionRecovery'] = _recovery
+                    if _process_completion_claims:
+                        _recovery = _blocked_compression_recovery_payload(
+                            s,
+                            stream_id,
+                            reason="process_completion_delivery_requires_terminal_receipt",
+                        )
+                    else:
+                        _compression_recovery_accepted, _recovery = (
+                            _claim_same_session_compression_recovery(
+                                s,
+                                stream_id,
+                                failed_user_text=str(
+                                    _active_turn_identity.get('text')
+                                    if isinstance(_active_turn_identity, dict)
+                                    else msg_text
+                                ),
+                                attachments=(
+                                    _active_turn_identity.get('attachments')
+                                    if isinstance(_active_turn_identity, dict)
+                                    else []
+                                ),
+                                source=str(
+                                    _active_turn_identity.get('source')
+                                    if isinstance(_active_turn_identity, dict)
+                                    else _turn_pending_source
+                                ),
+                            )
+                        )
                     _error_payload['compression_recovery'] = _recovery
-                    _error_payload['recommended_recovery_action'] = _recovery.get('recommended_action')
+                    _error_payload['terminal_state'] = 'compression_exhausted'
+                    _error_payload['automatic_recovery'] = bool(
+                        _compression_recovery_accepted
+                    )
+                    _error_payload['phase'] = _recovery.get('phase')
+                    if not _compression_recovery_accepted:
+                        _error_message['_compressionRecovery'] = _recovery
                 if _error_payload.get('details'):
                     _error_message['provider_details'] = _error_payload['details']
                 if _exc_type == 'cancelled':
                     _error_message['provider_details_label'] = 'Cancellation details'
                 elif _exc_type == 'interrupted':
                     _error_message['provider_details_label'] = 'Interruption details'
-                s.messages.append(_error_message)
+                if not _compression_recovery_accepted:
+                    s.messages.append(_error_message)
+                _terminal_session_persisted = False
                 if _process_completion_claims:
-                    _commit_exact_process_completion_terminal(
+                    _terminal_session_persisted = bool(
+                        _commit_exact_process_completion_terminal(
                         s,
                         _error_message,
                         _native_terminal_state_before,
+                        )
                     )
                 else:
                     try:
                         s.save()
+                        _terminal_session_persisted = True
                     except Exception:
                         pass
+                _terminal_journal_persisted = False
                 if not ephemeral:
                     try:
+                        _terminal_event = {
+                            "event": "interrupted",
+                            "created_at": time.time(),
+                            "reason": _exc_type,
+                        }
+                        if (
+                            _turn_pending_source == 'compression_recovery'
+                            and _terminal_session_persisted
+                        ):
+                            _terminal_event["recovery_terminal_persisted"] = True
+                            _terminal_event["recovery_presentation_session_id"] = (
+                                str(getattr(s, "session_id", session_id) or session_id)
+                            )
                         append_turn_journal_event_for_stream(
                             session_id,
                             stream_id,
-                            {
-                                "event": "interrupted",
-                                "created_at": time.time(),
-                                "reason": _exc_type,
-                            },
+                            _terminal_event,
                         )
+                        _terminal_journal_persisted = True
                     except Exception:
                         logger.debug("Failed to append interrupted turn journal event", exc_info=True)
+                if (
+                    _turn_pending_source == 'compression_recovery'
+                    and _terminal_session_persisted
+                    and _terminal_journal_persisted
+                ):
+                    from api.compression_recovery_receipts import (
+                        settle_recovery_after_durable_terminal,
+                    )
+
+                    settle_recovery_after_durable_terminal(
+                        s,
+                        child_stream_id=stream_id,
+                    )
             _error_payload['session_id'] = getattr(s, 'session_id', session_id)
             _error_payload['old_session_id'] = session_id
         put('apperror', _error_payload)
@@ -13734,6 +14043,7 @@ def _run_agent_streaming(
 
             recover_successors_after_unregister(
                 session_id,
+                parent_run_id=stream_id,
                 session=s,
                 profile=getattr(s, "profile", None) or profile,
             )
@@ -14195,6 +14505,15 @@ def cancel_stream(stream_id: str) -> bool:
                     _pending_atts_raw = getattr(_cs, 'pending_attachments', None)
                     _pending_atts = list(_pending_atts_raw) if isinstance(_pending_atts_raw, (list, tuple)) else []
                     _pending_started = getattr(_cs, 'pending_started_at', None) or 0
+                    if _pending_source == 'compression_recovery':
+                        from api.compression_recovery_receipts import (
+                            retire_session_compression_recoveries,
+                        )
+
+                        retire_session_compression_recoveries(
+                            _cs,
+                            reason='superseded_by_user',
+                        )
                     _msgs_for_recovery = _cs.messages if isinstance(_cs.messages, list) else None
                     if _pending_user and _msgs_for_recovery is not None:
                         _last_user = None

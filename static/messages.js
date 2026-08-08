@@ -1286,18 +1286,19 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
   return restoredVisible;
 }
 
-// The chat-start endpoint returns a structured 409 after a session has entered
-// terminal compression recovery. Keep this parser strict: a generic 409 or a
-// payload for another session must remain on the ordinary error path and must
-// never mutate the visible pane.
+// A stale client/server pair can still surface the retired manual-recovery 409.
+// Keep this parser strict and reconcile only the exact same task.
 function _compressionRecoveryPayloadFrom409(err, sid){
   if(!err || Number(err.status)!==409 || typeof err.body!=='string') return null;
   let body;
   try{ body=JSON.parse(err.body); }catch(_){ return null; }
-  if(!body || body.type!=='compression_recovery_required') return null;
+  if(!body || !['compression_recovery_required','reload_required'].includes(String(body.type||''))) return null;
   const targetSid=String(sid||'').trim();
   const bodySid=String(body.session_id||'').trim();
   if(!targetSid || (bodySid && bodySid!==targetSid)) return null;
+  if(body.type==='reload_required'&&body.reload_required===true){
+    return {body,recovery:null};
+  }
   const recovery=body.compression_recovery;
   if(!recovery || typeof recovery!=='object') return null;
   if(String(recovery.terminal_state||'')!=='compression_exhausted') return null;
@@ -1311,9 +1312,8 @@ function _compressionRecoveryPayloadFrom409(err, sid){
 }
 
 // Reconcile a late terminal 409 without losing the attempted composer turn.
-// This is deliberately a same-session reload: the explicit recovery card owns
-// the child-session transition, while this path owns optimistic-row cleanup,
-// draft/file restoration, and authoritative source-session refresh.
+// Recovery is server-owned; this path only restores the draft and reloads the
+// authoritative state for the same task.
 async function _handleCompressionRecovery409(
   err, sid, optimisticUser, draftText, filesSnapshot, clearPromise
 ){
@@ -1338,9 +1338,8 @@ async function _handleCompressionRecovery409(
     if(!_approvalSessionId || _approvalSessionId===sid) hideApprovalCard(true);
     if(!_clarifySessionId || _clarifySessionId===sid) hideClarifyCard(true,'terminal');
     removeThinking();
-    // A compression-recovery 409 is not a completed turn. Keep any queued
-    // successor durable and let the explicit recovery flow decide when it can
-    // run; draining here would overwrite the failed draft restored below.
+    // A compression-recovery 409 is not a completed turn. Keep queued work
+    // durable; draining here would overwrite the failed draft restored below.
     setBusy(false,{drainQueue:false});
     setComposerStatus('');
   }
@@ -1357,10 +1356,6 @@ async function _handleCompressionRecovery409(
 
   if(!visible) return true;
 
-  if(S.session){
-    S.session.compression_recovery=parsed.recovery;
-    if(typeof renderMessages==='function') renderMessages();
-  }
   if(typeof renderSessionList==='function') void renderSessionList();
 
   try{
@@ -1370,20 +1365,100 @@ async function _handleCompressionRecovery409(
       preserveActiveInput:true,
     });
   }catch(_){
-    // Keep the locally merged recovery card and restored composer if the
-    // reconciliation GET is temporarily unavailable.
+    // Keep the restored composer if the reconciliation GET is unavailable.
   }
+  return true;
+}
 
-  // A session switch may have raced the reload. Never focus or toast a card in
-  // a different visible session.
-  if(S.session&&S.session.session_id===sid){
-    if(!Object.prototype.hasOwnProperty.call(S.session,'compression_recovery')){
-      S.session.compression_recovery=parsed.recovery;
-    }
-    if(typeof renderMessages==='function') renderMessages();
-    if(typeof showCompressionRecoveryContinuationHint==='function'){
-      showCompressionRecoveryContinuationHint();
-    }
+function _acceptedAutomaticCompressionRecovery(data, sessionId){
+  const d=data&&typeof data==='object'?data:null;
+  const sid=String(sessionId||'').trim();
+  if(!d||!sid||String(d.type||'')!=='compression_exhausted') return null;
+  if(d.automatic_recovery!==true) return null;
+  const recovery=(d.compression_recovery&&typeof d.compression_recovery==='object')
+    ? d.compression_recovery
+    : (d.session&&d.session.compression_recovery&&typeof d.session.compression_recovery==='object'
+        ? d.session.compression_recovery
+        : null);
+  if(!recovery||String(recovery.terminal_state||'')!=='compression_exhausted') return null;
+  if(recovery.same_session!==true) return null;
+  const phase=String(d.phase||recovery.phase||'');
+  const terminalNoop=['settled','superseded'].includes(phase);
+  if(!terminalNoop&&!['claimed','starting','running'].includes(phase)) return null;
+  if(!terminalNoop&&recovery.automatic_recovery!==true) return null;
+
+  // Agent compression can rotate the backing session id while preserving one
+  // logical conversation. Accept that mapping only when every supplied alias
+  // agrees and the old id proves ownership of this exact stream. A rotated
+  // frame also needs its canonical snapshot; otherwise applying it could splice
+  // transcript state from two different sessions.
+  const oldSid=String(d.old_session_id||'').trim();
+  const frameSid=String(d.session_id||'').trim();
+  const newSid=String(d.new_session_id||'').trim();
+  const continuationSid=String(d.continuation_session_id||'').trim();
+  const snapshotSid=String(d.session&&d.session.session_id||'').trim();
+  const recoverySid=String(recovery.source_session_id||'').trim();
+  if(oldSid&&oldSid!==sid) return null;
+  const canonicalClaims=[newSid,continuationSid,snapshotSid].filter(Boolean);
+  const canonicalSid=canonicalClaims[0]||frameSid||recoverySid||sid;
+  if(canonicalClaims.some(candidate=>candidate!==canonicalSid)) return null;
+  if([frameSid,recoverySid].some(candidate=>candidate&&candidate!==sid&&candidate!==canonicalSid)) return null;
+  if(canonicalSid!==sid){
+    if(oldSid!==sid||!snapshotSid||snapshotSid!==canonicalSid) return null;
+  }else if(!oldSid&&!([frameSid,recoverySid,snapshotSid].includes(sid))){
+    return null;
+  }
+  return {
+    ...recovery,
+    phase,
+    automatic_recovery:true,
+    same_session:true,
+    source_session_id:recoverySid||canonicalSid,
+    message:String(recovery.message||'Recovering context...'),
+    _canonical_session_id:canonicalSid,
+    _terminal_noop:terminalNoop,
+  };
+}
+
+function _applyAcceptedAutomaticCompressionRecovery(data, sessionId){
+  const sid=String(sessionId||'').trim();
+  const recovery=_acceptedAutomaticCompressionRecovery(data,sid);
+  if(!recovery||!S.session) return false;
+  const currentSid=String(S.session.session_id||'').trim();
+  const canonicalSid=String(recovery._canonical_session_id||sid).trim();
+  if(recovery._terminal_noop===true){
+    // A replayed parent terminal can arrive after its successor settled or a
+    // human turn superseded it. Suppress that stale error, but do not replace
+    // the newer canonical transcript, active stream, or recovery presentation.
+    return currentSid===sid||currentSid===canonicalSid;
+  }
+  if(currentSid!==sid) return false;
+  const presentedRecovery={...recovery};
+  delete presentedRecovery._canonical_session_id;
+  delete presentedRecovery._terminal_noop;
+  const snapshot=data&&data.session;
+  if(snapshot&&typeof snapshot==='object'&&String(snapshot.session_id||'')===canonicalSid){
+    const nextSession={...snapshot,compression_recovery:presentedRecovery};
+    const nextMessages=Array.isArray(snapshot.messages)
+      ? snapshot.messages.filter(message=>message&&message.role)
+      : (Array.isArray(S.messages)?S.messages:[]);
+    S.session=nextSession;
+    S.messages=typeof _carryForwardEphemeralTurnFields==='function'
+      ? _carryForwardEphemeralTurnFields(S.messages||[],nextMessages)
+      : nextMessages;
+  }else{
+    if(canonicalSid!==sid) return false;
+    S.session.compression_recovery=presentedRecovery;
+  }
+  S.activeStreamId=null;
+  if(canonicalSid!==sid&&typeof startSessionStream==='function'){
+    // The terminal parent frame arrived on the pre-compression chat stream,
+    // but the automatic successor is broadcast on the canonical session
+    // channel. Rebind that transport in place without changing the visible
+    // task URL/sidebar identity; on-subscribe replay covers a child that wins
+    // the race and starts before this EventSource connects.
+    if(typeof _sessionStreamHiddenSid!=='undefined') _sessionStreamHiddenSid=null;
+    startSessionStream(canonicalSid);
   }
   return true;
 }
@@ -1469,13 +1544,6 @@ async function send(){
     _sendInProgress=false;_sendInProgressSid=null;
     return;
   }
-  if(typeof shouldInterceptCompressionRecoveryContinuation==='function'&&shouldInterceptCompressionRecoveryContinuation(text,S.pendingFiles)){
-    if(typeof redirectCompressionRecoverySend==='function') await redirectCompressionRecoverySend();
-    else if(typeof showCompressionRecoveryContinuationHint==='function') showCompressionRecoveryContinuationHint();
-    _sendInProgress=false;_sendInProgressSid=null;
-    return;
-  }
-
   // #5472: snapshot the ORIGINAL user-typed composer state now — before slash
   // rewrites (/moa, bundles) mutate `text` and before uploadPendingFiles()
   // clears S.pendingFiles. If /api/chat/start throws (turn never durably
@@ -6693,20 +6761,29 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const eventSid=d.old_session_id||d.session_id||'';
       const continuationSid=(d.session&&d.session.session_id)||d.new_session_id||d.continuation_session_id||'';
       const eventMatchesCurrent=!!(currentSid&&(eventSid===currentSid||continuationSid===currentSid));
+      const automaticRecoveryForStream=_acceptedAutomaticCompressionRecovery(d,activeSid);
+      const acceptedAutomaticRecovery=!!(
+        eventMatchesCurrent&&_applyAcceptedAutomaticCompressionRecovery(d,activeSid)
+      );
+      const acceptedAutomaticRecoveryNoop=!!(
+        acceptedAutomaticRecovery&&automaticRecoveryForStream&&automaticRecoveryForStream._terminal_noop===true
+      );
       if(eventMatchesCurrent){
-        _flushReasoningToAnchor();
-        _applyToAnchor('apperror',{
-          type:d.type||'error',
-          status:d.status||d.type||'error',
-          message:d.message||'',
-          hint:d.hint||'',
-          details:d.details||'',
-          session_id:d.session_id||eventSid||activeSid,
-          old_session_id:d.old_session_id||null,
-          new_session_id:d.new_session_id||d.continuation_session_id||null,
-        },e);
+        if(!acceptedAutomaticRecoveryNoop) _flushReasoningToAnchor();
+        if(!acceptedAutomaticRecovery){
+          _applyToAnchor('apperror',{
+            type:d.type||'error',
+            status:d.status||d.type||'error',
+            message:d.message||'',
+            hint:d.hint||'',
+            details:d.details||'',
+            session_id:d.session_id||eventSid||activeSid,
+            old_session_id:d.old_session_id||null,
+            new_session_id:d.new_session_id||d.continuation_session_id||null,
+          },e);
+        }
       }
-      if(S.session&&eventMatchesCurrent){
+      if(S.session&&eventMatchesCurrent&&!acceptedAutomaticRecoveryNoop){
         S.activeStreamId=null;
         _scheduleAnchorRegistryCleanup();
         clearLiveToolCards();if(!assistantText)removeThinking();
@@ -6731,7 +6808,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           const detailsLabel=isCancelled?'Cancellation details':isInterrupted?'Interruption details':isToolLimitReached?'Terminal state details':undefined;
           window._compressionUi=null;
           if(typeof clearCompressionUi==='function') clearCompressionUi();
-          if(isRecoveryControlMessage){
+          if(acceptedAutomaticRecovery){
+            // The server snapshot was applied before anchor projection. Keep
+            // the accepted exhaustion invisible and let the normal
+            // server_turn_started frame attach the same-task successor.
+          } else if(isRecoveryControlMessage){
             if(typeof showToast==='function') showToast('Stream recovery signal received. Restoring transcript...',3500,'error');
           } else if(d.session&&typeof d.session==='object'){
             S.session=d.session;
@@ -6747,7 +6828,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             S.messages.push({role:'assistant',content:`**${label}:** ${d.message}${hint}`,provider_details:details,provider_details_label:detailsLabel,_compressionRecovery:recovery||undefined});
             _attachProjectedAnchorSceneToLastAssistant(S.messages);
           }
-          if(!isRecoveryControlMessage){
+          if(!isRecoveryControlMessage&&!acceptedAutomaticRecovery){
             _anchorRetryTarget=[...S.messages].reverse().find(m=>m&&m.role==='assistant')||null;
             _anchorRetryIndex=_anchorRetryTarget?S.messages.indexOf(_anchorRetryTarget):-1;
           }
@@ -6778,15 +6859,22 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
             }
           })();
         } else {
-          _markSessionViewed((S.session&&S.session.session_id)||activeSid, S.messages.length);
+          if(!acceptedAutomaticRecovery){
+            _markSessionViewed((S.session&&S.session.session_id)||activeSid, S.messages.length);
+          }
           renderMessages({preserveScroll:true});
         }
+      }else if(acceptedAutomaticRecoveryNoop){
+        // The exact parent terminal was already settled or superseded. Its
+        // replay is a protocol acknowledgement, not a new UI event.
+      }else if(automaticRecoveryForStream){
+        if(typeof renderSessionList==='function') void renderSessionList();
       }else if(typeof trackBackgroundError==='function'){
         const _errTitle=(typeof _allSessions!=='undefined'&&_allSessions.find(s=>s.session_id===activeSid)||{}).title||null;
         trackBackgroundError(activeSid,_errTitle,d.message||'Error');
       }
       _setActivePaneIdleIfOwner();
-      renderSessionList(); // clear streaming indicator immediately on apperror
+      if(!acceptedAutomaticRecovery) renderSessionList();
     });
 
     source.addEventListener('warning',e=>{

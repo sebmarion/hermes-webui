@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -480,7 +481,7 @@ assert coordinator.steps[0].reconciler() is Reconciliation.PROVED_COMPLETE
     assert completed.returncode == 0, completed.stderr
 
 
-def test_restart_can_replace_early_step_after_step_thirteen(tmp_path):
+def test_restart_can_replace_early_step_after_step_fourteen(tmp_path):
     environment = _environment(tmp_path)
     operations = _operations()
     coordinator = build_managed_startup_coordinator(
@@ -509,7 +510,7 @@ def test_restart_can_replace_early_step_after_step_thirteen(tmp_path):
         receipt_codecs=_codecs(),
     )
     bundle = verified.step_receipt_bundle()
-    assert bundle.receipt_journal_generation == 14
+    assert bundle.receipt_journal_generation == 15
     assert bundle.receipts[0] == ("credential_permissions", replacement)
     assert all(receipt is not None for _name, receipt in bundle.receipts)
 
@@ -568,6 +569,7 @@ def test_only_approved_partial_steps_get_retry_policy(tmp_path):
     assert policies["async_delegation_recovery"] is (
         RetrySafePartialPolicy.ALLOW
     )
+    assert policies["compression_recovery"] is RetrySafePartialPolicy.ALLOW
     assert policies["state_directories"] is RetrySafePartialPolicy.ALLOW
     assert policies["tool_limit_continuation_recovery"] is (
         RetrySafePartialPolicy.ALLOW
@@ -599,6 +601,7 @@ def test_only_approved_partial_steps_get_retry_policy(tmp_path):
         "plugins",
         "process_completion_recovery",
         "async_delegation_recovery",
+        "compression_recovery",
         "tool_limit_continuation_recovery",
         "goal_continuation_recovery",
         "background_services",
@@ -691,3 +694,224 @@ def test_production_capability_never_uses_always_complete_fallback():
             "verify_managed_startup_exact",
             capability="process recovery",
         )
+
+
+def test_compression_recovery_start_forwards_exact_reserved_turn_binding():
+    import managed_startup_coordinator as managed
+
+    calls = []
+    routes = type(
+        "Routes",
+        (),
+        {
+            "start_session_turn": staticmethod(
+                lambda *args, **kwargs: calls.append((args, kwargs))
+                or {"stream_id": "stream-1"}
+            )
+        },
+    )
+    kwargs = {
+        "source": "compression_recovery",
+        "expected_profile": "default",
+        "attachments": [{"name": "proof.txt"}],
+        "recovery_claim_token": "claim-token",
+        "recovery_fingerprint": "f" * 64,
+        "recovery_context_messages": [
+            {"role": "user", "content": "finish it"}
+        ],
+    }
+
+    result = managed._start_compression_recovery_turn(
+        routes,
+        "session-1",
+        "continue exactly",
+        **kwargs,
+    )
+
+    assert result == {"stream_id": "stream-1"}
+    assert calls == [
+        (("session-1", "continue exactly"), kwargs),
+    ]
+
+
+def test_production_compression_operation_preserves_release_and_turn_bindings(
+    monkeypatch,
+    tmp_path,
+):
+    import managed_startup_coordinator as managed
+    from api import (
+        compression_recovery_receipts,
+        config,
+        managed_startup_configuration,
+        routes,
+    )
+
+    manifest_sha256 = release_manifest.deferred_release_manifest_sha256()
+    environment = _environment(tmp_path)
+    captured = {}
+    recovery_calls = []
+    verification_calls = []
+    turn_calls = []
+    recovery_receipt = object()
+
+    monkeypatch.setattr(config, "startup_run_admission_is_closed", lambda: True)
+    monkeypatch.setattr(
+        config,
+        "_managed_release_selected_from_environment",
+        lambda: True,
+    )
+    monkeypatch.setattr(config, "_RUN_ADMISSION_TRANSACTION_ID", TRANSACTION_ID)
+    monkeypatch.setattr(
+        managed_startup_configuration,
+        "configure_managed_startup_configuration_journal",
+        lambda path: Path(path),
+    )
+
+    def capture_coordinator(**kwargs):
+        captured.update(kwargs)
+        return "captured-coordinator"
+
+    def recover_exact(**kwargs):
+        recovery_calls.append(kwargs)
+        kwargs["start"](
+            "session-1",
+            "resume exactly",
+            source="compression_recovery",
+            expected_profile="default",
+            attachments=[{"name": "proof.txt"}],
+            recovery_claim_token="claim-token",
+            recovery_fingerprint="f" * 64,
+            recovery_context_messages=[
+                {"role": "user", "content": "finish it"}
+            ],
+        )
+        return recovery_receipt
+
+    def verify_exact(receipt, **kwargs):
+        verification_calls.append((receipt, kwargs))
+        return type("Verification", (), {"outcome": "COMPLETE"})()
+
+    monkeypatch.setattr(
+        managed,
+        "build_managed_startup_coordinator",
+        capture_coordinator,
+    )
+    monkeypatch.setattr(
+        compression_recovery_receipts,
+        "recover_managed_compression_recoveries_exact",
+        recover_exact,
+    )
+    monkeypatch.setattr(
+        compression_recovery_receipts,
+        "verify_managed_compression_recoveries_exact",
+        verify_exact,
+    )
+    monkeypatch.setattr(
+        routes,
+        "start_session_turn",
+        lambda *args, **kwargs: turn_calls.append((args, kwargs))
+        or {"stream_id": "stream-1"},
+    )
+    # Keep the WebUI binding test independent of which paired Agent revision
+    # happens to be installed in the test environment.
+    tools_package = __import__("tools")
+    fake_async = SimpleNamespace(
+        verify_managed_async_delegations_exact=lambda *_args, **_kwargs: None,
+        ManagedAsyncDelegationRecoveryReceipt=object,
+        ManagedAsyncDelegationRecoveryOutcome=object,
+        ManagedAsyncEventPostcondition=object,
+    )
+    fake_process_registry = SimpleNamespace(
+        recover_managed_startup_exact=lambda *_args, **_kwargs: None,
+        verify_managed_startup_exact=lambda *_args, **_kwargs: None,
+    )
+    fake_process_module = SimpleNamespace(
+        process_registry=fake_process_registry,
+        ManagedProcessRecoveryReceipt=object,
+        ManagedProcessRecoveryOutcome=object,
+    )
+    fake_durable_state = SimpleNamespace(FileIdentity=object)
+    for name, module in (
+        ("async_delegation", fake_async),
+        ("process_registry", fake_process_module),
+        ("durable_state", fake_durable_state),
+    ):
+        monkeypatch.setattr(tools_package, name, module, raising=False)
+        monkeypatch.setitem(sys.modules, f"tools.{name}", module)
+
+    assert managed.build_production_managed_startup_coordinator(
+        environment=environment
+    ) == "captured-coordinator"
+    operation = next(
+        item
+        for item in captured["operations"]
+        if item.name == "compression_recovery"
+    )
+
+    assert operation.mutator() is recovery_receipt
+    verified = operation.verifier(recovery_receipt)
+
+    expected_release_binding = {
+        "transaction_id": TRANSACTION_ID,
+        "manifest_sha256": manifest_sha256,
+    }
+    assert recovery_calls == [
+        {
+            **expected_release_binding,
+            "start": recovery_calls[0]["start"],
+        }
+    ]
+    assert turn_calls == [
+        (
+            ("session-1", "resume exactly"),
+            {
+                "source": "compression_recovery",
+                "expected_profile": "default",
+                "attachments": [{"name": "proof.txt"}],
+                "recovery_claim_token": "claim-token",
+                "recovery_fingerprint": "f" * 64,
+                "recovery_context_messages": [
+                    {"role": "user", "content": "finish it"}
+                ],
+            },
+        )
+    ]
+    assert verification_calls == [
+        (recovery_receipt, expected_release_binding),
+    ]
+    assert verified.outcome == "COMPLETE"
+    assert verified.receipt is recovery_receipt
+
+
+def test_restart_reconciles_completed_compression_without_relaunch(tmp_path):
+    environment = _environment(tmp_path)
+    operations = _operations()
+    compression_index = next(
+        index
+        for index, operation in enumerate(operations)
+        if operation.name == "compression_recovery"
+    )
+    first = build_managed_startup_coordinator(
+        environment=environment,
+        operations=operations,
+        receipt_codecs=_codecs(),
+    )
+    first.steps[compression_index].mutator()
+
+    relaunched = []
+    restarted_operations = list(operations)
+    restarted_operations[compression_index] = replace(
+        operations[compression_index],
+        mutator=lambda: relaunched.append("compression"),
+    )
+    restarted = build_managed_startup_coordinator(
+        environment=environment,
+        operations=tuple(restarted_operations),
+        receipt_codecs=_codecs(),
+    )
+
+    assert (
+        restarted.steps[compression_index].reconciler()
+        is Reconciliation.PROVED_COMPLETE
+    )
+    assert relaunched == []

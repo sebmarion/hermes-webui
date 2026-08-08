@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 
@@ -266,3 +269,281 @@ def compression_recovery_payload_for_session(session) -> dict | None:
 def clear_compression_recovery(session) -> None:
     session.recommended_recovery_action = None
     session.compression_recovery = {}
+
+
+class CompressionRecoveryBlocked(ValueError):
+    """Fail-closed result when no safe same-session recovery can be built."""
+
+    def __init__(self, reason: str):
+        self.reason = str(reason)
+        super().__init__(self.reason)
+
+
+_RECOVERY_ASSISTANT_UNSAFE_FLAGS = (
+    "_compressed_summary",
+    "_error",
+    "_internal",
+    "_synthetic",
+    "_recovery_control",
+    "_compression_recovery_reference",
+    "_tool_limit_continuation_control",
+    "_goal_continuation_control",
+    "_managed_continuation_control",
+)
+
+_RECOVERY_CONTROL_PREFIXES = (
+    "[compression recovery",
+    "[context compression",
+    "[context compaction",
+    "[prior context",
+    "[hermes_tool_limit_continuation]",
+    "[your active task list was preserved",
+)
+
+_RECOVERY_DEICTIC_MARKERS = (
+    " do it",
+    " do that",
+    " do this",
+    "handle it",
+    "handle that",
+    "handle this",
+    "you said",
+    "you mentioned",
+    "the other steps",
+    "those steps",
+    "as above",
+)
+
+
+def _recovery_block(reason: str) -> CompressionRecoveryBlocked:
+    return CompressionRecoveryBlocked(reason)
+
+
+def validate_recovery_attachments_for_use(
+    attachments: list[dict] | None,
+) -> list[dict]:
+    """Return safe attachment copies or block rather than silently dropping one."""
+
+    if attachments is None:
+        return []
+    if not isinstance(attachments, list):
+        raise _recovery_block("attachment_invalid")
+    if len(attachments) > 20:
+        raise _recovery_block("attachment_limit")
+
+    normalized: list[dict] = []
+    identities_by_name: dict[str, tuple[str, str, int | None, bool | None]] = {}
+    for raw in attachments:
+        if not isinstance(raw, dict):
+            raise _recovery_block("attachment_invalid")
+
+        name_value = raw.get("name")
+        path_value = raw.get("path")
+        mime_value = raw.get("mime")
+        if not all(isinstance(value, str) and value.strip() for value in (name_value, path_value, mime_value)):
+            raise _recovery_block("attachment_invalid")
+
+        name = name_value.strip()
+        path = path_value.strip()
+        mime = mime_value.strip()
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            raise _recovery_block("attachment_invalid")
+        if not candidate.is_file():
+            raise _recovery_block("attachment_missing")
+
+        size: int | None = None
+        if "size" in raw:
+            raw_size = raw.get("size")
+            if isinstance(raw_size, bool) or not isinstance(raw_size, int) or raw_size < 0:
+                raise _recovery_block("attachment_invalid")
+            size = raw_size
+
+        is_image: bool | None = None
+        if "is_image" in raw:
+            raw_is_image = raw.get("is_image")
+            if not isinstance(raw_is_image, bool):
+                raise _recovery_block("attachment_invalid")
+            is_image = raw_is_image
+
+        identity = (path, mime, size, is_image)
+        existing = identities_by_name.get(name)
+        if existing is not None:
+            if existing != identity:
+                raise _recovery_block("attachment_conflict")
+            continue
+        identities_by_name[name] = identity
+
+        item: dict[str, Any] = {"name": name, "path": path, "mime": mime}
+        if size is not None:
+            item["size"] = size
+        if is_image is not None:
+            item["is_image"] = is_image
+        normalized.append(item)
+    return normalized
+
+
+def _is_safe_assistant_checkpoint(message: dict) -> bool:
+    if message.get("role") != "assistant":
+        return False
+    if any(message.get(flag) for flag in _RECOVERY_ASSISTANT_UNSAFE_FLAGS):
+        return False
+    if message.get("tool_calls") or message.get("tool_call_id"):
+        return False
+    if message.get("reasoning") or message.get("reasoning_content"):
+        return False
+    text = _message_text(message)
+    if not text or text.lower().lstrip().startswith(_RECOVERY_CONTROL_PREFIXES):
+        return False
+    words = _normalize_intent_text(text).split()
+    return len(text) >= 40 and len(words) >= 6
+
+
+def _latest_safe_assistant_checkpoint_before_request(
+    session,
+    failed_user_text: str,
+) -> dict | None:
+    """Use visible order, and never borrow assistant output after the failed row."""
+
+    for attr in ("messages", "context_messages"):
+        messages = getattr(session, attr, None)
+        if not isinstance(messages, list):
+            continue
+        boundary = len(messages)
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "user"
+                and _message_text(message) == failed_user_text
+            ):
+                boundary = index
+                break
+        for message in reversed(messages[:boundary]):
+            if isinstance(message, dict) and _is_safe_assistant_checkpoint(message):
+                return message
+    return None
+
+
+def _is_independently_substantive_recovery_request(text: str) -> bool:
+    normalized = _normalize_intent_text(text)
+    if not normalized or is_generic_continuation_intent(text):
+        return False
+    padded = f" {normalized}"
+    if len(normalized) <= 160 and any(marker in padded for marker in _RECOVERY_DEICTIC_MARKERS):
+        return False
+    return len(text.strip()) >= 40 and len(normalized.split()) >= 6
+
+
+def _safe_partial_recovery_text(text: str) -> str:
+    value = str(text or "").strip()
+    if not value or value.lower().lstrip().startswith(_RECOVERY_CONTROL_PREFIXES):
+        return ""
+    from api.helpers import _redact_text
+
+    return "Partial, unverified work:\n\n" + _redact_text(value, _enabled=True)
+
+
+def _recovery_fingerprint(
+    *,
+    session_id: str,
+    parent_run_id: str,
+    context_messages: list[dict],
+    attachments: list[dict],
+) -> str:
+    canonical = json.dumps(
+        {
+            "session_id": session_id,
+            "parent_run_id": parent_run_id,
+            "context_messages": context_messages,
+            "attachments": attachments,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def build_same_session_recovery_seed(
+    session,
+    *,
+    parent_run_id: str,
+    failed_user_text: str,
+    attachments: list[dict] | None = None,
+    partial_assistant_text: str = "",
+) -> dict:
+    """Build a bounded, hidden recovery context without mutating the transcript."""
+
+    from api.helpers import _redact_text
+
+    request_text = str(failed_user_text or "")
+    if len(request_text) > COMPRESSION_RECOVERY_CONTEXT_MAX_CHARS:
+        raise _recovery_block("user_request_exceeds_context_budget")
+
+    summary = _latest_compressed_summary(session)
+    checkpoint = None
+    trust_source = ""
+    trusted_text = ""
+    if summary is not None and summary.get("role") == "assistant":
+        trust_source = "summary"
+        trusted_text = _redact_text(_message_text(summary), _enabled=True)
+    else:
+        checkpoint = _latest_safe_assistant_checkpoint_before_request(
+            session,
+            request_text,
+        )
+        if checkpoint is not None:
+            trust_source = "assistant_checkpoint"
+            trusted_text = _redact_text(_message_text(checkpoint), _enabled=True)
+        elif _is_independently_substantive_recovery_request(request_text):
+            trust_source = "user_request"
+        else:
+            raise _recovery_block("no_trustworthy_seed")
+
+    normalized_attachments = validate_recovery_attachments_for_use(attachments)
+    context_messages: list[dict] = []
+    assistant_budget = COMPRESSION_RECOVERY_CONTEXT_MAX_CHARS - len(request_text)
+
+    if trusted_text and assistant_budget > 0:
+        bounded = _bounded_recovery_text(trusted_text, assistant_budget)
+        if bounded:
+            context_messages.append(
+                {
+                    "role": "assistant",
+                    "content": bounded,
+                    "_compressed_summary": summary is not None,
+                    "_compression_recovery_reference": True,
+                }
+            )
+            assistant_budget -= len(bounded)
+
+    partial = _safe_partial_recovery_text(partial_assistant_text)
+    if partial and assistant_budget > 0:
+        bounded_partial = _bounded_recovery_text(partial, assistant_budget)
+        if bounded_partial:
+            context_messages.append(
+                {
+                    "role": "assistant",
+                    "content": bounded_partial,
+                    "_compression_recovery_partial": True,
+                }
+            )
+
+    context_messages.append({"role": "user", "content": request_text})
+    session_id = str(getattr(session, "session_id", "") or "")
+    parent_id = str(parent_run_id or "")
+    fingerprint = _recovery_fingerprint(
+        session_id=session_id,
+        parent_run_id=parent_id,
+        context_messages=context_messages,
+        attachments=normalized_attachments,
+    )
+    return {
+        "session_id": session_id,
+        "parent_run_id": parent_id,
+        "context_messages": context_messages,
+        "attachments": normalized_attachments,
+        "trust_source": trust_source,
+        "fingerprint": fingerprint,
+    }
