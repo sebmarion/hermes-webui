@@ -287,8 +287,9 @@ the normal stream renderer, and keeps the same selected conversation.
 On reload, pending/running recovery state is derived from session metadata and
 active-run truth. On successful successor settlement the metadata is cleared,
 so settled history contains no recovery card or synthetic user row. A blocked
-state renders one concise diagnostic with an in-place retry affordance or an
-instruction to send a clarifying message; it never proposes a new task.
+state renders one concise diagnostic instructing the user to clarify or resend
+through the still-enabled composer. It has no recovery button and never
+proposes a new task.
 
 The old `/api/session/compression-recovery/start` route and its new-session
 creation path are removed from the active UI contract. A cached client request
