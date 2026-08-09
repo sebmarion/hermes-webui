@@ -10,7 +10,9 @@ import time
 from types import SimpleNamespace
 
 
-def test_bestplan_completion_is_observational_and_never_starts_parent_turn(tmp_path, monkeypatch):
+def test_bestplan_completion_ingress_is_observational_and_never_starts_parent_turn(
+    tmp_path, monkeypatch,
+):
     from api import background_process as bp
     from api.delegation_wakeup_store import DelegationWakeupStore
 
@@ -32,6 +34,12 @@ def test_bestplan_completion_is_observational_and_never_starts_parent_turn(tmp_p
         bp, "dispatch_pending_delegation_wakeups_for_session",
         lambda sid: starts.append(sid) or 1,
     )
+    generic_batch_calls = []
+    monkeypatch.setattr(
+        bp,
+        "_process_async_delegation_event_claimed",
+        lambda *args, **kwargs: generic_batch_calls.append((args, kwargs)),
+    )
     emitted = []
     monkeypatch.setattr(
         bp, "_emit_bg_task_complete_events_coalesced",
@@ -49,12 +57,13 @@ def test_bestplan_completion_is_observational_and_never_starts_parent_turn(tmp_p
         "status": "completed",
         "results": [{"status": "completed", "summary": "evidence only"}],
     }
-    bp._process_async_delegation_event(event)
+    bp._process_one(event)
 
     row = store.get("bestplan-bp-1")
     assert row["state"] == "observed"
     assert row["tracker_acked_at"] is not None
     assert ack_states == ["observed"]
+    assert generic_batch_calls == []
     assert starts == []
     assert emitted and emitted[0][0] == "session-a"
 
@@ -79,6 +88,7 @@ def test_shutdown_waits_for_blocking_wakeup_worker_before_returning(monkeypatch)
     gate.set()
     stopper.join(timeout=2)
     assert returned.is_set()
+    bp._DRAIN_STOP.clear()
     bp._WAKEUP_INTAKE_STOP.clear()
 
 

@@ -1084,6 +1084,16 @@ def _process_one(evt: dict) -> None:
     """Route a single completion_queue event to the matching WebUI session."""
     from api import config as _cfg
 
+    # BestPlan delivery is observational: its completion evidence may update
+    # the durable receipt, but it must never enter the generic batch bridge
+    # below, which is allowed to start a parent-model wakeup turn.
+    if (
+        evt.get("type") == "async_delegation"
+        and str(evt.get("bestplan_plan_id") or "").strip()
+    ):
+        _process_async_delegation_event(evt)
+        return
+
     # Async delegation has a separate durable ownership/claim state machine.
     # Return after it runs so none of the generic process-registry in-memory
     # dedupe paths can ACK or discard this event first.

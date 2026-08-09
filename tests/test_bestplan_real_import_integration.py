@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
 import time
@@ -29,17 +30,13 @@ def _agent_modules(monkeypatch):
     return bestplan_state, async_delegation
 
 
-class _ImmediateThread:
-    def __init__(self, *, target, args=(), kwargs=None, **_ignored):
-        self.target = target
-        self.args = args
-        self.kwargs = kwargs or {}
-
-    def start(self):
-        self.target(*self.args, **self.kwargs)
-
-    def is_alive(self):
-        return False
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
 
 
 def test_real_checkpoint_crash_recovery_insert_ack_wakeup_and_restart(
@@ -154,18 +151,20 @@ def test_real_checkpoint_crash_recovery_insert_ack_wakeup_and_restart(
     assert plan_store.get_plan(capture.plan_id)["state"] == "completed_unverified"
 
     # Crash boundary: Hermes checkpoint exists, but WebUI never inserted the
-    # event. A genuinely fresh Python process runs WebUI's profile-aware
-    # startup recovery helper and returns the recovered canonical event.
+    # event. A genuinely fresh Python process gets the canonical event from
+    # ProcessRegistry's automatic startup recovery, without a second manual
+    # profile sweep or duplicate queue publication.
     recovery_code = """
 import json
-import sys
+import queue
 from api import background_process as bp
-from api import profiles
 from tools.process_registry import process_registry
-profiles.list_profiles_api = lambda: [{"name": "coder", "path": sys.argv[1]}]
-queued = bp.recover_profile_async_delegations()
 event = process_registry.completion_queue.get(timeout=2)
-print("RECOVERY_JSON=" + json.dumps({"queued": queued, "event": event}))
+try:
+    duplicate = process_registry.completion_queue.get_nowait()
+except queue.Empty:
+    duplicate = None
+print("RECOVERY_JSON=" + json.dumps({"event": event, "duplicate": duplicate}))
 """
     recovery_env = dict(os.environ)
     recovery_env["PYTHONPATH"] = os.pathsep.join(filter(None, (
@@ -174,7 +173,7 @@ print("RECOVERY_JSON=" + json.dumps({"queued": queued, "event": event}))
         recovery_env.get("PYTHONPATH", ""),
     )))
     recovered_process = subprocess.run(
-        [sys.executable, "-c", recovery_code, str(hermes_home)],
+        [sys.executable, "-c", recovery_code],
         cwd=os.getcwd(),
         env=recovery_env,
         capture_output=True,
@@ -187,8 +186,10 @@ print("RECOVERY_JSON=" + json.dumps({"queued": queued, "event": event}))
         if line.startswith("RECOVERY_JSON=")
     )
     recovery = json.loads(recovery_line.removeprefix("RECOVERY_JSON="))
-    assert recovery["queued"] == 1
     replayed = recovery["event"]
+    assert replayed["restored"] is True
+    assert replayed["delegation_id"] == go.delegation_id
+    assert recovery["duplicate"] is None
 
     web_store_path = tmp_path / "webui" / "private" / "wakeups.sqlite3"
     web_store = DelegationWakeupStore(web_store_path)
@@ -203,12 +204,19 @@ print("RECOVERY_JSON=" + json.dumps({"queued": queued, "event": event}))
     monkeypatch.setitem(models.SESSIONS, session.session_id, session)
     with web_cfg.PROCESS_SESSION_INDEX_LOCK:
         web_cfg.PROCESS_SESSION_INDEX.clear()
+    parent_turns = []
+    monkeypatch.setattr(
+        bp,
+        "_start_async_delegation_wakeup_turn",
+        lambda *args, **kwargs: parent_turns.append((args, kwargs)),
+    )
 
     bp._process_one(replayed)
 
     delivered = web_store.get(go.delegation_id)
     assert delivered["state"] == "observed"
     assert delivered["tracker_acked_at"] is not None
+    assert parent_turns == []
     persisted = async_delegation._read_persisted_unlocked(tracker_path)
     assert persisted["records"][go.delegation_id]["delivery_status"] == "delivered"
 
@@ -265,13 +273,21 @@ def test_real_two_profile_trackers_never_cross_ack(tmp_path, monkeypatch):
             events[event["origin_profile"]] = event
     assert set(events) == {"coder", "reviewer"}
 
+    parent_turns = []
+    monkeypatch.setattr(
+        bp,
+        "_start_async_delegation_wakeup_turn",
+        lambda *args, **kwargs: parent_turns.append((args, kwargs)),
+    )
     for profile, event in events.items():
         bp._process_one(event)
+        assert store.get(event["delegation_id"])["state"] == "observed"
         own = async_delegation._read_persisted_unlocked(trackers[profile])
         other_profile = "reviewer" if profile == "coder" else "coder"
         other = async_delegation._read_persisted_unlocked(trackers[other_profile])
         assert own["records"][event["delegation_id"]]["delivery_status"] == "delivered"
         assert event["delegation_id"] not in other["records"]
+    assert parent_turns == []
 
 
 def test_real_generic_target_turn_once_across_duplicate_restart_two_profiles_and_closed_tab(
@@ -283,20 +299,50 @@ def test_real_generic_target_turn_once_across_duplicate_restart_two_profiles_and
     monkeypatch.setenv("HERMES_WEBUI_RUNTIME_ADAPTER", "legacy-direct")
     _bestplan, async_delegation = _agent_modules(monkeypatch)
     from api import background_process as bp
-    from api import models, routes, turn_journal
-    from api.delegation_wakeup_store import DelegationWakeupStore
+    from api import models, process_event_utils, routes, turn_journal
     from tools.process_registry import process_registry
 
-    store_path = tmp_path / "webui" / "private" / "wakeups.sqlite3"
-    store = DelegationWakeupStore(store_path)
-    monkeypatch.setattr(bp, "_WAKEUP_STORE", store, raising=False)
-    monkeypatch.setattr(bp, "_WAKEUP_THREAD_FACTORY", _ImmediateThread, raising=False)
-    bp._WAKEUP_INTAKE_STOP.clear()
+    process_event_utils._reset_legacy_async_delivery_dedupe_for_tests()
+    monkeypatch.setattr(
+        routes,
+        "_resolve_chat_workspace_with_recovery",
+        lambda _session, _requested: str(tmp_path),
+    )
     provider_calls = []
     monkeypatch.setattr(
         routes, "_run_agent_streaming",
         lambda *args, **kwargs: provider_calls.append((args, kwargs)),
     )
+    claims = []
+    real_claim = bp.claim_async_delegation_delivery
+
+    def record_claim(event, consumer):
+        claim = real_claim(event, consumer)
+        claims.append(claim)
+        return claim
+
+    monkeypatch.setattr(bp, "claim_async_delegation_delivery", record_claim)
+    wakeup_starts = []
+    real_start = bp._start_async_delegation_wakeup_turn
+
+    def record_start(*args, **kwargs):
+        wakeup_starts.append((args, kwargs))
+        return real_start(*args, **kwargs)
+
+    monkeypatch.setattr(bp, "_start_async_delegation_wakeup_turn", record_start)
+    admissions = []
+    real_start_session_turn = routes.start_session_turn
+
+    def record_admission(*args, **kwargs):
+        try:
+            response = real_start_session_turn(*args, **kwargs)
+        except Exception as exc:
+            admissions.append({"exception": repr(exc)})
+            raise
+        admissions.append(response)
+        return response
+
+    monkeypatch.setattr(routes, "start_session_turn", record_admission)
 
     events = {}
     trackers = {}
@@ -328,14 +374,33 @@ def test_real_generic_target_turn_once_across_duplicate_restart_two_profiles_and
         if str(event.get("delegation_id", "")).startswith("generic-"):
             events[event["origin_profile"]] = event
     assert set(events) == {"coder", "reviewer"}
+    assert all(
+        not bp._session_has_active_turn(f"target-{profile}")
+        for profile in events
+    )
 
     for event in events.values():
-        bp._process_async_delegation_event(event)
-        bp._process_async_delegation_event(dict(event))
+        bp._process_one(event)
+    assert len(claims) == 2
+    assert all(claim is not None for claim in claims)
+    assert len(wakeup_starts) == 2
+    assert _wait_until(lambda: len(admissions) == 2)
+    assert all(result.get("stream_id") for result in admissions), admissions
+    assert _wait_until(lambda: len(provider_calls) == 2)
+    assert _wait_until(
+        lambda: all(
+            async_delegation._read_persisted_unlocked(trackers[profile])
+            ["records"][event["delegation_id"]]["delivery_status"]
+            == "delivered"
+            for profile, event in events.items()
+        )
+    )
+
+    for event in events.values():
+        bp._process_one(dict(event))
+    assert claims[2:] == [None, None]
     assert len(provider_calls) == 2
     for profile, event in events.items():
-        row = store.get(event["delegation_id"])
-        assert row["state"] == "delivered"
         journal = turn_journal.read_turn_journal(f"target-{profile}")["events"]
         assert sum(
             item.get("event") == "worker_started"
@@ -343,9 +408,13 @@ def test_real_generic_target_turn_once_across_duplicate_restart_two_profiles_and
             for item in journal
         ) == 1
 
-    store.close()
-    restarted = DelegationWakeupStore(store_path)
-    monkeypatch.setattr(bp, "_WAKEUP_STORE", restarted, raising=False)
-    for event in events.values():
-        bp._process_async_delegation_event(dict(event))
+    # A restarted Agent recovers from the per-profile tracker. Delivered rows
+    # are terminal, so neither profile republishes a parent-turn event.
+    for profile in ("coder", "reviewer"):
+        recovered = queue.Queue()
+        result = async_delegation.recover_async_delegations(
+            trackers[profile], target_queue=recovered, mark_restored=True,
+        )
+        assert result["queued"] == 0
+        assert recovered.empty()
     assert len(provider_calls) == 2
