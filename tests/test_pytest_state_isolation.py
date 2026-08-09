@@ -39,3 +39,34 @@ def test_auto_state_dir_name_distinguishes_reused_port_across_processes(
     second_name = conftest._auto_state_dir_name(repo_root, port=port)
     assert second_name != first_name
     assert second_name.endswith("-222-43210")
+
+
+def test_prepare_state_dir_preserves_auto_initialization_but_cleans_pinned_state(
+    tmp_path,
+):
+    import tests.conftest as conftest
+
+    auto_state = tmp_path / "auto-state"
+    auto_state.mkdir()
+    auto_marker = auto_state / "async_delegations.json"
+    auto_marker.write_text("{}", encoding="utf-8")
+    auto_workspace = auto_state / "test-workspace"
+    auto_workspace.mkdir()
+    workspace_marker = auto_workspace / "import-initialized"
+    workspace_marker.write_text("ready", encoding="utf-8")
+
+    conftest._prepare_test_state_dir(auto_state, pinned=False)
+
+    assert auto_marker.read_text(encoding="utf-8") == "{}"
+    assert workspace_marker.read_text(encoding="utf-8") == "ready"
+
+    pinned_state = tmp_path / "pinned-state"
+    pinned_state.mkdir()
+    stale_marker = pinned_state / "stale.json"
+    stale_marker.write_text("stale", encoding="utf-8")
+
+    conftest._prepare_test_state_dir(pinned_state, pinned=True)
+
+    assert pinned_state.is_dir()
+    assert not stale_marker.exists()
+    assert (pinned_state / "test-workspace").is_dir()

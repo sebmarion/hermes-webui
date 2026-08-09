@@ -4,7 +4,8 @@ Shared pytest fixtures for webui-mvp tests.
 TEST ISOLATION:
   Tests run against a SEPARATE server instance on an auto-derived test port
   with a completely separate state directory. Production data is never touched.
-  The test state dir is wiped before each full test run and again on teardown.
+  Auto-derived state is fresh per pytest process; explicitly pinned state is
+  wiped before the run, and both are cleaned again on teardown.
 
 PATH DISCOVERY:
   No hardcoded paths. Discovery order:
@@ -132,6 +133,7 @@ import tempfile as _tempfile
 _TEST_STATE_ROOT = pathlib.Path(
     os.getenv('HERMES_WEBUI_TEST_STATE_ROOT', _tempfile.gettempdir())
 ) / 'hermes-webui-tests'
+TEST_STATE_DIR_PINNED = bool(os.getenv('HERMES_WEBUI_TEST_STATE_DIR'))
 TEST_STATE_DIR = pathlib.Path(os.getenv(
     'HERMES_WEBUI_TEST_STATE_DIR',
     str(_TEST_STATE_ROOT / _auto_state_dir_name(REPO_ROOT, TEST_PORT))
@@ -914,6 +916,22 @@ def _rmtree_retry(path):
     )
 
 
+def _prepare_test_state_dir(path, *, pinned: bool) -> None:
+    """Prepare one test home without racing current-process startup writers.
+
+    The auto-derived path is fresh for this pytest process, but product modules
+    imported during collection legitimately initialize it before the session
+    fixture runs. Preserve that current-process state. An explicitly pinned path
+    may contain a previous run, so clean it first. ``exist_ok=True`` then closes
+    the check/delete/create race if an import-time writer recreates the directory.
+    """
+    target = pathlib.Path(path)
+    if pinned and target.exists():
+        _rmtree_retry(target)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "test-workspace").mkdir(parents=True, exist_ok=True)
+
+
 def _seed_test_skills(real_skills: pathlib.Path, test_skills: pathlib.Path) -> None:
     if not real_skills.exists() or test_skills.exists():
         return
@@ -952,11 +970,7 @@ def test_server():
         import time as _time
         _time.sleep(0.5)  # brief pause to let the port release
 
-    # Clean slate
-    if TEST_STATE_DIR.exists():
-        _rmtree_retry(TEST_STATE_DIR)
-    TEST_STATE_DIR.mkdir(parents=True)
-    TEST_WORKSPACE.mkdir(parents=True)
+    _prepare_test_state_dir(TEST_STATE_DIR, pinned=TEST_STATE_DIR_PINNED)
 
     # Symlink real skills into test home so skill-related tests work,
     # but all write-heavy state stays isolated.
