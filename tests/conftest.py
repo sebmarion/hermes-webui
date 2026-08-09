@@ -14,11 +14,13 @@ PATH DISCOVERY:
     3. Common install paths (~/.hermes/hermes-agent)
     4. System python3 as a last resort
 """
+import atexit
 import json
 import inspect
 import multiprocessing
 import os
 import pathlib
+import secrets
 import shutil
 import stat
 import subprocess
@@ -93,22 +95,26 @@ def _auto_test_port(repo_root) -> int:
     h = int(hashlib.md5(str(repo_root).encode()).hexdigest(), 16)
     return 20000 + (h % 10000)
 
-def _auto_state_dir_name(repo_root, port=None) -> str:
+_PYTEST_RUN_TOKEN = secrets.token_hex(8)
+
+
+def _auto_state_dir_name(repo_root, port=None, run_token=None) -> str:
     """Per-pytest-process state dir name.
 
-    Include the pytest PID as well as its free port. Ephemeral ports can be
-    reused immediately by a later process, while abandoned test-state writers
-    may still recreate the preceding run's directory after teardown. The PID
-    keeps sequential and concurrent runs distinct even when macOS reissues the
-    same port. Falls back to repo-hash-plus-PID when no port is supplied.
+    Include a per-import random token alongside the pytest PID and free port.
+    Both PIDs and ephemeral ports are reusable, while abandoned test-state
+    writers may still recreate a preceding run's directory after teardown. The
+    token keeps sequential and concurrent runs distinct even when macOS reissues
+    both values. Falls back to repo-hash-plus-PID-plus-token without a port.
     """
     import hashlib
     h = hashlib.md5(str(repo_root).encode()).hexdigest()[:8]
     process_id = os.getpid()
+    token = str(run_token or _PYTEST_RUN_TOKEN)
     return (
-        f"webui-test-{h}-{process_id}-{port}"
+        f"webui-test-{h}-{process_id}-{token}-{port}"
         if port
-        else f"webui-test-{h}-{process_id}"
+        else f"webui-test-{h}-{process_id}-{token}"
     )
 
 # Whether the test port was explicitly pinned (vs auto-allocated). An auto port
@@ -133,11 +139,23 @@ import tempfile as _tempfile
 _TEST_STATE_ROOT = pathlib.Path(
     os.getenv('HERMES_WEBUI_TEST_STATE_ROOT', _tempfile.gettempdir())
 ) / 'hermes-webui-tests'
-TEST_STATE_DIR_PINNED = bool(os.getenv('HERMES_WEBUI_TEST_STATE_DIR'))
-TEST_STATE_DIR = pathlib.Path(os.getenv(
-    'HERMES_WEBUI_TEST_STATE_DIR',
-    str(_TEST_STATE_ROOT / _auto_state_dir_name(REPO_ROOT, TEST_PORT))
-)).resolve()
+_TEST_STATE_ROOT = _TEST_STATE_ROOT.resolve()
+_TEST_STATE_INITIALIZED_ENV = '_HERMES_WEBUI_TEST_STATE_INITIALIZED'
+_incoming_test_state_dir = os.getenv('HERMES_WEBUI_TEST_STATE_DIR')
+TEST_STATE_DIR = pathlib.Path(
+    _incoming_test_state_dir
+    or str(_TEST_STATE_ROOT / _auto_state_dir_name(REPO_ROOT, TEST_PORT))
+).resolve()
+_incoming_initialized_dir = os.getenv(_TEST_STATE_INITIALIZED_ENV)
+_TEST_STATE_DIR_ALREADY_INITIALIZED = bool(
+    _incoming_test_state_dir
+    and _incoming_initialized_dir
+    and pathlib.Path(_incoming_initialized_dir).expanduser().resolve()
+    == TEST_STATE_DIR
+)
+TEST_STATE_DIR_PINNED = bool(
+    _incoming_test_state_dir and not _TEST_STATE_DIR_ALREADY_INITIALIZED
+)
 
 # Production-proximity guard: refuse to run if the resolved test state dir lands
 # inside the REAL Hermes home tree — a misconfigured HERMES_WEBUI_TEST_STATE_DIR
@@ -170,6 +188,120 @@ if _under_prod and not _under_temp:
 
 TEST_WORKSPACE = TEST_STATE_DIR / 'test-workspace'
 
+
+def _validate_pinned_test_state_dir(path, *, state_root) -> None:
+    """Fail closed unless recursive cleanup targets a dedicated Hermes test dir."""
+    target = pathlib.Path(path).expanduser().resolve()
+    root = pathlib.Path(state_root).expanduser().resolve()
+
+    def _strict_child(child, parent):
+        return child != parent and parent in child.parents
+
+    configured_child = (
+        root.name == "hermes-webui-tests" and _strict_child(target, root)
+    )
+    system_temp_roots = {_TEMP_ROOT, pathlib.Path("/tmp").resolve()}
+    under_system_temp = any(
+        _strict_child(target, temp_root) for temp_root in system_temp_roots
+    )
+    dedicated_temp_name = target.name.startswith("hermes-") or any(
+        parent.name == "hermes-webui-tests" for parent in target.parents
+    )
+    protected = (
+        HOME.resolve(),
+        REPO_ROOT.resolve(),
+        _PROD_HERMES_HOME,
+    )
+    overlaps_protected = any(
+        target == anchor or anchor in target.parents or target in anchor.parents
+        for anchor in protected
+    )
+    eligible = (
+        target.name != "hermes-webui-tests"
+        and (configured_child or (under_system_temp and dedicated_temp_name))
+        and not overlaps_protected
+    )
+    if not eligible:
+        raise RuntimeError(
+            "REFUSING TO RUN: HERMES_WEBUI_TEST_STATE_DIR must be an isolated "
+            "Hermes test path under a system temp directory or a dedicated "
+            f"child of {root}; got {target}."
+        )
+
+
+def _rmtree_retry(path):
+    """Remove a tree, retrying transient writer and read-only-handle races."""
+    target = pathlib.Path(path)
+    if not target.exists():
+        return
+
+    def _clear_readonly(_func, entry, _exc):
+        try:
+            os.chmod(entry, 0o666)
+            _func(entry)
+        except Exception:
+            raise
+
+    rmtree_kwargs = (
+        {"onexc": _clear_readonly}
+        if "onexc" in inspect.signature(shutil.rmtree).parameters
+        else {"onerror": _clear_readonly}
+    ) if sys.platform == "win32" else {}
+
+    attempts = 5
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            shutil.rmtree(target, **rmtree_kwargs)
+            return
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            last_exc = exc
+            if attempt == attempts:
+                break
+            time.sleep(0.3)
+
+    shutil.rmtree(target, ignore_errors=True)
+    if not target.exists():
+        return
+    try:
+        leftovers = [child.name for child in list(target.iterdir())[:5]]
+    except Exception:
+        leftovers = []
+    import warnings as _warnings
+    leftover_note = f" leftovers={leftovers}" if leftovers else ""
+    _warnings.warn(
+        f"_rmtree_retry: could not fully remove {target} after {attempts} attempts"
+        f"{leftover_note} (last_exc={last_exc!r}); left for OS temp cleanup.",
+        stacklevel=2,
+    )
+
+
+def _initialize_test_state_dir(path, *, pinned: bool) -> None:
+    """Create a clean test home before any product-module probe or collection."""
+    target = pathlib.Path(path)
+    if pinned and target.exists():
+        _rmtree_retry(target)
+    target.mkdir(parents=True)
+    (target / "test-workspace").mkdir(parents=True)
+
+
+def _ensure_test_state_dir(path) -> None:
+    """Idempotently retain owner initialization in aliases and descendants."""
+    target = pathlib.Path(path)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "test-workspace").mkdir(parents=True, exist_ok=True)
+
+
+def _cleanup_owned_test_state_dir(path, *, owner_pid: int) -> None:
+    """Clean only in the initializer, never an inherited raw-fork child."""
+    if os.getpid() == owner_pid:
+        _rmtree_retry(path)
+
+
+_validate_pinned_test_state_dir(TEST_STATE_DIR, state_root=_TEST_STATE_ROOT)
+
 # Publish at module level so api.config, _pytest_port.py, and any test module
 # importing stateful API code during collection see the isolated test paths.
 #
@@ -200,6 +332,21 @@ os.environ['HERMES_CONFIG_PATH'] = str(TEST_STATE_DIR / 'config.yaml')
 # test server env is scrubbed identically in the test_server fixture below.
 for _model_env in ('HERMES_MODEL', 'OPENAI_MODEL', 'LLM_MODEL'):
     os.environ.pop(_model_env, None)
+
+# Prepare exactly once before any Agent import probe or pytest test-module
+# collection. Descendant processes and a second conftest alias inherit the
+# private resolved-path marker and are reuse-only; only the owner registers
+# cleanup for collect-only, collection-failure, and normal interpreter exit.
+if _TEST_STATE_DIR_ALREADY_INITIALIZED:
+    _ensure_test_state_dir(TEST_STATE_DIR)
+else:
+    _initialize_test_state_dir(TEST_STATE_DIR, pinned=TEST_STATE_DIR_PINNED)
+    os.environ[_TEST_STATE_INITIALIZED_ENV] = str(TEST_STATE_DIR)
+    atexit.register(
+        _cleanup_owned_test_state_dir,
+        TEST_STATE_DIR,
+        owner_pid=os.getpid(),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -849,89 +996,6 @@ def _kill_port_owner(port):
         pass
 
 
-def _rmtree_retry(path):
-    """Remove a tree, retrying transient races (Linux + Windows).
-
-    The retry loop covers two real failure modes seen in CI/local:
-      * Windows: read-only bits / lingering handles (cleared via onexc/onerror).
-      * Linux: `OSError [Errno 39] Directory not empty` — a background thread or
-        daemon (model-metadata fetcher, session-events watcher, profile writer)
-        creates a file inside the tree WHILE shutil.rmtree is walking it, so the
-        parent rmdir fails even though we just emptied it. A short retry lets the
-        racing writer settle; a final ignore_errors sweep guarantees teardown
-        never fails the test over a pure cleanup race (the dir is abandoned test
-        state, not an assertion target).
-    """
-    target = pathlib.Path(path)
-    if not target.exists():
-        return
-
-    def _clear_readonly(_func, entry, _exc):
-        try:
-            os.chmod(entry, 0o666)
-            _func(entry)
-        except Exception:
-            raise
-
-    rmtree_kwargs = (
-        {"onexc": _clear_readonly}
-        if "onexc" in inspect.signature(shutil.rmtree).parameters
-        else {"onerror": _clear_readonly}
-    ) if sys.platform == "win32" else {}
-
-    attempts = 5
-    last_exc = None
-    for attempt in range(1, attempts + 1):
-        try:
-            shutil.rmtree(target, **rmtree_kwargs)
-            return
-        except FileNotFoundError:
-            return
-        except Exception as exc:
-            last_exc = exc
-            if attempt == attempts:
-                break
-            time.sleep(0.3)
-
-    # Final fallback: a concurrent-writer race (Errno 39) shouldn't fail teardown.
-    # Best-effort ignore_errors sweep; if anything remains it's abandoned test
-    # state under HERMES_HOME, not something a test asserts on.
-    shutil.rmtree(target, ignore_errors=True)
-    if not target.exists():
-        return
-    leftovers = []
-    try:
-        leftovers = [child.name for child in list(target.iterdir())[:5]]
-    except Exception:
-        pass
-    # Don't raise — log-and-continue. Raising here turns a benign cleanup race
-    # into a spurious test ERROR (the behaviour #4283-area tests hit when a
-    # model-metadata background fetch repopulated the profile dir mid-teardown).
-    import warnings as _warnings
-    leftover_note = f" leftovers={leftovers}" if leftovers else ""
-    _warnings.warn(
-        f"_rmtree_retry: could not fully remove {target} after {attempts} attempts"
-        f"{leftover_note} (last_exc={last_exc!r}); left for OS temp cleanup.",
-        stacklevel=2,
-    )
-
-
-def _prepare_test_state_dir(path, *, pinned: bool) -> None:
-    """Prepare one test home without racing current-process startup writers.
-
-    The auto-derived path is fresh for this pytest process, but product modules
-    imported during collection legitimately initialize it before the session
-    fixture runs. Preserve that current-process state. An explicitly pinned path
-    may contain a previous run, so clean it first. ``exist_ok=True`` then closes
-    the check/delete/create race if an import-time writer recreates the directory.
-    """
-    target = pathlib.Path(path)
-    if pinned and target.exists():
-        _rmtree_retry(target)
-    target.mkdir(parents=True, exist_ok=True)
-    (target / "test-workspace").mkdir(parents=True, exist_ok=True)
-
-
 def _seed_test_skills(real_skills: pathlib.Path, test_skills: pathlib.Path) -> None:
     if not real_skills.exists() or test_skills.exists():
         return
@@ -970,7 +1034,7 @@ def test_server():
         import time as _time
         _time.sleep(0.5)  # brief pause to let the port release
 
-    _prepare_test_state_dir(TEST_STATE_DIR, pinned=TEST_STATE_DIR_PINNED)
+    _ensure_test_state_dir(TEST_STATE_DIR)
 
     # Symlink real skills into test home so skill-related tests work,
     # but all write-heavy state stays isolated.
