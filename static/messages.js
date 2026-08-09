@@ -1497,6 +1497,14 @@ function _warnComposerOwnershipMismatch(ownership, text, files){
   }catch(_){ }
 }
 
+function _parseBestplanInvocation(text){
+  const parts=String(text||'').trim().split(/\s+/).slice(1);
+  const count=/^\d+$/.test(parts[0]||'')
+    ?Math.max(2,Math.min(5,Number(parts.shift())))
+    :4;
+  return {count,task:parts.join(' ').trim()};
+}
+
 async function send(){
   // Static guards expect _defaultMessageMode to stay near send() while the actual
   // read remains in the S.busy branch below.
@@ -1738,9 +1746,9 @@ async function send(){
         }
       }
       if(_agentCmdName==='bestplan'||_agentCmdName==='bp'){
-        const _bpParts=text.trim().split(/\s+/).slice(1);
-        const _bpCount=/^\d+$/.test(_bpParts[0]||'')?Math.max(2,Math.min(5,Number(_bpParts.shift()))):3;
-        const _bpArgs=_bpParts.join(' ').trim();
+        const _bpInvocation=_parseBestplanInvocation(text);
+        const _bpCount=_bpInvocation.count;
+        const _bpArgs=_bpInvocation.task;
         if(!_bpArgs){
           S.messages.push({role:'user',content:text,_ts:Date.now()/1000});
           S.messages.push({role:'assistant',content:'BestPlan unavailable: provide a task after /bestplan.',_ts:Date.now()/1000});

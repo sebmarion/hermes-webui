@@ -3047,12 +3047,12 @@ def _try_resolve_bestplan_go_ingress(
             )
         return None
 
-    if int(getattr(_bestplan_state, "BESTPLAN_HOST_CAPABILITY_VERSION", 0) or 0) < 1:
+    if int(getattr(_bestplan_state, "BESTPLAN_HOST_CAPABILITY_VERSION", 0) or 0) < 2:
         return _bestplan_host_result(
             original_message=original_message,
             conversation_history=conversation_history,
             status="capability_upgrade_required",
-            response="Plan execution was not started (capability_upgrade_required): Hermes core V1 host capability required",
+            response="Plan execution was not started (capability_upgrade_required): Hermes core V2 host capability required",
             host_agent=host_agent or agent,
         )
     store = BestplanStore(db_path=Path(profile_home) / "state.db")
@@ -3115,7 +3115,7 @@ def _capture_bestplan_result(
         raise
     if not is_bestplan_invocation(invocation_message):
         return result
-    if int(getattr(_bestplan_state, "BESTPLAN_HOST_CAPABILITY_VERSION", 0) or 0) < 1:
+    if int(getattr(_bestplan_state, "BESTPLAN_HOST_CAPABILITY_VERSION", 0) or 0) < 2:
         updated = dict(result)
         response = re.sub(
             r"<<<HERMES_BESTPLAN_V1>>>.*?<<<END_HERMES_BESTPLAN_V1>>>",
@@ -3123,7 +3123,7 @@ def _capture_bestplan_result(
         ).strip()
         response = "\n\n".join(filter(None, (
             response,
-            "[BestPlan status: planning-only; Hermes core capability V1 is required before this plan can be executable.]",
+            "[BestPlan status: planning-only; Hermes core capability V2 is required before this plan can be executable.]",
         )))
         updated["final_response"] = response
         messages = [dict(item) if isinstance(item, dict) else item for item in (updated.get("messages") or [])]
@@ -3143,6 +3143,7 @@ def _capture_bestplan_result(
         profile=str(profile or ""),
         workspace=workspace,
         store=BestplanStore(db_path=Path(profile_home) / "state.db"),
+        provisional=True,
     )
     try:
         return capture_bestplan_agent_result(result, host_agent=host_agent, **kwargs)
@@ -3157,8 +3158,192 @@ def _bestplan_capture_invocation_message(
     """Restore host command identity after the route strips stale-client syntax."""
     if bestplan_config is None:
         return str(message)
-    count = bestplan_config.get("count", 3)
+    from agent.bestplan_orchestrator import normalize_count
+
+    count = normalize_count(bestplan_config.get("count"))
     return f"/bestplan {count} {str(message).strip()}".strip()
+
+
+def _bestplan_result_is_successful_for_capture(
+    result: dict,
+    *,
+    host_agent,
+    captured_terminal_error,
+    previous_messages,
+    previous_context_messages,
+    message: str,
+    source: str,
+    active_turn_identity,
+) -> bool:
+    """Accept only a terminal, current-turn assistant success for plan capture."""
+    if not isinstance(result, dict):
+        return False
+    error = result.get("error")
+    if (isinstance(error, str) and error.strip()) or (
+        error and not isinstance(error, str)
+    ):
+        return False
+    if getattr(host_agent, "_last_error", None) or captured_terminal_error:
+        return False
+    if (
+        _agent_result_terminal_failure(result)
+        or _agent_result_tool_limit_reached(result)
+        or _agent_result_guardrail_blocked(result) is not None
+    ):
+        return False
+    status = str(result.get("status") or result.get("state") or "").strip().lower()
+    if status and status not in {
+        "ok",
+        "success",
+        "succeeded",
+        "complete",
+        "completed",
+        "done",
+    }:
+        return False
+    if result.get("completed") is False:
+        return False
+    if result.get("interrupted") is True:
+        return False
+    result_messages = result.get("messages") or []
+    if not _assistant_reply_added_after_current_turn(
+        result_messages,
+        previous_context_messages,
+        message,
+    ):
+        return False
+    return not _merged_transcript_lacks_final_assistant_answer(
+        previous_messages,
+        previous_context_messages,
+        result_messages,
+        message,
+        source=source,
+        active_turn_identity=active_turn_identity,
+    )
+
+
+def _capture_bestplan_result_after_writeback_fence(
+    result: dict,
+    *,
+    bestplan_config: Optional[dict],
+    ephemeral: bool,
+    session,
+    stream_id: str,
+    cancel_event,
+    host_agent,
+    captured_terminal_error,
+    previous_messages,
+    previous_context_messages,
+    message: str,
+    source: str,
+    active_turn_identity,
+    profile_home: str,
+    provisional_plan_ids: list[str],
+) -> tuple[dict, bool, Optional[str]]:
+    """Capture a routed BestPlan only at the locked success-writeback fence.
+
+    The caller must hold the session's agent lock. ``bestplan_config`` is the
+    host-owned routing capability; model-visible skill prose is never authority
+    to enter executable-plan capture.
+    """
+    if bestplan_config is None or ephemeral:
+        return result, False, None
+    if cancel_event.is_set() or not _stream_writeback_is_current(session, stream_id):
+        return result, False, None
+    if not _bestplan_result_is_successful_for_capture(
+        result,
+        host_agent=host_agent,
+        captured_terminal_error=captured_terminal_error,
+        previous_messages=previous_messages,
+        previous_context_messages=previous_context_messages,
+        message=message,
+        source=source,
+        active_turn_identity=active_turn_identity,
+    ):
+        return result, False, None
+    captured = _capture_bestplan_result(
+        result,
+        invocation_message=_bestplan_capture_invocation_message(
+            message, bestplan_config
+        ),
+        session_id=str(getattr(session, "session_id", "") or ""),
+        profile=str(getattr(session, "profile", None) or ""),
+        workspace=str(session.workspace),
+        profile_home=profile_home,
+        host_agent=host_agent,
+    )
+    capture = captured.get("bestplan_capture") if isinstance(captured, dict) else None
+    if isinstance(capture, dict) and capture.get("executable") is True:
+        plan_id = str(capture.get("plan_id") or "").strip()
+        if plan_id and plan_id not in provisional_plan_ids:
+            provisional_plan_ids.append(plan_id)
+    else:
+        plan_id = ""
+    return captured, True, plan_id or None
+
+
+def _commit_provisional_bestplan_capture(
+    plan_id: str,
+    *,
+    profile_home: str,
+    session,
+    stream_id: str,
+) -> None:
+    """Expose exactly one plan after the receipt-bearing transcript commits."""
+    active_stream_id = getattr(session, "active_stream_id", None)
+    if active_stream_id not in {None, stream_id}:
+        raise RuntimeError(
+            "BestPlan provisional capture lost current-stream ownership"
+        )
+    latest_assistant = next(
+        (
+            message
+            for message in reversed(getattr(session, "messages", None) or [])
+            if isinstance(message, dict) and message.get("role") == "assistant"
+        ),
+        None,
+    )
+    receipt_marker = f"Bestplan executable receipt: {plan_id}."
+    if latest_assistant is None or receipt_marker not in _message_text(
+        latest_assistant.get("content")
+    ):
+        raise RuntimeError(
+            "BestPlan provisional capture receipt is no longer durable"
+        )
+    import importlib
+
+    bestplan_state = importlib.import_module("agent.bestplan_state")
+    store = bestplan_state.BestplanStore(
+        db_path=Path(profile_home) / "state.db"
+    )
+    try:
+        if not store.commit_provisional_plan(plan_id):
+            raise RuntimeError("BestPlan provisional capture could not be committed")
+    finally:
+        store.close()
+
+
+def _reject_uncommitted_bestplan_captures(
+    plan_ids: list[str],
+    *,
+    profile_home: str,
+    committed_plan_id: Optional[str] = None,
+) -> None:
+    """Reject this turn's provisional plans unless transcript commit won."""
+    if not plan_ids:
+        return
+    import importlib
+
+    bestplan_state = importlib.import_module("agent.bestplan_state")
+    store = bestplan_state.BestplanStore(
+        db_path=Path(profile_home) / "state.db"
+    )
+    try:
+        for plan_id in plan_ids:
+            if plan_id != committed_plan_id:
+                store.reject_plan(plan_id)
+    finally:
+        store.close()
 
 
 def _run_agent_with_bestplan_ingress(
@@ -9796,6 +9981,9 @@ def _run_agent_streaming(
     _metering_thread = threading.Thread(target=_metering_ticker, daemon=True)
 
     _success_writeback_committed = False
+    _bestplan_provisional_plan_ids: list[str] = []
+    _bestplan_commit_candidate_plan_id: Optional[str] = None
+    _bestplan_committed_plan_id: Optional[str] = None
     _delivery_writeback_committed = False
     _terminal_writeback_uncertain = False
     _terminal_cleanup_save_suppressed = False
@@ -11511,20 +11699,11 @@ def _run_agent_streaming(
                 profile_home=_profile_home,
                 config=_cfg,
             )
+            _bestplan_capture_linearized = False
+            _bestplan_capture_config = None
             if result is None:
+                _bestplan_capture_config = bestplan_config
                 result = agent.run_conversation(**_run_conversation_kwargs)
-                if str(result.get("final_response") or "").strip():
-                    result = _capture_bestplan_result(
-                        result,
-                        invocation_message=_bestplan_capture_invocation_message(
-                            msg_text, bestplan_config
-                        ),
-                        session_id=session_id,
-                        profile=str(getattr(s, "profile", None) or ""),
-                        workspace=str(s.workspace),
-                        profile_home=_profile_home,
-                        host_agent=agent,
-                    )
             # #6068: read the served model after the run.  The agent may mutate
             # ``agent.model`` when a fallback/provider route fires, so the
             # pre-run resolved model would misattribute the completed turn.
@@ -11622,6 +11801,29 @@ def _run_agent_streaming(
                             getattr(s, 'active_stream_id', None),
                         )
                         return
+                (
+                    result,
+                    _bestplan_capture_linearized,
+                    _bestplan_commit_candidate_plan_id,
+                ) = (
+                    _capture_bestplan_result_after_writeback_fence(
+                        result,
+                        bestplan_config=_bestplan_capture_config,
+                        ephemeral=ephemeral,
+                        session=s,
+                        stream_id=stream_id,
+                        cancel_event=cancel_event,
+                        host_agent=agent,
+                        captured_terminal_error=_captured_terminal_error[0],
+                        previous_messages=_previous_messages,
+                        previous_context_messages=_previous_context_messages,
+                        message=msg_text,
+                        source=_turn_pending_source,
+                        active_turn_identity=_active_turn_identity,
+                        profile_home=_profile_home,
+                        provisional_plan_ids=_bestplan_provisional_plan_ids,
+                    )
+                )
                 if _process_completion_claims:
                     _native_terminal_state_before = _snapshot_native_terminal_state(s)
                 with _stream_writeback_stage(_writeback_timings, "merge_result"):
@@ -11701,7 +11903,7 @@ def _run_agent_streaming(
                     )
                     if isinstance(result, dict):
                         result = {**result, 'messages': _context_result_messages}
-                    if cancel_event.is_set():
+                    if cancel_event.is_set() and not _bestplan_capture_linearized:
                         _finalize_cancelled_turn(s, ephemeral=False)
                         try:
                             append_turn_journal_event_for_stream(
@@ -12180,14 +12382,77 @@ def _run_agent_streaming(
                                 )
                                 if moa_config is not None:
                                     _heal_kwargs["moa_config"] = moa_config
+                                if bestplan_config is not None:
+                                    _heal_kwargs["bestplan_config"] = bestplan_config
                                 _heal_result = agent.run_conversation(**_heal_kwargs)
                                 _active_turn_identity = _resolve_active_turn_authority(
                                     _active_turn_identity,
                                     result=_heal_result,
                                     agent=agent,
                                 )
+                                if cancel_event.is_set():
+                                    _finalize_cancelled_turn(s, ephemeral=ephemeral)
+                                    if not ephemeral:
+                                        try:
+                                            append_turn_journal_event_for_stream(
+                                                session_id,
+                                                stream_id,
+                                                {
+                                                    "event": "interrupted",
+                                                    "created_at": time.time(),
+                                                    "reason": "cancelled",
+                                                },
+                                            )
+                                        except Exception:
+                                            logger.debug(
+                                                "Failed to append cancelled self-heal turn journal event",
+                                                exc_info=True,
+                                            )
+                                    put('cancel', _cancel_event_payload('Cancelled by user'))
+                                    return
+                                if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                                    logger.info(
+                                        "Skipping stale stream self-heal capture for session %s stream %s; active_stream_id=%s",
+                                        getattr(s, 'session_id', session_id),
+                                        stream_id,
+                                        getattr(s, 'active_stream_id', None),
+                                    )
+                                    return
+                                _bestplan_capture_accepted = True
+                                if bestplan_config is not None:
+                                    (
+                                        _heal_result,
+                                        _bestplan_capture_accepted,
+                                        _bestplan_commit_candidate_plan_id,
+                                    ) = (
+                                        _capture_bestplan_result_after_writeback_fence(
+                                            _heal_result,
+                                            bestplan_config=bestplan_config,
+                                            ephemeral=ephemeral,
+                                            session=s,
+                                            stream_id=stream_id,
+                                            cancel_event=cancel_event,
+                                            host_agent=agent,
+                                            captured_terminal_error=None,
+                                            previous_messages=_previous_messages,
+                                            previous_context_messages=_previous_context_messages,
+                                            message=msg_text,
+                                            source=_turn_pending_source,
+                                            active_turn_identity=_active_turn_identity,
+                                            profile_home=_profile_home,
+                                            provisional_plan_ids=_bestplan_provisional_plan_ids,
+                                        )
+                                    )
+                                    if _bestplan_capture_accepted:
+                                        _bestplan_capture_linearized = True
                                 _heal_all_msgs = _heal_result.get('messages') or []
-                                _heal_ok = _has_new_assistant_reply(_heal_all_msgs, _prev_len) or _token_sent
+                                _heal_ok = (
+                                    _bestplan_capture_accepted
+                                    and (
+                                        _has_new_assistant_reply(_heal_all_msgs, _prev_len)
+                                        or _token_sent
+                                    )
+                                )
                             except Exception as _retry_exc:
                                 logger.warning(
                                     '[webui] self-heal: retry also failed: %s', _retry_exc,
@@ -12195,17 +12460,7 @@ def _run_agent_streaming(
                                 _heal_ok = False
                             if _heal_ok and _heal_result is not None:
                                 # Retry succeeded — replace result and skip error
-                                result = _capture_bestplan_result(
-                                    _heal_result,
-                                    invocation_message=_bestplan_capture_invocation_message(
-                                        msg_text, bestplan_config
-                                    ),
-                                    session_id=session_id,
-                                    profile=str(getattr(s, "profile", None) or ""),
-                                    workspace=str(s.workspace),
-                                    profile_home=_profile_home,
-                                    host_agent=agent,
-                                )
+                                result = _heal_result
                                 # Fall through past the error-emission block;
                                 # the post-result persistence code below will
                                 # process ``result`` normally.  We jump past
@@ -12866,7 +13121,7 @@ def _run_agent_streaming(
                             )
                         except Exception:
                             logger.debug("Failed to append assistant_started turn journal event", exc_info=True)
-                if cancel_event.is_set():
+                if cancel_event.is_set() and not _bestplan_capture_linearized:
                     _finalize_cancelled_turn(s, ephemeral=False)
                     try:
                         append_turn_journal_event_for_stream(
@@ -12911,7 +13166,7 @@ def _run_agent_streaming(
                 else:
                     with _stream_writeback_stage(_writeback_timings, "session_save"):
                         s.save()
-                if cancel_event.is_set():
+                if cancel_event.is_set() and not _bestplan_capture_linearized:
                     _finalize_cancelled_turn(s, ephemeral=False)
                     try:
                         append_turn_journal_event_for_stream(
@@ -13036,7 +13291,7 @@ def _run_agent_streaming(
             # suppression cannot observe stale pause state or lose its update.
             _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
             with _lock_ctx:
-                if cancel_event.is_set():
+                if cancel_event.is_set() and not _bestplan_capture_linearized:
                     _finalize_cancelled_turn(s, ephemeral=False)
                     try:
                         append_turn_journal_event_for_stream(
@@ -13067,7 +13322,7 @@ def _run_agent_streaming(
                     and not _terminal_cleanup_save_suppressed
                     and clear_process_wakeup_pause(s, reason='run_completed')
                 ):
-                    if cancel_event.is_set():
+                    if cancel_event.is_set() and not _bestplan_capture_linearized:
                         s.process_wakeup_pause = dict(_process_wakeup_pause_before_clear)
                         try:
                             s.save(touch_updated_at=False)
@@ -13116,7 +13371,7 @@ def _run_agent_streaming(
                                 "after terminal delivery commit (error=%s)",
                                 type(_pause_clear_exc).__name__,
                             )
-                    if cancel_event.is_set():
+                    if cancel_event.is_set() and not _bestplan_capture_linearized:
                         s.process_wakeup_pause = dict(_process_wakeup_pause_before_clear)
                         try:
                             s.save(touch_updated_at=False)
@@ -13137,6 +13392,16 @@ def _run_agent_streaming(
                             logger.debug("Failed to append cancelled turn journal event", exc_info=True)
                         put('cancel', _cancel_event_payload('Cancelled by user'))
                         return
+                if _bestplan_commit_candidate_plan_id:
+                    _commit_provisional_bestplan_capture(
+                        _bestplan_commit_candidate_plan_id,
+                        profile_home=_profile_home,
+                        session=s,
+                        stream_id=stream_id,
+                    )
+                    _bestplan_committed_plan_id = (
+                        _bestplan_commit_candidate_plan_id
+                    )
                 _success_writeback_committed = True
             if _process_completion_claims:
                 try:
@@ -13611,6 +13876,8 @@ def _run_agent_streaming(
                         )
                         if moa_config is not None:
                             _heal_kwargs2["moa_config"] = moa_config
+                        if bestplan_config is not None:
+                            _heal_kwargs2["bestplan_config"] = bestplan_config
                         _heal_result = _heal_agent.run_conversation(**_heal_kwargs2)
                         _active_turn_identity = _resolve_active_turn_authority(
                             _active_turn_identity,
@@ -13699,6 +13966,36 @@ def _run_agent_streaming(
                                     raise RuntimeError(
                                         "Credential self-heal retry has no final assistant answer"
                                     )
+                                (
+                                    _heal_result,
+                                    _bestplan_capture_accepted,
+                                    _bestplan_commit_candidate_plan_id,
+                                ) = (
+                                    _capture_bestplan_result_after_writeback_fence(
+                                        _heal_result,
+                                        bestplan_config=bestplan_config,
+                                        ephemeral=ephemeral,
+                                        session=s,
+                                        stream_id=stream_id,
+                                        cancel_event=cancel_event,
+                                        host_agent=_heal_agent,
+                                        captured_terminal_error=None,
+                                        previous_messages=_previous_messages,
+                                        previous_context_messages=_previous_context_messages,
+                                        message=msg_text,
+                                        source=_turn_pending_source,
+                                        active_turn_identity=_active_turn_identity,
+                                        profile_home=_profile_home,
+                                        provisional_plan_ids=_bestplan_provisional_plan_ids,
+                                    )
+                                )
+                                if (
+                                    bestplan_config is not None
+                                    and not _bestplan_capture_accepted
+                                ):
+                                    raise RuntimeError(
+                                        "Credential self-heal retry was not committable for BestPlan capture"
+                                    )
                                 if _process_completion_claims:
                                     _native_terminal_state_before = (
                                         _snapshot_native_terminal_state(s)
@@ -13748,6 +14045,16 @@ def _run_agent_streaming(
                                         return
                                 else:
                                     s.save()
+                                if _bestplan_commit_candidate_plan_id:
+                                    _commit_provisional_bestplan_capture(
+                                        _bestplan_commit_candidate_plan_id,
+                                        profile_home=_profile_home,
+                                        session=s,
+                                        stream_id=stream_id,
+                                    )
+                                    _bestplan_committed_plan_id = (
+                                        _bestplan_commit_candidate_plan_id
+                                    )
                                 _success_writeback_committed = True
                         logger.info('[webui] self-heal (except path): retry succeeded')
                         return  # skip error emission
@@ -13990,6 +14297,24 @@ def _run_agent_streaming(
             _error_payload['old_session_id'] = session_id
         put('apperror', _error_payload)
     finally:
+        if _bestplan_provisional_plan_ids:
+            _lock_ctx = (
+                _agent_lock
+                if _agent_lock is not None
+                else contextlib.nullcontext()
+            )
+            try:
+                with _lock_ctx:
+                    _reject_uncommitted_bestplan_captures(
+                        _bestplan_provisional_plan_ids,
+                        profile_home=_profile_home,
+                        committed_plan_id=_bestplan_committed_plan_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to reject uncommitted BestPlan capture(s) for stream %s",
+                    stream_id,
+                )
         # A durable Agent outbox event is ACKed only after this turn's
         # transcript writeback committed. Every other exit path explicitly
         # requeues the exact claimed event for retry. If the success-path ACK

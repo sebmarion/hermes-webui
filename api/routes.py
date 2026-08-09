@@ -26582,6 +26582,24 @@ def _compression_recovery_required_payload(session):
     }
 
 
+def _parse_bestplan_chat_message(message):
+    """Return the host-owned BestPlan task/config encoded in a chat message."""
+    msg = str(message or "").strip()
+    match = re.match(r"^/(?:bestplan|bp)(?:\s+|$)", msg, flags=re.IGNORECASE)
+    if match is None:
+        return msg, None
+    parts = msg[match.end():].strip().split()
+    requested_count = None
+    if parts and parts[0].isascii() and parts[0].isdigit():
+        requested_count = int(parts.pop(0))
+    task = " ".join(parts).strip()
+    if not task:
+        raise ValueError("BestPlan unavailable: provide a task after /bestplan.")
+    from agent.bestplan_orchestrator import normalize_count
+
+    return task, {"count": normalize_count(requested_count)}
+
+
 def _handle_chat_start(handler, body, diag=None):
     try:
         diag.stage("validate_session_id") if diag else None
@@ -26708,27 +26726,12 @@ def _handle_chat_start(handler, body, diag=None):
         diag.stage("normalize_message") if diag else None
         msg = str(body.get("message", "")).strip()
         recovered_bestplan_config = None
-        if not body.get("bestplan_config"):
-            bestplan_match = re.match(
-                r"^/(?:bestplan|bp)(?:\s+|$)", msg, flags=re.IGNORECASE
-            )
-            if bestplan_match:
-                bestplan_parts = msg[bestplan_match.end():].strip().split()
-                bestplan_count = 3
-                if (
-                    bestplan_parts
-                    and bestplan_parts[0].isascii()
-                    and bestplan_parts[0].isdigit()
-                ):
-                    bestplan_count = int(bestplan_parts.pop(0))
-                msg = " ".join(bestplan_parts).strip()
-                if not msg:
-                    return bad(
-                        handler,
-                        "BestPlan unavailable: provide a task after /bestplan.",
-                        400,
-                    )
-                recovered_bestplan_config = {"count": bestplan_count}
+        has_bestplan_config = "bestplan_config" in body
+        if not has_bestplan_config:
+            try:
+                msg, recovered_bestplan_config = _parse_bestplan_chat_message(msg)
+            except ValueError as exc:
+                return bad(handler, str(exc), 400)
         if not msg:
             return bad(handler, "message is required")
         diag.stage("normalize_attachments") if diag else None
@@ -26761,14 +26764,18 @@ def _handle_chat_start(handler, body, diag=None):
                 moa_config = resolve_moa_config()
             except RuntimeError as e:
                 return bad(handler, str(e), 503)
-        raw_bestplan = body.get("bestplan_config") or recovered_bestplan_config
-        if raw_bestplan:
-            if gateway_chat_enabled:
-                return bad(handler, "BestPlan is unavailable on gateway-backed sessions", 409)
+        raw_bestplan = (
+            body.get("bestplan_config")
+            if has_bestplan_config
+            else recovered_bestplan_config
+        )
+        if has_bestplan_config or recovered_bestplan_config is not None:
             if not isinstance(raw_bestplan, dict):
                 return bad(handler, "Invalid BestPlan configuration", 400)
+            if gateway_chat_enabled:
+                return bad(handler, "BestPlan is unavailable on gateway-backed sessions", 409)
             from agent.bestplan_orchestrator import normalize_count
-            bestplan_config = {"count": normalize_count(raw_bestplan.get("count", 3))}
+            bestplan_config = {"count": normalize_count(raw_bestplan.get("count"))}
         diag.stage("resolve_model_provider") if diag else None
         model, model_provider, normalized_model = _resolve_compatible_session_model_state(
             requested_model,

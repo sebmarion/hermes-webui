@@ -40,7 +40,7 @@ def _install_bestplan_module(monkeypatch, *, resolved):
         return {**result, "captured": True}
 
     module.BestplanStore = BestplanStore
-    module.BESTPLAN_HOST_CAPABILITY_VERSION = 1
+    module.BESTPLAN_HOST_CAPABILITY_VERSION = 2
     module.try_resolve_go = try_resolve_go
     module.capture_bestplan_agent_result = capture_bestplan_agent_result
     module.is_bestplan_invocation = lambda message: "bestplan" in str(message).lower()
@@ -116,6 +116,7 @@ def test_no_plan_runs_model_then_captures_bestplan_envelope(tmp_path, monkeypatc
     assert result["captured"] is True
     assert len(calls["capture"]) == 1
     assert calls["capture"][0][1]["invocation_message"].startswith("[IMPORTANT:")
+    assert calls["capture"][0][1]["provisional"] is True
 
 
 def test_stale_client_task_recovers_bestplan_identity_for_host_capture(
@@ -145,6 +146,7 @@ def test_stale_client_task_recovers_bestplan_identity_for_host_capture(
     assert invocation == "/bestplan 4 fix the envelope leak"
     assert result["captured"] is True
     assert calls["capture"][0][1]["invocation_message"] == invocation
+    assert calls["capture"][0][1]["provisional"] is True
 
 
 def test_missing_core_is_transparent_disabled_but_go_fails_closed_enabled(tmp_path, monkeypatch):
@@ -289,6 +291,7 @@ def test_immediately_previous_core_capture_signature_is_planning_only(monkeypatc
     module.BestplanStore = lambda **_kwargs: (_ for _ in ()).throw(
         AssertionError("old core capture must not open state")
     )
+    module.BESTPLAN_HOST_CAPABILITY_VERSION = 1
     monkeypatch.setitem(sys.modules, "agent.bestplan_state", module)
     envelope = (
         "commentary\n<<<HERMES_BESTPLAN_V1>>>\n{}\n"
@@ -302,6 +305,35 @@ def test_immediately_previous_core_capture_signature_is_planning_only(monkeypatc
     assert result["bestplan_capture"]["executable"] is False
     assert "planning-only" in result["final_response"]
     assert "HERMES_BESTPLAN" not in result["final_response"]
+
+
+def test_capability_v1_go_cannot_dispatch_pre_hardening_plan(monkeypatch, tmp_path):
+    import api.streaming as streaming
+
+    module = types.ModuleType("agent.bestplan_state")
+    module.BESTPLAN_HOST_CAPABILITY_VERSION = 1
+    module.is_go_enabled = lambda _config=None: True
+    module.BestplanStore = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("V1 go must not open legacy pending authority")
+    )
+    module.try_resolve_go = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("V1 go must not resolve legacy pending authority")
+    )
+    monkeypatch.setitem(sys.modules, "agent.bestplan_state", module)
+
+    result = streaming._try_resolve_bestplan_go_ingress(
+        object(),
+        original_message="go",
+        conversation_history=[],
+        session_id="s",
+        profile="coder",
+        workspace="/tmp/work",
+        profile_home=str(tmp_path),
+        config={"autonomy": {"go_enabled": True}},
+    )
+
+    assert result["host_ingress"]["status"] == "capability_upgrade_required"
+    assert "V2" in result["final_response"]
 
 
 def test_immediately_previous_recovery_signature_preserves_generic_root_replay(monkeypatch):
