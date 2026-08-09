@@ -31,8 +31,8 @@ def test_poll_path_skips_non_external_sessions():
     )
 
 
-def test_session_events_refresh_active_session():
+def test_focus_and_visibility_recovery_refresh_active_session():
     src = SESSIONS_JS.read_text(encoding="utf-8")
-    body = _function_body(src, "_scheduleSessionEventsRefresh")
-    assert "void refreshSessionList(request.reason||'event', request.opts)" in body
-    assert "_scheduleSessionEventsRefresh(eventTargetsActiveSession?'event-active-session':'event', {force:true, refreshActive:true})" in src
+    body = _function_body(src, "ensureActiveSessionExternalRefreshPoll")
+    assert "refreshActiveSessionIfExternallyUpdated('visible')" in body
+    assert "refreshActiveSessionIfExternallyUpdated('focus')" in body

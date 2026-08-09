@@ -121,49 +121,42 @@ def test_session_time_refresh_has_own_visibility_hook():
     assert "startStreamingPoll re-renders the list" not in block
 
 
-def test_session_list_external_refresh_uses_sse_invalidation_not_polling():
-    """New sessions should refresh the sidebar from server invalidation events."""
+def test_session_list_external_refresh_uses_visible_activity_poll_and_resume_catch_up():
+    """Sidebar state refreshes without a persistent session-list EventSource."""
     assert "async function refreshSessionList(reason='manual', opts={})" in SESSIONS_JS
     assert "let _sessionListRefreshPendingRequest = null;" in SESSIONS_JS
     assert "function _mergeSessionListRefreshOptions(prev, next)" in SESSIONS_JS
-    assert "function _refreshSessionListAfterSidebarResume(reason)" in SESSIONS_JS
-    assert "_sessionEventsNeedsRefreshOnOpen = false" in SESSIONS_JS
-    assert "void refreshSessionList(reason, {force:true})" in SESSIONS_JS
-    assert "function ensureSessionEventsSSE()" in SESSIONS_JS
-    assert "new EventSource('api/sessions/events')" in SESSIONS_JS
-    assert "addEventListener('sessions_changed'" in SESSIONS_JS
-    assert "function _scheduleSessionEventsRefresh(reason, opts={})" in SESSIONS_JS
-    assert "let _sessionEventsRefreshPendingRequest = null;" in SESSIONS_JS
-    assert "_sessionEventsNeedsRefreshOnOpen = true" in SESSIONS_JS
+    assert "async function _refreshSessionListAfterSidebarResume(reason)" in SESSIONS_JS
+    assert "await refreshSessionList(reason, {force:true})" in SESSIONS_JS
+    assert "_scheduleSessionListRefresh(reason, {force:true})" in SESSIONS_JS
+    assert "function ensureSessionActivityPoll()" in SESSIONS_JS
+    assert "const _sessionActivityPollMs = 5000;" in SESSIONS_JS
+    activity_poll = _function_body(SESSIONS_JS, "ensureSessionActivityPoll")
+    assert "_installSidebarSseFocusHook();" in activity_poll
+    assert "setInterval(" in activity_poll
+    assert "document.hidden" in activity_poll
+    assert "renderSessionList({deferWhileInteracting:true})" in activity_poll
+    assert "visibilitychange" in activity_poll
+    assert "renderSessionList({deferWhileInteracting:false})" in activity_poll
+    assert "function _scheduleSessionListRefresh(reason, opts={})" in SESSIONS_JS
+    assert "let _sessionListRefreshScheduleTimer = 0;" in SESSIONS_JS
+    assert "let _sessionListRefreshScheduledRequest = null;" in SESSIONS_JS
     assert "void _refreshSessionListAfterSidebarResume('focus')" in SESSIONS_JS
-    assert "void _refreshSessionListAfterSidebarResume('visible')" in SESSIONS_JS
-    assert "void _refreshSessionListAfterSidebarResume('reconnect')" in SESSIONS_JS
     assert "renderSessionList({deferWhileInteracting:!force})" in SESSIONS_JS
     assert "const refreshActive = !!(opts && opts.refreshActive)" in SESSIONS_JS
     assert "if(refreshActive) await refreshActiveSessionIfExternallyUpdated(reason||'session-list')" in SESSIONS_JS
     assert "_sessionListRefreshPendingRequest = {" in SESSIONS_JS
-    assert "_scheduleSessionEventsRefresh(pendingRequest.reason, pendingRequest.opts)" in SESSIONS_JS
-    assert "ensureSessionEventsSSE();" in SESSIONS_JS
-    assert "document._hermesSessionEventsVisibilityHook" in SESSIONS_JS
-    ensure_fn = SESSIONS_JS[SESSIONS_JS.find("function ensureSessionEventsSSE()") :]
-    # The visibility hook must be installed before the open-guard early-return.
-    # #4151 replaced the `document.hidden) return` open guard with the focus-aware
-    # `_sidebarSseBackgrounded()) return` predicate (which also covers PWA blur).
-    assert ensure_fn.find("document._hermesSessionEventsVisibilityHook") < ensure_fn.find("_sidebarSseBackgrounded()) return")
+    assert "_scheduleSessionListRefresh(pendingRequest.reason, pendingRequest.opts)" in SESSIONS_JS
+    assert "_scheduleSessionEventsRefresh" not in SESSIONS_JS
+    assert "_sessionEventsRefreshTimer" not in SESSIONS_JS
+    assert "_sessionEventsRefreshPendingRequest" not in SESSIONS_JS
     assert "_sessionListExternalRefreshMs" not in SESSIONS_JS
-    assert "addEventListener('sessions_changed', (ev) => {" in ensure_fn
-    assert "const activeProfile = S.activeProfile || 'default';" in ensure_fn
-    assert "const payload = typeof ev?.data === 'string' ? JSON.parse(ev.data) : {};" in ensure_fn
-    assert "const eventProfile = payload && typeof payload.profile === 'string' ? payload.profile : '';" in ensure_fn
-    assert "if (!_sessionEventProfilesMatch(eventProfile, activeProfile)) {" in ensure_fn
-    assert "function _sessionEventTargetsActiveSession(payload)" in SESSIONS_JS
-    assert "typeof payload.session_id === 'string'" in SESSIONS_JS
-    assert "eventTargetsActiveSession?'event-active-session':'event'" in ensure_fn
-    assert "_scheduleSessionEventsRefresh(eventTargetsActiveSession?'event-active-session':'event', {force:true, refreshActive:true})" in ensure_fn
+    assert "ensureSessionEventsSSE" not in SESSIONS_JS
+    assert "new EventSource('api/sessions/events')" not in SESSIONS_JS
 
 
-def test_session_events_refresh_forces_hidden_sidebar_render_from_event_path():
-    """The production sessions_changed path must force the hidden sidebar list render."""
+def test_session_list_refresh_debounce_forces_hidden_sidebar_render():
+    """A forced scheduled refresh must render even while the page is hidden."""
     merge_body = (
         _function_body(SESSIONS_JS, "_mergeSessionListRefreshOptions")
         if "function _mergeSessionListRefreshOptions" in SESSIONS_JS
@@ -173,7 +166,7 @@ def test_session_events_refresh_forces_hidden_sidebar_render_from_event_path():
         [
             merge_body,
             _function_body(SESSIONS_JS, "refreshSessionList"),
-            _function_body(SESSIONS_JS, "_scheduleSessionEventsRefresh"),
+            _function_body(SESSIONS_JS, "_scheduleSessionListRefresh"),
         ]
     )
     script = textwrap.dedent(
@@ -188,11 +181,11 @@ def test_session_events_refresh_forces_hidden_sidebar_render_from_event_path():
         }};
         let _sessionListRefreshInFlight = false;
         let _sessionListRefreshPendingRequest = null;
-        let _sessionEventsRefreshTimer = 0;
-        let _sessionEventsRefreshPendingRequest = null;
+        let _sessionListRefreshScheduleTimer = 0;
+        let _sessionListRefreshScheduledRequest = null;
         {functions}
         (async() => {{
-          _scheduleSessionEventsRefresh('event-active-session', {{force:true, refreshActive:true}});
+          _scheduleSessionListRefresh('sidebar-update', {{force:true, refreshActive:true}});
           await Promise.resolve();
           process.stdout.write(JSON.stringify(record));
         }})().catch((err) => {{
@@ -204,7 +197,7 @@ def test_session_events_refresh_forces_hidden_sidebar_render_from_event_path():
     out = _run_node(script)
     assert out == [
         {"kind": "render", "opts": {"deferWhileInteracting": False}},
-        {"kind": "active", "reason": "event-active-session"},
+        {"kind": "active", "reason": "sidebar-update"},
     ]
 
 
@@ -215,7 +208,7 @@ def test_session_list_external_refresh_forced_resume_survives_hidden_inflight_re
         for name in (
             "_mergeSessionListRefreshOptions",
             "refreshSessionList",
-            "_scheduleSessionEventsRefresh",
+            "_scheduleSessionListRefresh",
             "_refreshSessionListAfterSidebarResume",
         )
     )
@@ -243,11 +236,11 @@ def test_session_list_external_refresh_forced_resume_survives_hidden_inflight_re
         global.clearTimeout = () => {{}};
         let _sessionListRefreshInFlight = false;
         let _sessionListRefreshPendingRequest = null;
-        let _sessionEventsRefreshTimer = 0;
-        let _sessionEventsRefreshPendingRequest = null;
+        let _sessionListRefreshScheduleTimer = 0;
+        let _sessionListRefreshScheduledRequest = null;
         {functions}
         (async() => {{
-          await refreshSessionList('event', {{refreshActive:true}});
+          await refreshSessionList('sidebar-update', {{refreshActive:true}});
           await refreshSessionList('manual');
           process.stdout.write(JSON.stringify({{
             record,
@@ -262,21 +255,73 @@ def test_session_list_external_refresh_forced_resume_survives_hidden_inflight_re
     out = _run_node(script)
     assert out["record"] == [
         {"kind": "render", "opts": {"deferWhileInteracting": True}},
-        {"kind": "active", "reason": "event"},
+        {"kind": "active", "reason": "sidebar-update"},
         {"kind": "render", "opts": {"deferWhileInteracting": False}},
     ]
-    assert "refreshSessionList(reason, {force:true})" in out["resumeSrc"]
+    assert "await refreshSessionList(reason, {force:true})" in out["resumeSrc"]
+    assert "_scheduleSessionListRefresh(reason, {force:true})" in out["resumeSrc"]
     assert "refreshActive:true" not in out["resumeSrc"]
 
 
-def test_session_events_refresh_timer_merges_pending_force_and_active_options():
+def test_session_list_focus_resume_performs_immediate_and_scheduled_refresh():
+    """Focus refreshes now, then once more after the projection seed rebuilds."""
+    functions = "\n\n".join(
+        _function_body(SESSIONS_JS, name)
+        for name in (
+            "_mergeSessionListRefreshOptions",
+            "refreshSessionList",
+            "_scheduleSessionListRefresh",
+            "_refreshSessionListAfterSidebarResume",
+        )
+    )
+    script = textwrap.dedent(
+        f"""
+        const record = [];
+        global.document = {{hidden: false}};
+        global.renderSessionList = async (opts) => record.push(opts);
+        global.refreshActiveSessionIfExternallyUpdated = async () => {{}};
+        let timerCb = null;
+        let timerDelay = null;
+        global.setTimeout = (cb, delay) => {{
+          timerCb = cb;
+          timerDelay = delay;
+          return 1;
+        }};
+        let _sessionListRefreshInFlight = false;
+        let _sessionListRefreshPendingRequest = null;
+        let _sessionListRefreshScheduleTimer = 0;
+        let _sessionListRefreshScheduledRequest = null;
+        {functions}
+        (async() => {{
+          await _refreshSessionListAfterSidebarResume('focus');
+          const beforeTimer = record.slice();
+          timerCb();
+          await new Promise((resolve) => setImmediate(resolve));
+          process.stdout.write(JSON.stringify({{beforeTimer, afterTimer:record, timerDelay}}));
+        }})().catch((err) => {{
+          process.stderr.write(String(err.stack || err) + '\\n');
+          process.exit(1);
+        }});
+        """
+    )
+    assert _run_node(script) == {
+        "beforeTimer": [{"deferWhileInteracting": False}],
+        "afterTimer": [
+            {"deferWhileInteracting": False},
+            {"deferWhileInteracting": False},
+        ],
+        "timerDelay": 300,
+    }
+
+
+def test_session_list_refresh_timer_merges_pending_force_and_active_options():
     """The debounce window must not drop force or active-refresh intent."""
     functions = "\n\n".join(
         _function_body(SESSIONS_JS, name)
         for name in (
             "_mergeSessionListRefreshOptions",
             "refreshSessionList",
-            "_scheduleSessionEventsRefresh",
+            "_scheduleSessionListRefresh",
         )
     )
     script = textwrap.dedent(
@@ -290,12 +335,12 @@ def test_session_events_refresh_timer_merges_pending_force_and_active_options():
         global.clearTimeout = () => {{}};
         let _sessionListRefreshInFlight = false;
         let _sessionListRefreshPendingRequest = null;
-        let _sessionEventsRefreshTimer = 0;
-        let _sessionEventsRefreshPendingRequest = null;
+        let _sessionListRefreshScheduleTimer = 0;
+        let _sessionListRefreshScheduledRequest = null;
         {functions}
         (async() => {{
-          _scheduleSessionEventsRefresh('focus', {{force:true}});
-          _scheduleSessionEventsRefresh('event-active-session', {{refreshActive:true}});
+          _scheduleSessionListRefresh('focus', {{force:true}});
+          _scheduleSessionListRefresh('sidebar-update', {{refreshActive:true}});
           timerCb();
           await Promise.resolve();
           process.stdout.write(JSON.stringify(record));
@@ -307,14 +352,14 @@ def test_session_events_refresh_timer_merges_pending_force_and_active_options():
     )
     assert _run_node(script) == [
         {"kind": "render", "opts": {"deferWhileInteracting": False}},
-        {"kind": "active", "reason": "event-active-session"},
+        {"kind": "active", "reason": "sidebar-update"},
     ]
 
 
-def test_session_event_profile_filter_tolerates_default_root_aliases():
+def test_session_profile_filter_tolerates_default_root_aliases():
     assert "function _profileMatchesActiveProfile(profile, activeProfile)" in SESSIONS_JS
     assert "return eventName === 'default' && !!S.activeProfileIsDefault;" in SESSIONS_JS
-    assert "function _sessionEventProfilesMatch(eventProfile, activeProfile)" in SESSIONS_JS
+    assert "_sessionEventProfilesMatch" not in SESSIONS_JS
     assert "if (!_profileMatchesActiveProfile(sessionProfile, activeProfile)) return false;" in SESSIONS_JS
     assert "activeProfileIsDefault:true" in UI_JS
     assert "const activeProfileState = await _resolveActiveProfileBootstrapState();" in BOOT_JS

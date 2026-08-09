@@ -1,24 +1,22 @@
-"""Structural tests for #4151 — PWA two-window connection-pool saturation.
+"""Structural scope guards for #4151 multi-window connection-pool safety.
 
 #3992/#3996 close the idle SSE streams on the Page Visibility API
 (`visibilitychange` / `document.hidden`). But a PWA *standalone* window does NOT
 reliably fire `visibilitychange` when it loses focus to another window of the
-same app — `document.hidden` only flips on minimize. So two side-by-side PWA
-windows both stay `visibilityState==='visible'`, each holds its sidebar SSE
-streams open, and 2x3 = 6 = the per-origin HTTP/1.1 connection limit; every
-later fetch() queues behind the saturated pool and times out (#4151).
+same app — `document.hidden` only flips on minimize. Two visible WebUI windows
+therefore used to hold three persistent streams each and exhaust the six-slot
+HTTP/1.1 pool.
 
-The fix makes the two GLOBAL sidebar streams (session-events + gateway) also
-close on window `blur` (gated on `document.hasFocus()`, the signal
-`visibilitychange` misses) and reopen on `focus`, via a shared
-`_sidebarSseBackgrounded()` predicate and a debounced `_installSidebarSseFocusHook()`.
+The session-list `/api/sessions/events` client stream is retired in favor of the
+existing visible five-second activity poll plus focus/visibility catch-up. The
+gateway stream still closes on sustained blur via the shared focus hook.
 
 CRITICAL SCOPE GUARD (the regression these tests lock): the PER-SESSION live
 stream (`startSessionStream` in messages.js) must stay visibility-only and must
 NOT be torn down on blur — it carries live `bg_task_complete` toasts +
 `server_turn_started` live-view that an unfocused-but-VISIBLE window must still
-receive. So the focus hook lives in sessions.js and only touches
-`_closeSessionEventsSSE()` + `stopGatewaySSE()`.
+receive. So the focus hook lives in sessions.js and only touches the gateway
+stream.
 
 Source-grep checks (the hooks live in static JS with no server round trip).
 """
@@ -46,22 +44,22 @@ def test_backgrounded_predicate_uses_hasfocus_not_only_hidden():
     assert "!document.hasFocus()" in block
 
 
-def test_focus_hook_closes_both_global_sidebar_streams():
-    """The blur path closes the session-events AND gateway streams."""
+def test_focus_hook_closes_only_the_gateway_sidebar_stream():
+    """The blur path frees the retained global gateway stream."""
     assert "function _installSidebarSseFocusHook()" in SESSIONS_JS
     start = SESSIONS_JS.find("function _installSidebarSseFocusHook()")
     block = SESSIONS_JS[start:start + 1700]
     # Installed once.
     assert "_hermesSidebarSseFocusHook" in block
-    # Blur listener tears down both global streams.
+    # Blur listener tears down the retained global stream.
     assert "window.addEventListener('blur'" in block
-    assert "_closeSessionEventsSSE()" in block
     assert "stopGatewaySSE()" in block
-    # Focus listener reopens both and refreshes the list.
+    # Focus listener reopens it and refreshes the list.
     assert "window.addEventListener('focus'" in block
-    assert "ensureSessionEventsSSE()" in block
     assert "startGatewaySSE()" in block
     assert "_refreshSessionListAfterSidebarResume('focus')" in block
+    assert "_closeSessionEventsSSE" not in block
+    assert "ensureSessionEventsSSE" not in block
 
 
 def test_blur_close_is_debounced_and_rechecks_focus_at_fire_time():
@@ -83,8 +81,8 @@ def test_blur_close_is_debounced_and_rechecks_focus_at_fire_time():
 def test_focus_reopen_does_not_thrash_the_gateway_stream():
     """The focus handler must NOT unconditionally restart the gateway stream.
 
-    startGatewaySSE() begins with an unconditional stopGatewaySSE() (it is NOT
-    idempotent, unlike ensureSessionEventsSSE()'s `if(_sessionEventsSSE) return`).
+    startGatewaySSE() begins with an unconditional stopGatewaySSE() (it is not
+    idempotent).
     On a transient blur shorter than the 1s debounce, the blur-close timer is
     cleared and the gateway stream is never torn down — so an unconditional
     startGatewaySSE() on the following focus would drop+reconnect the live gateway,
@@ -98,8 +96,8 @@ def test_focus_reopen_does_not_thrash_the_gateway_stream():
     focus_idx = block.find("window.addEventListener('focus'")
     assert focus_idx != -1
     focus_body = block[focus_idx:]
-    # The gateway reopen is guarded on the stream being closed (mirrors the
-    # session-events idempotency), not called unconditionally.
+    # The gateway reopen is guarded on the stream being closed, not called
+    # unconditionally.
     assert "if(!_gatewaySSE) startGatewaySSE()" in focus_body, (
         "focus handler must guard startGatewaySSE() on `!_gatewaySSE` so a "
         "transient blur+focus does not drop+reconnect a still-open gateway stream"
@@ -108,14 +106,17 @@ def test_focus_reopen_does_not_thrash_the_gateway_stream():
     assert "\n    startGatewaySSE();" not in focus_body
 
 
-def test_session_events_open_guard_uses_backgrounded_predicate():
-    """ensureSessionEventsSSE installs the focus hook and gates open on the predicate."""
-    start = SESSIONS_JS.find("function ensureSessionEventsSSE()")
+def test_activity_poll_owns_focus_and_visibility_catch_up():
+    """The poll installs focus catch-up and refreshes immediately on re-show."""
+    start = SESSIONS_JS.find("function ensureSessionActivityPoll()")
     assert start != -1
-    block = SESSIONS_JS[start:start + 700]
+    block = SESSIONS_JS[start:start + 900]
     assert "_installSidebarSseFocusHook()" in block
-    # Open guard is the focus-aware predicate, not the old hidden-only check.
-    assert "if(_sidebarSseBackgrounded()) return;" in block
+    assert "_sessionActivityPollMs = 5000" in SESSIONS_JS
+    assert "setInterval(" in block
+    assert "if(typeof document!=='undefined'&&document.hidden) return;" in block
+    assert "document.addEventListener('visibilitychange',_sessionActivityPollVisibilityHandler);" in block
+    assert "if(!document.hidden) void renderSessionList({deferWhileInteracting:false});" in block
 
 
 def test_gateway_open_guard_uses_backgrounded_predicate():
@@ -148,7 +149,7 @@ def test_per_session_stream_NOT_closed_on_blur():
             "that regresses live bg_task_complete / server_turn_started for an "
             "unfocused-but-visible window (#4151 scope guard)"
         )
-    # (b) the sidebar focus hook only manages the two global streams.
+    # (b) the sidebar focus hook only manages the retained gateway stream.
     start = SESSIONS_JS.find("function _installSidebarSseFocusHook()")
     block = SESSIONS_JS[start:start + 1700]
     assert "stopSessionStream" not in block

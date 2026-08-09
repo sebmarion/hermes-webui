@@ -1,12 +1,8 @@
-"""Structural tests for #3996 — close idle SSE on hidden tabs to free the
-HTTP/1.1 connection pool (#3992), plus the reopen-on-re-show correctness fix.
+"""Structural tests for #3996 — retained SSE visibility lifecycle.
 
-Two idle persistent SSE connections per window (gateway stream + per-session
-stream) plus the always-present session-events stream meant 2 windows x 3 = 6 =
-the browser's per-origin HTTP/1.1 connection limit, so any subsequent fetch()
-queued behind a saturated pool and timed out. #3996 adds Page Visibility API
-hooks that close those streams while the tab is hidden and reopen them on
-re-show, mirroring the existing ensureSessionEventsSSE() pattern.
+The global session-list EventSource has since been retired, but the gateway and
+per-session streams must still close while hidden and reopen on re-show so idle
+pages release their remaining HTTP/1.1 connections.
 
 These are source-grep checks (the hooks live in static JS with no server round
 trip). The key regression guard is that the *per-session* stream actually

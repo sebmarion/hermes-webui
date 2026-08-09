@@ -8587,7 +8587,7 @@ function startSessionStream(sid) {
   }
   stopSessionStream();
   _sessionStreamSessionId = sid;
-  // Visibility hook (install once) — mirror ensureSessionEventsSSE() pattern.
+  // Visibility hook (install once) for the retained per-session stream.
   // Capture the active session id into a dedicated var BEFORE closing, because
   // stopSessionStream() nulls _sessionStreamSessionId — so the reopen path can't
   // rely on it (that was the bug: the stream never reopened on tab re-show).

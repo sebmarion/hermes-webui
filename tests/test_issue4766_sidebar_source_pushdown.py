@@ -643,7 +643,6 @@ global.startStreamingPoll = () => {{}};
 global.stopStreamingPoll = () => {{}};
 global.ensureSessionTimeRefreshPoll = () => {{}};
 global.ensureActiveSessionExternalRefreshPoll = () => {{}};
-    global.ensureSessionEventsSSE = () => {{}};
     global.animateNextSessionListRefresh = () => {{}};
     global.renderSessionListFromCache = () => {{}};
     {exclude_hidden_fn}

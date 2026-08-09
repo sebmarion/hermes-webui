@@ -176,11 +176,6 @@ function _profileMatchesActiveProfile(profile, activeProfile){
   return eventName === 'default' && !!S.activeProfileIsDefault;
 }
 
-function _sessionEventProfilesMatch(eventProfile, activeProfile){
-  if(!(typeof eventProfile === 'string' && eventProfile.trim())) return true;
-  return _profileMatchesActiveProfile(eventProfile, activeProfile);
-}
-
 function _isRestorableNewChatDraftSession(session, requireDraft=false) {
   if (!session || !session.session_id) return false;
   const messageCount = Number(session.message_count || 0);
@@ -6207,7 +6202,6 @@ function _applySessionListPayload(sessData, projData, opts){
     animateNextSessionListRefresh({enterAll:true});
     _sessionListFirstRenderAnimated=true;
   }
-  ensureSessionEventsSSE();
   // #4671: this payload is the freshly-resolved /api/sessions response (and a superseded
   // response was already discarded by the generation guard upstream), so _allSessions now
   // holds the CURRENT profile's rows. Clear the skeleton flag right before painting so this
@@ -6482,10 +6476,9 @@ let _sessionActivityPollTimer = null;
 let _sessionActivityPollVisibilityHandler = null;
 // #3107: the active-session "is it externally updated?" poll used to fire
 // every 5 s. On long sessions this caused visible scroll jitter and a
-// noticeable network/CPU floor because the SSE session-events stream
-// already pushes invalidations in real time; this poll exists only as a
-// fallback for the case where SSE is broken/unavailable. Bump to 30 s
-// to keep the safety net without turning it into a primary refresh path.
+// noticeable network/CPU floor. The five-second visible-page activity poll
+// already refreshes sidebar state; this slower poll is only the active
+// transcript safety net for imported/external sessions.
 const _activeSessionExternalRefreshMs = 30000;
 let _streamingPollTimer = null;
 let _sessionTimeRefreshTimer = null;
@@ -6494,21 +6487,8 @@ let _sessionTimeRefreshVisibilityHandler = null;
 let _activeSessionExternalRefreshTimer = null;
 let _activeSessionExternalRefreshInFlight = false;
 let _deferredActiveSessionExternalRefreshReason = '';
-let _sessionEventsSSE = null;
-let _sessionEventsRefreshTimer = 0;
-let _sessionEventsRefreshPendingRequest = null;
-let _sessionEventsReconnectTimer = 0;
-let _sessionEventsNeedsRefreshOnOpen = false;
-let _sessionEventsReconnectAttempt = 0;
-const _sessionEventsReconnectBaseMs = 5000;
-const _sessionEventsReconnectMaxMs = 30000;
-
-function _sessionEventsReconnectDelayMs(){
-  const attempt = Math.max(0, Number(_sessionEventsReconnectAttempt || 0));
-  const base = Math.min(_sessionEventsReconnectMaxMs, _sessionEventsReconnectBaseMs * Math.pow(2, attempt));
-  const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(base * 0.35)));
-  return Math.min(_sessionEventsReconnectMaxMs, Math.floor(base * 0.75) + jitter);
-}
+let _sessionListRefreshScheduleTimer = 0;
+let _sessionListRefreshScheduledRequest = null;
 let _sessionListRefreshInFlight = false;
 let _sessionListRefreshPendingRequest = null;
 
@@ -6519,10 +6499,12 @@ function _mergeSessionListRefreshOptions(prev, next){
   return merged;
 }
 
-function _refreshSessionListAfterSidebarResume(reason){
-  // A direct resume refresh satisfies any pending onopen catch-up from the same close.
-  _sessionEventsNeedsRefreshOnOpen = false;
-  void refreshSessionList(reason, {force:true});
+async function _refreshSessionListAfterSidebarResume(reason){
+  await refreshSessionList(reason, {force:true});
+  // The first response after a cross-client mutation can be the bounded
+  // last-known projection while its canonical rebuild finishes. One generic
+  // follow-up replaces that seed without restoring a persistent EventSource.
+  _scheduleSessionListRefresh(reason, {force:true});
 }
 
 function startStreamingPoll(){
@@ -6569,11 +6551,15 @@ function ensureSessionTimeRefreshPoll(){
   }
 }
 
-// Hermes One local runs update state.db directly, so they cannot emit the
-// WebUI session-events SSE notification. Keep a lightweight visible-page poll
-// for the shared activity overlay; the server-side cache still bounds the
-// expensive projection rebuilds.
+// Hermes One local runs update state.db directly, so browser-local push is not
+// guaranteed. Keep a lightweight visible-page poll for the shared activity
+// overlay; the server-side cache still bounds the expensive projection rebuilds.
 function ensureSessionActivityPoll(){
+  // The activity poll owns sidebar catch-up now that the global
+  // /api/sessions/events EventSource is retired. Install the gateway focus
+  // lifecycle even when external-session sync itself is disabled so every
+  // visible page gets the same immediate focus refresh.
+  _installSidebarSseFocusHook();
   if(_sessionActivityPollTimer) return;
   _sessionActivityPollTimer=setInterval(()=>{
     if(typeof document!=='undefined'&&document.hidden) return;
@@ -6633,11 +6619,11 @@ async function refreshActiveSessionIfExternallyUpdated(reason){
     return 'skipped';
   }
   // #3916/#4195: the 30s timer is only a fallback for imported/external sessions.
-  // WebUI-native sessions should not keep probing forever when the sidebar SSE
-  // is healthy, but they still must reconcile when an actual sessions_changed
-  // event, focus, or visibility recovery says another client/process mutated
-  // the active transcript (#4205 follow-up shape). The idle-reconcile path uses
-  // a non-'poll' reason, so it already sails through this gate untouched.
+  // WebUI-native sessions should not keep probing forever, but they still must
+  // reconcile on focus or visibility recovery when another client/process may
+  // have mutated the active transcript (#4205 follow-up shape). The
+  // idle-reconcile path uses a non-'poll' reason, so it already sails through
+  // this gate untouched.
   if((reason||'poll')==='poll' && !_isExternalSession(S.session)) return 'skipped';
   // Cooldown: don't force-reload immediately after streaming ends — the
   // "done" event already delivered the final messages. Reloading here would
@@ -6751,50 +6737,33 @@ async function refreshSessionList(reason='manual', opts={}){
     _sessionListRefreshInFlight = false;
     const pendingRequest = _sessionListRefreshPendingRequest;
     _sessionListRefreshPendingRequest = null;
-    if(pendingRequest) _scheduleSessionEventsRefresh(pendingRequest.reason, pendingRequest.opts);
+    if(pendingRequest) _scheduleSessionListRefresh(pendingRequest.reason, pendingRequest.opts);
   }
 }
 
-function _scheduleSessionEventsRefresh(reason, opts={}){
-  _sessionEventsRefreshPendingRequest = {
-    reason: reason || (_sessionEventsRefreshPendingRequest && _sessionEventsRefreshPendingRequest.reason) || 'event',
-    opts:_mergeSessionListRefreshOptions(_sessionEventsRefreshPendingRequest && _sessionEventsRefreshPendingRequest.opts, opts),
+function _scheduleSessionListRefresh(reason, opts={}){
+  const pendingRequest = _sessionListRefreshScheduledRequest;
+  _sessionListRefreshScheduledRequest = {
+    reason: reason || (pendingRequest && pendingRequest.reason) || 'session-list',
+    opts:_mergeSessionListRefreshOptions(pendingRequest && pendingRequest.opts, opts),
   };
-  if(_sessionEventsRefreshTimer) return;
-  _sessionEventsRefreshTimer = setTimeout(() => {
-    _sessionEventsRefreshTimer = 0;
-    const request = _sessionEventsRefreshPendingRequest || {reason:'event', opts:{}};
-    _sessionEventsRefreshPendingRequest = null;
-    void refreshSessionList(request.reason||'event', request.opts);
+  if(_sessionListRefreshScheduleTimer) return;
+  _sessionListRefreshScheduleTimer = setTimeout(() => {
+    _sessionListRefreshScheduleTimer = 0;
+    const request = _sessionListRefreshScheduledRequest;
+    _sessionListRefreshScheduledRequest = null;
+    if(request) void refreshSessionList(request.reason, request.opts);
   }, 300);
 }
 
-function _sessionEventTargetsActiveSession(payload){
-  const eventSessionId = payload && typeof payload.session_id === 'string' ? payload.session_id : '';
-  if(!eventSessionId) return false;
-  return !!(S.session && S.session.session_id && S.session.session_id === eventSessionId);
-}
-
-// ── #4151: focus-aware close for the two GLOBAL sidebar SSE streams ──────────
-// Each WebUI window holds up to three persistent SSE connections (session-events
-// + gateway + the per-session stream). #3992/#3996 close them on the Page
-// Visibility API (`visibilitychange` / `document.hidden`) so a hidden tab frees
-// HTTP/1.1 pool slots. But a PWA *standalone* window does NOT reliably fire
-// `visibilitychange` when it merely loses focus to another window of the same
-// app — `document.hidden` only flips on minimize. So two side-by-side PWA windows
-// both stay `visibilityState==='visible'`, each keeps its sidebar streams open,
-// and 2x3 = 6 = the per-origin HTTP/1.1 connection limit; every later fetch()
-// (the 30s polls) queues behind the saturated pool and times out (#4151).
-// `document.hasFocus()` is the signal `visibilitychange` misses — only one window
-// holds focus at a time.
-//
-// Scope: ONLY the two global sidebar streams (session-events + gateway). The
-// per-session live stream (messages.js `startSessionStream`) deliberately stays
-// visibility-only — it carries live `bg_task_complete` toasts and
-// `server_turn_started` live-view that an unfocused-but-VISIBLE window must still
-// receive (the OS-notification path is gated on `document.hidden`, so the in-app
-// toast is the only completion signal a visible-unfocused window gets). Closing
-// it on blur would regress the multi-window live-view UX.
+// ── #4151: focus-aware close for the gateway sidebar SSE stream ──────────────
+// The global /api/sessions/events client stream is deliberately retired: the
+// visible five-second activity poll plus focus/visibility catch-up keeps the
+// sidebar current without consuming one persistent HTTP/1.1 connection per
+// page. The gateway stream still closes on sustained blur because standalone
+// PWA windows do not reliably emit `visibilitychange` when another window takes
+// focus. The per-session live stream remains visibility-only so a visible,
+// unfocused window can still receive completion and live-view events.
 function _sidebarSseBackgrounded(){
   if(typeof document === 'undefined') return false;
   if(document.hidden) return true;
@@ -6817,90 +6786,19 @@ function _installSidebarSseFocusHook(){
       _sidebarSseBlurCloseTimer = 0;
       // Re-check at fire time — focus may have returned during the debounce.
       if(_sidebarSseBackgrounded()){
-        _closeSessionEventsSSE();
         stopGatewaySSE();
       }
     }, _SIDEBAR_SSE_BLUR_CLOSE_MS);
   });
   window.addEventListener('focus', () => {
     if(_sidebarSseBlurCloseTimer){ clearTimeout(_sidebarSseBlurCloseTimer); _sidebarSseBlurCloseTimer = 0; }
-    // Reopen and catch up on anything missed while blurred. ensureSessionEventsSSE()
-    // is idempotent (`if(_sessionEventsSSE) return`), but startGatewaySSE() is NOT — it
-    // begins with an unconditional stopGatewaySSE(). So only reopen the gateway when it
-    // was actually closed; otherwise a transient blur shorter than the debounce (where
-    // the blur-close timer was cleared and the stream was never torn down) would
-    // drop+reconnect the live gateway on every window switch, cancelling its poll
-    // fallback and resetting probe/warning state — the exact thrash the debounce exists
-    // to prevent, in the multi-window scenario this fix targets (#4151).
-    ensureSessionEventsSSE();
+    // Reopen and catch up on anything missed while blurred. startGatewaySSE()
+    // begins with an unconditional stopGatewaySSE(), so only reopen when the
+    // stream was actually closed; otherwise a transient blur+focus would thrash
+    // the live gateway connection.
     if(!_gatewaySSE) startGatewaySSE();
     void _refreshSessionListAfterSidebarResume('focus');
   });
-}
-
-function _closeSessionEventsSSE(){
-  if(_sessionEventsSSE){
-    try{if(_sessionEventsSSE.readyState!==2)_sessionEventsSSE.close();}catch(_){ }
-    _sessionEventsSSE = null;
-    _sessionEventsNeedsRefreshOnOpen = true;
-  }
-}
-
-function ensureSessionEventsSSE(){
-  if(typeof document !== 'undefined' && !document._hermesSessionEventsVisibilityHook){
-    document.addEventListener('visibilitychange', () => {
-      if(document.hidden){
-        _closeSessionEventsSSE();
-      }else{
-        ensureSessionEventsSSE();
-        void _refreshSessionListAfterSidebarResume('visible');
-      }
-    });
-    document._hermesSessionEventsVisibilityHook = true;
-  }
-  _installSidebarSseFocusHook();
-  if(typeof EventSource==='undefined') return;
-  if(_sidebarSseBackgrounded()) return;
-  if(_sessionEventsSSE) return;
-  try{
-    // Same-origin relative URL preserves subpath mounts and normal WebUI cookies.
-    _sessionEventsSSE = new EventSource('api/sessions/events');
-    _sessionEventsSSE.onopen = () => {
-      _sessionEventsReconnectAttempt = 0;
-      if(!_sessionEventsNeedsRefreshOnOpen) return;
-      _sessionEventsNeedsRefreshOnOpen = false;
-      void _refreshSessionListAfterSidebarResume('reconnect');
-    };
-    _sessionEventsSSE.addEventListener('sessions_changed', (ev) => {
-      const activeProfile = S.activeProfile || 'default';
-      let eventTargetsActiveSession = false;
-      try {
-        const payload = typeof ev?.data === 'string' ? JSON.parse(ev.data) : {};
-        const eventProfile = payload && typeof payload.profile === 'string' ? payload.profile : '';
-        if (!_sessionEventProfilesMatch(eventProfile, activeProfile)) {
-          return;
-        }
-        eventTargetsActiveSession = _sessionEventTargetsActiveSession(payload);
-      } catch (_err) {
-        // Non-JSON payload (or transient malformed event). Keep legacy behavior:
-        // refresh once event was seen.
-      }
-      _scheduleSessionEventsRefresh(eventTargetsActiveSession?'event-active-session':'event', {force:true, refreshActive:true});
-    });
-    _sessionEventsSSE.onerror = () => {
-      _sessionEventsNeedsRefreshOnOpen = true;
-      _closeSessionEventsSSE();
-      if(_sessionEventsReconnectTimer) return;
-      const delayMs = _sessionEventsReconnectDelayMs();
-      _sessionEventsReconnectAttempt = Math.min(_sessionEventsReconnectAttempt + 1, 6);
-      _sessionEventsReconnectTimer = setTimeout(() => {
-        _sessionEventsReconnectTimer = 0;
-        ensureSessionEventsSSE();
-      }, delayMs);
-    };
-  }catch(e){
-    _closeSessionEventsSSE();
-  }
 }
 
 if(typeof window!=='undefined') window.refreshSessionList = refreshSessionList;
@@ -6998,7 +6896,7 @@ async function probeGatewaySSEStatus(){
 function startGatewaySSE(){
   stopGatewaySSE();
   if(!window._showCliSessions) return;
-  // Visibility hook (install once) — mirror ensureSessionEventsSSE() pattern
+  // Visibility hook (install once) — close while hidden and reopen on return.
   if(typeof document !== 'undefined' && !document._hermesGatewaySSEVisibilityHook){
     document.addEventListener('visibilitychange', () => {
       if(document.hidden){

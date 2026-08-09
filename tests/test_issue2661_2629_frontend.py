@@ -5,14 +5,11 @@ PANELS_JS = Path("static/panels.js").read_text(encoding="utf-8")
 CHANGELOG = Path("CHANGELOG.md").read_text(encoding="utf-8")
 
 
-def test_session_events_reconnect_uses_jittered_backoff_not_fixed_delay():
-    assert "function _sessionEventsReconnectDelayMs()" in SESSIONS_JS
-    assert "Math.random()" in SESSIONS_JS
-    assert "_sessionEventsReconnectMaxMs" in SESSIONS_JS
-    assert "_sessionEventsReconnectAttempt = 0" in SESSIONS_JS
-    ensure_fn = SESSIONS_JS[SESSIONS_JS.find("function ensureSessionEventsSSE()") :]
-    assert "const delayMs = _sessionEventsReconnectDelayMs();" in ensure_fn
-    assert "}, 5000);" not in ensure_fn
+def test_session_list_eventsource_client_is_retired_with_its_reconnect_state():
+    assert "new EventSource('api/sessions/events')" not in SESSIONS_JS
+    assert "function ensureSessionEventsSSE()" not in SESSIONS_JS
+    assert "function _sessionEventsReconnectDelayMs()" not in SESSIONS_JS
+    assert "_sessionEventsReconnectTimer" not in SESSIONS_JS
 
 
 def test_cron_expanded_run_renders_full_content_inline():
