@@ -509,6 +509,7 @@ from api.profiles import (  # noqa: F401, E402  (re-export)
     get_active_profile_name,
     get_active_profile_name as _get_active_profile_name,
     get_active_hermes_home,
+    get_hermes_home_for_profile,
     list_profiles_api,
     profile_scope_for_detached_worker,
 )
@@ -607,10 +608,13 @@ def _is_profile_agnostic_foreign_session(cli_meta) -> bool:
 def _request_session_visibility_exempt(method: str, path: str | None) -> bool:
     if not path:
         return False
-    if method == "GET" and path == "/api/session":
-        # Detail-load owns profile mismatch handling so the frontend can switch
-        # to the session's profile instead of treating a valid cross-profile
-        # deep link as a deleted/stale session.
+    if method == "GET" and path in {
+        "/api/session",
+        "/api/bestplan/push-prompt",
+    }:
+        # These routes resolve the canonical session before they enforce
+        # profile visibility. Pre-gating the browser-supplied alias can check
+        # the wrong physical session and bypass the canonical boundary.
         return True
     if method != "POST":
         return False
@@ -701,6 +705,124 @@ def _guard_request_session_visibility(handler, parsed, body=None, method="GET") 
     if isinstance(body, dict) and not _session_id_visible_to_request_profile(handler, body.get("session_id")):
         return False
     return True
+
+
+def _handle_bestplan_push_prompt(handler, parsed) -> bool:
+    """Read one context-bound local push prompt without consuming it."""
+    unavailable = "BestPlan push prompt is temporarily unavailable"
+
+    query = parse_qs(parsed.query or "")
+    requested_sid = str(query.get("session_id", [""])[0] or "").strip()
+    if not requested_sid:
+        bad(handler, "session_id is required", status=400)
+        return True
+    if not is_safe_session_id(requested_sid):
+        bad(handler, "Session not found", status=404)
+        return True
+
+    try:
+        resolution = resolve_shared_session(
+            _active_state_db_path(),
+            requested_sid,
+        )
+        resolution_status = str(getattr(resolution, "status", "found") or "")
+        canonical_sid = str(
+            getattr(resolution, "canonical_id", "") or ""
+        ).strip()
+    except Exception:
+        logger.debug(
+            "BestPlan local push session resolution failed for %s",
+            requested_sid,
+            exc_info=True,
+        )
+        return bad(handler, unavailable, status=503) or True
+    if resolution_status == "missing":
+        bad(handler, "Session not found", status=404)
+        return True
+    if resolution_status not in {"found", "ambiguous"}:
+        return bad(handler, unavailable, status=503) or True
+    if not canonical_sid or not is_safe_session_id(canonical_sid):
+        return bad(handler, unavailable, status=503) or True
+
+    try:
+        session = get_session(canonical_sid, metadata_only=True)
+    except KeyError:
+        bad(handler, "Session not found", status=404)
+        return True
+    except Exception:
+        logger.debug(
+            "BestPlan local push session load failed for %s",
+            canonical_sid,
+            exc_info=True,
+        )
+        return bad(handler, unavailable, status=503) or True
+
+    try:
+        profile = str(getattr(session, "profile", None) or "")
+        visible = _session_visible_to_active_profile(profile, handler)
+        workspace = str(getattr(session, "workspace", None) or "").strip()
+    except Exception:
+        logger.debug(
+            "BestPlan local push session identity read failed for %s",
+            canonical_sid,
+            exc_info=True,
+        )
+        return bad(handler, unavailable, status=503) or True
+    if not visible:
+        bad(handler, "Session not found", status=404)
+        return True
+    if resolution_status == "ambiguous":
+        return j(handler, {"prompt": None}) or True
+    if not workspace:
+        return bad(handler, unavailable, status=503) or True
+
+    store = None
+    prompt = None
+    failed = False
+    try:
+        from agent.bestplan_local_push import recover_local_push_prompt
+        from agent.bestplan_state import BestplanStore
+
+        profile_home = get_hermes_home_for_profile(profile)
+        store = BestplanStore(
+            db_path=Path(profile_home) / "state.db",
+            reconcile_push_state=False,
+        )
+        prompt = recover_local_push_prompt(
+            session_id=canonical_sid,
+            profile=profile,
+            workspace=workspace,
+            store=store,
+            deadline=time.monotonic() + 10.0,
+        )
+    except Exception:
+        failed = True
+        logger.debug(
+            "BestPlan local push prompt recovery failed for session %s",
+            canonical_sid,
+            exc_info=True,
+        )
+    finally:
+        if store is not None:
+            try:
+                close_store = getattr(store, "close", None)
+                if not callable(close_store):
+                    raise RuntimeError("BestPlan store has no close method")
+                close_store()
+            except Exception:
+                failed = True
+                logger.debug(
+                    "BestPlan local push store close failed for session %s",
+                    canonical_sid,
+                    exc_info=True,
+                )
+    if failed:
+        return bad(handler, unavailable, status=503) or True
+    if prompt is None:
+        return j(handler, {"prompt": None}) or True
+    if not isinstance(prompt, str) or not prompt:
+        return bad(handler, unavailable, status=503) or True
+    return j(handler, {"prompt": prompt}) or True
 
 
 def _active_skills_dir() -> Path:
@@ -13895,6 +14017,9 @@ def handle_get(handler, parsed) -> bool:
 
     if parsed.path.startswith("/api/") and not _guard_request_session_visibility(handler, parsed, method="GET"):
         return True
+
+    if parsed.path == "/api/bestplan/push-prompt":
+        return _handle_bestplan_push_prompt(handler, parsed)
 
     # ── Insights / knowledge status ──
     if parsed.path == "/api/insights":

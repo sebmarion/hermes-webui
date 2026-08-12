@@ -1937,6 +1937,11 @@
   .onboarding-actions .sm-btn{padding:10px 16px;}
   .reconnect-banner{display:none;background:var(--surface);border:1px solid var(--accent-bg-strong);border-radius:10px;padding:10px 16px;margin:10px auto;max-width:780px;font-size:13px;color:var(--accent-text);display:none;align-items:center;justify-content:space-between;gap:12px;}
   .reconnect-banner.visible{display:flex;}
+  .bestplan-push-prompt-card[hidden]{display:none!important;}
+  .bestplan-push-prompt-card{flex-shrink:0;width:100%;padding:8px 20px 0;}
+  .bestplan-push-prompt-card__inner{display:flex;align-items:baseline;gap:8px;max-width:var(--msg-max);margin:0 auto;padding:9px 12px;border:1px solid color-mix(in srgb,var(--warning) 38%,var(--border));border-radius:var(--radius-md);background:color-mix(in srgb,var(--warning) 8%,var(--surface));}
+  .bestplan-push-prompt-card__heading{flex:0 0 auto;color:var(--warning);font-size:var(--font-size-sm);font-weight:650;line-height:1.4;}
+  .bestplan-push-prompt-card__text{min-width:0;color:var(--muted);font-size:var(--font-size-sm);line-height:1.4;white-space:pre-wrap;overflow-wrap:anywhere;}
   .reconnect-btn{padding:6px 12px;border-radius:8px;font-size:12px;font-weight:600;background:var(--accent-bg-strong);border:1px solid var(--accent-bg-strong);color:var(--accent-text);cursor:pointer;}
   .reconnect-btn:hover{background:var(--accent-bg-strong);}
   .offline-banner{position:fixed;left:0;right:0;top:0;z-index:1200;display:none;align-items:center;justify-content:space-between;gap:14px;padding:12px 18px;border-bottom:1px solid color-mix(in srgb,var(--accent) 50%,var(--surface));background:color-mix(in srgb,var(--surface) 88%,var(--accent));color:var(--text);box-shadow:0 12px 40px rgba(0,0,0,.22);backdrop-filter:blur(10px);}
@@ -3257,6 +3262,8 @@
   }
 
   @media (max-width: 640px){
+    .bestplan-push-prompt-card{padding:6px 10px 0;}
+    .bestplan-push-prompt-card__inner{align-items:flex-start;flex-direction:column;gap:2px;}
     /* Match the close (X) glyph to the new-conversation (+) button's 14px size
        (previously 18px — the only 18px panel-head icon, so the X read visibly
        larger than the +) and align its vertical center with the +. The + sits

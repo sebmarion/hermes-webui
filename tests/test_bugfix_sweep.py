@@ -144,9 +144,14 @@ def test_session_url_builder_strips_legacy_session_query_alias():
 def test_cross_profile_session_deep_links_switch_profile_instead_of_self_healing():
     routes = (ROOT / "api" / "routes.py").read_text(encoding="utf-8")
     sessions = (ROOT / "static" / "sessions.js").read_text(encoding="utf-8")
+    guard_start = routes.index("def _request_session_visibility_exempt")
+    guard_end = routes.index("\n\ndef ", guard_start)
+    visibility_guard = routes[guard_start:guard_end]
 
     assert '"code": "session_profile_mismatch"' in routes
-    assert 'if method == "GET" and path == "/api/session":' in routes
+    assert 'method == "GET"' in visibility_guard
+    assert '"/api/session"' in visibility_guard
+    assert '"/api/bestplan/push-prompt"' in visibility_guard
     assert "function _sessionProfileMismatchFromError" in sessions
     assert "_switchProfileForSessionLoad(profileMismatch.profile)" in sessions
     assert "skipProfileResolve:true" in sessions

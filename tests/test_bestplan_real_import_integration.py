@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import time
 import types
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +39,365 @@ def _wait_until(predicate, timeout=5.0):
             return True
         time.sleep(0.01)
     return bool(predicate())
+
+
+def _local_bridge_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "local-bridge-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "bestplan-webui@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "BestPlan WebUI Test"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "feature.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "feature.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    return repo
+
+
+def _local_bridge_response(workspace: str, bestplan_state) -> str:
+    manifest = {
+        "version": 1,
+        "mode": "delegate",
+        "risk": "low",
+        "slices": [
+            {
+                "id": "implement",
+                "kind": "implement",
+                "goal": "Implement the approved WebUI change",
+                "depends_on": [],
+                "capability": "fast_fallback",
+                "workspace": workspace,
+                "allowed_paths": ["feature.py"],
+                "read_only": False,
+                "expected_artifacts": ["feature.py"],
+                "acceptance": [
+                    "pytest -q -- tests/test_bestplan_real_import_integration.py",
+                ],
+            }
+        ],
+        "merge_policy": "Integrate after exact checks.",
+        "stop_condition": "All exact checks pass.",
+        "escalation_predicates": ["verification_failed_after_local_repair"],
+    }
+    envelope = (
+        f"{bestplan_state.BESTPLAN_ENVELOPE_START}\n"
+        + json.dumps({"version": 1, "manifest": manifest}, sort_keys=True)
+        + f"\n{bestplan_state.BESTPLAN_ENVELOPE_END}"
+    )
+    return "Suggested plan.\n\n" + envelope
+
+
+def _local_bridge_inputs(snapshot, tmp_path: Path):
+    from agent.bestplan_contract import BoundCommand, ControllerIdentity
+    from agent.bestplan_local import LocalCheckPlan, LocalExecutionInputs
+
+    controller_source = tmp_path / "controller"
+    controller_source.mkdir(exist_ok=True)
+    controller = ControllerIdentity(
+        repository_id=snapshot.repo.repository_id,
+        controller_id="webui-local-controller",
+        release_oid=snapshot.head_oid,
+        artifact_sha256=hashlib.sha256(b"controller").hexdigest(),
+    )
+    command = BoundCommand(
+        identifier="pytest",
+        executable="/usr/bin/true",
+        executable_sha256=hashlib.sha256(b"true").hexdigest(),
+        argv=(),
+        logical_cwd="integration",
+        env=(),
+        inputs=(),
+        cache=(),
+        timeout_seconds=60,
+        network_allowlist=(),
+    )
+    check_plan = LocalCheckPlan(
+        commands=(command,),
+        runtime_read_paths=(),
+        sandbox_executable=Path("/usr/bin/sandbox-exec"),
+        sandbox_executable_sha256=hashlib.sha256(b"sandbox").hexdigest(),
+        policy_version="bestplan-check-v1",
+        check_runtime_digest=hashlib.sha256(b"runtime").hexdigest(),
+        pytest_module_path=Path("/opt/test/pytest/__init__.py"),
+    )
+    return LocalExecutionInputs(
+        controller_source=controller_source.resolve(),
+        controller=controller,
+        check_plan=check_plan,
+    )
+
+
+def test_real_agent_webui_local_capture_go_prompt_and_decline_without_model(
+    tmp_path, monkeypatch,
+):
+    """Prove the WebUI host path uses the real local-main Agent contract."""
+    bestplan_state, _async_delegation = _agent_modules(monkeypatch)
+    from agent import bestplan_local
+    from agent.bestplan_local_git import (
+        LOCAL_MAIN_REF,
+        LocalMainLandingReceipt,
+        LocalMainPushTarget,
+    )
+    from agent.bestplan_local_push import recover_local_push_prompt
+    from api import streaming
+    from gateway import session_context
+
+    assert bestplan_state.BESTPLAN_HOST_CAPABILITY_VERSION >= 2
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    workspace = _local_bridge_repo(tmp_path).resolve()
+    session_id = "webui-local-bestplan"
+    stream_id = "stream-local-bestplan"
+    profile = "coder"
+    current_config = {"bestplan": {"explorers": 3}}
+
+    from agent.bestplan_source import capture_source_snapshot, resolve_repo_identity
+
+    snapshot = capture_source_snapshot(
+        resolve_repo_identity(str(workspace)),
+        time.monotonic() + 20.0,
+    )
+    monkeypatch.setattr(
+        bestplan_local,
+        "capture_local_execution_inputs",
+        lambda **_kwargs: _local_bridge_inputs(snapshot, tmp_path),
+    )
+
+    capture_calls = []
+    real_capture = bestplan_state.capture_bestplan_agent_result
+
+    def capture_through_real_agent(result, **kwargs):
+        capture_calls.append(dict(kwargs))
+        return real_capture(result, **kwargs)
+
+    monkeypatch.setattr(
+        bestplan_state,
+        "capture_bestplan_agent_result",
+        capture_through_real_agent,
+    )
+    model_response = _local_bridge_response(str(workspace), bestplan_state)
+    session = types.SimpleNamespace(
+        session_id=session_id,
+        profile=profile,
+        workspace=str(workspace),
+        active_stream_id=stream_id,
+        messages=[],
+    )
+    result = {
+        "final_response": model_response,
+        "messages": [
+            {"role": "user", "content": "implement the approved change"},
+            {"role": "assistant", "content": model_response},
+        ],
+        "completed": True,
+    }
+    captured, accepted, plan_id = (
+        streaming._capture_bestplan_result_after_writeback_fence(
+            result,
+            bestplan_config={"count": 3},
+            config=current_config,
+            ephemeral=False,
+            session=session,
+            stream_id=stream_id,
+            cancel_event=types.SimpleNamespace(is_set=lambda: False),
+            host_agent=None,
+            captured_terminal_error=None,
+            previous_messages=[],
+            previous_context_messages=[],
+            message="implement the approved change",
+            source="webui",
+            active_turn_identity=None,
+            profile_home=str(profile_home),
+            provisional_plan_ids=[],
+        )
+    )
+    assert accepted is True
+    assert plan_id == captured["bestplan_capture"]["plan_id"]
+    assert captured["bestplan_capture"]["executable"] is True
+    assert capture_calls[0]["local_execution"] is True
+    assert capture_calls[0]["config"] is current_config
+
+    session.messages = captured["messages"]
+    streaming._commit_provisional_bestplan_capture(
+        plan_id,
+        profile_home=str(profile_home),
+        session=session,
+        stream_id=stream_id,
+    )
+    state_path = profile_home / "state.db"
+    store = bestplan_state.BestplanStore(
+        db_path=state_path,
+        reconcile_push_state=False,
+    )
+    row = store.get_plan(plan_id)
+    assert row["state"] == bestplan_state.PlanState.PENDING
+    assert row["execution_protocol"] == 2
+    assert row["promotion_contract_version"] == 1
+    assert row["promotion_mode"] == "local_main"
+    store.close()
+
+    # ``tools.delegate_tool`` imports every terminal backend. The WebUI test
+    # environment deliberately does not install those optional runtimes, so
+    # replace only this expensive dispatch seam while the Agent state machine,
+    # validation, capture, go resolver, and push state remain real imports.
+    delegate_tool = types.ModuleType("tools.delegate_tool")
+    monkeypatch.setitem(sys.modules, "tools.delegate_tool", delegate_tool)
+    local_runtime = types.SimpleNamespace(candidate_runtime=object())
+    monkeypatch.setattr(
+        bestplan_local,
+        "build_local_execution_runtime",
+        lambda **_kwargs: local_runtime,
+    )
+    monkeypatch.setattr(
+        bestplan_local,
+        "build_local_authority_bindings",
+        lambda _runtimes: ("webui-authority",),
+    )
+    delegate_tool._validate_bestplan_host_runtime = lambda *_args, **_kwargs: None
+    delegate_tool._bestplan_host_runtime_projection = (
+        lambda _runtime: {"candidate_host_runtime_digest": "d" * 64}
+    )
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
+    runtime = {
+        "route": "code_worker",
+        "provider": "controlled",
+        "model": "webui-local-test",
+        "runtime_fingerprint": "a" * 64,
+    }
+    delegate_tool.resolve_bestplan_runtime_specs = (
+        lambda _tasks, _parent, **_kwargs: [dict(runtime)]
+    )
+    dispatch_calls = []
+    integration_oid = snapshot.head_oid
+    check_digest = "c" * 64
+
+    def controlled_dispatch(**kwargs):
+        dispatch_calls.append(kwargs)
+        dispatch_store = bestplan_state.BestplanStore(
+            db_path=state_path,
+            reconcile_push_state=False,
+        )
+        try:
+            target = LocalMainPushTarget(
+                remote_name="origin",
+                remote_ref=LOCAL_MAIN_REF,
+                display_url="ssh://git.example.invalid/project.git",
+                remote_identity_sha256=hashlib.sha256(b"exact remote").hexdigest(),
+                observed_remote_oid=snapshot.head_oid,
+                integration_oid=integration_oid,
+            )
+            prepared = dispatch_store.prepare_local_push(
+                kwargs["plan_id"],
+                session_id=session_id,
+                profile=profile,
+                workspace=str(workspace),
+                expected_target_oid=snapshot.head_oid,
+                integration_oid=integration_oid,
+                check_set_digest=check_digest,
+                target=target,
+                expires_at=int(time.time()) + 600,
+            )
+            assert prepared is not None
+            assert dispatch_store.activate_local_push(
+                kwargs["plan_id"],
+                landing_receipt=LocalMainLandingReceipt(
+                    target_ref=LOCAL_MAIN_REF,
+                    old_oid=snapshot.head_oid,
+                    new_oid=integration_oid,
+                    check_receipt_digest=check_digest,
+                ),
+            )
+        finally:
+            dispatch_store.close()
+        return {
+            "status": "dispatched",
+            "delegation_id": kwargs["dispatch_id"],
+        }
+
+    delegate_tool.dispatch_bestplan_tasks_async = controlled_dispatch
+
+    class NoModelAgent:
+        model_calls = 0
+
+        def run_conversation(self, **_kwargs):
+            type(self).model_calls += 1
+            raise AssertionError("exact BestPlan controls must not enter the model")
+
+        def _persist_session(self, *_args, **_kwargs):
+            return True
+
+    host_agent = NoModelAgent()
+    go_result = streaming._run_agent_with_bestplan_ingress(
+        host_agent,
+        original_message="go",
+        invocation_message="go",
+        conversation_history=captured["messages"],
+        run_conversation_kwargs={"user_message": "go"},
+        session_id=session_id,
+        profile=profile,
+        workspace=str(workspace),
+        profile_home=str(profile_home),
+        config={},
+    )
+    assert go_result["host_ingress"]["status"] == "waiting"
+    assert go_result["api_calls"] == 0
+    assert NoModelAgent.model_calls == 0
+    assert len(dispatch_calls) == 1
+    assert dispatch_calls[0]["promotion_mode"] == "local_main"
+
+    store = bestplan_state.BestplanStore(
+        db_path=state_path,
+        reconcile_push_state=False,
+    )
+    prompt = recover_local_push_prompt(
+        session_id=session_id,
+        profile=profile,
+        workspace=str(workspace),
+        store=store,
+        now=time.time(),
+    )
+    assert prompt is not None
+    assert "Reply `push` or `no`." in prompt
+    assert store.get_plan(plan_id)["local_push_state"] == "awaiting"
+    store.close()
+
+    no_result = streaming._run_agent_with_bestplan_ingress(
+        host_agent,
+        original_message="no",
+        invocation_message="no",
+        conversation_history=go_result["messages"],
+        run_conversation_kwargs={"user_message": "no"},
+        session_id=session_id,
+        profile=profile,
+        workspace=str(workspace),
+        profile_home=str(profile_home),
+        config={},
+    )
+    assert no_result["host_ingress"]["status"] == "push_declined"
+    assert no_result["api_calls"] == 0
+    assert NoModelAgent.model_calls == 0
+    assert "did not change the remote" in no_result["final_response"]
+
+    store = bestplan_state.BestplanStore(
+        db_path=state_path,
+        reconcile_push_state=False,
+    )
+    assert store.get_plan(plan_id)["local_push_state"] == "declined"
+    assert recover_local_push_prompt(
+        session_id=session_id,
+        profile=profile,
+        workspace=str(workspace),
+        store=store,
+        now=time.time(),
+    ) is None
+    store.close()
 
 
 def test_real_checkpoint_crash_recovery_insert_ack_wakeup_and_restart(

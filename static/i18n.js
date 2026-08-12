@@ -164,6 +164,7 @@ const LOCALES = {
     reconnect_active: 'A response is still being generated. Reload when ready?',
     reconnect_finished: 'A response was in progress when you last left. Messages may have updated.',
     // approval card
+    bestplan_push_prompt_heading: 'Push local main?',
     approval_heading: 'Approval required',
     approval_desc_prefix: 'Dangerous command detected',
     approval_btn_once: 'Allow once',
@@ -1929,6 +1930,7 @@ const LOCALES = {
     reconnect_active: 'Una risposta è ancora in generazione. Ricaricare quando pronta?',
     reconnect_finished: 'Una risposta era in corso quando hai lasciato. I messaggi potrebbero essere aggiornati.',
     // approval card
+    bestplan_push_prompt_heading: 'Inviare il main locale?',
     approval_heading: 'Approvazione richiesta',
     approval_desc_prefix: 'Comando pericoloso rilevato',
     approval_btn_once: 'Consenti una volta',
@@ -3675,6 +3677,7 @@ const LOCALES = {
     reconnect_active: '応答を生成中です。準備ができたら再読み込みしますか?',
     reconnect_finished: '前回離脱時に応答が進行中でした。メッセージが更新されている可能性があります。',
     // approval card
+    bestplan_push_prompt_heading: 'ローカルの main をプッシュしますか？',
     approval_heading: '承認が必要',
     approval_desc_prefix: '危険なコマンドを検出しました',
     approval_btn_once: '今回だけ許可',
@@ -5409,6 +5412,7 @@ const LOCALES = {
     regen_failed: 'Не удалось сгенерировать заново: ',
     reconnect_active: 'Ответ всё ещё генерируется. Обновить, когда будет готово?',
     reconnect_finished: 'Когда вы уходили, ответ ещё генерировался. Сообщения могли обновиться.',
+    bestplan_push_prompt_heading: 'Отправить локальную ветку main?',
     approval_heading: 'Требуется подтверждение',
     approval_desc_prefix: 'Обнаружена опасная команда',
     approval_btn_once: 'Разрешить один раз',
@@ -7124,6 +7128,7 @@ const LOCALES = {
     reconnect_active: 'Todavía se está generando una respuesta. ¿Recargar cuando termine?',
     reconnect_finished: 'Había una respuesta en curso cuando te fuiste. Puede que los mensajes se hayan actualizado.',
     // approval card
+    bestplan_push_prompt_heading: '¿Enviar la rama main local?',
     approval_heading: 'Se requiere aprobación',
     approval_desc_prefix: 'Se detectó un comando peligroso',
     approval_btn_once: 'Permitir una vez',
@@ -8817,6 +8822,7 @@ const LOCALES = {
     reconnect_active: 'Eine Antwort wird noch generiert. Neu laden, wenn bereit?',
     reconnect_finished: 'Eine Antwort war in Arbeit, als Sie zuletzt gegangen sind. Nachrichten könnten aktualisiert worden sein.',
     // approval card
+    bestplan_push_prompt_heading: 'Lokalen main-Branch pushen?',
     approval_heading: 'Genehmigung erforderlich',
     approval_desc_prefix: 'Gefährlicher Befehl erkannt',
     approval_btn_once: 'Einmal zulassen',
@@ -10503,6 +10509,7 @@ const LOCALES = {
     reconnect_active: '回复仍在生成中，准备好后要重新加载吗？',
     reconnect_finished: '你离开时有回复正在生成，消息内容可能已经更新。',
     // approval card
+    bestplan_push_prompt_heading: '推送本地 main？',
     approval_heading: '需要审批',
     approval_desc_prefix: '检测到危险命令',
     approval_btn_once: '允许一次',
@@ -12212,6 +12219,7 @@ const LOCALES = {
     reconnect_active: '回覆仍在產生中。完成後要重新載入嗎？',
     reconnect_finished: '離開時仍有回覆正在處理。訊息可能已經更新。',
     // approval card
+    bestplan_push_prompt_heading: '推送本機 main？',
     approval_heading: '需要核准',
     approval_desc_prefix: '偵測到危險命令',
     approval_btn_once: '允許一次',
@@ -13867,6 +13875,7 @@ const LOCALES = {
     reconnect_active: 'Uma resposta ainda está sendo gerada. Recarregar quando estiver pronto?',
     reconnect_finished: 'Uma resposta estava em andamento quando você saiu. As mensagens podem ter atualizado.',
     // approval card
+    bestplan_push_prompt_heading: 'Enviar a main local?',
     approval_heading: 'Aprovação necessária',
     approval_desc_prefix: 'Comando perigoso detectado',
     approval_btn_once: 'Permitir uma vez',
@@ -15498,6 +15507,7 @@ const LOCALES = {
     reconnect_active: 'A response is still being generated. Reload when ready?',
     reconnect_finished: 'A response was in progress when you last left. Messages may have updated.',
     // approval card
+    bestplan_push_prompt_heading: '로컬 main을 푸시할까요?',
     approval_heading: '승인 필요',
     approval_desc_prefix: '위험한 명령이 감지되었습니다',
     approval_btn_once: '한 번 허용',
@@ -17255,6 +17265,7 @@ const LOCALES = {
     regen_failed: 'Échec de la régénération : ',
     reconnect_active: 'Une réponse est toujours en cours de génération. Recharger quand vous êtes prêt ?',
     reconnect_finished: 'Une réponse était en cours lors de votre dernier départ. Les messages ont peut-être été mis à jour.',
+    bestplan_push_prompt_heading: 'Pousser la branche main locale ?',
     approval_heading: 'Approbation requise',
     approval_desc_prefix: 'Commande dangereuse détectée',
     approval_btn_once: 'Autoriser une fois',
@@ -20043,6 +20054,7 @@ const LOCALES = {
     approval_desc_prefix: 'Byl zjištěn nebezpečný příkaz',
     approval_gateway_unsupported: 'Schválení vyžadují novější gateway. Upgradujte připojený Hermes gateway.',
     approval_gateway_unsupported_label: 'Schválení nejsou podporována',
+    bestplan_push_prompt_heading: 'Odeslat místní větev main?',
     approval_heading: 'Požadováno schválení',
     approval_responding: 'Reakce\u2026',
     auto_compress_label: 'Automatická komprese',
@@ -20681,6 +20693,7 @@ const LOCALES = {
     reconnect_active: 'Halen bir yanıt oluşturuluyor. Hazır olduğunuzda yeniden yüklensin mi?',
     reconnect_finished: 'En son ayrıldığınızda bir yanıt sürüyordu. Mesajlar güncellenmiş olabilir.',
     // approval card
+    bestplan_push_prompt_heading: 'Yerel main dalı gönderilsin mi?',
     approval_heading: 'Onay gerekli',
     approval_desc_prefix: 'Tehlikeli komut algılandı',
     approval_btn_once: 'Bir kez izin ver',
@@ -22430,6 +22443,7 @@ const LOCALES = {
     reconnect_active: 'Odpowiedź jest nadal generowana. Odświeżyć, gdy będzie gotowa?',
     reconnect_finished: 'Podczas Twojej ostatniej wizyty odpowiedź była w toku. Wiadomości mogły zostać zaktualizowane.',
     // approval card
+    bestplan_push_prompt_heading: 'Wysłać lokalną gałąź main?',
     approval_heading: 'Wymagana aprobata',
     approval_desc_prefix: 'Wykryto niebezpieczne polecenie',
     approval_btn_once: 'Zezwól raz',
@@ -24164,6 +24178,7 @@ const LOCALES = {
     reconnect_active: 'Một phản hồi vẫn đang được tạo. Tải lại khi sẵn sàng?',
     reconnect_finished: 'Một phản hồi đang diễn ra khi bạn rời đi lần trước. Tin nhắn có thể đã được cập nhật.',
     // approval card
+    bestplan_push_prompt_heading: 'Đẩy nhánh main cục bộ?',
     approval_heading: 'Yêu cầu phê duyệt',
     approval_desc_prefix: 'Phát hiện lệnh nguy hiểm',
     approval_btn_once: 'Cho phép một lần',

@@ -1804,6 +1804,7 @@ async function loadSession(sid){
       return false;
     }
   }
+  if(typeof _beginBestplanPushPromptSessionLoad==='function') _beginBestplanPushPromptSessionLoad(sid);
   // Mark this session as the in-flight load. Subsequent loadSession() calls
   // will overwrite this; stale awaits use the mismatch to bail out (#1060).
   const _loadGeneration = ++_loadSessionGeneration;
@@ -2601,6 +2602,17 @@ async function loadSession(sid){
       elapsed_ms:Date.now()-_lazyTailLoadStartedAt,
     });
   }
+
+  if(
+    S.session &&
+    S.session.session_id &&
+    typeof _commitBestplanPushPromptSessionLoad==='function'
+  ) _commitBestplanPushPromptSessionLoad(S.session.session_id);
+  if(
+    S.session &&
+    S.session.session_id &&
+    typeof _refreshBestplanPushPrompt==='function'
+  ) void _refreshBestplanPushPrompt(S.session.session_id);
 
   // ── Cross-channel handoff hint ──
   // After session fully loaded, check if this is a messaging session with

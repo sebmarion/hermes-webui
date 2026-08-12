@@ -8,6 +8,78 @@ function _apiUrl(path) {
   return new URL(path, document.baseURI || location.href).href;
 }
 
+let _bestplanPushPromptGeneration = 0;
+let _bestplanPushPromptSessionId = null;
+
+function _clearBestplanPushPrompt() {
+  const card = $('bestplanPushPromptCard');
+  const text = $('bestplanPushPromptText');
+  if (text) text.textContent = '';
+  if (card) {
+    card.hidden = true;
+    card.setAttribute('aria-hidden', 'true');
+    card.setAttribute('inert', '');
+    delete card.dataset.sessionId;
+  }
+  _bestplanPushPromptSessionId = null;
+}
+
+function _renderBestplanPushPrompt(prompt, sid) {
+  const activeSid = S.session && S.session.session_id;
+  if (!sid || activeSid !== sid) return false;
+  if (prompt === null) {
+    _clearBestplanPushPrompt();
+    return true;
+  }
+  if (typeof prompt !== 'string' || !prompt.length) return false;
+  const card = $('bestplanPushPromptCard');
+  const text = $('bestplanPushPromptText');
+  if (!card || !text) return false;
+  text.textContent = prompt;
+  card.dataset.sessionId = sid;
+  card.hidden = false;
+  card.setAttribute('aria-hidden', 'false');
+  card.removeAttribute('inert');
+  _bestplanPushPromptSessionId = sid;
+  return true;
+}
+
+function _beginBestplanPushPromptSessionLoad(sid) {
+  _bestplanPushPromptGeneration += 1;
+}
+
+function _commitBestplanPushPromptSessionLoad(sid) {
+  const committedSid = String(sid || '').trim();
+  if (!committedSid) return false;
+  if (_bestplanPushPromptSessionId && _bestplanPushPromptSessionId !== committedSid) {
+    _clearBestplanPushPrompt();
+  }
+  return true;
+}
+
+async function _refreshBestplanPushPrompt(sid) {
+  const requestedSid = String(sid || '').trim();
+  if (!requestedSid) return false;
+  const generation = ++_bestplanPushPromptGeneration;
+  let data;
+  try {
+    data = await api(
+      `/api/bestplan/push-prompt?session_id=${encodeURIComponent(requestedSid)}`,
+      {timeoutMs: 10000, timeoutToast: false, retries: 0},
+    );
+  } catch (_) {
+    return false;
+  }
+  if (
+    generation !== _bestplanPushPromptGeneration ||
+    !S.session ||
+    S.session.session_id !== requestedSid
+  ) return false;
+  if (!data || !Object.prototype.hasOwnProperty.call(data, 'prompt')) return false;
+  if (data.prompt !== null && typeof data.prompt !== 'string') return false;
+  return _renderBestplanPushPrompt(data.prompt, requestedSid);
+}
+
 // Module-scope dedupe ring buffer for bg_task_complete events. Shared between
 // the in-turn STREAMS path (per-turn EventSource inside the chat-stream wirer)
 // and the persistent session-scoped path (/api/session/stream), so the
@@ -6572,6 +6644,12 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           // TTS auto-read: speak the last assistant response if enabled (#499)
           if(typeof autoReadLastAssistant==='function') setTimeout(()=>autoReadLastAssistant(), 300);
         }
+        if(
+          isActiveSession &&
+          S.session &&
+          S.session.session_id===completedSid &&
+          typeof _refreshBestplanPushPrompt==='function'
+        ) void _refreshBestplanPushPrompt(completedSid);
         if(!lastAsst&&_terminalDoneMessages.length){
           lastAsst=[..._terminalDoneMessages].reverse().find(m=>m&&m.role==='assistant')||null;
         }
@@ -8830,6 +8908,9 @@ function _handleBgTaskCompleteEvent(e, expectedSid, opts) {
     const evt_id = d.event_id ? String(d.event_id) : '';
     if (!evt_id) return;  // server contract requires event_id; ignore otherwise
     if (_bgTaskCompleteRingBufferAdd(sid, evt_id)) return;  // duplicate
+    try {
+      if (typeof _refreshBestplanPushPrompt === 'function') void _refreshBestplanPushPrompt(sid);
+    } catch (_) {}
     const pid = String(d.task_id || '');
     const _viewed = typeof _isSessionActivelyViewed === 'function' && _isSessionActivelyViewed(sid);
     if (_viewed) {

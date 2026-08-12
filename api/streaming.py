@@ -6,6 +6,7 @@ import base64
 import contextlib
 import contextvars
 import hashlib
+import inspect
 import json
 import logging
 import mimetypes
@@ -3005,6 +3006,24 @@ def _bestplan_host_result(
     }
 
 
+def _callable_accepts_keyword(callable_obj, keyword: str) -> bool:
+    """Return false only when a callable signature proves a keyword unsupported."""
+    try:
+        parameters = inspect.signature(callable_obj).parameters
+    except (TypeError, ValueError):
+        return True
+    parameter = parameters.get(keyword)
+    if parameter is not None and parameter.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    }:
+        return True
+    return any(
+        item.kind == inspect.Parameter.VAR_KEYWORD
+        for item in parameters.values()
+    )
+
+
 def _try_resolve_bestplan_go_ingress(
     agent,
     *,
@@ -3017,35 +3036,42 @@ def _try_resolve_bestplan_go_ingress(
     config: dict,
     host_agent=None,
 ):
-    """Resolve bare go without consuming generic process notifications."""
-    if str(original_message or "").strip().casefold() != "go":
-        return None
-    go_enabled = bool(((config or {}).get("autonomy") or {}).get("go_enabled"))
-    if not go_enabled:
+    """Resolve exact BestPlan control replies before any model call."""
+    control = original_message
+    if not isinstance(control, str) or control not in {"go", "push", "no"}:
         return None
     try:
         import importlib
 
         _bestplan_state = importlib.import_module("agent.bestplan_state")
         BestplanStore = _bestplan_state.BestplanStore
-        is_go_enabled = _bestplan_state.is_go_enabled
         try_resolve_go = _bestplan_state.try_resolve_go
     except ModuleNotFoundError as exc:
-        # WebUI can be upgraded before its managed Hermes runtime. Preserve
-        # ordinary turns while the feature is disabled, but never let an
-        # explicitly enabled bare-go request fall through into model tools.
+        # WebUI can be upgraded before its managed Hermes runtime. Exact host
+        # control replies must fail closed because only Agent can determine
+        # whether a context-bound local plan or push prompt is pending.
         if exc.name != "agent.bestplan_state":
-            raise
-        if go_enabled:
-            response = "Plan execution was not started (resolver_unavailable): Hermes core upgrade required"
-            return _bestplan_host_result(
-                original_message=original_message,
-                conversation_history=conversation_history,
-                status="resolver_unavailable",
-                response=response,
-                host_agent=host_agent or agent,
-            )
-        return None
+            logger.exception("BestPlan host resolver import failed")
+        response = "Plan execution was not started (resolver_unavailable): Hermes core upgrade required"
+        return _bestplan_host_result(
+            original_message=original_message,
+            conversation_history=conversation_history,
+            status="resolver_unavailable",
+            response=response,
+            host_agent=host_agent or agent,
+        )
+    except Exception:
+        logger.exception("BestPlan host resolver API failed closed")
+        return _bestplan_host_result(
+            original_message=original_message,
+            conversation_history=conversation_history,
+            status="resolver_error",
+            response=(
+                "Plan execution was not started (resolver_error): "
+                "Hermes core host resolver failed closed"
+            ),
+            host_agent=host_agent or agent,
+        )
 
     if int(getattr(_bestplan_state, "BESTPLAN_HOST_CAPABILITY_VERSION", 0) or 0) < 2:
         return _bestplan_host_result(
@@ -3055,19 +3081,76 @@ def _try_resolve_bestplan_go_ingress(
             response="Plan execution was not started (capability_upgrade_required): Hermes core V2 host capability required",
             host_agent=host_agent or agent,
         )
-    store = BestplanStore(db_path=Path(profile_home) / "state.db")
-    try:
-        resolved = try_resolve_go(
-            original_message,
-            session_id=session_id,
-            profile=str(profile or ""),
-            workspace=workspace,
-            parent_agent=agent,
-            config=config,
-            store=store,
-        )
-    except Exception as exc:
-        if is_go_enabled(config):
+
+    if control in {"push", "no"}:
+        try:
+            import importlib
+
+            try_resolve_local_push = importlib.import_module(
+                "agent.bestplan_local_push"
+            ).try_resolve_local_push
+            store = BestplanStore(
+                db_path=Path(profile_home) / "state.db",
+                reconcile_push_state=False,
+            )
+            try:
+                resolved = try_resolve_local_push(
+                    original_message,
+                    session_id=session_id,
+                    profile=str(profile or ""),
+                    workspace=workspace,
+                    store=store,
+                )
+            finally:
+                close_store = getattr(store, "close", None)
+                if callable(close_store):
+                    close_store()
+        except Exception:
+            logger.exception("BestPlan local push resolver failed closed")
+            return _bestplan_host_result(
+                original_message=original_message,
+                conversation_history=conversation_history,
+                status="push_stale",
+                response=(
+                    "The push confirmation for plan (unknown) failed closed "
+                    "(push_stale): local push resolver failed closed."
+                ),
+                host_agent=host_agent or agent,
+            )
+        if resolved is None or not resolved.resolved:
+            status = str(getattr(resolved, "status", "") or "no_push_prompt")
+            return _bestplan_host_result(
+                original_message=original_message,
+                conversation_history=conversation_history,
+                status=status,
+                response=(
+                    "No active, context-matched BestPlan push confirmation "
+                    "exists. No remote write was started."
+                ),
+                host_agent=host_agent or agent,
+            )
+    else:
+        try:
+            store = BestplanStore(
+                db_path=Path(profile_home) / "state.db",
+                reconcile_push_state=False,
+            )
+            try:
+                resolved = try_resolve_go(
+                    original_message,
+                    session_id=session_id,
+                    profile=str(profile or ""),
+                    workspace=workspace,
+                    parent_agent=agent,
+                    config=config,
+                    store=store,
+                )
+            finally:
+                close_store = getattr(store, "close", None)
+                if callable(close_store):
+                    close_store()
+        except Exception as exc:
+            logger.exception("BestPlan go resolver failed closed")
             response = f"Plan execution was not started (resolver_error): {type(exc).__name__}: {exc}"
             return _bestplan_host_result(
                 original_message=original_message,
@@ -3076,19 +3159,16 @@ def _try_resolve_bestplan_go_ingress(
                 response=response,
                 host_agent=host_agent or agent,
             )
-        raise
-    if resolved.resolved:
-        try:
-            return resolved.to_agent_result(
-                conversation_history=conversation_history,
-                user_message=original_message,
-                host_agent=host_agent or agent,
-            )
-        except TypeError:
-            return resolved.to_agent_result(
-                conversation_history=conversation_history,
-                user_message=original_message,
-            )
+
+    if resolved is not None and resolved.resolved:
+        to_agent_result = resolved.to_agent_result
+        result_kwargs = {
+            "conversation_history": conversation_history,
+            "user_message": original_message,
+        }
+        if _callable_accepts_keyword(to_agent_result, "host_agent"):
+            result_kwargs["host_agent"] = host_agent or agent
+        return to_agent_result(**result_kwargs)
     return None
 
 
@@ -3101,6 +3181,8 @@ def _capture_bestplan_result(
     workspace: str,
     profile_home: str,
     host_agent=None,
+    config: Optional[dict] = None,
+    local_execution: bool = False,
 ) -> dict:
     try:
         import importlib
@@ -3137,18 +3219,27 @@ def _capture_bestplan_result(
             "error": "capability_upgrade_required",
         }
         return updated
+    store = BestplanStore(db_path=Path(profile_home) / "state.db")
     kwargs = dict(
         invocation_message=invocation_message,
         session_id=session_id,
         profile=str(profile or ""),
         workspace=workspace,
-        store=BestplanStore(db_path=Path(profile_home) / "state.db"),
+        store=store,
         provisional=True,
+        config=config,
+        local_execution=local_execution,
     )
     try:
-        return capture_bestplan_agent_result(result, host_agent=host_agent, **kwargs)
-    except TypeError:
+        if _callable_accepts_keyword(
+            capture_bestplan_agent_result, "host_agent"
+        ):
+            kwargs["host_agent"] = host_agent
         return capture_bestplan_agent_result(result, **kwargs)
+    finally:
+        close_store = getattr(store, "close", None)
+        if callable(close_store):
+            close_store()
 
 
 def _bestplan_capture_invocation_message(
@@ -3226,6 +3317,7 @@ def _capture_bestplan_result_after_writeback_fence(
     result: dict,
     *,
     bestplan_config: Optional[dict],
+    config: dict,
     ephemeral: bool,
     session,
     stream_id: str,
@@ -3271,6 +3363,8 @@ def _capture_bestplan_result_after_writeback_fence(
         workspace=str(session.workspace),
         profile_home=profile_home,
         host_agent=host_agent,
+        config=config,
+        local_execution=True,
     )
     capture = captured.get("bestplan_capture") if isinstance(captured, dict) else None
     if isinstance(capture, dict) and capture.get("executable") is True:
@@ -3383,6 +3477,7 @@ def _run_agent_with_bestplan_ingress(
         workspace=workspace,
         profile_home=profile_home,
         host_agent=agent,
+        config=config,
     )
 
 
@@ -11620,12 +11715,24 @@ def _run_agent_streaming(
             )
             _ckpt_thread.start()
 
-            _pending_async_acceptances = []
-            _process_notifications = _drain_webui_process_notifications(
-                session_id,
-                claimed_events=_process_completion_claims,
-                pending_async_acceptances=_pending_async_acceptances,
+            result = _try_resolve_bestplan_go_ingress(
+                agent,
+                original_message=msg_text,
+                conversation_history=_previous_context_messages,
+                session_id=session_id,
+                profile=str(getattr(s, "profile", None) or ""),
+                workspace=str(s.workspace),
+                profile_home=_profile_home,
+                config=_cfg,
             )
+            _pending_async_acceptances = []
+            _process_notifications = []
+            if result is None:
+                _process_notifications = _drain_webui_process_notifications(
+                    session_id,
+                    claimed_events=_process_completion_claims,
+                    pending_async_acceptances=_pending_async_acceptances,
+                )
             _bestplan_invocation_message = _expand_bestplan_skill_invocation(
                 msg_text,
                 session_id=session_id,
@@ -11667,38 +11774,29 @@ def _run_agent_streaming(
             # boundary: immediately before invoking the agent with the message
             # that contains their notifications. A failed ACK is removed from
             # this turn and requeued so retry cannot create a duplicate prompt.
-            _rejected_async_notifications = _accept_pending_async_delegations(
-                _pending_async_acceptances,
-                session_id=session_id,
-            )
-            if _rejected_async_notifications:
-                for _notification in _rejected_async_notifications:
-                    try:
-                        _process_notifications.remove(_notification)
-                    except ValueError:
-                        pass
-                _agent_msg_text = msg_text
-                if _process_notifications:
-                    _agent_msg_text = "\n\n".join(
-                        [*_process_notifications, msg_text]
-                    ).strip()
-                user_message = _build_native_multimodal_message(workspace_ctx, _agent_msg_text,
-                    attachments,
-                    workspace,
-                    cfg=_cfg,
+            if result is None:
+                _rejected_async_notifications = _accept_pending_async_delegations(
+                    _pending_async_acceptances,
+                    session_id=session_id,
                 )
-                _run_conversation_kwargs["user_message"] = user_message
+                if _rejected_async_notifications:
+                    for _notification in _rejected_async_notifications:
+                        try:
+                            _process_notifications.remove(_notification)
+                        except ValueError:
+                            pass
+                    _agent_msg_text = msg_text
+                    if _process_notifications:
+                        _agent_msg_text = "\n\n".join(
+                            [*_process_notifications, msg_text]
+                        ).strip()
+                    user_message = _build_native_multimodal_message(workspace_ctx, _agent_msg_text,
+                        attachments,
+                        workspace,
+                        cfg=_cfg,
+                    )
+                    _run_conversation_kwargs["user_message"] = user_message
 
-            result = _try_resolve_bestplan_go_ingress(
-                agent,
-                original_message=msg_text,
-                conversation_history=_previous_context_messages,
-                session_id=session_id,
-                profile=str(getattr(s, "profile", None) or ""),
-                workspace=str(s.workspace),
-                profile_home=_profile_home,
-                config=_cfg,
-            )
             _bestplan_capture_linearized = False
             _bestplan_capture_config = None
             if result is None:
@@ -11809,6 +11907,7 @@ def _run_agent_streaming(
                     _capture_bestplan_result_after_writeback_fence(
                         result,
                         bestplan_config=_bestplan_capture_config,
+                        config=_cfg,
                         ephemeral=ephemeral,
                         session=s,
                         stream_id=stream_id,
@@ -12428,6 +12527,7 @@ def _run_agent_streaming(
                                         _capture_bestplan_result_after_writeback_fence(
                                             _heal_result,
                                             bestplan_config=bestplan_config,
+                                            config=_cfg,
                                             ephemeral=ephemeral,
                                             session=s,
                                             stream_id=stream_id,
@@ -13974,6 +14074,7 @@ def _run_agent_streaming(
                                     _capture_bestplan_result_after_writeback_fence(
                                         _heal_result,
                                         bestplan_config=bestplan_config,
+                                        config=_cfg,
                                         ephemeral=ephemeral,
                                         session=s,
                                         stream_id=stream_id,

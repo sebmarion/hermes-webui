@@ -328,7 +328,10 @@ def _bestplan_executable_result(history, workspace):
                 "allowed_paths": ["file.txt"],
                 "read_only": False,
                 "expected_artifacts": ["file.txt"],
-                "acceptance": ["file is independently inspected"],
+                "acceptance": [
+                    "pytest -q -- tests/test_sample.py::test_sample",
+                    "file is independently inspected",
+                ],
             }
         ],
         "merge_policy": "No automatic integration.",
@@ -385,7 +388,18 @@ def _prepare_real_bestplan_capture(tmp_path, monkeypatch):
         check=True,
     )
     (workspace / "file.txt").write_text("base", encoding="utf-8")
-    subprocess.run(["git", "add", "file.txt"], cwd=workspace, check=True)
+    (workspace / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    tests_dir = workspace / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_sample.py").write_text(
+        "def test_sample():\n    assert True\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "add", "file.txt", "pytest.ini", "tests/test_sample.py"],
+        cwd=workspace,
+        check=True,
+    )
     subprocess.run(["git", "commit", "-qm", "base"], cwd=workspace, check=True)
 
     profile_home = tmp_path / "hermes-home"
@@ -739,6 +753,7 @@ def test_bestplan_config_survives_credential_401_exception_retry(
         bestplan_config,
         bestplan_config,
     ]
+    assert isinstance(capture_calls[0].get("config"), dict)
     assert capture_calls == [
         {
             "invocation_message": "/bestplan 4 Inspect it",
@@ -747,6 +762,8 @@ def test_bestplan_config_survives_credential_401_exception_retry(
             "workspace": str(tmp_path),
             "profile_home": mock.ANY,
             "host_agent": mock.ANY,
+            "config": mock.ANY,
+            "local_execution": True,
         }
     ]
 

@@ -33,6 +33,21 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _javascript_function_source(source: str, name: str) -> str:
+    marker = f"function {name}("
+    start = source.index(marker)
+    brace = source.index("{", start)
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError(f"Unclosed JavaScript function: {name}")
+
+
 # ---------------------------------------------------------------------------
 # Defect B — server-initiated turn fans `server_turn_started` to SessionChannel
 # ---------------------------------------------------------------------------
@@ -556,8 +571,7 @@ def test_emit_to_session_streams_skip_unknown_owner_documented_in_source():
 def test_frontend_handler_requires_event_id_to_surface():
     """Source-grep: _handleBgTaskCompleteEvent ignores events without event_id."""
     js = (REPO_ROOT / "static" / "messages.js").read_text()
-    fn_ix = js.index("function _handleBgTaskCompleteEvent")
-    fn_src = js[fn_ix:fn_ix + 1800]
+    fn_src = _javascript_function_source(js, "_handleBgTaskCompleteEvent")
     # event_id is extracted from the payload.
     assert "d.event_id" in fn_src
     # Missing event_id short-circuits before any dedupe / ack.
