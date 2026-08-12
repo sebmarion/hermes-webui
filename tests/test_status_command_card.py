@@ -88,7 +88,7 @@ function makeSeg() {{
 }}
 
 const ordinaryBlock = extractBlock(
-  "const hasVisibleBody=!!(String(content||'').trim()||filesHtml||recoveryHtml);",
+  "const hasVisibleBody=!!(String(content||'').trim()||filesHtml);",
   "_assistantTurnBlocks(currentAssistantTurn).appendChild(seg);"
 );
 const orderedBlock = extractBlock(
@@ -107,9 +107,12 @@ function runBaseOrdinary(opts) {{
   const thinkingText = opts.thinkingText || '';
   const window = {{ _showThinking: opts.showThinking !== false }};
   function isSimplifiedToolCalling() {{ return !!opts.simplified; }}
-  const hasVisibleBody = !!(String(content || '').trim() || filesHtml || statusHtml || recoveryHtml);
+  const hasVisibleBody = !!(String(content || '').trim() || filesHtml);
   if (statusHtml) {{
     seg.insertAdjacentHTML('beforeend', statusHtml);
+    if (hasVisibleBody) {{
+      seg.insertAdjacentHTML('beforeend', `${{filesHtml}}<div class="msg-body">${{bodyHtml}}</div>${{footHtml}}`);
+    }}
   }} else if (hasVisibleBody) {{
     seg.insertAdjacentHTML('beforeend', `${{filesHtml}}<div class="msg-body">${{bodyHtml}}</div>${{footHtml}}`);
   }} else if (!(thinkingText && window._showThinking !== false && !isSimplifiedToolCalling())) {{
@@ -193,7 +196,7 @@ console.log(JSON.stringify({{
     headStatusBeforeBody:
       ordinaryHead.html.indexOf('<status-card>limit</status-card>') <
       ordinaryHead.html.indexOf('<div class="msg-body"><p>Final report</p></div>'),
-    baseDropsBody: !ordinaryBase.html.includes('<div class="msg-body"><p>Final report</p></div>'),
+    baseKeepsBody: ordinaryBase.html.includes('<div class="msg-body"><p>Final report</p></div>'),
   }},
   statusOnly: {{
     html: statusOnly.html,
@@ -275,7 +278,7 @@ def test_render_messages_treats_status_card_as_visible_assistant_content():
 def test_render_messages_keeps_final_report_when_status_card_present():
     probe = _status_render_probe()
     ordinary = probe["ordinary"]
-    assert ordinary["baseDropsBody"] is True
+    assert ordinary["baseKeepsBody"] is True
     assert ordinary["headHasBody"] is True
     assert ordinary["headStatusBeforeBody"] is True
 

@@ -16,6 +16,21 @@ REPO_ROOT = pathlib.Path(__file__).parent.parent.resolve()
 
 from tests._pytest_port import BASE
 
+
+def _javascript_function_source(source: str, name: str) -> str:
+    marker = f"function {name}("
+    start = source.index(marker)
+    brace = source.index("{", start)
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError(f"Unclosed JavaScript function: {name}")
+
 def get(path):
     with urllib.request.urlopen(BASE + path, timeout=10) as r:
         return json.loads(r.read()), r.status
@@ -799,9 +814,7 @@ def test_renderMessages_preserves_loading_placeholder_for_session_switch(cleanup
     instead of clearing #msgInner to an empty transcript.
     """
     ui_src = (REPO_ROOT / "static/ui.js").read_text()
-    fn_start = ui_src.find("function renderMessages")
-    assert fn_start >= 0, "renderMessages() not found in ui.js"
-    fn_body = ui_src[fn_start:fn_start + 1400]
+    fn_body = _javascript_function_source(ui_src, "renderMessages")
 
     compact = re.sub(r"\s+", "", fn_body)
     assert (
