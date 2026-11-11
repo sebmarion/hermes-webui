@@ -7,27 +7,19 @@ workflow notes here.
 
 ## Read first
 
-Before making changes, read:
+Read `AGENTS.local.md` if present. It contains machine-local restrictions and cannot broaden the authority granted by the user or this file.
 
-1. `README.md`
-2. `CONTRIBUTING.md`
-3. `docs/CONTRACTS.md`
-4. `CHANGELOG.md`
+Read [CONTRIBUTING.md](CONTRIBUTING.md) when preparing a contribution. For release history, read the relevant entries in [CHANGELOG.md](CHANGELOG.md). Use [README.md](README.md) for setup and project orientation.
 
-If `AGENTS.local.md` exists in this checkout, read it after this file. It may
-add machine-local restrictions, but it cannot broaden the authority granted by
-the user or these project instructions.
+Before editing, read [docs/CONTRACTS.md](docs/CONTRACTS.md) and the linked contract or RFC for the affected subsystem. For architecture, testing, or setup, use the matching reference:
 
-For architecture, testing, or setup work, also read the matching reference:
+- [ARCHITECTURE.md](ARCHITECTURE.md) for design constraints and module layout.
+- [TESTING.md](TESTING.md) for verification commands and manual checks.
+- [Onboarding](docs/onboarding.md) for first-run behavior.
+- [Troubleshooting](docs/troubleshooting.md) for diagnosis.
+- [RFCs](docs/rfcs/README.md) for state, durability, and larger design changes.
 
-- `ARCHITECTURE.md` for design constraints and current module layout
-- `TESTING.md` for local verification commands and manual test guidance
-- `docs/onboarding.md` for first-run onboarding behavior
-- `docs/troubleshooting.md` for diagnostic flows
-- `docs/rfcs/README.md` for larger RFCs and state/durability contracts
-
-For UI or UX work, read `docs/UIUX-GUIDE.md` and `DESIGN.md` before
-changing layout, interaction flow, themes, chat rendering, or composer chrome.
+Read [docs/UIUX-GUIDE.md](docs/UIUX-GUIDE.md) and [DESIGN.md](DESIGN.md) before changing layout, interaction, themes, chat rendering, or the composer.
 
 ## Onboarding and reinstall support
 
@@ -49,8 +41,6 @@ Follow that checklist's safety rules:
 ## Contribution style
 
 - Keep one logical change per PR; split unrelated refactors or cleanup.
-- Read `docs/CONTRACTS.md` and the linked contract/RFC for the touched
-  subsystem before editing.
 - For local pytest runs, use `./scripts/test.sh` instead of bare `python3`,
   `python -m pytest`, or `pytest`. The script creates/uses the repo `.venv`,
   pins execution to Python 3.11-3.13, and installs missing dev test dependencies.
